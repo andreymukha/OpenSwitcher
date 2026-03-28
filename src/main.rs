@@ -1,13 +1,17 @@
-use evdev::{Device, InputEventKind, Key, enumerate};
+use evdev::{enumerate, Device, InputEventKind, Key};
+use open_switcher::SwitcherApi;
+use serde::Deserialize;
 use std::error::Error;
 use std::fs;
-use serde::Deserialize;
+use std::path::PathBuf;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
-use std::path::PathBuf;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use zbus::blocking::ConnectionBuilder;
-use open_switcher::SwitcherApi;
+use zbus::SignalContext;
 
 #[derive(Deserialize)]
 struct Config {
@@ -35,8 +39,17 @@ struct FeaturesConfig {
 
 fn find_keyboard() -> Option<PathBuf> {
     for (path, device) in enumerate() {
+        let name = device.name().unwrap_or("");
+
+        if name.contains("Virtual") || name.contains("Button") || name.contains("Camera") {
+            continue;
+        }
+
         if let Some(keys) = device.supported_keys() {
-            if keys.contains(Key::KEY_ENTER) && keys.contains(Key::KEY_SPACE) && keys.contains(Key::KEY_A) {
+            if keys.contains(Key::KEY_ENTER)
+                && keys.contains(Key::KEY_SPACE)
+                && keys.contains(Key::KEY_A)
+            {
                 return Some(path);
             }
         }
@@ -49,19 +62,33 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config: Config = toml::from_str(&config_str)?;
 
     let enabled = Arc::new(AtomicBool::new(true));
-    let api = SwitcherApi { enabled: enabled.clone() };
-    
-    // Исправлено: всё в нижнем регистре
-    let _conn = ConnectionBuilder::session()?
+    let layout = Arc::new(AtomicBool::new(true));
+
+    let api = SwitcherApi {
+        enabled: enabled.clone(),
+        layout: layout.clone(),
+    };
+
+    let conn = ConnectionBuilder::session()?
         .name("org.openswitcher.daemon")?
         .serve_at("/org/openswitcher/daemon", api)?
         .build()?;
-    
+
     println!("[OK] D-Bus интерфейс готов.");
 
     let kb_path = find_keyboard().ok_or("Keyboard not found")?;
     let mut real_dev = Device::open(kb_path)?;
+
+    println!(
+        "[INFO] Выбрана клавиатура: {}",
+        real_dev.name().unwrap_or("Unknown")
+    );
+    println!("⏳ Уберите руки от клавиатуры! Перехват через 2 секунды...");
+
+    thread::sleep(Duration::from_secs(2));
+
     real_dev.grab()?;
+    println!("[OK] Клавиатура успешно перехвачена. Можно печатать.");
 
     let mut virtual_dev = uinput::default()?
         .name("Open-Switcher Virtual Device")?
@@ -78,16 +105,35 @@ fn main() -> Result<(), Box<dyn Error>> {
         for event in real_dev.fetch_events()? {
             if let InputEventKind::Key(key) = event.kind() {
                 let value = event.value();
+
                 if value == 1 {
                     if key == switch_key_code {
                         if !buffer.is_empty() {
                             println!("[ACTION] Ручное исправление...");
+
                             for _ in 0..buffer.len() {
                                 virtual_dev.click(&uinput::event::keyboard::Key::BackSpace)?;
                                 thread::sleep(Duration::from_millis(config.delays.backspace_ms));
                             }
+
                             switch_layout(&mut virtual_dev, &config.layout.keys)?;
+
+                            let ctxt =
+                                SignalContext::new(conn.inner(), "/org/openswitcher/daemon")?;
+
+                            let new_layout = !layout.load(Ordering::SeqCst);
+                            layout.store(new_layout, Ordering::SeqCst);
+
+                            let enabled_now = enabled.load(Ordering::SeqCst);
+
+                            let _ = zbus::block_on(SwitcherApi::status_changed(
+                                &ctxt,
+                                enabled_now,
+                                new_layout,
+                            ));
+
                             thread::sleep(Duration::from_millis(config.layout.delay_ms));
+
                             for k in &buffer {
                                 virtual_dev.write(0x01, k.code() as i32, 1)?;
                                 virtual_dev.write(0x01, k.code() as i32, 0)?;
@@ -99,7 +145,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
 
                     match key {
-                        Key::KEY_SPACE | Key::KEY_ENTER | Key::KEY_DOT | Key::KEY_COMMA | Key::KEY_SEMICOLON => {
+                        Key::KEY_SPACE
+                        | Key::KEY_ENTER
+                        | Key::KEY_DOT
+                        | Key::KEY_COMMA
+                        | Key::KEY_SEMICOLON => {
                             buffer.clear();
                             forward_event(&mut virtual_dev, key, 1)?;
                         }
@@ -108,7 +158,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                             forward_event(&mut virtual_dev, key, 1)?;
                         }
                         _ => {
-                            if is_character(key) { buffer.push(key); }
+                            if is_character(key) {
+                                buffer.push(key);
+                            }
                             forward_event(&mut virtual_dev, key, 1)?;
                         }
                     }
@@ -134,10 +186,12 @@ fn switch_layout(vdev: &mut uinput::Device, keys: &[String]) -> Result<(), Box<d
         let u_key = parse_uinput_key(key_name)?;
         vdev.press(&u_key)?;
     }
+
     for key_name in keys.iter().rev() {
         let u_key = parse_uinput_key(key_name)?;
         vdev.release(&u_key)?;
     }
+
     vdev.synchronize()?;
     Ok(())
 }
@@ -160,8 +214,17 @@ fn forward_event(vdev: &mut uinput::Device, key: Key, value: i32) -> Result<(), 
 
 fn is_character(k: Key) -> bool {
     let code = k.code();
-    (code >= Key::KEY_Q.code() && code <= Key::KEY_P.code()) ||
-    (code >= Key::KEY_A.code() && code <= Key::KEY_L.code()) ||
-    (code >= Key::KEY_Z.code() && code <= Key::KEY_M.code()) ||
-    matches!(k, Key::KEY_LEFTBRACE | Key::KEY_RIGHTBRACE | Key::KEY_SEMICOLON | Key::KEY_APOSTROPHE | Key::KEY_COMMA | Key::KEY_DOT | Key::KEY_GRAVE)
+    (code >= Key::KEY_Q.code() && code <= Key::KEY_P.code())
+        || (code >= Key::KEY_A.code() && code <= Key::KEY_L.code())
+        || (code >= Key::KEY_Z.code() && code <= Key::KEY_M.code())
+        || matches!(
+            k,
+            Key::KEY_LEFTBRACE
+                | Key::KEY_RIGHTBRACE
+                | Key::KEY_SEMICOLON
+                | Key::KEY_APOSTROPHE
+                | Key::KEY_COMMA
+                | Key::KEY_DOT
+                | Key::KEY_GRAVE
+        )
 }

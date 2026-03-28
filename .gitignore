@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.log
+/daemon.log
+/tray.log
+.gemini/

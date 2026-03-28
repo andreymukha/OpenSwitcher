@@ -1,4 +1,4 @@
-use ksni::{menu::StandardItem, MenuItem, Tray, TrayService};
+use ksni::{menu::CheckmarkItem, menu::StandardItem, Icon, MenuItem, Tray, TrayService};
 use std::process::Command;
 use std::sync::mpsc;
 use zbus::blocking::Connection;
@@ -29,33 +29,124 @@ struct OpenSwitcherTray {
     tx_update: mpsc::Sender<(bool, bool)>,
 }
 
+fn draw_icon(enabled: bool, is_en: bool) -> Vec<Icon> {
+    let width = 22;
+    let height = 22;
+    let mut data = vec![0u8; (width * height * 4) as usize];
+
+    // Синий (активный), Серый (неактивный)
+    let (bg_a, bg_r, bg_g, bg_b) = if enabled {
+        (255, 30, 144, 255) // Синий
+    } else {
+        (255, 120, 120, 120) // Серый
+    };
+
+    // Заливаем фон
+    for i in 0..(width * height) as usize {
+        data[i * 4] = bg_a;
+        data[i * 4 + 1] = bg_r;
+        data[i * 4 + 2] = bg_g;
+        data[i * 4 + 3] = bg_b;
+    }
+
+    let char_e = [
+        [1, 1, 1, 1, 1],
+        [1, 1, 0, 0, 0],
+        [1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 0],
+        [1, 1, 0, 0, 0],
+        [1, 1, 0, 0, 0],
+        [1, 1, 1, 1, 1],
+    ];
+    let char_n = [
+        [1, 1, 0, 0, 1],
+        [1, 1, 1, 0, 1],
+        [1, 1, 1, 0, 1],
+        [1, 1, 1, 1, 1],
+        [1, 0, 1, 1, 1],
+        [1, 0, 1, 1, 1],
+        [1, 0, 0, 1, 1],
+    ];
+    let char_r = [
+        [1, 1, 1, 1, 0],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [1, 1, 1, 1, 0],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+    ];
+    let char_u = [
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [1, 1, 0, 1, 1],
+        [0, 1, 1, 1, 0],
+    ];
+
+    let (left_char, right_char) = if is_en {
+        (char_e, char_n)
+    } else {
+        (char_r, char_u)
+    };
+
+    let start_y = 7;
+    let start_x_left = 5;
+    let start_x_right = 12;
+
+    // Рисуем буквы (белым цветом)
+    for y in 0..7 {
+        for x in 0..5 {
+            if left_char[y][x] == 1 {
+                let px = (start_y + y) * width + (start_x_left + x);
+                let idx = (px * 4) as usize;
+                data[idx] = 255;
+                data[idx + 1] = 255;
+                data[idx + 2] = 255;
+                data[idx + 3] = 255;
+            }
+            if right_char[y][x] == 1 {
+                let px = (start_y + y) * width + (start_x_right + x);
+                let idx = (px * 4) as usize;
+                data[idx] = 255;
+                data[idx + 1] = 255;
+                data[idx + 2] = 255;
+                data[idx + 3] = 255;
+            }
+        }
+    }
+
+    vec![Icon {
+        width: width as i32,
+        height: height as i32,
+        data,
+    }]
+}
+
 impl Tray for OpenSwitcherTray {
     fn id(&self) -> String {
-        "open-switcher-final-v4".into()
+        "open-switcher-final-v6".into()
     }
 
     fn title(&self) -> String {
-        let layout = if self.layout { "EN" } else { "RU" };
-        let status = if self.enabled { "ВКЛ" } else { "ВЫКЛ" };
-        format!("OpenSwitcher: {} [{}]", status, layout)
+        "OpenSwitcher".into()
     }
 
     fn icon_name(&self) -> String {
-        if self.layout {
-            "input-keyboard".into()
-        } else {
-            "preferences-desktop-locale".into()
-        }
+        "".into()
+    }
+
+    fn icon_pixmap(&self) -> Vec<Icon> {
+        draw_icon(self.enabled, self.layout)
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
-            StandardItem {
-                label: if self.enabled {
-                    "✅ Авто-смена: ВКЛ".into()
-                } else {
-                    "❌ Авто-смена: ВЫКЛ".into()
-                },
+            CheckmarkItem {
+                label: "Автопереключение".into(),
+                checked: self.enabled,
                 activate: Box::new(|this: &mut OpenSwitcherTray| {
                     if this.proxy.toggle().is_ok() {
                         let new_state = !this.enabled;
@@ -73,6 +164,22 @@ impl Tray for OpenSwitcherTray {
                 ..Default::default()
             }
             .into(),
+            MenuItem::Separator,
+            StandardItem {
+                label: "Настройки...".into(),
+                activate: Box::new(|_| {
+                    std::thread::spawn(|| {
+                        let config_path = open_switcher::get_config_path();
+                        let script_path = format!("{}/projects/open-switcher/settings_ui.py", std::env::var("HOME").unwrap_or("/home/fly".into()));
+                        
+                        let _ = Command::new("python3")
+                            .arg(&script_path)
+                            .arg(&config_path)
+                            .spawn();
+                    });
+                }),
+                ..Default::default()
+            }.into(),
             MenuItem::Separator,
             StandardItem {
                 label: "Выход".into(),
@@ -119,7 +226,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(err) => {
-                    eprintln!("signal error: {err}");
+                    eprintln!("signal error: {}", err);
                     std::thread::sleep(std::time::Duration::from_millis(500));
                 }
             }

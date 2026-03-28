@@ -1,5 +1,32 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use zbus::{dbus_interface, SignalContext};
+use std::path::PathBuf;
+use std::fs;
+
+pub fn get_config_path() -> PathBuf {
+    let mut path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+    path.push(".config");
+    path.push("open-switcher");
+    fs::create_dir_all(&path).unwrap_or_default();
+    path.push("config.toml");
+    
+    if !path.exists() {
+        let default_config = r#"[layout]
+keys = ["LeftControl", "LeftShift"]
+delay_ms = 30
+
+[delays]
+backspace_ms = 0
+typing_ms = 0
+
+[features]
+undo_key = "Pause"
+"#;
+        fs::write(&path, default_config).unwrap_or_default();
+    }
+    
+    path
+}
 
 pub struct SwitcherApi {
     pub enabled: Arc<AtomicBool>,

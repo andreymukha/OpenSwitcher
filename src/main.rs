@@ -147,7 +147,8 @@ fn should_switch(buffer: &[Keystroke]) -> bool {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let config_str = fs::read_to_string("config.toml")?;
+    let config_path = open_switcher::get_config_path();
+    let config_str = fs::read_to_string(&config_path)?;
     let config: Config = toml::from_str(&config_str)?;
 
     let enabled = Arc::new(AtomicBool::new(true));

@@ -5,9 +5,9 @@ use zbus::blocking::Connection;
 use zbus::dbus_proxy;
 
 #[dbus_proxy(
-    interface = "org.openswitcher.daemon",
-    default_service = "org.openswitcher.daemon",
-    default_path = "/org/openswitcher/daemon"
+    interface = "org.oswitch.core",
+    default_service = "org.oswitch.core",
+    default_path = "/org/oswitch/core"
 )]
 trait Switcher {
     fn toggle(&self) -> zbus::Result<()>;

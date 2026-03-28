@@ -1,10 +1,10 @@
 [layout]
 keys = ["LeftControl", "LeftShift"]
-delay_ms = 100
+delay_ms = 30
 
 [delays]
-backspace_ms = 15
-typing_ms = 10
+backspace_ms = 0
+typing_ms = 0
 
 [features]
 undo_key = "Pause"

@@ -6,7 +6,7 @@ pub struct SwitcherApi {
     pub layout: Arc<AtomicBool>,
 }
 
-#[dbus_interface(name = "org.openswitcher.daemon")]
+#[dbus_interface(name = "org.oswitch.core")]
 impl SwitcherApi {
     pub fn toggle(&self, #[zbus(signal_context)] ctxt: SignalContext<'_>) {
         let new_enabled = !self.enabled.load(Ordering::SeqCst);

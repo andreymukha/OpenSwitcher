@@ -1,133 +1,239 @@
-Техническое задание: Проект «OpenSwitcher»
+# OpenSwitcher
 
-1. Цель проекта
+OpenSwitcher — Linux desktop utility на Rust для автоматического переключения раскладки клавиатуры.
 
-Создание фонового сервиса (демона) для ОС Linux, обеспечивающего автоматическое переключение раскладки клавиатуры и автокоррекцию текста (аналог Punto Switcher). Основная задача — обеспечить стабильную работу независимо от графического сервера (X11 или Wayland).
+Сейчас проект состоит из трёх независимых программ, связанных через D-Bus:
 
-2. Технологический стек
+- `open-switcher` — демон, единственный источник истины для настроек
+- `open-switcher-tray` — tray-клиент
+- `open-switcher-settings` — окно настроек на GTK4 + libadwaita
 
-Язык программирования: Rust (редакция 2021+).
+Важно:
 
-Низкоуровневое взаимодействие:
+- `config.toml` читает и пишет только демон
+- tray и settings UI работают с демоном только через D-Bus
+- GUI не работает с конфигом напрямую
 
-libevdev — для чтения «сырых» событий ввода.
+## Зависимости
 
-uinput — для эмуляции нажатий клавиш.
+Для Linux Mint / Ubuntu-подобной системы:
 
-Интерфейс и Трей:
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential \
+  pkg-config \
+  libgtk-4-dev \
+  libadwaita-1-dev
+```
 
-D-Bus — основной протокол связи между бэкендом и графической оболочкой.
+## Сборка
 
-GNOME Shell Extension (JS) — для нативной интеграции в GNOME.
+Проверка всех бинарников:
 
-ksni (Rust) — для поддержки трея в KDE, XFCE и других окружениях.
+```bash
+cargo check --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
+```
 
-Хранение данных: JSON/TOML для конфигураций и словарей.
+Полная локальная сборка:
 
-3. Основные требования и функции
+```bash
+cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
+```
 
-Функция
+Тесты:
 
-Описание
+```bash
+cargo test --lib --test dbus_api
+```
 
-Приоритет
+## Запуск
 
-Низкоуровневый перехват
+Демон:
 
-Чтение скан-кодов напрямую из /dev/input/event*.
+```bash
+./target/debug/open-switcher
+```
 
-Критический
+Tray:
 
-Эмуляция ввода
+```bash
+./target/debug/open-switcher-tray
+```
 
-Имитация нажатий Backspace для удаления и ввод исправленного текста.
+Окно настроек:
 
-Критический
+```bash
+./target/debug/open-switcher-settings
+```
 
-Индикатор в трее
+Для удобства можно использовать `manage.sh`:
 
-Иконка (флаг страны), отображающая текущую раскладку.
+```bash
+./manage.sh build
+./manage.sh start
+./manage.sh status
+./manage.sh logs
+./manage.sh settings
+./manage.sh stop
+```
 
-Высокий
+Если нужен `release`, можно передать:
 
-Раздельное меню
+```bash
+OPEN_SWITCHER_PROFILE=release ./manage.sh build
+OPEN_SWITCHER_PROFILE=release ./manage.sh start
+```
 
-Разные меню для левого клика (быстрое) и правого клика (полное).
+## Конфиг
 
-Средний
+Путь к конфигу:
 
-Поддержка Wayland/X11
+```text
+~/.config/open-switcher/config.toml
+```
 
-Работа через уровень ядра и D-Bus для интерфейса.
+Конфигом управляет только демон.
 
-Высокий
+## Быстрая проверка D-Bus
 
-Режимы работы
+Получить текущие настройки:
 
-Возможность отключения автоматики (только горячие клавиши).
+```bash
+gdbus call \
+  --session \
+  --dest org.oswitch.core \
+  --object-path /org/oswitch/core \
+  --method org.oswitch.core.GetSettings
+```
 
-Высокий
+Обновить настройки:
 
-4. Архитектура системы
+```bash
+gdbus call \
+  --session \
+  --dest org.oswitch.core \
+  --object-path /org/oswitch/core \
+  --method org.oswitch.core.UpdateSettings \
+  "(uint32 77, 'F12')"
+```
 
-4.1. Модуль прослушивания (Input Listener)
+Подписаться на сигналы состояния:
 
-Мониторинг клавиатур и захват событий через файлы устройств.
+```bash
+gdbus monitor \
+  --session \
+  --dest org.oswitch.core \
+  --object-path /org/oswitch/core
+```
 
-4.2. Движок логики (Logic Engine)
+Переключить состояние демона:
 
-Буферизация последних нажатий.
+```bash
+gdbus call \
+  --session \
+  --dest org.oswitch.core \
+  --object-path /org/oswitch/core \
+  --method org.oswitch.core.Toggle
+```
 
-Статистический анализ и поиск по словарям.
+## Локальный сценарий проверки
 
-Управление флагом "Автопереключение".
+1. Собрать проект через `cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings`.
+2. Запустить `./target/debug/open-switcher`.
+3. Запустить `./target/debug/open-switcher-tray`.
+4. При необходимости открыть `./target/debug/open-switcher-settings`.
+5. Проверить `GetSettings` и `UpdateSettings` через `gdbus`.
+6. Убедиться, что `~/.config/open-switcher/config.toml` обновляет именно демон.
 
-4.3. Интерфейсный модуль (UI Controller)
+## Типичные проблемы
 
-D-Bus Service: Бэкенд выставляет методы (toggle_auto, change_lang) и сигналы (layout_changed).
+### `Dbus(NameTaken)` или `The name org.oswitch.core is already owned`
 
-Клиенты интерфейса: Трей-иконка (для KDE/XFCE) или системное расширение (для GNOME).
+Причина:
 
-5. Особенности реализации в Linux
+- уже запущен другой экземпляр `open-switcher`
 
-Нативная интеграция в GNOME: * Разработка расширения (Extension), которое встраивается в верхнюю панель или меню быстрых настроек.
+Что проверить:
 
-Взаимодействие с Rust-демоном через системную или сессионную шину D-Bus.
+```bash
+gdbus call \
+  --session \
+  --dest org.freedesktop.DBus \
+  --object-path /org/freedesktop/DBus \
+  --method org.freedesktop.DBus.NameHasOwner \
+  org.oswitch.core
+```
 
-Взаимодействие процессов (IPC): * Демон работает как сервер, предоставляя API для управления настройками и получения статуса.
+Если нужно освободить имя:
 
-Звуки: * Воспроизведение через libcanberra или напрямую через PipeWire.
+```bash
+pkill -f '/target/.*/open-switcher($| )'
+```
 
-6. План разработки
+### `ServiceUnknown` при вызове `gdbus`
 
-Этап 1 (MVP): Чтение событий клавиатуры на Rust, логирование в консоль.
+Причина:
 
-Этап 2 (Core): Реализация виртуальной клавиатуры (uinput) и базовых алгоритмов замены.
+- демон не запущен
+- или завершился сразу после старта
 
-Этап 3 (D-Bus API): Создание серверной части в Rust для управления демоном "извне".
+Что делать:
 
-Этап 4 (UI & GNOME): Разработка расширения для GNOME Shell и стандартного трея для остальных оболочек.
+1. Убедиться, что `./target/debug/open-switcher` действительно запущен.
+2. Проверить, что имя есть на session bus.
+3. Только после этого запускать tray и settings UI.
 
-Этап 5 (Final): Окно настроек, поддержка конфигурационных файлов и инсталлятор.
+### Не собирается settings UI
 
-7. Функционал оригинала (для референса)
+Чаще всего не хватает системных GTK/libadwaita пакетов.
 
-7.1. Поведение интерфейса
+Установить:
 
-Левый клик по индикатору: Быстрое меню (Смена языка, Вкл/Выкл автопереключение).
+```bash
+sudo apt-get install -y \
+  build-essential \
+  pkg-config \
+  libgtk-4-dev \
+  libadwaita-1-dev
+```
 
-Правый клик: Полное контекстное меню (Настройки, Буфер обмена, Выход).
+### Tray или settings UI не видят демон
 
-Двойной клик: Открытие окна настроек.
+Проверь окружение session D-Bus:
 
-7.2. Горячие клавиши
+```bash
+echo "$DBUS_SESSION_BUS_ADDRESS"
+```
 
-Pause/Break: Сменить раскладку последнего введенного слова.
+Если запускаешь из нестандартной сессии или через скрипт, убедись, что клиент и демон работают в одной пользовательской session bus.
 
-Shift + Pause/Break: Сменить раскладку выделенного текста.
+### Демон стартует, но не работает с клавиатурой
 
-Alt + Pause/Break: Изменить регистр выделенного текста (ЗАГЛАВНЫЕ <-> строчные).
+Проверь:
 
-Alt + Scroll Lock: Транслитерация выделенного текста (Привет -> Privet).
+- доступ к `/dev/input/event*`
+- доступ к `uinput`
+- что процесс действительно нашёл физическую клавиатуру
 
-Ctrl + Alt + V: Вставка текста без форматирования.
+Полезно запустить демон напрямую и посмотреть его stdout/stderr:
+
+```bash
+./target/debug/open-switcher
+```
+
+### `xset` не возвращает корректную раскладку
+
+Проверь переменные окружения:
+
+```bash
+echo "$DISPLAY"
+echo "$XAUTHORITY"
+```
+
+Для X11 они должны указывать на реальную пользовательскую сессию.
+
+## Документация
+
+- Актуальная схема проекта: [docs/architecture.md](/home/fly/projects/open-switcher/docs/architecture.md)
+- Историческое ТЗ и исходное описание проекта: [docs/technical-spec.md](/home/fly/projects/open-switcher/docs/technical-spec.md)

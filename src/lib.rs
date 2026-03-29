@@ -3,11 +3,16 @@ use zbus::{dbus_interface, SignalContext};
 use std::path::PathBuf;
 use std::fs;
 
-pub fn get_config_path() -> PathBuf {
-    let mut path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()));
+pub fn get_config_dir() -> PathBuf {
+    let mut path = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()));
     path.push(".config");
     path.push("open-switcher");
-    fs::create_dir_all(&path).unwrap_or_default();
+    let _ = fs::create_dir_all(&path);
+    path
+}
+
+pub fn get_config_path() -> PathBuf {
+    let mut path = get_config_dir();
     path.push("config.toml");
     
     if !path.exists() {
@@ -22,7 +27,7 @@ typing_ms = 0
 [features]
 undo_key = "Pause"
 "#;
-        fs::write(&path, default_config).unwrap_or_default();
+        let _ = fs::write(&path, default_config);
     }
     
     path

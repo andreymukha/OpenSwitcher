@@ -3,11 +3,37 @@ name = "open-switcher"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "open-switcher"
+path = "src/main.rs"
+
+[[bin]]
+name = "open-switcher-tray"
+path = "src/bin/tray.rs"
+
+[[bin]]
+name = "open-switcher-settings"
+path = "src/bin/settings.rs"
+required-features = ["settings-ui"]
+
+[features]
+default = []
+settings-ui = ["dep:gtk", "dep:adw"]
+
 [dependencies]
 evdev = "0.12"
 uinput = "0.1.3"
 serde = { version = "1.0", features = ["derive"] }
-toml = "0.5"
-zbus = { version = "3.14", features = ["blocking"] }
+toml = "0.8"
+zbus = { version = "3.15", features = ["blocking"] }
+zvariant = "3.15"
 ksni = "0.2.1"
 async-io = "1.13"
+async-channel = "2.5"
+thiserror = "1.0"
+dirs = "5.0"
+gtk = { package = "gtk4", version = "0.9", optional = true }
+adw = { package = "libadwaita", version = "0.7", features = ["v1_4"], optional = true }
+
+[dev-dependencies]
+tempfile = "3.15"

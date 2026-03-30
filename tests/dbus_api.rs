@@ -1,7 +1,10 @@
 use open_switcher::config::AppConfig;
 use open_switcher::daemon::runtime::{ConfigService, RuntimeState};
 use open_switcher::dbus::{OpenSwitcherDbusApi, INTERFACE_NAME, OBJECT_PATH};
-use open_switcher::model::{SettingsDto, UndoKey, UpdateSettingsResult};
+use open_switcher::model::{
+    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource,
+    SettingsDto, UndoKey, UpdateSettingsResult,
+};
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,12 +25,18 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let initial: SettingsDto = proxy.call("GetSettings", &())?;
     assert_eq!(initial.layout_delay_ms, 30);
     assert_eq!(initial.undo_key, UndoKey::Pause);
+    assert_eq!(initial.layout_switch.combo, LayoutSwitchCombo::ctrl_shift());
 
     let result: UpdateSettingsResult = proxy.call(
         "UpdateSettings",
         &(SettingsDto {
             layout_delay_ms: 77,
             undo_key: UndoKey::F12,
+            layout_switch: LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::alt_shift(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            },
         }),
     )?;
     assert!(!result.restart_required);
@@ -35,10 +44,13 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let updated: SettingsDto = proxy.call("GetSettings", &())?;
     assert_eq!(updated.layout_delay_ms, 77);
     assert_eq!(updated.undo_key, UndoKey::F12);
+    assert_eq!(updated.layout_switch.combo, LayoutSwitchCombo::alt_shift());
+    assert_eq!(updated.layout_switch.source, LayoutSwitchSource::Manual);
 
-    let config: AppConfig = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    let config = AppConfig::load_or_create(&config_path)?;
     assert_eq!(config.layout.delay_ms, 77);
     assert_eq!(config.features.undo_key, UndoKey::F12);
+    assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::alt_shift());
 
     Ok(())
 }
@@ -59,6 +71,11 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
             &(SettingsDto {
                 layout_delay_ms: 999,
                 undo_key: UndoKey::Pause,
+                layout_switch: LayoutSwitchSetting {
+                    combo: LayoutSwitchCombo::ctrl_shift(),
+                    source: LayoutSwitchSource::Manual,
+                    auto_detected: AutoDetectedLayoutSwitch::default(),
+                },
             }),
         )
         .expect_err("invalid settings must be rejected");
@@ -66,7 +83,7 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
     let error_text = error.to_string();
     assert!(error_text.contains("Задержка переключения"));
 
-    let config: AppConfig = toml::from_str(&std::fs::read_to_string(&config_path)?)?;
+    let config = AppConfig::load_or_create(&config_path)?;
     assert_eq!(config.layout.delay_ms, 30);
     assert_eq!(config.features.undo_key, UndoKey::Pause);
 

@@ -2,8 +2,10 @@ pub mod config;
 pub mod daemon;
 pub mod dbus;
 pub mod error;
+pub mod layout_switch;
 pub mod model;
 #[cfg(feature = "settings-ui")]
 pub mod settings_ui;
+pub mod system;
 #[cfg(feature = "settings-ui")]
 pub mod tray;

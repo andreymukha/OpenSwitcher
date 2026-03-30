@@ -1,7 +1,7 @@
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
-use crate::model::{LayoutSwitchKey, UndoKey};
+use crate::model::{LayoutModifier, LayoutSwitchCombo, LayoutTriggerKey, UndoKey};
 use evdev::{enumerate, Device, InputEvent, Key};
 use std::env;
 use std::path::PathBuf;
@@ -106,7 +106,7 @@ impl KeyboardController {
             thread::sleep(Duration::from_millis(config.backspace_ms));
         }
 
-        self.switch_layout(&config.layout_keys)?;
+        self.switch_layout(config.layout_switch_combo)?;
         thread::sleep(Duration::from_millis(config.layout_delay_ms));
 
         for stroke in &plan.buffer {
@@ -149,18 +149,28 @@ impl KeyboardController {
         Ok(())
     }
 
-    fn switch_layout(&mut self, keys: &[LayoutSwitchKey]) -> Result<(), SwitcherError> {
-        for &key in keys {
+    fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+        for modifier in combo.modifiers() {
             self.virtual_device
-                .press(&layout_switch_key_to_uinput_key(key))?;
+                .press(&layout_modifier_to_uinput_key(modifier))?;
+        }
+
+        if let Some(key) = combo.key {
+            self.virtual_device
+                .press(&layout_trigger_key_to_uinput_key(key))?;
         }
 
         self.virtual_device.synchronize()?;
         thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
 
-        for &key in keys.iter().rev() {
+        if let Some(key) = combo.key {
             self.virtual_device
-                .release(&layout_switch_key_to_uinput_key(key))?;
+                .release(&layout_trigger_key_to_uinput_key(key))?;
+        }
+
+        for modifier in combo.modifiers().collect::<Vec<_>>().into_iter().rev() {
+            self.virtual_device
+                .release(&layout_modifier_to_uinput_key(modifier))?;
         }
 
         self.virtual_device.synchronize()?;
@@ -228,12 +238,19 @@ pub fn undo_key_to_evdev_key(key: UndoKey) -> Key {
     }
 }
 
-fn layout_switch_key_to_uinput_key(key: LayoutSwitchKey) -> uinput::event::keyboard::Key {
+fn layout_modifier_to_uinput_key(modifier: LayoutModifier) -> uinput::event::keyboard::Key {
+    match modifier {
+        LayoutModifier::Ctrl => uinput::event::keyboard::Key::LeftControl,
+        LayoutModifier::Alt => uinput::event::keyboard::Key::LeftAlt,
+        LayoutModifier::Shift => uinput::event::keyboard::Key::LeftShift,
+        LayoutModifier::Super => uinput::event::keyboard::Key::LeftMeta,
+    }
+}
+
+fn layout_trigger_key_to_uinput_key(key: LayoutTriggerKey) -> uinput::event::keyboard::Key {
     match key {
-        LayoutSwitchKey::LeftControl => uinput::event::keyboard::Key::LeftControl,
-        LayoutSwitchKey::LeftShift => uinput::event::keyboard::Key::LeftShift,
-        LayoutSwitchKey::LeftAlt => uinput::event::keyboard::Key::LeftAlt,
-        LayoutSwitchKey::CapsLock => uinput::event::keyboard::Key::CapsLock,
+        LayoutTriggerKey::Space => uinput::event::keyboard::Key::Space,
+        LayoutTriggerKey::CapsLock => uinput::event::keyboard::Key::CapsLock,
     }
 }
 

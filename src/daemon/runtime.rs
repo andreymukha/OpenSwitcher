@@ -1,13 +1,18 @@
 use crate::config::AppConfig;
 use crate::error::{ConfigError, SettingsError};
-use crate::model::{LayoutSwitchKey, Settings, UndoKey, UpdateSettingsResult};
+use crate::layout_switch::{
+    failed_detection_fallback, DesktopSettingsReader, LayoutSwitchAutoDetector,
+};
+use crate::model::SystemContext;
+use crate::model::{LayoutSwitchCombo, Settings, UndoKey, UpdateSettingsResult};
+use crate::system::SystemContextDetector;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
-    pub layout_keys: Vec<LayoutSwitchKey>,
+    pub layout_switch_combo: LayoutSwitchCombo,
     pub layout_delay_ms: u64,
     pub backspace_ms: u64,
     pub typing_ms: u64,
@@ -17,7 +22,7 @@ pub struct RuntimeConfigSnapshot {
 impl From<&AppConfig> for RuntimeConfigSnapshot {
     fn from(value: &AppConfig) -> Self {
         Self {
-            layout_keys: value.layout.keys.clone(),
+            layout_switch_combo: value.layout.switch_combo,
             layout_delay_ms: value.layout.delay_ms as u64,
             backspace_ms: value.delays.backspace_ms as u64,
             typing_ms: value.delays.typing_ms as u64,
@@ -33,7 +38,41 @@ pub struct ConfigService {
 
 impl ConfigService {
     pub fn load(config_path: PathBuf) -> Result<Self, ConfigError> {
-        let config = AppConfig::load_or_create(&config_path)?;
+        let context = SystemContextDetector::detect_current()?;
+        let detector = LayoutSwitchAutoDetector::new();
+        Self::load_with_context_and_detector(config_path, context, &detector)
+    }
+
+    fn load_with_context_and_detector<R: DesktopSettingsReader>(
+        config_path: PathBuf,
+        context: SystemContext,
+        detector: &LayoutSwitchAutoDetector<R>,
+    ) -> Result<Self, ConfigError> {
+        let mut config = AppConfig::load_or_create(&config_path)?;
+
+        let should_detect = !matches!(
+            config.layout.switch_source,
+            crate::model::LayoutSwitchSource::Manual
+        );
+
+        if should_detect {
+            let detected = match detector.detect(context) {
+                Ok(detected) => detected,
+                Err(error) => {
+                    eprintln!(
+                        "[config] Failed to auto-detect layout switch combo, using fallback: {error}"
+                    );
+                    failed_detection_fallback(context)
+                }
+            };
+            if config.settings().layout_switch != detected {
+                config.layout.switch_combo = detected.combo;
+                config.layout.switch_source = detected.source;
+                config.layout.auto_detected = detected.auto_detected;
+                config.save_to_path(&config_path)?;
+            }
+        }
+
         Ok(Self {
             config_path,
             inner: RwLock::new(config),
@@ -86,6 +125,324 @@ impl ConfigService {
             .read()
             .map(|config| RuntimeConfigSnapshot::from(&*config))
             .map_err(|_| SettingsError::LockPoisoned)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::LayoutAutoDetectError;
+    use crate::model::{
+        AutoDetectedLayoutSwitch, DesktopEnvironment, DetectionConfidence, DetectionStrategy,
+        DistroKind, LayoutSwitchSetting, LayoutSwitchSource, SessionType,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tempfile::TempDir;
+
+    #[derive(Clone)]
+    struct CountingReader {
+        calls: Arc<AtomicUsize>,
+        combo: LayoutSwitchCombo,
+    }
+
+    impl DesktopSettingsReader for CountingReader {
+        fn gsettings_string_list(
+            &self,
+            _schema: &str,
+            _key: &str,
+        ) -> Result<Vec<String>, LayoutAutoDetectError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![match self.combo {
+                combo if combo == LayoutSwitchCombo::ctrl_shift() => "grp:ctrl_shift_toggle",
+                combo if combo == LayoutSwitchCombo::alt_shift() => "grp:alt_shift_toggle",
+                combo if combo == LayoutSwitchCombo::caps_lock() => "grp:caps_toggle",
+                combo if combo == LayoutSwitchCombo::ctrl_space() => "grp:ctrl_space_toggle",
+                combo if combo == LayoutSwitchCombo::super_space() => "grp:win_space_toggle",
+                _ => "grp:ctrl_shift_toggle",
+            }
+            .to_string()])
+        }
+
+        fn xfconf_string(
+            &self,
+            _channel: &str,
+            _property: &str,
+        ) -> Result<String, LayoutAutoDetectError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(match self.combo {
+                combo if combo == LayoutSwitchCombo::ctrl_shift() => "grp:ctrl_shift_toggle",
+                combo if combo == LayoutSwitchCombo::alt_shift() => "grp:alt_shift_toggle",
+                combo if combo == LayoutSwitchCombo::caps_lock() => "grp:caps_toggle",
+                combo if combo == LayoutSwitchCombo::ctrl_space() => "grp:ctrl_space_toggle",
+                combo if combo == LayoutSwitchCombo::super_space() => "grp:win_space_toggle",
+                _ => "grp:ctrl_shift_toggle",
+            }
+            .to_string())
+        }
+
+        fn xfconf_bool(
+            &self,
+            _channel: &str,
+            _property: &str,
+        ) -> Result<bool, LayoutAutoDetectError> {
+            Ok(false)
+        }
+
+        fn setxkbmap_query(&self) -> Result<String, LayoutAutoDetectError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(format!(
+                "rules: evdev\noptions:    {}\n",
+                match self.combo {
+                    combo if combo == LayoutSwitchCombo::ctrl_shift() => {
+                        "grp:ctrl_shift_toggle,grp_led:scroll"
+                    }
+                    combo if combo == LayoutSwitchCombo::alt_shift() => {
+                        "grp:alt_shift_toggle,grp_led:scroll"
+                    }
+                    combo if combo == LayoutSwitchCombo::caps_lock() => {
+                        "grp:caps_toggle,grp_led:scroll"
+                    }
+                    combo if combo == LayoutSwitchCombo::ctrl_space() => {
+                        "grp:ctrl_space_toggle,grp_led:scroll"
+                    }
+                    combo if combo == LayoutSwitchCombo::super_space() => {
+                        "grp:win_space_toggle,grp_led:scroll"
+                    }
+                    _ => "grp:ctrl_shift_toggle,grp_led:scroll",
+                }
+            ))
+        }
+    }
+
+    fn cinnamon_x11_context() -> SystemContext {
+        SystemContext {
+            session_type: SessionType::X11,
+            desktop_environment: DesktopEnvironment::Cinnamon,
+            distro: DistroKind::LinuxMint,
+        }
+    }
+
+    fn gnome_wayland_context() -> SystemContext {
+        SystemContext {
+            session_type: SessionType::Wayland,
+            desktop_environment: DesktopEnvironment::Gnome,
+            distro: DistroKind::Ubuntu,
+        }
+    }
+
+    #[test]
+    fn detects_combo_on_first_load_and_persists_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&calls),
+            combo: LayoutSwitchCombo::alt_shift(),
+        });
+
+        let service = ConfigService::load_with_context_and_detector(
+            path.clone(),
+            cinnamon_x11_context(),
+            &detector,
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            service.get_settings().unwrap().layout_switch.combo,
+            LayoutSwitchCombo::alt_shift()
+        );
+
+        let persisted = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(
+            persisted.layout.switch_source,
+            LayoutSwitchSource::AutoDetected
+        );
+        assert_eq!(
+            persisted.layout.switch_combo,
+            LayoutSwitchCombo::alt_shift()
+        );
+    }
+
+    #[test]
+    fn rechecks_auto_detected_combo_when_context_did_not_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&calls),
+            combo: LayoutSwitchCombo::ctrl_shift(),
+        });
+
+        ConfigService::load_with_context_and_detector(
+            path.clone(),
+            cinnamon_x11_context(),
+            &detector,
+        )
+        .unwrap();
+        ConfigService::load_with_context_and_detector(path, cinnamon_x11_context(), &detector)
+            .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn redetects_when_auto_detected_context_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&calls),
+            combo: LayoutSwitchCombo::ctrl_shift(),
+        });
+
+        ConfigService::load_with_context_and_detector(
+            path.clone(),
+            cinnamon_x11_context(),
+            &detector,
+        )
+        .unwrap();
+        ConfigService::load_with_context_and_detector(
+            path.clone(),
+            gnome_wayland_context(),
+            &detector,
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let persisted = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(
+            persisted.layout.switch_source,
+            LayoutSwitchSource::AutoFallback
+        );
+        assert_eq!(
+            persisted.layout.auto_detected,
+            AutoDetectedLayoutSwitch {
+                strategy: DetectionStrategy::NoSupportedStrategy,
+                confidence: DetectionConfidence::Unsupported,
+                context: gnome_wayland_context(),
+            }
+        );
+    }
+
+    #[test]
+    fn preserves_manual_choice_even_when_context_changes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = LayoutSwitchCombo::caps_lock();
+        config.layout.switch_source = LayoutSwitchSource::Manual;
+        config.save_to_path(&path).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&calls),
+            combo: LayoutSwitchCombo::alt_shift(),
+        });
+
+        let service =
+            ConfigService::load_with_context_and_detector(path, cinnamon_x11_context(), &detector)
+                .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            service.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::caps_lock(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn refreshes_auto_detected_combo_when_system_combo_changes_without_context_change() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let first_detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&first_calls),
+            combo: LayoutSwitchCombo::ctrl_shift(),
+        });
+
+        ConfigService::load_with_context_and_detector(
+            path.clone(),
+            cinnamon_x11_context(),
+            &first_detector,
+        )
+        .unwrap();
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let second_detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&second_calls),
+            combo: LayoutSwitchCombo::alt_shift(),
+        });
+
+        let service = ConfigService::load_with_context_and_detector(
+            path.clone(),
+            cinnamon_x11_context(),
+            &second_detector,
+        )
+        .unwrap();
+
+        assert_eq!(second_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            service.get_settings().unwrap().layout_switch.combo,
+            LayoutSwitchCombo::alt_shift()
+        );
+        let persisted = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(
+            persisted.layout.switch_combo,
+            LayoutSwitchCombo::alt_shift()
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_config_in_runtime_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[layout]
+keys = ["LeftControl", "LeftShift"]
+delay_ms = 30
+
+[delays]
+backspace_ms = 0
+typing_ms = 0
+
+[features]
+undo_key = "Pause"
+"#,
+        )
+        .unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let detector = LayoutSwitchAutoDetector::with_reader(CountingReader {
+            calls: Arc::clone(&calls),
+            combo: LayoutSwitchCombo::alt_shift(),
+        });
+
+        let context = SystemContext {
+            session_type: SessionType::X11,
+            desktop_environment: DesktopEnvironment::Xfce,
+            distro: DistroKind::LinuxMint,
+        };
+
+        let error =
+            match ConfigService::load_with_context_and_detector(path.clone(), context, &detector) {
+                Ok(_) => panic!("legacy config must be rejected in dev runtime path"),
+                Err(error) => error,
+            };
+
+        assert!(matches!(error, ConfigError::LegacyFormatUnsupported));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("keys = ["));
     }
 }
 

@@ -1,7 +1,7 @@
 use super::dbus_client::SettingsDbusClient;
 use super::state::{DomainState, ViewState};
 use crate::error::{SettingsClientError, UiError};
-use crate::model::{UndoKey, UpdateSettingsResult};
+use crate::model::{LayoutSwitchCombo, UndoKey, UpdateSettingsResult};
 use async_channel::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -75,6 +75,48 @@ impl SettingsPresenter {
 
     pub fn update_undo_key(&self, value: UndoKey) {
         let changed = self.with_state(|state| state.update_undo_key(value));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn update_layout_switch_combo(&self, value: LayoutSwitchCombo) {
+        let changed = self.with_state(|state| state.update_layout_switch_combo(value));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn unlock_layout_switch_override(&self) {
+        let changed = self.with_state(DomainState::unlock_layout_switch_override);
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn start_layout_switch_capture(&self) {
+        let changed = self.with_state(DomainState::start_layout_switch_capture);
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn cancel_layout_switch_capture(&self) {
+        let changed = self.with_state(DomainState::cancel_layout_switch_capture);
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn apply_captured_layout_switch(&self, combo: LayoutSwitchCombo) {
+        let changed = self.with_state(|state| state.apply_captured_layout_switch(combo));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn show_layout_switch_presets(&self) {
+        let changed = self.with_state(DomainState::show_layout_switch_presets);
         if changed {
             let _ = self.emit_view_state();
         }

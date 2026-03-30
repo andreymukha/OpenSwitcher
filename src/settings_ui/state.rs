@@ -1,4 +1,6 @@
-use crate::model::{Settings, UndoKey};
+use crate::model::{
+    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSource, Settings, UndoKey,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RequestState {
@@ -12,12 +14,16 @@ pub struct DomainState {
     loaded: Option<Settings>,
     draft: Settings,
     request_state: RequestState,
+    layout_switch_manual_override: bool,
+    layout_switch_capture_active: bool,
+    show_layout_switch_presets: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewState {
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
+    pub layout_switch: LayoutSwitchViewState,
     pub loading: bool,
     pub saving: bool,
     pub loaded: bool,
@@ -28,6 +34,28 @@ pub struct ViewState {
     pub status_text: &'static str,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutSwitchViewState {
+    pub combo: LayoutSwitchCombo,
+    pub combo_label: String,
+    pub source: LayoutSwitchSource,
+    pub editable: bool,
+    pub manual_override_active: bool,
+    pub show_unlock_hint: bool,
+    pub show_fallback_hint: bool,
+    pub capture_active: bool,
+    pub capture_hint: &'static str,
+    pub show_manual_presets: bool,
+    pub actions: LayoutSwitchActionsState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayoutSwitchActionsState {
+    pub can_auto_detect: bool,
+    pub can_capture: bool,
+    pub can_choose_manually: bool,
+}
+
 impl DomainState {
     pub fn new() -> Self {
         let draft = Settings::default();
@@ -35,6 +63,9 @@ impl DomainState {
             loaded: None,
             draft,
             request_state: RequestState::Loading,
+            layout_switch_manual_override: false,
+            layout_switch_capture_active: false,
+            show_layout_switch_presets: false,
         }
     }
 
@@ -42,6 +73,9 @@ impl DomainState {
         self.loaded = Some(settings);
         self.draft = settings;
         self.request_state = RequestState::Idle;
+        self.layout_switch_manual_override = false;
+        self.layout_switch_capture_active = false;
+        self.show_layout_switch_presets = false;
     }
 
     pub fn begin_loading(&mut self) -> bool {
@@ -63,12 +97,14 @@ impl DomainState {
         }
 
         self.request_state = RequestState::Saving;
-        Some(self.draft)
+        Some(self.settings_for_save())
     }
 
     pub fn save_succeeded(&mut self) {
-        self.loaded = Some(self.draft);
+        self.loaded = Some(self.settings_for_save());
         self.request_state = RequestState::Idle;
+        self.layout_switch_manual_override = false;
+        self.layout_switch_capture_active = false;
     }
 
     pub fn save_failed(&mut self) {
@@ -81,10 +117,16 @@ impl DomainState {
         };
 
         if self.draft == loaded {
+            self.layout_switch_manual_override = false;
+            self.layout_switch_capture_active = false;
+            self.show_layout_switch_presets = false;
             return false;
         }
 
         self.draft = loaded;
+        self.layout_switch_manual_override = false;
+        self.layout_switch_capture_active = false;
+        self.show_layout_switch_presets = false;
         true
     }
 
@@ -106,6 +148,74 @@ impl DomainState {
         true
     }
 
+    pub fn update_layout_switch_combo(&mut self, value: LayoutSwitchCombo) -> bool {
+        if self.draft.layout_switch.combo == value {
+            return false;
+        }
+
+        self.draft.layout_switch.combo = value;
+        self.layout_switch_manual_override = true;
+        true
+    }
+
+    pub fn unlock_layout_switch_override(&mut self) -> bool {
+        if self.layout_switch_manual_override
+            || !self
+                .loaded
+                .map(|settings| settings.layout_switch.is_locked_by_auto_detection())
+                .unwrap_or(false)
+        {
+            return false;
+        }
+
+        self.layout_switch_manual_override = true;
+        true
+    }
+
+    pub fn start_layout_switch_capture(&mut self) -> bool {
+        if self.request_state == RequestState::Saving || self.loaded.is_none() {
+            return false;
+        }
+
+        self.layout_switch_manual_override = true;
+        self.layout_switch_capture_active = true;
+        self.show_layout_switch_presets = false;
+        true
+    }
+
+    pub fn cancel_layout_switch_capture(&mut self) -> bool {
+        if !self.layout_switch_capture_active {
+            return false;
+        }
+
+        self.layout_switch_capture_active = false;
+        true
+    }
+
+    pub fn apply_captured_layout_switch(&mut self, combo: LayoutSwitchCombo) -> bool {
+        self.layout_switch_capture_active = false;
+        self.layout_switch_manual_override = true;
+        self.show_layout_switch_presets = false;
+
+        if self.draft.layout_switch.combo == combo {
+            return true;
+        }
+
+        self.draft.layout_switch.combo = combo;
+        true
+    }
+
+    pub fn show_layout_switch_presets(&mut self) -> bool {
+        if self.request_state == RequestState::Saving || self.loaded.is_none() {
+            return false;
+        }
+
+        self.layout_switch_manual_override = true;
+        self.layout_switch_capture_active = false;
+        self.show_layout_switch_presets = true;
+        true
+    }
+
     pub fn view_state(&self) -> ViewState {
         let loading = self.request_state == RequestState::Loading;
         let saving = self.request_state == RequestState::Saving;
@@ -118,6 +228,37 @@ impl DomainState {
         ViewState {
             layout_delay_ms: self.draft.layout_delay_ms,
             undo_key: self.draft.undo_key,
+            layout_switch: LayoutSwitchViewState {
+                combo: self.draft.layout_switch.combo,
+                combo_label: self.draft.layout_switch.combo.short_label(),
+                source: if self.layout_switch_manual_override {
+                    LayoutSwitchSource::Manual
+                } else {
+                    self.draft.layout_switch.source
+                },
+                editable: loaded
+                    && !saving
+                    && (!self.draft.layout_switch.is_locked_by_auto_detection()
+                        || self.layout_switch_manual_override),
+                manual_override_active: self.layout_switch_manual_override,
+                show_unlock_hint: loaded
+                    && self.draft.layout_switch.is_locked_by_auto_detection()
+                    && !self.layout_switch_manual_override,
+                show_fallback_hint: loaded
+                    && self.draft.layout_switch.source == LayoutSwitchSource::AutoFallback,
+                capture_active: self.layout_switch_capture_active,
+                capture_hint: if self.layout_switch_capture_active {
+                    "Нажмите желаемую комбинацию. Esc — отмена."
+                } else {
+                    ""
+                },
+                show_manual_presets: self.show_layout_switch_presets,
+                actions: LayoutSwitchActionsState {
+                    can_auto_detect: loaded && !saving,
+                    can_capture: loaded && !saving,
+                    can_choose_manually: loaded && !saving,
+                },
+            },
             loading,
             saving,
             loaded,
@@ -133,6 +274,15 @@ impl DomainState {
                 ""
             },
         }
+    }
+
+    fn settings_for_save(&self) -> Settings {
+        let mut settings = self.draft;
+        if self.layout_switch_manual_override {
+            settings.layout_switch.source = LayoutSwitchSource::Manual;
+            settings.layout_switch.auto_detected = AutoDetectedLayoutSwitch::default();
+        }
+        settings
     }
 }
 

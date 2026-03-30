@@ -170,7 +170,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     {
         let presenter = presenter.clone();
         let ui = Rc::clone(&ui);
-        ui.capture_button().connect_clicked(move |_| {
+        ui.capture_row().connect_activated(move |_| {
             if ui.current_view_state().layout_switch.capture_active {
                 presenter.cancel_layout_switch_capture();
             } else {
@@ -181,7 +181,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
 
     {
         let presenter = presenter.clone();
-        ui.choose_presets_button().connect_clicked(move |_| {
+        ui.choose_presets_row().connect_activated(move |_| {
             presenter.show_layout_switch_presets();
         });
     }
@@ -276,19 +276,21 @@ fn build_form_widgets() -> FormWidgets {
     layout_switch_value_row.add_suffix(&layout_switch_value_label);
     group.add(&layout_switch_value_row);
 
-    let layout_switch_actions_row = adw::ActionRow::builder()
-        .title("Ручной выбор")
-        .subtitle(
-            "Основной путь: захватить реальную комбинацию. Список оставлен как запасной вариант.",
-        )
+    let capture_row = adw::ActionRow::builder()
+        .title("Нажмите комбинацию")
+        .subtitle("Основной ручной способ: захватить реальную комбинацию клавиш")
         .build();
-    let actions_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    let capture_button = gtk::Button::with_label("Нажмите комбинацию");
-    let choose_presets_button = gtk::Button::with_label("Выбрать из списка");
-    actions_box.append(&capture_button);
-    actions_box.append(&choose_presets_button);
-    layout_switch_actions_row.add_suffix(&actions_box);
-    group.add(&layout_switch_actions_row);
+    capture_row.set_activatable(true);
+    capture_row.add_suffix(&gtk::Image::from_icon_name("keyboard-shortcuts-symbolic"));
+    group.add(&capture_row);
+
+    let choose_presets_row = adw::ActionRow::builder()
+        .title("Выбрать из списка")
+        .subtitle("Запасной вариант, если захватить комбинацию сейчас неудобно")
+        .build();
+    choose_presets_row.set_activatable(true);
+    choose_presets_row.add_suffix(&gtk::Image::from_icon_name("view-list-symbolic"));
+    group.add(&choose_presets_row);
 
     let layout_switch_presets_revealer = gtk::Revealer::new();
     layout_switch_presets_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
@@ -332,8 +334,8 @@ fn build_form_widgets() -> FormWidgets {
         delay_spin,
         undo_dropdown,
         layout_switch_value_label,
-        capture_button,
-        choose_presets_button,
+        capture_row,
+        choose_presets_row,
         layout_switch_presets_revealer,
         layout_switch_dropdown,
         layout_switch_hint_label,
@@ -348,8 +350,8 @@ struct FormWidgets {
     delay_spin: gtk::SpinButton,
     undo_dropdown: gtk::DropDown,
     layout_switch_value_label: gtk::Label,
-    capture_button: gtk::Button,
-    choose_presets_button: gtk::Button,
+    capture_row: adw::ActionRow,
+    choose_presets_row: adw::ActionRow,
     layout_switch_presets_revealer: gtk::Revealer,
     layout_switch_dropdown: gtk::DropDown,
     layout_switch_hint_label: gtk::Label,
@@ -627,21 +629,21 @@ impl SettingsWindow {
             .clone()
     }
 
-    fn capture_button(&self) -> gtk::Button {
+    fn capture_row(&self) -> adw::ActionRow {
         self.form
             .borrow()
             .as_ref()
             .expect("form widgets must be installed before access")
-            .capture_button
+            .capture_row
             .clone()
     }
 
-    fn choose_presets_button(&self) -> gtk::Button {
+    fn choose_presets_row(&self) -> adw::ActionRow {
         self.form
             .borrow()
             .as_ref()
             .expect("form widgets must be installed before access")
-            .choose_presets_button
+            .choose_presets_row
             .clone()
     }
 
@@ -712,17 +714,21 @@ impl SettingsWindow {
             }
 
             let manual_actions_enabled = state.layout_switch.editable;
-            form.capture_button.set_sensitive(
+            form.capture_row.set_sensitive(
                 state.layout_switch.actions.can_capture
                     && (manual_actions_enabled || state.layout_switch.capture_active),
             );
-            form.capture_button
-                .set_label(if state.layout_switch.capture_active {
-                    "Отменить ввод"
-                } else {
-                    "Нажмите комбинацию"
-                });
-            form.choose_presets_button.set_sensitive(
+            form.capture_row.set_title(if state.layout_switch.capture_active {
+                "Отменить ввод"
+            } else {
+                "Нажмите комбинацию"
+            });
+            form.capture_row.set_subtitle(if state.layout_switch.capture_active {
+                state.layout_switch.capture_hint
+            } else {
+                "Основной ручной способ: захватить реальную комбинацию клавиш"
+            });
+            form.choose_presets_row.set_sensitive(
                 state.layout_switch.actions.can_choose_manually
                     && manual_actions_enabled
                     && !state.layout_switch.capture_active,

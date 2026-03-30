@@ -5,4 +5,5 @@ pub mod error;
 pub mod model;
 #[cfg(feature = "settings-ui")]
 pub mod settings_ui;
+#[cfg(feature = "settings-ui")]
 pub mod tray;

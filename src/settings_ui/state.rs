@@ -44,6 +44,15 @@ impl DomainState {
         self.request_state = RequestState::Idle;
     }
 
+    pub fn begin_loading(&mut self) -> bool {
+        if self.request_state == RequestState::Saving {
+            return false;
+        }
+
+        self.request_state = RequestState::Loading;
+        true
+    }
+
     pub fn finish_loading(&mut self) {
         self.request_state = RequestState::Idle;
     }
@@ -64,6 +73,19 @@ impl DomainState {
 
     pub fn save_failed(&mut self) {
         self.request_state = RequestState::Idle;
+    }
+
+    pub fn discard_changes(&mut self) -> bool {
+        let Some(loaded) = self.loaded else {
+            return false;
+        };
+
+        if self.draft == loaded {
+            return false;
+        }
+
+        self.draft = loaded;
+        true
     }
 
     pub fn update_layout_delay(&mut self, value: u32) -> bool {

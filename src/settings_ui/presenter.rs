@@ -14,6 +14,11 @@ pub enum PresenterEvent {
     SaveSucceeded(UpdateSettingsResult),
 }
 
+pub enum SaveRequest {
+    Ignored,
+    Accepted(ViewState),
+}
+
 #[derive(Clone)]
 pub struct SettingsPresenter {
     inner: Arc<PresenterInner>,
@@ -37,6 +42,15 @@ impl SettingsPresenter {
     }
 
     pub fn initialize(&self) {
+        self.reload();
+    }
+
+    pub fn reload(&self) {
+        let should_load = self.with_state(DomainState::begin_loading);
+        if !should_load {
+            return;
+        }
+
         let _ = self.emit_view_state();
         let presenter = self.clone();
         thread::spawn(move || match presenter.inner.client.load_settings() {
@@ -66,20 +80,29 @@ impl SettingsPresenter {
         }
     }
 
-    pub fn save(&self) {
+    pub fn discard_changes(&self) {
+        let changed = self.with_state(DomainState::discard_changes);
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn save(&self) -> SaveRequest {
         let snapshot = self.with_state(|state| state.begin_save());
         let Some(snapshot) = snapshot else {
-            return;
+            return SaveRequest::Ignored;
         };
+
+        let saving_view_state = self.with_state(|state| state.view_state());
+        let _ = self.send_event(PresenterEvent::ViewStateChanged(saving_view_state.clone()));
 
         if let Err(error) = snapshot.validate() {
             self.with_state(DomainState::save_failed);
-            let _ = self.emit_view_state();
+            let reset_view_state = self.with_state(|state| state.view_state());
+            let _ = self.send_event(PresenterEvent::ViewStateChanged(reset_view_state.clone()));
             let _ = self.send_event(PresenterEvent::SaveFailed(SettingsClientError::from(error)));
-            return;
+            return SaveRequest::Accepted(reset_view_state);
         }
-
-        let _ = self.emit_view_state();
 
         let presenter = self.clone();
         thread::spawn(
@@ -96,6 +119,8 @@ impl SettingsPresenter {
                 }
             },
         );
+
+        SaveRequest::Accepted(saving_view_state)
     }
 
     fn emit_view_state(&self) -> Result<(), UiError> {

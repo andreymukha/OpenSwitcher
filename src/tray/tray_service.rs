@@ -1,8 +1,6 @@
 use super::dbus_listener::DbusListener;
+use async_channel::Sender;
 use ksni::{menu::CheckmarkItem, menu::StandardItem, Icon, MenuItem, Tray};
-use std::env;
-use std::path::PathBuf;
-use std::process::Command;
 
 #[derive(Clone, Copy, Debug)]
 pub struct TrayState {
@@ -10,14 +8,25 @@ pub struct TrayState {
     pub layout_is_english: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum TrayCommand {
+    ShowSettings,
+    Quit,
+}
+
 pub struct OpenSwitcherTray {
     dbus: DbusListener,
+    command_tx: Sender<TrayCommand>,
     pub state: TrayState,
 }
 
 impl OpenSwitcherTray {
-    pub fn new(dbus: DbusListener, state: TrayState) -> Self {
-        Self { dbus, state }
+    pub fn new(dbus: DbusListener, state: TrayState, command_tx: Sender<TrayCommand>) -> Self {
+        Self {
+            dbus,
+            command_tx,
+            state,
+        }
     }
 }
 
@@ -54,11 +63,10 @@ impl Tray for OpenSwitcherTray {
             MenuItem::Separator,
             StandardItem {
                 label: "Настройки...".into(),
-                activate: Box::new(|_| {
-                    std::thread::spawn(|| {
-                        let executable = find_settings_executable();
-                        let _ = Command::new(executable).spawn();
-                    });
+                activate: Box::new(|this: &mut OpenSwitcherTray| {
+                    if let Err(err) = this.command_tx.try_send(TrayCommand::ShowSettings) {
+                        eprintln!("[tray] Failed to request settings window: {err}");
+                    }
                 }),
                 ..Default::default()
             }
@@ -66,7 +74,12 @@ impl Tray for OpenSwitcherTray {
             MenuItem::Separator,
             StandardItem {
                 label: "Выход".into(),
-                activate: Box::new(|_| std::process::exit(0)),
+                activate: Box::new(|this: &mut OpenSwitcherTray| {
+                    if let Err(err) = this.command_tx.try_send(TrayCommand::Quit) {
+                        eprintln!("[tray] Failed to request tray shutdown: {err}");
+                        std::process::exit(1);
+                    }
+                }),
                 ..Default::default()
             }
             .into(),
@@ -75,6 +88,10 @@ impl Tray for OpenSwitcherTray {
 }
 
 fn draw_icon(enabled: bool, layout_is_english: bool) -> Vec<Icon> {
+    vec![draw_bitmap_icon(enabled, layout_is_english)]
+}
+
+fn draw_bitmap_icon(enabled: bool, layout_is_english: bool) -> Icon {
     let width = 22;
     let height = 22;
     let mut data = vec![0u8; width * height * 4];
@@ -144,11 +161,11 @@ fn draw_icon(enabled: bool, layout_is_english: bool) -> Vec<Icon> {
     draw_char(&mut data, left_mask, 2, 4, width);
     draw_char(&mut data, right_mask, 12, 4, width);
 
-    vec![Icon {
+    Icon {
         width: width as i32,
         height: height as i32,
         data,
-    }]
+    }
 }
 
 fn draw_char(data: &mut [u8], mask: &str, x_offset: usize, y_offset: usize, image_width: usize) {
@@ -166,17 +183,4 @@ fn draw_char(data: &mut [u8], mask: &str, x_offset: usize, y_offset: usize, imag
             }
         }
     }
-}
-
-fn find_settings_executable() -> PathBuf {
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(bin_dir) = current_exe.parent() {
-            let candidate = bin_dir.join("open-switcher-settings");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-    }
-
-    PathBuf::from("open-switcher-settings")
 }

@@ -158,14 +158,20 @@ fn draw_bitmap_icon(enabled: bool, layout_is_english: bool) -> Icon {
     } else {
         (char_r, char_u)
     };
-    draw_char(&mut data, left_mask, 2, 4, width);
-    draw_char(&mut data, right_mask, 12, 4, width);
+    let mask_height = mask_height(left_mask).max(mask_height(right_mask));
+    let y_offset = (height - mask_height) / 2;
+    draw_char(&mut data, left_mask, 2, y_offset, width);
+    draw_char(&mut data, right_mask, 12, y_offset, width);
 
     Icon {
         width: width as i32,
         height: height as i32,
         data,
     }
+}
+
+fn mask_height(mask: &str) -> usize {
+    mask.trim().lines().count()
 }
 
 fn draw_char(data: &mut [u8], mask: &str, x_offset: usize, y_offset: usize, image_width: usize) {

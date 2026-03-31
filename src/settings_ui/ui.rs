@@ -2,9 +2,8 @@ use super::dbus_client::SettingsDbusClient;
 use super::presenter::{PresenterEvent, SaveRequest, SettingsPresenter};
 use super::state::{LayoutSwitchActionsState, LayoutSwitchViewState, ViewState};
 use crate::error::SettingsClientError;
-use crate::model::{LayoutModifier, LayoutSwitchCombo, LayoutTriggerKey};
+use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState, LayoutSwitchCombo};
 use adw::prelude::*;
-use gtk::gdk;
 use gtk::glib::{self, SignalHandlerId};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -19,33 +18,13 @@ enum SettingsWindowMode {
     Standalone,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct CaptureProgress {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    super_key: bool,
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CaptureDialogState {
+    candidate: Option<LayoutSwitchCombo>,
+    error: Option<String>,
 }
 
-impl CaptureProgress {
-    fn set_modifier(&mut self, modifier: LayoutModifier, pressed: bool) {
-        match modifier {
-            LayoutModifier::Ctrl => self.ctrl = pressed,
-            LayoutModifier::Alt => self.alt = pressed,
-            LayoutModifier::Shift => self.shift = pressed,
-            LayoutModifier::Super => self.super_key = pressed,
-        }
-    }
-
-    fn combo_with_key(self, key: LayoutTriggerKey) -> Option<LayoutSwitchCombo> {
-        LayoutSwitchCombo::from_parts(self.ctrl, self.alt, self.shift, self.super_key, Some(key))
-            .ok()
-    }
-
-    fn modifier_only_combo(self) -> Option<LayoutSwitchCombo> {
-        LayoutSwitchCombo::from_parts(self.ctrl, self.alt, self.shift, self.super_key, None).ok()
-    }
-
+impl CaptureDialogState {
     fn clear(&mut self) {
         *self = Self::default();
     }
@@ -109,13 +88,12 @@ pub fn run_standalone() {
 }
 
 fn initialize_window(ui: Rc<SettingsWindow>) {
-    let form = build_form_widgets();
+    let form = build_form_widgets(&ui.window);
     ui.install_form(form);
 
     let (event_tx, event_rx) = async_channel::unbounded();
     let presenter = SettingsPresenter::new(SettingsDbusClient, event_tx);
     ui.set_presenter(presenter.clone());
-    ui.install_capture_controller(presenter.clone());
 
     let delay_handler = {
         let presenter = presenter.clone();
@@ -140,22 +118,9 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     };
     ui.set_undo_handler(undo_handler);
 
-    let layout_switch_handler = {
-        let presenter = presenter.clone();
-        let dropdown = ui.layout_switch_dropdown();
-        dropdown.connect_selected_notify(move |dropdown| {
-            if let Some(combo) = crate::model::LayoutSwitchCombo::COMMON_CHOICES
-                .get(dropdown.selected() as usize)
-                .copied()
-            {
-                presenter.update_layout_switch_combo(combo);
-            }
-        })
-    };
-    ui.set_layout_switch_handler(layout_switch_handler);
-
     {
         let presenter = presenter.clone();
+        let ui = Rc::clone(&ui);
         let label = ui.layout_switch_hint_label();
         label.connect_activate_link(move |_, uri| {
             if uri == "app://unlock-layout-switch" {
@@ -170,20 +135,66 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     {
         let presenter = presenter.clone();
         let ui = Rc::clone(&ui);
-        ui.capture_row().connect_activated(move |_| {
-            if ui.current_view_state().layout_switch.capture_active {
-                presenter.cancel_layout_switch_capture();
-            } else {
-                presenter.start_layout_switch_capture();
+        ui.layout_switch_value_row().connect_activated(move |_| {
+            if !ui.current_view_state().layout_switch.editable {
+                return;
+            }
+
+            match presenter.start_layout_switch_capture() {
+                Ok(()) => {
+                    ui.reset_capture_dialog();
+                    ui.open_layout_switch_dialog();
+                }
+                Err(error) => ui.show_client_error(error, false),
             }
         });
     }
 
     {
         let presenter = presenter.clone();
-        ui.choose_presets_row().connect_activated(move |_| {
-            presenter.show_layout_switch_presets();
+        let ui = Rc::clone(&ui);
+        ui.dialog_cancel_button().connect_clicked(move |_| {
+            ui.reset_capture_dialog();
+            if let Err(error) = presenter.cancel_layout_switch_capture() {
+                ui.show_client_error(error, false);
+            }
+            ui.close_layout_switch_dialog();
         });
+    }
+
+    {
+        let presenter = presenter.clone();
+        let ui = Rc::clone(&ui);
+        ui.dialog_ok_button().connect_clicked(move |_| {
+            let candidate = ui.capture_dialog_state.borrow().candidate;
+            let Some(combo) = candidate else {
+                return;
+            };
+
+            match presenter.confirm_captured_layout_switch(combo) {
+                Ok(()) => {
+                    ui.reset_capture_dialog();
+                    ui.close_layout_switch_dialog();
+                }
+                Err(error) => ui.show_client_error(error, false),
+            }
+        });
+    }
+
+    {
+        let presenter = presenter.clone();
+        let ui = Rc::clone(&ui);
+        ui.layout_switch_dialog()
+            .connect_close_request(move |dialog| {
+                if ui.current_view_state().layout_switch.capture_active {
+                    ui.reset_capture_dialog();
+                    if let Err(error) = presenter.cancel_layout_switch_capture() {
+                        ui.show_client_error(error, false);
+                    }
+                }
+                dialog.hide();
+                glib::Propagation::Stop
+            });
     }
 
     {
@@ -199,6 +210,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
 
     {
         let ui = Rc::clone(&ui);
+        let presenter_for_events = presenter.clone();
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = event_rx.recv().await {
                 match event {
@@ -208,6 +220,9 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     PresenterEvent::LoadFailed(error) => ui.show_client_error(error, true),
                     PresenterEvent::SaveFailed(error) => ui.show_client_error(error, false),
                     PresenterEvent::SaveSucceeded(result) => ui.show_toast(&result.message),
+                    PresenterEvent::CaptureStateChanged(state) => {
+                        ui.apply_capture_state(&presenter_for_events, state)
+                    }
                 }
             }
         });
@@ -216,7 +231,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     presenter.initialize();
 }
 
-fn build_form_widgets() -> FormWidgets {
+fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     let clamp = adw::Clamp::new();
     clamp.set_margin_top(8);
     clamp.set_margin_bottom(12);
@@ -273,45 +288,83 @@ fn build_form_widgets() -> FormWidgets {
     layout_switch_value_label.set_halign(gtk::Align::End);
     layout_switch_value_label.set_valign(gtk::Align::Center);
     layout_switch_value_label.add_css_class("monospace");
+    let layout_switch_value_icon = gtk::Image::from_icon_name("go-next-symbolic");
+    layout_switch_value_row.add_suffix(&layout_switch_value_icon);
     layout_switch_value_row.add_suffix(&layout_switch_value_label);
     group.add(&layout_switch_value_row);
 
-    let capture_row = adw::ActionRow::builder()
-        .title("Нажмите комбинацию")
-        .subtitle("Основной ручной способ: захватить реальную комбинацию клавиш")
+    let layout_switch_dialog = adw::Window::builder()
+        .title("Выбор комбинации раскладки")
+        .default_width(380)
+        .default_height(240)
+        .modal(true)
+        .resizable(false)
         .build();
-    capture_row.set_activatable(true);
-    capture_row.add_suffix(&gtk::Image::from_icon_name("keyboard-shortcuts-symbolic"));
-    group.add(&capture_row);
+    layout_switch_dialog.set_transient_for(Some(parent_window));
+    layout_switch_dialog.set_hide_on_close(true);
 
-    let choose_presets_row = adw::ActionRow::builder()
-        .title("Выбрать из списка")
-        .subtitle("Запасной вариант, если захватить комбинацию сейчас неудобно")
-        .build();
-    choose_presets_row.set_activatable(true);
-    choose_presets_row.add_suffix(&gtk::Image::from_icon_name("view-list-symbolic"));
-    group.add(&choose_presets_row);
+    let dialog_toolbar = adw::ToolbarView::new();
+    let dialog_header = adw::HeaderBar::new();
+    let dialog_title = adw::WindowTitle::new("Выбор комбинации", "Переключение раскладки");
+    dialog_header.set_title_widget(Some(&dialog_title));
+    dialog_toolbar.add_top_bar(&dialog_header);
 
-    let layout_switch_presets_revealer = gtk::Revealer::new();
-    layout_switch_presets_revealer.set_transition_type(gtk::RevealerTransitionType::SlideDown);
-    layout_switch_presets_revealer.set_reveal_child(false);
+    let dialog_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    dialog_box.set_margin_top(18);
+    dialog_box.set_margin_bottom(18);
+    dialog_box.set_margin_start(18);
+    dialog_box.set_margin_end(18);
 
-    let layout_switch_presets_row = adw::ActionRow::builder()
-        .title("Выбор из списка")
-        .subtitle("Запасной вариант, если текущую комбинацию неудобно захватывать прямо сейчас")
-        .build();
-    let layout_switch_labels: Vec<String> = crate::model::LayoutSwitchCombo::COMMON_CHOICES
-        .iter()
-        .map(|combo| combo.short_label())
-        .collect();
-    let layout_switch_label_refs: Vec<&str> =
-        layout_switch_labels.iter().map(String::as_str).collect();
-    let layout_switch_dropdown = gtk::DropDown::from_strings(&layout_switch_label_refs);
-    layout_switch_dropdown.set_valign(gtk::Align::Center);
-    layout_switch_presets_row.add_suffix(&layout_switch_dropdown);
-    layout_switch_presets_row.set_activatable_widget(Some(&layout_switch_dropdown));
-    layout_switch_presets_revealer.set_child(Some(&layout_switch_presets_row));
-    group.add(&layout_switch_presets_revealer);
+    let dialog_heading = gtk::Label::new(Some("Нажмите комбинацию..."));
+    dialog_heading.set_halign(gtk::Align::Start);
+    dialog_heading.add_css_class("title-3");
+    dialog_box.append(&dialog_heading);
+
+    let dialog_capture_hint = gtk::Label::new(Some(
+        "Поддерживаются Ctrl+Shift, Alt+Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift. Esc — отмена.",
+    ));
+    dialog_capture_hint.set_halign(gtk::Align::Start);
+    dialog_capture_hint.set_wrap(true);
+    dialog_capture_hint.add_css_class("dim-label");
+    dialog_box.append(&dialog_capture_hint);
+
+    let dialog_current_title = gtk::Label::new(Some("Текущая комбинация"));
+    dialog_current_title.set_halign(gtk::Align::Start);
+    dialog_current_title.add_css_class("caption-heading");
+    dialog_box.append(&dialog_current_title);
+
+    let dialog_current_combo_label = gtk::Label::new(Some("Пока не выбрана"));
+    dialog_current_combo_label.set_halign(gtk::Align::Start);
+    dialog_current_combo_label.set_wrap(true);
+    dialog_current_combo_label.add_css_class("monospace");
+    dialog_current_combo_label.add_css_class("title-4");
+    dialog_box.append(&dialog_current_combo_label);
+
+    let dialog_error_label = gtk::Label::new(None);
+    dialog_error_label.set_halign(gtk::Align::Start);
+    dialog_error_label.set_wrap(true);
+    dialog_error_label.add_css_class("error");
+    dialog_error_label.hide();
+    dialog_box.append(&dialog_error_label);
+
+    let dialog_actions_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    dialog_actions_box.set_margin_top(6);
+
+    let dialog_cancel_button = gtk::Button::with_label("Отмена");
+    let dialog_ok_button = gtk::Button::with_label("ОК");
+    dialog_ok_button.add_css_class("suggested-action");
+    dialog_ok_button.set_sensitive(false);
+
+    let dialog_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    dialog_spacer.set_hexpand(true);
+
+    dialog_actions_box.append(&dialog_cancel_button);
+    dialog_actions_box.append(&dialog_spacer);
+    dialog_actions_box.append(&dialog_ok_button);
+    dialog_box.append(&dialog_actions_box);
+
+    dialog_toolbar.set_content(Some(&dialog_box));
+    layout_switch_dialog.set_content(Some(&dialog_toolbar));
 
     let layout_switch_hint_label = gtk::Label::new(None);
     layout_switch_hint_label.set_halign(gtk::Align::Start);
@@ -333,15 +386,18 @@ fn build_form_widgets() -> FormWidgets {
         clamp,
         delay_spin,
         undo_dropdown,
+        layout_switch_value_row,
         layout_switch_value_label,
-        capture_row,
-        choose_presets_row,
-        layout_switch_presets_revealer,
-        layout_switch_dropdown,
+        layout_switch_value_icon,
+        layout_switch_dialog,
+        dialog_capture_hint,
+        dialog_current_combo_label,
+        dialog_error_label,
+        dialog_ok_button,
+        dialog_cancel_button,
         layout_switch_hint_label,
         delay_handler: None,
         undo_handler: None,
-        layout_switch_handler: None,
     }
 }
 
@@ -349,15 +405,18 @@ struct FormWidgets {
     clamp: adw::Clamp,
     delay_spin: gtk::SpinButton,
     undo_dropdown: gtk::DropDown,
+    layout_switch_value_row: adw::ActionRow,
     layout_switch_value_label: gtk::Label,
-    capture_row: adw::ActionRow,
-    choose_presets_row: adw::ActionRow,
-    layout_switch_presets_revealer: gtk::Revealer,
-    layout_switch_dropdown: gtk::DropDown,
+    layout_switch_value_icon: gtk::Image,
+    layout_switch_dialog: adw::Window,
+    dialog_capture_hint: gtk::Label,
+    dialog_current_combo_label: gtk::Label,
+    dialog_error_label: gtk::Label,
+    dialog_ok_button: gtk::Button,
+    dialog_cancel_button: gtk::Button,
     layout_switch_hint_label: gtk::Label,
     delay_handler: Option<SignalHandlerId>,
     undo_handler: Option<SignalHandlerId>,
-    layout_switch_handler: Option<SignalHandlerId>,
 }
 
 struct SettingsWindow {
@@ -370,7 +429,7 @@ struct SettingsWindow {
     form: RefCell<Option<FormWidgets>>,
     presenter: RefCell<Option<SettingsPresenter>>,
     current_view_state: RefCell<ViewState>,
-    capture_progress: RefCell<CaptureProgress>,
+    capture_dialog_state: RefCell<CaptureDialogState>,
 }
 
 impl SettingsWindow {
@@ -442,7 +501,7 @@ impl SettingsWindow {
             form: RefCell::new(None),
             presenter: RefCell::new(None),
             current_view_state: RefCell::new(initial_view_state()),
-            capture_progress: RefCell::new(CaptureProgress::default()),
+            capture_dialog_state: RefCell::new(CaptureDialogState::default()),
         });
 
         if mode == SettingsWindowMode::Embedded {
@@ -471,116 +530,62 @@ impl SettingsWindow {
         self.form_container.append(&form.clamp);
         self.form.replace(Some(form));
         self.apply_view_state(&initial_view_state());
-    }
-
-    fn install_capture_controller(self: &Rc<Self>, presenter: SettingsPresenter) {
-        let controller = gtk::EventControllerKey::new();
-
-        {
-            let ui_weak = Rc::downgrade(self);
-            let presenter = presenter.clone();
-            controller.connect_key_pressed(move |_, key, _, _| {
-                let Some(ui) = ui_weak.upgrade() else {
-                    return glib::Propagation::Proceed;
-                };
-
-                if !ui.current_view_state().layout_switch.capture_active {
-                    return glib::Propagation::Proceed;
-                }
-
-                if key == gdk::Key::Escape {
-                    ui.reset_capture_progress();
-                    presenter.cancel_layout_switch_capture();
-                    return glib::Propagation::Stop;
-                }
-
-                if let Some(modifier) = layout_modifier_from_key(key) {
-                    ui.capture_progress.borrow_mut().set_modifier(modifier, true);
-                    return glib::Propagation::Stop;
-                }
-
-                if let Some(trigger_key) = layout_trigger_key_from_key(key) {
-                    let combo = {
-                        let progress = *ui.capture_progress.borrow();
-                        progress.combo_with_key(trigger_key)
-                    };
-                    if let Some(combo) = combo {
-                        ui.reset_capture_progress();
-                        presenter.apply_captured_layout_switch(combo);
-                    } else {
-                        ui.show_toast(
-                            "Эта комбинация пока не поддерживается. Попробуйте Ctrl+Shift, Alt+Shift, CapsLock, Ctrl+Space или Super+Space.",
-                        );
-                    }
-                    return glib::Propagation::Stop;
-                }
-
-                ui.show_toast(
-                    "Сейчас поддерживаются Ctrl+Shift, Alt+Shift, CapsLock, Ctrl+Space и Super+Space.",
-                );
-                glib::Propagation::Stop
-            });
-        }
-
-        {
-            let ui_weak = Rc::downgrade(self);
-            controller.connect_key_released(move |_, key, _, _| {
-                let Some(ui) = ui_weak.upgrade() else {
-                    return;
-                };
-
-                if !ui.current_view_state().layout_switch.capture_active {
-                    return;
-                }
-
-                let Some(modifier) = layout_modifier_from_key(key) else {
-                    return;
-                };
-
-                let should_finalize = {
-                    let progress = *ui.capture_progress.borrow();
-                    progress
-                        .modifier_only_combo()
-                        .is_some_and(|combo| combo.modifiers_count() >= 2)
-                };
-
-                if should_finalize {
-                    if let Some(presenter) = ui.presenter.borrow().as_ref().cloned() {
-                        let combo = {
-                            let progress = *ui.capture_progress.borrow();
-                            progress.modifier_only_combo()
-                        };
-                        if let Some(combo) = combo {
-                            ui.reset_capture_progress();
-                            presenter.apply_captured_layout_switch(combo);
-                            return;
-                        }
-                    }
-                }
-
-                ui.capture_progress
-                    .borrow_mut()
-                    .set_modifier(modifier, false);
-            });
-        }
-
-        self.window.add_controller(controller);
+        self.update_capture_dialog_widgets();
     }
 
     fn set_presenter(&self, presenter: SettingsPresenter) {
         self.presenter.replace(Some(presenter));
     }
 
+    fn apply_capture_state(&self, presenter: &SettingsPresenter, state: LayoutSwitchCaptureState) {
+        match state.phase {
+            LayoutSwitchCapturePhase::Idle => {
+                presenter.sync_layout_switch_capture_active(false);
+                self.reset_capture_dialog();
+            }
+            LayoutSwitchCapturePhase::Waiting => {
+                self.capture_dialog_state.borrow_mut().clear();
+                self.update_capture_dialog_widgets();
+            }
+            LayoutSwitchCapturePhase::Candidate => {
+                if state.has_candidate {
+                    let combo = state.candidate;
+                    self.set_capture_candidate(combo);
+                }
+            }
+            LayoutSwitchCapturePhase::Unsupported => {
+                let message = if state.message.is_empty() {
+                    "Эта комбинация сейчас не поддерживается OpenSwitcher.".to_string()
+                } else {
+                    state.message
+                };
+                self.set_capture_error(message);
+            }
+            LayoutSwitchCapturePhase::Cancelled => {
+                presenter.sync_layout_switch_capture_active(false);
+                self.reset_capture_dialog();
+                self.close_layout_switch_dialog();
+            }
+            LayoutSwitchCapturePhase::Finished => {
+                presenter.sync_layout_switch_capture_active(false);
+                self.reset_capture_dialog();
+            }
+        }
+    }
+
     fn reload_from_daemon(&self) {
-        self.reset_capture_progress();
+        self.reset_capture_dialog();
         if let Some(presenter) = self.presenter.borrow().as_ref().cloned() {
             presenter.reload();
         }
     }
 
     fn discard_pending_changes(&self) {
-        self.reset_capture_progress();
+        self.reset_capture_dialog();
         if let Some(presenter) = self.presenter.borrow().as_ref().cloned() {
+            if self.current_view_state().layout_switch.capture_active {
+                let _ = presenter.cancel_layout_switch_capture();
+            }
             presenter.discard_changes();
         }
     }
@@ -597,18 +602,51 @@ impl SettingsWindow {
         }
     }
 
-    fn set_layout_switch_handler(&self, handler: SignalHandlerId) {
-        if let Some(form) = self.form.borrow_mut().as_mut() {
-            form.layout_switch_handler = Some(handler);
-        }
-    }
-
     fn current_view_state(&self) -> ViewState {
         self.current_view_state.borrow().clone()
     }
 
-    fn reset_capture_progress(&self) {
-        self.capture_progress.borrow_mut().clear();
+    fn reset_capture_dialog(&self) {
+        self.capture_dialog_state.borrow_mut().clear();
+        self.update_capture_dialog_widgets();
+    }
+
+    fn set_capture_candidate(&self, combo: LayoutSwitchCombo) {
+        let mut state = self.capture_dialog_state.borrow_mut();
+        state.candidate = Some(combo);
+        state.error = None;
+        drop(state);
+        self.update_capture_dialog_widgets();
+    }
+
+    fn set_capture_error(&self, message: impl Into<String>) {
+        let mut state = self.capture_dialog_state.borrow_mut();
+        state.candidate = None;
+        state.error = Some(message.into());
+        drop(state);
+        self.update_capture_dialog_widgets();
+    }
+
+    fn update_capture_dialog_widgets(&self) {
+        let state = self.capture_dialog_state.borrow().clone();
+        if let Some(form) = self.form.borrow().as_ref() {
+            match state.candidate {
+                Some(combo) => form
+                    .dialog_current_combo_label
+                    .set_text(combo.short_label()),
+                None => form.dialog_current_combo_label.set_text("Пока не выбрана"),
+            }
+
+            if let Some(error) = state.error.as_deref() {
+                form.dialog_error_label.set_text(error);
+                form.dialog_error_label.show();
+            } else {
+                form.dialog_error_label.hide();
+            }
+
+            form.dialog_ok_button
+                .set_sensitive(state.candidate.is_some());
+        }
     }
 
     fn delay_spin(&self) -> gtk::SpinButton {
@@ -629,30 +667,39 @@ impl SettingsWindow {
             .clone()
     }
 
-    fn capture_row(&self) -> adw::ActionRow {
+    fn layout_switch_value_row(&self) -> adw::ActionRow {
         self.form
             .borrow()
             .as_ref()
             .expect("form widgets must be installed before access")
-            .capture_row
+            .layout_switch_value_row
             .clone()
     }
 
-    fn choose_presets_row(&self) -> adw::ActionRow {
+    fn layout_switch_dialog(&self) -> adw::Window {
         self.form
             .borrow()
             .as_ref()
             .expect("form widgets must be installed before access")
-            .choose_presets_row
+            .layout_switch_dialog
             .clone()
     }
 
-    fn layout_switch_dropdown(&self) -> gtk::DropDown {
+    fn dialog_ok_button(&self) -> gtk::Button {
         self.form
             .borrow()
             .as_ref()
             .expect("form widgets must be installed before access")
-            .layout_switch_dropdown
+            .dialog_ok_button
+            .clone()
+    }
+
+    fn dialog_cancel_button(&self) -> gtk::Button {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .dialog_cancel_button
             .clone()
     }
 
@@ -665,11 +712,21 @@ impl SettingsWindow {
             .clone()
     }
 
+    fn open_layout_switch_dialog(&self) {
+        if let Some(form) = self.form.borrow().as_ref() {
+            self.reset_capture_dialog();
+            form.layout_switch_dialog.present();
+        }
+    }
+
+    fn close_layout_switch_dialog(&self) {
+        if let Some(form) = self.form.borrow().as_ref() {
+            form.layout_switch_dialog.hide();
+        }
+    }
+
     fn apply_view_state(&self, state: &ViewState) {
         *self.current_view_state.borrow_mut() = state.clone();
-        if !state.layout_switch.capture_active {
-            self.reset_capture_progress();
-        }
 
         if let Some(form) = self.form.borrow().as_ref() {
             if let Some(delay_handler) = &form.delay_handler {
@@ -698,61 +755,31 @@ impl SettingsWindow {
             form.layout_switch_value_label
                 .set_text(&state.layout_switch.combo_label);
 
-            if let Some(layout_switch_handler) = &form.layout_switch_handler {
-                form.layout_switch_dropdown
-                    .block_signal(layout_switch_handler);
-            }
-            let preset_index = crate::model::LayoutSwitchCombo::COMMON_CHOICES
-                .iter()
-                .position(|combo| *combo == state.layout_switch.combo)
-                .unwrap_or(0);
-            form.layout_switch_dropdown
-                .set_selected(preset_index as u32);
-            if let Some(layout_switch_handler) = &form.layout_switch_handler {
-                form.layout_switch_dropdown
-                    .unblock_signal(layout_switch_handler);
-            }
-
             let manual_actions_enabled = state.layout_switch.editable;
-            form.capture_row.set_sensitive(
-                state.layout_switch.actions.can_capture
-                    && (manual_actions_enabled || state.layout_switch.capture_active),
-            );
-            form.capture_row.set_title(if state.layout_switch.capture_active {
-                "Отменить ввод"
-            } else {
-                "Нажмите комбинацию"
-            });
-            form.capture_row.set_subtitle(if state.layout_switch.capture_active {
-                state.layout_switch.capture_hint
-            } else {
-                "Основной ручной способ: захватить реальную комбинацию клавиш"
-            });
-            form.choose_presets_row.set_sensitive(
-                state.layout_switch.actions.can_choose_manually
-                    && manual_actions_enabled
-                    && !state.layout_switch.capture_active,
-            );
-            form.layout_switch_presets_revealer
-                .set_reveal_child(state.layout_switch.show_manual_presets);
-            form.layout_switch_dropdown.set_sensitive(
-                state.layout_switch.show_manual_presets
-                    && manual_actions_enabled
-                    && !state.layout_switch.capture_active,
-            );
+            let row_is_actionable =
+                state.layout_switch.actions.can_capture && manual_actions_enabled;
+            form.layout_switch_value_row
+                .set_activatable(row_is_actionable);
+            form.layout_switch_value_row
+                .set_sensitive(state.form_enabled);
+            form.layout_switch_value_icon.set_visible(row_is_actionable);
 
-            if state.layout_switch.capture_active {
-                form.layout_switch_hint_label
-                    .set_text(state.layout_switch.capture_hint);
-                form.layout_switch_hint_label.show();
-            } else if state.layout_switch.show_unlock_hint {
+            form.dialog_capture_hint
+                .set_text(if state.layout_switch.capture_active {
+                    state.layout_switch.capture_hint
+                } else {
+                    "Нажмите поддерживаемую комбинацию. Esc — отмена."
+                });
+
+            if state.layout_switch.show_unlock_hint {
                 form.layout_switch_hint_label.set_markup(
                     "Раскладка определена автоматически. Если мы определили неправильно, нажмите <a href=\"app://unlock-layout-switch\">сюда</a>.",
                 );
                 form.layout_switch_hint_label.show();
             } else if state.layout_switch.show_fallback_hint {
-                form.layout_switch_hint_label
-                    .set_text("Автоопределение раскладки не удалось. Захватите комбинацию вручную или используйте список как запасной вариант.");
+                form.layout_switch_hint_label.set_text(
+                    "Автоопределение раскладки не удалось. Захватите комбинацию вручную.",
+                );
                 form.layout_switch_hint_label.show();
             } else {
                 form.layout_switch_hint_label.hide();
@@ -786,28 +813,6 @@ impl SettingsWindow {
     }
 }
 
-fn layout_modifier_from_key(key: gdk::Key) -> Option<LayoutModifier> {
-    match key {
-        gdk::Key::Control_L | gdk::Key::Control_R => Some(LayoutModifier::Ctrl),
-        gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::Meta_L | gdk::Key::Meta_R => {
-            Some(LayoutModifier::Alt)
-        }
-        gdk::Key::Shift_L | gdk::Key::Shift_R => Some(LayoutModifier::Shift),
-        gdk::Key::Super_L | gdk::Key::Super_R | gdk::Key::Hyper_L | gdk::Key::Hyper_R => {
-            Some(LayoutModifier::Super)
-        }
-        _ => None,
-    }
-}
-
-fn layout_trigger_key_from_key(key: gdk::Key) -> Option<LayoutTriggerKey> {
-    match key {
-        gdk::Key::space => Some(LayoutTriggerKey::Space),
-        gdk::Key::Caps_Lock => Some(LayoutTriggerKey::CapsLock),
-        _ => None,
-    }
-}
-
 fn initial_view_state() -> ViewState {
     ViewState {
         layout_delay_ms: crate::model::Settings::default().layout_delay_ms,
@@ -817,7 +822,8 @@ fn initial_view_state() -> ViewState {
             combo_label: crate::model::Settings::default()
                 .layout_switch
                 .combo
-                .short_label(),
+                .short_label()
+                .to_string(),
             source: crate::model::Settings::default().layout_switch.source,
             editable: false,
             manual_override_active: false,
@@ -825,12 +831,7 @@ fn initial_view_state() -> ViewState {
             show_fallback_hint: false,
             capture_active: false,
             capture_hint: "",
-            show_manual_presets: false,
-            actions: LayoutSwitchActionsState {
-                can_auto_detect: false,
-                can_capture: false,
-                can_choose_manually: false,
-            },
+            actions: LayoutSwitchActionsState { can_capture: false },
         },
         loading: true,
         saving: false,
@@ -866,45 +867,5 @@ fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'stati
             source.to_string(),
         ),
         SettingsClientError::Validation(error) => ("Некорректные значения", error.to_string()),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capture_progress_builds_modifier_only_combo() {
-        let mut progress = CaptureProgress::default();
-        progress.set_modifier(LayoutModifier::Ctrl, true);
-        progress.set_modifier(LayoutModifier::Shift, true);
-
-        assert_eq!(
-            progress.modifier_only_combo(),
-            Some(LayoutSwitchCombo::ctrl_shift())
-        );
-    }
-
-    #[test]
-    fn capture_progress_builds_combo_with_trigger_key() {
-        let mut progress = CaptureProgress::default();
-        progress.set_modifier(LayoutModifier::Ctrl, true);
-
-        assert_eq!(
-            progress.combo_with_key(LayoutTriggerKey::Space),
-            Some(LayoutSwitchCombo::ctrl_space())
-        );
-        assert_eq!(
-            CaptureProgress::default().combo_with_key(LayoutTriggerKey::CapsLock),
-            Some(LayoutSwitchCombo::caps_lock())
-        );
-    }
-
-    #[test]
-    fn capture_progress_rejects_unsupported_space_without_modifiers() {
-        assert_eq!(
-            CaptureProgress::default().combo_with_key(LayoutTriggerKey::Space),
-            None
-        );
     }
 }

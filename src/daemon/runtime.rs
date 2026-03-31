@@ -1,14 +1,17 @@
 use crate::config::AppConfig;
-use crate::error::{ConfigError, SettingsError};
+use crate::daemon::capture::LayoutSwitchCaptureSession;
+use crate::error::{CaptureError, ConfigError, SettingsError};
 use crate::layout_switch::{
     failed_detection_fallback, DesktopSettingsReader, LayoutSwitchAutoDetector,
 };
 use crate::model::SystemContext;
-use crate::model::{LayoutSwitchCombo, Settings, UndoKey, UpdateSettingsResult};
+use crate::model::{
+    LayoutSwitchCaptureState, LayoutSwitchCombo, Settings, UndoKey, UpdateSettingsResult,
+};
 use crate::system::SystemContextDetector;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
@@ -155,15 +158,7 @@ mod tests {
             _key: &str,
         ) -> Result<Vec<String>, LayoutAutoDetectError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![match self.combo {
-                combo if combo == LayoutSwitchCombo::ctrl_shift() => "grp:ctrl_shift_toggle",
-                combo if combo == LayoutSwitchCombo::alt_shift() => "grp:alt_shift_toggle",
-                combo if combo == LayoutSwitchCombo::caps_lock() => "grp:caps_toggle",
-                combo if combo == LayoutSwitchCombo::ctrl_space() => "grp:ctrl_space_toggle",
-                combo if combo == LayoutSwitchCombo::super_space() => "grp:win_space_toggle",
-                _ => "grp:ctrl_shift_toggle",
-            }
-            .to_string()])
+            Ok(vec![self.combo.xkb_option().to_string()])
         }
 
         fn xfconf_string(
@@ -172,15 +167,7 @@ mod tests {
             _property: &str,
         ) -> Result<String, LayoutAutoDetectError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(match self.combo {
-                combo if combo == LayoutSwitchCombo::ctrl_shift() => "grp:ctrl_shift_toggle",
-                combo if combo == LayoutSwitchCombo::alt_shift() => "grp:alt_shift_toggle",
-                combo if combo == LayoutSwitchCombo::caps_lock() => "grp:caps_toggle",
-                combo if combo == LayoutSwitchCombo::ctrl_space() => "grp:ctrl_space_toggle",
-                combo if combo == LayoutSwitchCombo::super_space() => "grp:win_space_toggle",
-                _ => "grp:ctrl_shift_toggle",
-            }
-            .to_string())
+            Ok(self.combo.xkb_option().to_string())
         }
 
         fn xfconf_bool(
@@ -194,25 +181,8 @@ mod tests {
         fn setxkbmap_query(&self) -> Result<String, LayoutAutoDetectError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(format!(
-                "rules: evdev\noptions:    {}\n",
-                match self.combo {
-                    combo if combo == LayoutSwitchCombo::ctrl_shift() => {
-                        "grp:ctrl_shift_toggle,grp_led:scroll"
-                    }
-                    combo if combo == LayoutSwitchCombo::alt_shift() => {
-                        "grp:alt_shift_toggle,grp_led:scroll"
-                    }
-                    combo if combo == LayoutSwitchCombo::caps_lock() => {
-                        "grp:caps_toggle,grp_led:scroll"
-                    }
-                    combo if combo == LayoutSwitchCombo::ctrl_space() => {
-                        "grp:ctrl_space_toggle,grp_led:scroll"
-                    }
-                    combo if combo == LayoutSwitchCombo::super_space() => {
-                        "grp:win_space_toggle,grp_led:scroll"
-                    }
-                    _ => "grp:ctrl_shift_toggle,grp_led:scroll",
-                }
+                "rules: evdev\noptions:    {},grp_led:scroll\n",
+                self.combo.xkb_option()
             ))
         }
     }
@@ -450,6 +420,7 @@ pub struct RuntimeState {
     enabled: AtomicBool,
     layout_is_english: AtomicBool,
     config_service: ConfigService,
+    capture_session: Mutex<LayoutSwitchCaptureSession>,
 }
 
 impl RuntimeState {
@@ -458,6 +429,7 @@ impl RuntimeState {
             enabled: AtomicBool::new(true),
             layout_is_english: AtomicBool::new(true),
             config_service,
+            capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
         }
     }
 
@@ -493,5 +465,57 @@ impl RuntimeState {
 
     pub fn config_snapshot(&self) -> Result<RuntimeConfigSnapshot, SettingsError> {
         self.config_service.snapshot()
+    }
+
+    pub fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.start())
+    }
+
+    pub fn cancel_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.cancel())
+    }
+
+    pub fn finish_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.finish())
+    }
+
+    pub fn layout_switch_capture_state(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.current_state())
+    }
+
+    pub fn is_capture_active(&self) -> Result<bool, CaptureError> {
+        let session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.is_active())
+    }
+
+    pub fn handle_capture_key_event(
+        &self,
+        key: evdev::Key,
+        value: i32,
+    ) -> Result<Option<LayoutSwitchCaptureState>, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.handle_key_event(key, value))
     }
 }

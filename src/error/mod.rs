@@ -39,6 +39,12 @@ pub enum SettingsError {
 }
 
 #[derive(Debug, Error)]
+pub enum CaptureError {
+    #[error("Capture session lock is poisoned")]
+    LockPoisoned,
+}
+
+#[derive(Debug, Error)]
 pub enum SwitcherError {
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -48,6 +54,8 @@ pub enum SwitcherError {
     DbusApi(#[from] DbusError),
     #[error(transparent)]
     Settings(#[from] SettingsError),
+    #[error(transparent)]
+    Capture(#[from] CaptureError),
     #[error(transparent)]
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]

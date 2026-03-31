@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod keyboard;
 pub mod runtime;
 pub mod service;

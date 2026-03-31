@@ -1,7 +1,7 @@
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
-use crate::model::{LayoutModifier, LayoutSwitchCombo, LayoutTriggerKey, UndoKey};
+use crate::model::{LayoutSwitchCombo, UndoKey};
 use evdev::{enumerate, Device, InputEvent, Key};
 use std::env;
 use std::path::PathBuf;
@@ -12,6 +12,7 @@ use std::time::Duration;
 const INPUT_EVENT_KEYBOARD: i32 = 0x01;
 const MODIFIER_SYNC_DELAY_MS: u64 = 20;
 const LAYOUT_SWITCH_DELAY_MS: u64 = 20;
+const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
 
 pub struct KeyboardController {
     real_device: Device,
@@ -58,7 +59,9 @@ impl ModifierState {
 
 impl KeyboardController {
     pub fn open() -> Result<Self, SwitcherError> {
-        let keyboard_path = find_keyboard().ok_or(SwitcherError::KeyboardNotFound)?;
+        let keyboard_path = configured_keyboard_path()
+            .or_else(find_keyboard)
+            .ok_or(SwitcherError::KeyboardNotFound)?;
         let mut real_device = Device::open(keyboard_path)?;
         println!(
             "[INFO] Клавиатура: {}",
@@ -150,32 +153,39 @@ impl KeyboardController {
     }
 
     fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
-        for modifier in combo.modifiers() {
-            self.virtual_device
-                .press(&layout_modifier_to_uinput_key(modifier))?;
+        let (modifiers, trigger_key) = layout_switch_combo_sequence(combo);
+
+        for modifier in modifiers {
+            self.virtual_device.press(modifier)?;
         }
 
-        if let Some(key) = combo.key {
-            self.virtual_device
-                .press(&layout_trigger_key_to_uinput_key(key))?;
+        if let Some(key) = trigger_key {
+            self.virtual_device.press(key)?;
         }
 
         self.virtual_device.synchronize()?;
         thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
 
-        if let Some(key) = combo.key {
-            self.virtual_device
-                .release(&layout_trigger_key_to_uinput_key(key))?;
+        if let Some(key) = trigger_key {
+            self.virtual_device.release(key)?;
         }
 
-        for modifier in combo.modifiers().collect::<Vec<_>>().into_iter().rev() {
-            self.virtual_device
-                .release(&layout_modifier_to_uinput_key(modifier))?;
+        for modifier in modifiers.iter().rev() {
+            self.virtual_device.release(modifier)?;
         }
 
         self.virtual_device.synchronize()?;
         Ok(())
     }
+}
+
+fn configured_keyboard_path() -> Option<PathBuf> {
+    let raw = env::var_os(KEYBOARD_PATH_ENV)?;
+    if raw.is_empty() {
+        return None;
+    }
+
+    Some(PathBuf::from(raw))
 }
 
 pub fn is_russian_layout() -> Result<bool, SwitcherError> {
@@ -238,19 +248,35 @@ pub fn undo_key_to_evdev_key(key: UndoKey) -> Key {
     }
 }
 
-fn layout_modifier_to_uinput_key(modifier: LayoutModifier) -> uinput::event::keyboard::Key {
-    match modifier {
-        LayoutModifier::Ctrl => uinput::event::keyboard::Key::LeftControl,
-        LayoutModifier::Alt => uinput::event::keyboard::Key::LeftAlt,
-        LayoutModifier::Shift => uinput::event::keyboard::Key::LeftShift,
-        LayoutModifier::Super => uinput::event::keyboard::Key::LeftMeta,
-    }
-}
+fn layout_switch_combo_sequence(
+    combo: LayoutSwitchCombo,
+) -> (
+    &'static [uinput::event::keyboard::Key],
+    Option<&'static uinput::event::keyboard::Key>,
+) {
+    use uinput::event::keyboard::Key;
 
-fn layout_trigger_key_to_uinput_key(key: LayoutTriggerKey) -> uinput::event::keyboard::Key {
-    match key {
-        LayoutTriggerKey::Space => uinput::event::keyboard::Key::Space,
-        LayoutTriggerKey::CapsLock => uinput::event::keyboard::Key::CapsLock,
+    static CTRL_SHIFT: [Key; 2] = [Key::LeftControl, Key::LeftShift];
+    static ALT_SHIFT: [Key; 2] = [Key::LeftAlt, Key::LeftShift];
+    static CTRL_SPACE: [Key; 1] = [Key::LeftControl];
+    static SUPER_SPACE: [Key; 1] = [Key::LeftMeta];
+    static LEFT_CTRL_LEFT_SHIFT: [Key; 2] = [Key::LeftControl, Key::LeftShift];
+    static RIGHT_CTRL_RIGHT_SHIFT: [Key; 2] = [Key::RightControl, Key::RightShift];
+    static LEFT_ALT_LEFT_SHIFT: [Key; 2] = [Key::LeftAlt, Key::LeftShift];
+    static RIGHT_ALT_RIGHT_SHIFT: [Key; 2] = [Key::RightAlt, Key::RightShift];
+    static SPACE: Key = Key::Space;
+    static CAPS_LOCK: Key = Key::CapsLock;
+
+    match combo {
+        LayoutSwitchCombo::CtrlShift => (&CTRL_SHIFT, None),
+        LayoutSwitchCombo::AltShift => (&ALT_SHIFT, None),
+        LayoutSwitchCombo::CapsLock => (&[], Some(&CAPS_LOCK)),
+        LayoutSwitchCombo::CtrlSpace => (&CTRL_SPACE, Some(&SPACE)),
+        LayoutSwitchCombo::SuperSpace => (&SUPER_SPACE, Some(&SPACE)),
+        LayoutSwitchCombo::LeftCtrlLeftShift => (&LEFT_CTRL_LEFT_SHIFT, None),
+        LayoutSwitchCombo::RightCtrlRightShift => (&RIGHT_CTRL_RIGHT_SHIFT, None),
+        LayoutSwitchCombo::LeftAltLeftShift => (&LEFT_ALT_LEFT_SHIFT, None),
+        LayoutSwitchCombo::RightAltRightShift => (&RIGHT_ALT_RIGHT_SHIFT, None),
     }
 }
 

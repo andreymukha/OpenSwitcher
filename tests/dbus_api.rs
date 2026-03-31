@@ -2,8 +2,9 @@ use open_switcher::config::AppConfig;
 use open_switcher::daemon::runtime::{ConfigService, RuntimeState};
 use open_switcher::dbus::{OpenSwitcherDbusApi, INTERFACE_NAME, OBJECT_PATH};
 use open_switcher::model::{
-    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource,
-    SettingsDto, UndoKey, UpdateSettingsResult,
+    AutoDetectedLayoutSwitch, LayoutSwitchCapturePhase, LayoutSwitchCaptureState,
+    LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, SettingsDto, UndoKey,
+    UpdateSettingsResult,
 };
 use std::error::Error;
 use std::path::PathBuf;
@@ -86,6 +87,31 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
     let config = AppConfig::load_or_create(&config_path)?;
     assert_eq!(config.layout.delay_ms, 30);
     assert_eq!(config.features.undo_key, UndoKey::Pause);
+
+    Ok(())
+}
+
+#[test]
+fn dbus_exposes_layout_switch_capture_session_controls() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("capture");
+    let _service = spawn_service(&config_path, &service_name)?;
+
+    let client = Connection::session()?;
+    let proxy = settings_proxy(&client, &service_name)?;
+
+    let initial: LayoutSwitchCaptureState = proxy.call("GetLayoutSwitchCaptureState", &())?;
+    assert_eq!(initial.phase, LayoutSwitchCapturePhase::Idle);
+
+    let started: LayoutSwitchCaptureState = proxy.call("StartLayoutSwitchCapture", &())?;
+    assert_eq!(started.phase, LayoutSwitchCapturePhase::Waiting);
+
+    let cancelled: LayoutSwitchCaptureState = proxy.call("CancelLayoutSwitchCapture", &())?;
+    assert_eq!(cancelled.phase, LayoutSwitchCapturePhase::Cancelled);
+
+    let finished: LayoutSwitchCaptureState = proxy.call("FinishLayoutSwitchCapture", &())?;
+    assert_eq!(finished.phase, LayoutSwitchCapturePhase::Finished);
 
     Ok(())
 }

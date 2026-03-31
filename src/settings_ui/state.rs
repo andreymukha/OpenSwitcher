@@ -16,7 +16,6 @@ pub struct DomainState {
     request_state: RequestState,
     layout_switch_manual_override: bool,
     layout_switch_capture_active: bool,
-    show_layout_switch_presets: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,15 +44,12 @@ pub struct LayoutSwitchViewState {
     pub show_fallback_hint: bool,
     pub capture_active: bool,
     pub capture_hint: &'static str,
-    pub show_manual_presets: bool,
     pub actions: LayoutSwitchActionsState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayoutSwitchActionsState {
-    pub can_auto_detect: bool,
     pub can_capture: bool,
-    pub can_choose_manually: bool,
 }
 
 impl DomainState {
@@ -65,7 +61,6 @@ impl DomainState {
             request_state: RequestState::Loading,
             layout_switch_manual_override: false,
             layout_switch_capture_active: false,
-            show_layout_switch_presets: false,
         }
     }
 
@@ -75,7 +70,6 @@ impl DomainState {
         self.request_state = RequestState::Idle;
         self.layout_switch_manual_override = false;
         self.layout_switch_capture_active = false;
-        self.show_layout_switch_presets = false;
     }
 
     pub fn begin_loading(&mut self) -> bool {
@@ -119,14 +113,12 @@ impl DomainState {
         if self.draft == loaded {
             self.layout_switch_manual_override = false;
             self.layout_switch_capture_active = false;
-            self.show_layout_switch_presets = false;
             return false;
         }
 
         self.draft = loaded;
         self.layout_switch_manual_override = false;
         self.layout_switch_capture_active = false;
-        self.show_layout_switch_presets = false;
         true
     }
 
@@ -145,16 +137,6 @@ impl DomainState {
         }
 
         self.draft.undo_key = value;
-        true
-    }
-
-    pub fn update_layout_switch_combo(&mut self, value: LayoutSwitchCombo) -> bool {
-        if self.draft.layout_switch.combo == value {
-            return false;
-        }
-
-        self.draft.layout_switch.combo = value;
-        self.layout_switch_manual_override = true;
         true
     }
 
@@ -179,7 +161,6 @@ impl DomainState {
 
         self.layout_switch_manual_override = true;
         self.layout_switch_capture_active = true;
-        self.show_layout_switch_presets = false;
         true
     }
 
@@ -195,7 +176,6 @@ impl DomainState {
     pub fn apply_captured_layout_switch(&mut self, combo: LayoutSwitchCombo) -> bool {
         self.layout_switch_capture_active = false;
         self.layout_switch_manual_override = true;
-        self.show_layout_switch_presets = false;
 
         if self.draft.layout_switch.combo == combo {
             return true;
@@ -205,14 +185,12 @@ impl DomainState {
         true
     }
 
-    pub fn show_layout_switch_presets(&mut self) -> bool {
-        if self.request_state == RequestState::Saving || self.loaded.is_none() {
+    pub fn set_layout_switch_capture_active(&mut self, active: bool) -> bool {
+        if self.layout_switch_capture_active == active {
             return false;
         }
 
-        self.layout_switch_manual_override = true;
-        self.layout_switch_capture_active = false;
-        self.show_layout_switch_presets = true;
+        self.layout_switch_capture_active = active;
         true
     }
 
@@ -230,7 +208,7 @@ impl DomainState {
             undo_key: self.draft.undo_key,
             layout_switch: LayoutSwitchViewState {
                 combo: self.draft.layout_switch.combo,
-                combo_label: self.draft.layout_switch.combo.short_label(),
+                combo_label: self.draft.layout_switch.combo.short_label().to_string(),
                 source: if self.layout_switch_manual_override {
                     LayoutSwitchSource::Manual
                 } else {
@@ -252,11 +230,8 @@ impl DomainState {
                 } else {
                     ""
                 },
-                show_manual_presets: self.show_layout_switch_presets,
                 actions: LayoutSwitchActionsState {
-                    can_auto_detect: loaded && !saving,
                     can_capture: loaded && !saving,
-                    can_choose_manually: loaded && !saving,
                 },
             },
             loading,

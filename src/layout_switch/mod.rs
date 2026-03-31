@@ -335,6 +335,10 @@ fn combo_from_xkb_option(option: &str) -> Option<LayoutSwitchCombo> {
         "grp:caps_toggle" => Some(LayoutSwitchCombo::caps_lock()),
         "grp:ctrl_space_toggle" => Some(LayoutSwitchCombo::ctrl_space()),
         "grp:win_space_toggle" => Some(LayoutSwitchCombo::super_space()),
+        "grp:lctrl_lshift_toggle" => Some(LayoutSwitchCombo::left_ctrl_left_shift()),
+        "grp:rctrl_rshift_toggle" => Some(LayoutSwitchCombo::right_ctrl_right_shift()),
+        "grp:lalt_lshift_toggle" => Some(LayoutSwitchCombo::left_alt_left_shift()),
+        "grp:ralt_rshift_toggle" => Some(LayoutSwitchCombo::right_alt_right_shift()),
         _ => None,
     }
 }
@@ -474,6 +478,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_side_specific_xfce_x11_combo_from_xfconf() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            xfconf_group: "grp:rctrl_rshift_toggle".to_string(),
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(xfce_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::right_ctrl_right_shift());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+    }
+
+    #[test]
     fn xfce_xfconf_falls_back_for_unsupported_combo() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
             xfconf_group: "grp:toggle".to_string(),
@@ -538,6 +554,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_side_specific_cinnamon_x11_combo() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            gsettings_values: vec!["grp:lalt_lshift_toggle".to_string()],
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(cinnamon_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::left_alt_left_shift());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+    }
+
+    #[test]
     fn falls_back_for_unsupported_context() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader::default());
         let context = SystemContext {
@@ -566,5 +594,17 @@ mod tests {
         assert_eq!(setting.combo, LayoutSwitchCombo::default());
         assert_eq!(setting.source, LayoutSwitchSource::AutoFallback);
         assert_eq!(setting.auto_detected.confidence, DetectionConfidence::Low);
+    }
+
+    #[test]
+    fn detects_right_alt_shift_option() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            gsettings_values: vec!["grp:ralt_rshift_toggle".to_string()],
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(cinnamon_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::right_alt_right_shift());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
     }
 }

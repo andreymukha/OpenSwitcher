@@ -4,7 +4,7 @@ use crate::daemon::keyboard::{
 };
 use crate::daemon::runtime::RuntimeState;
 use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
-use crate::dbus::emit_status_changed;
+use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
 use evdev::InputEventKind;
 use std::sync::Arc;
@@ -42,6 +42,21 @@ impl DaemonService {
     }
 
     fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
+        if self.runtime.is_capture_active()? {
+            self.modifiers.update(key, value);
+
+            if let Some(state) = self.runtime.handle_capture_key_event(key, value)? {
+                emit_layout_switch_capture_state_changed(&self.connection, &state)?;
+            }
+
+            if !self.runtime.is_capture_active()? {
+                self.buffer.clear();
+                self.last_word_buffer.clear();
+            }
+
+            return Ok(());
+        }
+
         let config = self.runtime.config_snapshot()?;
         self.modifiers.update(key, value);
 

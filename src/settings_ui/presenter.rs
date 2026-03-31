@@ -1,7 +1,7 @@
 use super::dbus_client::SettingsDbusClient;
 use super::state::{DomainState, ViewState};
 use crate::error::{SettingsClientError, UiError};
-use crate::model::{LayoutSwitchCombo, UndoKey, UpdateSettingsResult};
+use crate::model::{LayoutSwitchCaptureState, LayoutSwitchCombo, UndoKey, UpdateSettingsResult};
 use async_channel::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -12,6 +12,7 @@ pub enum PresenterEvent {
     LoadFailed(SettingsClientError),
     SaveFailed(SettingsClientError),
     SaveSucceeded(UpdateSettingsResult),
+    CaptureStateChanged(LayoutSwitchCaptureState),
 }
 
 pub enum SaveRequest {
@@ -42,6 +43,16 @@ impl SettingsPresenter {
     }
 
     pub fn initialize(&self) {
+        let (capture_tx, capture_rx) = async_channel::unbounded();
+        self.inner.client.spawn_capture_listener(capture_tx);
+
+        let presenter = self.clone();
+        thread::spawn(move || {
+            while let Ok(state) = capture_rx.recv_blocking() {
+                let _ = presenter.send_event(PresenterEvent::CaptureStateChanged(state));
+            }
+        });
+
         self.reload();
     }
 
@@ -80,13 +91,6 @@ impl SettingsPresenter {
         }
     }
 
-    pub fn update_layout_switch_combo(&self, value: LayoutSwitchCombo) {
-        let changed = self.with_state(|state| state.update_layout_switch_combo(value));
-        if changed {
-            let _ = self.emit_view_state();
-        }
-    }
-
     pub fn unlock_layout_switch_override(&self) {
         let changed = self.with_state(DomainState::unlock_layout_switch_override);
         if changed {
@@ -94,36 +98,62 @@ impl SettingsPresenter {
         }
     }
 
-    pub fn start_layout_switch_capture(&self) {
+    pub fn start_layout_switch_capture(&self) -> Result<(), SettingsClientError> {
         let changed = self.with_state(DomainState::start_layout_switch_capture);
         if changed {
             let _ = self.emit_view_state();
         }
+
+        match self.inner.client.start_layout_switch_capture() {
+            Ok(state) => {
+                let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+                Ok(())
+            }
+            Err(error) => {
+                self.with_state(DomainState::cancel_layout_switch_capture);
+                let _ = self.emit_view_state();
+                Err(error)
+            }
+        }
     }
 
-    pub fn cancel_layout_switch_capture(&self) {
+    pub fn cancel_layout_switch_capture(&self) -> Result<(), SettingsClientError> {
         let changed = self.with_state(DomainState::cancel_layout_switch_capture);
         if changed {
             let _ = self.emit_view_state();
         }
-    }
 
-    pub fn apply_captured_layout_switch(&self, combo: LayoutSwitchCombo) {
-        let changed = self.with_state(|state| state.apply_captured_layout_switch(combo));
-        if changed {
-            let _ = self.emit_view_state();
+        match self.inner.client.cancel_layout_switch_capture() {
+            Ok(state) => {
+                let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+                Ok(())
+            }
+            Err(error) => Err(error),
         }
     }
 
-    pub fn show_layout_switch_presets(&self) {
-        let changed = self.with_state(DomainState::show_layout_switch_presets);
+    pub fn confirm_captured_layout_switch(
+        &self,
+        combo: LayoutSwitchCombo,
+    ) -> Result<(), SettingsClientError> {
+        let state = self.inner.client.finish_layout_switch_capture()?;
+        let changed = self.with_state(|current| current.apply_captured_layout_switch(combo));
         if changed {
             let _ = self.emit_view_state();
         }
+        let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+        Ok(())
     }
 
     pub fn discard_changes(&self) {
         let changed = self.with_state(DomainState::discard_changes);
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn sync_layout_switch_capture_active(&self, active: bool) {
+        let changed = self.with_state(|state| state.set_layout_switch_capture_active(active));
         if changed {
             let _ = self.emit_view_state();
         }

@@ -1,7 +1,7 @@
 use crate::error::{LayoutSwitchComboParseError, UndoKeyParseError, ValidationError};
-use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use zvariant::{Signature, Type};
+use zvariant::Type;
 
 pub const LAYOUT_DELAY_MIN_MS: u32 = 0;
 pub const LAYOUT_DELAY_MAX_MS: u32 = 500;
@@ -29,165 +29,118 @@ impl UndoKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LayoutModifier {
-    Ctrl,
-    Alt,
-    Shift,
-    Super,
-}
-
-impl LayoutModifier {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ctrl => "Ctrl",
-            Self::Alt => "Alt",
-            Self::Shift => "Shift",
-            Self::Super => "Super",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum LayoutTriggerKey {
-    Space,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Type)]
+#[zvariant(signature = "s")]
+pub enum LayoutSwitchCombo {
+    #[serde(rename = "CtrlShift")]
+    CtrlShift,
+    #[serde(rename = "AltShift")]
+    AltShift,
+    #[serde(rename = "CapsLock")]
     CapsLock,
-}
-
-impl LayoutTriggerKey {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Space => "Space",
-            Self::CapsLock => "CapsLock",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct LayoutSwitchCombo {
-    pub ctrl: bool,
-    pub alt: bool,
-    pub shift: bool,
-    pub super_key: bool,
-    pub key: Option<LayoutTriggerKey>,
+    #[serde(rename = "CtrlSpace")]
+    CtrlSpace,
+    #[serde(rename = "SuperSpace")]
+    SuperSpace,
+    #[serde(rename = "LeftCtrlLeftShift")]
+    LeftCtrlLeftShift,
+    #[serde(rename = "RightCtrlRightShift")]
+    RightCtrlRightShift,
+    #[serde(rename = "LeftAltLeftShift")]
+    LeftAltLeftShift,
+    #[serde(rename = "RightAltRightShift")]
+    RightAltRightShift,
 }
 
 impl LayoutSwitchCombo {
-    pub const COMMON_CHOICES: [LayoutSwitchCombo; 5] = [
+    pub const WHITELIST: [LayoutSwitchCombo; 9] = [
         LayoutSwitchCombo::ctrl_shift(),
         LayoutSwitchCombo::alt_shift(),
         LayoutSwitchCombo::caps_lock(),
         LayoutSwitchCombo::ctrl_space(),
         LayoutSwitchCombo::super_space(),
+        LayoutSwitchCombo::left_ctrl_left_shift(),
+        LayoutSwitchCombo::right_ctrl_right_shift(),
+        LayoutSwitchCombo::left_alt_left_shift(),
+        LayoutSwitchCombo::right_alt_right_shift(),
     ];
 
     pub const fn ctrl_shift() -> Self {
-        Self {
-            ctrl: true,
-            alt: false,
-            shift: true,
-            super_key: false,
-            key: None,
-        }
+        Self::CtrlShift
     }
 
     pub const fn alt_shift() -> Self {
-        Self {
-            ctrl: false,
-            alt: true,
-            shift: true,
-            super_key: false,
-            key: None,
-        }
+        Self::AltShift
     }
 
     pub const fn caps_lock() -> Self {
-        Self {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            super_key: false,
-            key: Some(LayoutTriggerKey::CapsLock),
-        }
+        Self::CapsLock
     }
 
     pub const fn ctrl_space() -> Self {
-        Self {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            super_key: false,
-            key: Some(LayoutTriggerKey::Space),
-        }
+        Self::CtrlSpace
     }
 
     pub const fn super_space() -> Self {
-        Self {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            super_key: true,
-            key: Some(LayoutTriggerKey::Space),
+        Self::SuperSpace
+    }
+
+    pub const fn left_ctrl_left_shift() -> Self {
+        Self::LeftCtrlLeftShift
+    }
+
+    pub const fn right_ctrl_right_shift() -> Self {
+        Self::RightCtrlRightShift
+    }
+
+    pub const fn left_alt_left_shift() -> Self {
+        Self::LeftAltLeftShift
+    }
+
+    pub const fn right_alt_right_shift() -> Self {
+        Self::RightAltRightShift
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::CtrlShift => "CtrlShift",
+            Self::AltShift => "AltShift",
+            Self::CapsLock => "CapsLock",
+            Self::CtrlSpace => "CtrlSpace",
+            Self::SuperSpace => "SuperSpace",
+            Self::LeftCtrlLeftShift => "LeftCtrlLeftShift",
+            Self::RightCtrlRightShift => "RightCtrlRightShift",
+            Self::LeftAltLeftShift => "LeftAltLeftShift",
+            Self::RightAltRightShift => "RightAltRightShift",
         }
     }
 
-    pub const fn modifiers_count(self) -> usize {
-        self.ctrl as usize + self.alt as usize + self.shift as usize + self.super_key as usize
-    }
-
-    pub fn modifiers(self) -> impl Iterator<Item = LayoutModifier> {
-        [
-            self.ctrl.then_some(LayoutModifier::Ctrl),
-            self.alt.then_some(LayoutModifier::Alt),
-            self.shift.then_some(LayoutModifier::Shift),
-            self.super_key.then_some(LayoutModifier::Super),
-        ]
-        .into_iter()
-        .flatten()
-    }
-
-    pub fn from_parts(
-        ctrl: bool,
-        alt: bool,
-        shift: bool,
-        super_key: bool,
-        key: Option<LayoutTriggerKey>,
-    ) -> Result<Self, LayoutSwitchComboParseError> {
-        let combo = Self {
-            ctrl,
-            alt,
-            shift,
-            super_key,
-            key,
-        };
-
-        if combo.is_valid() {
-            Ok(combo)
-        } else {
-            Err(LayoutSwitchComboParseError::UnsupportedValue {
-                value: combo.to_string(),
-            })
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::CtrlShift => "Ctrl+Shift",
+            Self::AltShift => "Alt+Shift",
+            Self::CapsLock => "CapsLock",
+            Self::CtrlSpace => "Ctrl+Space",
+            Self::SuperSpace => "Super+Space",
+            Self::LeftCtrlLeftShift => "Left Ctrl+Left Shift",
+            Self::RightCtrlRightShift => "Right Ctrl+Right Shift",
+            Self::LeftAltLeftShift => "Left Alt+Left Shift",
+            Self::RightAltRightShift => "Right Alt+Right Shift",
         }
     }
 
-    pub fn is_valid(self) -> bool {
-        if self.key.is_some() {
-            return self.ctrl
-                || self.alt
-                || self.shift
-                || self.super_key
-                || self.key == Some(LayoutTriggerKey::CapsLock);
+    pub const fn xkb_option(self) -> &'static str {
+        match self {
+            Self::CtrlShift => "grp:ctrl_shift_toggle",
+            Self::AltShift => "grp:alt_shift_toggle",
+            Self::CapsLock => "grp:caps_toggle",
+            Self::CtrlSpace => "grp:ctrl_space_toggle",
+            Self::SuperSpace => "grp:win_space_toggle",
+            Self::LeftCtrlLeftShift => "grp:lctrl_lshift_toggle",
+            Self::RightCtrlRightShift => "grp:rctrl_rshift_toggle",
+            Self::LeftAltLeftShift => "grp:lalt_lshift_toggle",
+            Self::RightAltRightShift => "grp:ralt_rshift_toggle",
         }
-
-        self.modifiers_count() >= 2
-    }
-
-    pub fn config_value(self) -> String {
-        self.to_string()
-    }
-
-    pub fn short_label(self) -> String {
-        self.to_string()
     }
 }
 
@@ -211,12 +164,7 @@ impl std::fmt::Display for UndoKey {
 
 impl std::fmt::Display for LayoutSwitchCombo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut parts: Vec<&'static str> =
-            self.modifiers().map(|modifier| modifier.as_str()).collect();
-        if let Some(key) = self.key {
-            parts.push(key.as_str());
-        }
-        f.write_str(&parts.join("+"))
+        f.write_str(self.short_label())
     }
 }
 
@@ -240,70 +188,19 @@ impl FromStr for LayoutSwitchCombo {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "CtrlShift" => return Ok(Self::ctrl_shift()),
-            "AltShift" => return Ok(Self::alt_shift()),
-            "CapsLock" => return Ok(Self::caps_lock()),
-            "CtrlSpace" => return Ok(Self::ctrl_space()),
-            "SuperSpace" => return Ok(Self::super_space()),
-            _ => {}
-        }
-
-        let mut ctrl = false;
-        let mut alt = false;
-        let mut shift = false;
-        let mut super_key = false;
-        let mut key = None;
-
-        for part in value
-            .split('+')
-            .map(str::trim)
-            .filter(|part| !part.is_empty())
-        {
-            match part {
-                "Ctrl" => ctrl = true,
-                "Alt" => alt = true,
-                "Shift" => shift = true,
-                "Super" => super_key = true,
-                "Space" => key = Some(LayoutTriggerKey::Space),
-                "CapsLock" => key = Some(LayoutTriggerKey::CapsLock),
-                _ => {
-                    return Err(LayoutSwitchComboParseError::UnsupportedValue {
-                        value: value.to_string(),
-                    })
-                }
-            }
-        }
-
-        Self::from_parts(ctrl, alt, shift, super_key, key).map_err(|_| {
-            LayoutSwitchComboParseError::UnsupportedValue {
+            "CtrlShift" | "Ctrl+Shift" => Ok(Self::ctrl_shift()),
+            "AltShift" | "Alt+Shift" => Ok(Self::alt_shift()),
+            "CapsLock" => Ok(Self::caps_lock()),
+            "CtrlSpace" | "Ctrl+Space" => Ok(Self::ctrl_space()),
+            "SuperSpace" | "Super+Space" => Ok(Self::super_space()),
+            "LeftCtrlLeftShift" | "Left Ctrl+Left Shift" => Ok(Self::left_ctrl_left_shift()),
+            "RightCtrlRightShift" | "Right Ctrl+Right Shift" => Ok(Self::right_ctrl_right_shift()),
+            "LeftAltLeftShift" | "Left Alt+Left Shift" => Ok(Self::left_alt_left_shift()),
+            "RightAltRightShift" | "Right Alt+Right Shift" => Ok(Self::right_alt_right_shift()),
+            _ => Err(LayoutSwitchComboParseError::UnsupportedValue {
                 value: value.to_string(),
-            }
-        })
-    }
-}
-
-impl Serialize for LayoutSwitchCombo {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.config_value())
-    }
-}
-
-impl<'de> Deserialize<'de> for LayoutSwitchCombo {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::from_str(&value).map_err(D::Error::custom)
-    }
-}
-
-impl Type for LayoutSwitchCombo {
-    fn signature() -> Signature<'static> {
-        String::signature()
+            }),
+        }
     }
 }
 
@@ -392,6 +289,92 @@ pub enum DetectionConfidence {
     Low,
     #[serde(rename = "High")]
     High,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
+#[zvariant(signature = "s")]
+pub enum LayoutSwitchCapturePhase {
+    #[default]
+    #[serde(rename = "Idle")]
+    Idle,
+    #[serde(rename = "Waiting")]
+    Waiting,
+    #[serde(rename = "Candidate")]
+    Candidate,
+    #[serde(rename = "Unsupported")]
+    Unsupported,
+    #[serde(rename = "Cancelled")]
+    Cancelled,
+    #[serde(rename = "Finished")]
+    Finished,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type, Default)]
+pub struct LayoutSwitchCaptureState {
+    pub phase: LayoutSwitchCapturePhase,
+    pub candidate: LayoutSwitchCombo,
+    pub has_candidate: bool,
+    pub message: String,
+}
+
+impl LayoutSwitchCaptureState {
+    pub fn idle() -> Self {
+        Self::default()
+    }
+
+    pub fn waiting() -> Self {
+        Self {
+            phase: LayoutSwitchCapturePhase::Waiting,
+            candidate: LayoutSwitchCombo::default(),
+            has_candidate: false,
+            message: String::new(),
+        }
+    }
+
+    pub fn candidate(combo: LayoutSwitchCombo) -> Self {
+        Self {
+            phase: LayoutSwitchCapturePhase::Candidate,
+            candidate: combo,
+            has_candidate: true,
+            message: String::new(),
+        }
+    }
+
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            phase: LayoutSwitchCapturePhase::Unsupported,
+            candidate: LayoutSwitchCombo::default(),
+            has_candidate: false,
+            message: message.into(),
+        }
+    }
+
+    pub fn cancelled() -> Self {
+        Self {
+            phase: LayoutSwitchCapturePhase::Cancelled,
+            candidate: LayoutSwitchCombo::default(),
+            has_candidate: false,
+            message: String::new(),
+        }
+    }
+
+    pub fn finished() -> Self {
+        Self {
+            phase: LayoutSwitchCapturePhase::Finished,
+            candidate: LayoutSwitchCombo::default(),
+            has_candidate: false,
+            message: String::new(),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.phase,
+            LayoutSwitchCapturePhase::Waiting
+                | LayoutSwitchCapturePhase::Candidate
+                | LayoutSwitchCapturePhase::Unsupported
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -568,12 +551,68 @@ mod tests {
             ("CapsLock", LayoutSwitchCombo::caps_lock()),
             ("Ctrl+Space", LayoutSwitchCombo::ctrl_space()),
             ("Super+Space", LayoutSwitchCombo::super_space()),
+            (
+                "Left Ctrl+Left Shift",
+                LayoutSwitchCombo::left_ctrl_left_shift(),
+            ),
+            (
+                "Right Ctrl+Right Shift",
+                LayoutSwitchCombo::right_ctrl_right_shift(),
+            ),
+            (
+                "Left Alt+Left Shift",
+                LayoutSwitchCombo::left_alt_left_shift(),
+            ),
+            (
+                "Right Alt+Right Shift",
+                LayoutSwitchCombo::right_alt_right_shift(),
+            ),
         ];
 
         for (raw, expected) in combos {
             assert_eq!(LayoutSwitchCombo::from_str(raw).unwrap(), expected);
             assert_eq!(expected.to_string(), raw);
         }
+    }
+
+    #[test]
+    fn maps_supported_layout_switch_combos_to_xkb_options() {
+        assert_eq!(
+            LayoutSwitchCombo::ctrl_shift().xkb_option(),
+            "grp:ctrl_shift_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::alt_shift().xkb_option(),
+            "grp:alt_shift_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::caps_lock().xkb_option(),
+            "grp:caps_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::ctrl_space().xkb_option(),
+            "grp:ctrl_space_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::super_space().xkb_option(),
+            "grp:win_space_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::left_ctrl_left_shift().xkb_option(),
+            "grp:lctrl_lshift_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::right_ctrl_right_shift().xkb_option(),
+            "grp:rctrl_rshift_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::left_alt_left_shift().xkb_option(),
+            "grp:lalt_lshift_toggle"
+        );
+        assert_eq!(
+            LayoutSwitchCombo::right_alt_right_shift().xkb_option(),
+            "grp:ralt_rshift_toggle"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::error::SettingsError;
+use crate::error::{CaptureError, SettingsError};
 use thiserror::Error;
 use zbus::fdo;
 
@@ -6,6 +6,8 @@ use zbus::fdo;
 pub enum DbusError {
     #[error(transparent)]
     Settings(#[from] SettingsError),
+    #[error(transparent)]
+    Capture(#[from] CaptureError),
     #[error("Failed to emit D-Bus signal")]
     Signal(#[source] zbus::Error),
 }

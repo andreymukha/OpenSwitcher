@@ -52,6 +52,36 @@ logfile_for() {
     esac
 }
 
+process_name_for() {
+    case "$1" in
+        daemon) printf '%s\n' 'open-switcher' ;;
+        tray) printf '%s\n' 'open-switcher-tray' ;;
+        settings) printf '%s\n' 'open-switcher-settings' ;;
+        *) return 1 ;;
+    esac
+}
+
+find_component_pids() {
+    local component="$1"
+    local binary process_name target_dir_pattern
+    binary="$(binary_path_for "$component")"
+    process_name="$(process_name_for "$component")"
+    target_dir_pattern="${TARGET_DIR//\//\\/}"
+
+    ps -eo pid=,args= | awk -v binary="$binary" -v process_name="$process_name" -v target_dir_pattern="$target_dir_pattern" '
+        {
+            pid = $1
+            cmd = $2
+            base = cmd
+            sub("^.*/", "", base)
+        }
+        base != process_name { next }
+        cmd == binary { print pid; next }
+        cmd ~ ("^" target_dir_pattern "/" process_name "$") { print pid; next }
+        cmd ~ ("^\\./target/(debug|release)/" process_name "$") { print pid; next }
+    ' | sort -u
+}
+
 is_running() {
     local pidfile="$1"
 
@@ -114,27 +144,50 @@ stop_component() {
     local pidfile
     pidfile="$(pidfile_for "$component")"
 
-    if ! is_running "$pidfile"; then
+    local -a pids=()
+    if is_running "$pidfile"; then
+        pids+=("$(cat "$pidfile")")
+    fi
+
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        pids+=("$pid")
+    done < <(find_component_pids "$component")
+
+    if [[ "${#pids[@]}" -eq 0 ]]; then
         rm -f "$pidfile"
         echo "$component уже остановлен."
         return 0
     fi
 
+    mapfile -t pids < <(printf '%s\n' "${pids[@]}" | sort -u)
+
     local pid
-    pid="$(cat "$pidfile")"
-    kill "$pid" 2>/dev/null || true
+    for pid in "${pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
 
     for _ in {1..20}; do
-        if ! kill -0 "$pid" 2>/dev/null; then
+        local any_running=0
+        for pid in "${pids[@]}"; do
+            if kill -0 "$pid" 2>/dev/null; then
+                any_running=1
+                break
+            fi
+        done
+
+        if [[ "$any_running" -eq 0 ]]; then
             rm -f "$pidfile"
-            echo "$component остановлен."
+            echo "$component остановлен (${#pids[@]} process(es))."
             return 0
         fi
         sleep 0.2
     done
 
     echo "$component не завершился после SIGTERM, отправляю SIGKILL."
-    kill -9 "$pid" 2>/dev/null || true
+    for pid in "${pids[@]}"; do
+        kill -9 "$pid" 2>/dev/null || true
+    done
     rm -f "$pidfile"
 }
 
@@ -143,8 +196,18 @@ show_status() {
         local pidfile
         pidfile="$(pidfile_for "$component")"
 
+        local -a pids=()
         if is_running "$pidfile"; then
-            echo "$component: running (PID $(cat "$pidfile"))"
+            pids+=("$(cat "$pidfile")")
+        fi
+        while IFS= read -r pid; do
+            [[ -n "$pid" ]] || continue
+            pids+=("$pid")
+        done < <(find_component_pids "$component")
+
+        if [[ "${#pids[@]}" -gt 0 ]]; then
+            mapfile -t pids < <(printf '%s\n' "${pids[@]}" | sort -u)
+            echo "$component: running (PID(s) ${pids[*]})"
         else
             rm -f "$pidfile"
             echo "$component: stopped"

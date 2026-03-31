@@ -94,6 +94,23 @@ impl KeyboardController {
         Ok(self.real_device.fetch_events()?.collect())
     }
 
+    pub fn with_temporarily_released_grab<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, SwitcherError>,
+    ) -> Result<T, SwitcherError> {
+        self.real_device.ungrab()?;
+
+        let operation_result = f(self);
+        let regrab_result = self.real_device.grab().map_err(SwitcherError::from);
+
+        match (operation_result, regrab_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(regrab_error)) => Err(regrab_error),
+            (Err(error), Err(_regrab_error)) => Err(error),
+        }
+    }
+
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
         self.virtual_device
             .write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;

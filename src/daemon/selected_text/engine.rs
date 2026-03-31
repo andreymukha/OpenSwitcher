@@ -1,3 +1,5 @@
+use super::{log_selected_text_debug, summarize_text};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConversionDirection {
     EnToRu,
@@ -15,51 +17,93 @@ pub struct ConversionOutcome {
 pub(super) struct LayoutConversionEngine;
 
 impl LayoutConversionEngine {
-    pub(super) fn convert_selected_text(&self, text: &str) -> Option<ConversionOutcome> {
+    pub(super) fn convert_selected_text(&self, text: &str) -> ConversionOutcome {
         let segments = segment_text(text);
+        log_selected_text_debug(
+            "segment-start",
+            &format!("input={}", summarize_text(text)),
+        );
+        log_selected_text_debug(
+            "segment-list",
+            &format!("segments={}", summarize_segments(&segments)),
+        );
         let mut converted = String::with_capacity(text.len());
         let mut en_to_ru_segments = 0usize;
         let mut ru_to_en_segments = 0usize;
-        let mut changed_segments = 0usize;
+        let mut text_segments = 0usize;
+        let mut last_text_direction: Option<ConversionDirection> = None;
 
-        for segment in &segments {
+        for (index, segment) in segments.iter().enumerate() {
             match segment.kind {
                 SegmentKind::Whitespace | SegmentKind::Separator => {
-                    converted.push_str(segment.text);
-                }
-                SegmentKind::Text => match decide_segment_conversion(segment.text) {
-                    SegmentDecision::Keep => converted.push_str(segment.text),
-                    SegmentDecision::Convert {
-                        direction,
-                        converted_text,
-                    } => {
-                        converted.push_str(&converted_text);
-                        changed_segments += 1;
-                        match direction {
-                            ConversionDirection::EnToRu => en_to_ru_segments += 1,
-                            ConversionDirection::RuToEn => ru_to_en_segments += 1,
-                            ConversionDirection::Mixed => {}
-                        }
-                    }
-                },
-            }
-        }
+                    let separator_direction =
+                        last_text_direction.or_else(|| next_text_direction(&segments, index + 1));
 
-        if changed_segments == 0 || converted == text {
-            return None;
+                    if segment.kind == SegmentKind::Separator {
+                        if let Some(direction) = separator_direction {
+                            let converted_separator = convert_with_direction(segment.text, direction);
+                            log_selected_text_debug(
+                                "separator-conversion",
+                                &format!(
+                                    "segment={} direction={direction:?} converted_preview={}",
+                                    summarize_text(segment.text),
+                                    summarize_text(&converted_separator)
+                                ),
+                            );
+                            converted.push_str(&converted_separator);
+                        } else {
+                            converted.push_str(segment.text);
+                        }
+                    } else {
+                        converted.push_str(segment.text);
+                    }
+                }
+                SegmentKind::Text => {
+                    text_segments += 1;
+                    let evaluation = evaluate_segment_conversion(segment.text);
+                    log_selected_text_debug(
+                        "segment-evaluation",
+                        &format!(
+                            "segment={} latin_letters={} cyrillic_letters={} direction={:?} reason={} converted_preview={}",
+                            summarize_text(segment.text),
+                            evaluation.latin_letter_count,
+                            evaluation.cyrillic_letter_count,
+                            evaluation.direction,
+                            evaluation.reason,
+                            summarize_text(&evaluation.converted_text)
+                        ),
+                    );
+
+                    converted.push_str(&evaluation.converted_text);
+                    last_text_direction = Some(evaluation.direction);
+                    match evaluation.direction {
+                        ConversionDirection::EnToRu => en_to_ru_segments += 1,
+                        ConversionDirection::RuToEn => ru_to_en_segments += 1,
+                        ConversionDirection::Mixed => {}
+                    }
+                }
+            }
         }
 
         let direction = match (en_to_ru_segments > 0, ru_to_en_segments > 0) {
             (true, true) => ConversionDirection::Mixed,
             (true, false) => ConversionDirection::EnToRu,
             (false, true) => ConversionDirection::RuToEn,
-            (false, false) => return None,
+            (false, false) => ConversionDirection::EnToRu,
         };
 
-        Some(ConversionOutcome {
+        log_selected_text_debug(
+            "final-decision",
+            &format!(
+                "result=Replaced direction={direction:?} text_segments={text_segments} output={}",
+                summarize_text(&converted)
+            ),
+        );
+
+        ConversionOutcome {
             converted_text: converted,
             direction,
-        })
+        }
     }
 }
 
@@ -121,211 +165,61 @@ fn is_segment_text_char(ch: char) -> bool {
     ch.is_ascii_alphabetic() || is_cyrillic_letter(ch)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Script {
-    Latin,
-    Cyrillic,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SegmentAnalysis<'a> {
-    original: &'a str,
-    dominant_script: Option<Script>,
-    letter_count: usize,
-    english_score: i32,
-    russian_score: i32,
+struct SegmentEvaluation {
+    latin_letter_count: usize,
+    cyrillic_letter_count: usize,
+    direction: ConversionDirection,
+    converted_text: String,
+    reason: &'static str,
 }
 
-fn analyze_segment(segment: &str) -> SegmentAnalysis<'_> {
-    SegmentAnalysis {
-        original: segment,
-        dominant_script: dominant_script(segment),
-        letter_count: segment_letter_count(segment),
-        english_score: score_segment_as_english(segment),
-        russian_score: score_segment_as_russian(segment),
-    }
-}
+fn evaluate_segment_conversion(segment: &str) -> SegmentEvaluation {
+    let latin_letter_count = segment.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let cyrillic_letter_count = segment.chars().filter(|ch| is_cyrillic_letter(*ch)).count();
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SegmentDecision {
-    Keep,
-    Convert {
-        direction: ConversionDirection,
-        converted_text: String,
-    },
-}
-
-fn decide_segment_conversion(segment: &str) -> SegmentDecision {
-    let analysis = analyze_segment(segment);
-    let Some(script) = analysis.dominant_script else {
-        return SegmentDecision::Keep;
-    };
-
-    if analysis.letter_count <= 1 {
-        return SegmentDecision::Keep;
-    }
-
-    let (direction, converted, current_score, converted_score) = match script {
-        Script::Latin => {
-            let converted = map_text(segment, en_to_ru_char);
-            (
-                ConversionDirection::EnToRu,
-                converted.clone(),
-                analysis.english_score,
-                score_segment_as_russian(&converted),
-            )
-        }
-        Script::Cyrillic => {
-            let converted = map_text(segment, ru_to_en_char);
-            (
-                ConversionDirection::RuToEn,
-                converted.clone(),
-                analysis.russian_score,
-                score_segment_as_english(&converted),
-            )
-        }
-    };
-
-    if converted == segment {
-        return SegmentDecision::Keep;
-    }
-
-    let min_gain = match analysis.letter_count {
-        0 | 1 => unreachable!("short segments are filtered out above"),
-        2 => 4,
-        _ => 2,
-    };
-
-    if converted_score >= current_score + min_gain {
-        SegmentDecision::Convert {
-            direction,
-            converted_text: converted,
-        }
+    let (direction, reason) = if cyrillic_letter_count > latin_letter_count {
+        (ConversionDirection::RuToEn, "majority-cyrillic")
+    } else if latin_letter_count > cyrillic_letter_count {
+        (ConversionDirection::EnToRu, "majority-latin")
     } else {
-        SegmentDecision::Keep
+        (ConversionDirection::EnToRu, "default-en-to-ru")
+    };
+
+    let converted_text = convert_with_direction(segment, direction);
+
+    SegmentEvaluation {
+        latin_letter_count,
+        cyrillic_letter_count,
+        direction,
+        converted_text,
+        reason,
     }
 }
 
-fn dominant_script(segment: &str) -> Option<Script> {
-    let mut has_latin = false;
-    let mut has_cyrillic = false;
+fn summarize_segments(segments: &[Segment<'_>]) -> String {
+    segments
+        .iter()
+        .map(|segment| format!("{:?}:{}", segment.kind, summarize_text(segment.text)))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
 
-    for ch in segment.chars() {
-        if ch.is_ascii_alphabetic() {
-            has_latin = true;
-        } else if is_cyrillic_letter(ch) {
-            has_cyrillic = true;
+fn next_text_direction(segments: &[Segment<'_>], start_index: usize) -> Option<ConversionDirection> {
+    for segment in &segments[start_index..] {
+        if segment.kind == SegmentKind::Text {
+            return Some(evaluate_segment_conversion(segment.text).direction);
         }
     }
 
-    match (has_latin, has_cyrillic) {
-        (true, false) => Some(Script::Latin),
-        (false, true) => Some(Script::Cyrillic),
-        _ => None,
-    }
+    None
 }
 
-fn segment_letter_count(segment: &str) -> usize {
-    segment
-        .chars()
-        .filter(|ch| is_segment_text_char(*ch))
-        .count()
-}
-
-fn score_segment_as_english(segment: &str) -> i32 {
-    score_segment(
-        segment,
-        |ch| ch.is_ascii_alphabetic(),
-        is_english_vowel,
-        ENGLISH_COMMON_BIGRAMS,
-        ENGLISH_AWKWARD_BIGRAMS,
-    )
-}
-
-fn score_segment_as_russian(segment: &str) -> i32 {
-    score_segment(
-        segment,
-        is_cyrillic_letter,
-        is_russian_vowel,
-        RUSSIAN_COMMON_BIGRAMS,
-        RUSSIAN_AWKWARD_BIGRAMS,
-    )
-}
-
-fn score_segment(
-    segment: &str,
-    is_letter: impl Fn(char) -> bool,
-    is_vowel: impl Fn(char) -> bool,
-    common_bigrams: &[&str],
-    awkward_bigrams: &[&str],
-) -> i32 {
-    let letters: String = segment
-        .chars()
-        .filter(|ch| is_letter(*ch))
-        .flat_map(|ch| ch.to_lowercase())
-        .collect();
-    if letters.is_empty() {
-        return 0;
+fn convert_with_direction(text: &str, direction: ConversionDirection) -> String {
+    match direction {
+        ConversionDirection::EnToRu | ConversionDirection::Mixed => map_text(text, en_to_ru_char),
+        ConversionDirection::RuToEn => map_text(text, ru_to_en_char),
     }
-
-    let chars: Vec<char> = letters.chars().collect();
-    let vowel_count = chars.iter().filter(|ch| is_vowel(**ch)).count();
-    let max_consonant_run = max_consonant_run(&chars, &is_vowel);
-
-    let mut score = 0i32;
-    score += (vowel_count as i32) * 3;
-
-    if vowel_count == 0 {
-        score -= 4;
-    } else if vowel_count * 4 >= chars.len() {
-        score += 1;
-    }
-
-    if max_consonant_run > 3 {
-        score -= ((max_consonant_run - 3) as i32) * 3;
-    }
-
-    for bigram in common_bigrams {
-        if letters.contains(bigram) {
-            score += 2;
-        }
-    }
-
-    for bigram in awkward_bigrams {
-        if letters.contains(bigram) {
-            score -= 3;
-        }
-    }
-
-    score
-}
-
-fn max_consonant_run(chars: &[char], is_vowel: &impl Fn(char) -> bool) -> usize {
-    let mut current = 0usize;
-    let mut max_run = 0usize;
-
-    for ch in chars {
-        if is_vowel(*ch) {
-            current = 0;
-            continue;
-        }
-
-        current += 1;
-        max_run = max_run.max(current);
-    }
-
-    max_run
-}
-
-fn is_english_vowel(ch: char) -> bool {
-    matches!(ch, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')
-}
-
-fn is_russian_vowel(ch: char) -> bool {
-    matches!(
-        ch,
-        'а' | 'е' | 'ё' | 'и' | 'о' | 'у' | 'ы' | 'э' | 'ю' | 'я'
-    )
 }
 
 fn map_text(text: &str, map_char: fn(char) -> char) -> String {
@@ -335,15 +229,6 @@ fn map_text(text: &str, map_char: fn(char) -> char) -> String {
 fn is_cyrillic_letter(ch: char) -> bool {
     matches!(ch, 'А'..='Я' | 'а'..='я' | 'Ё' | 'ё')
 }
-
-const ENGLISH_COMMON_BIGRAMS: &[&str] = &[
-    "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "ll", "lo", "or", "rl", "ld", "wo",
-];
-const ENGLISH_AWKWARD_BIGRAMS: &[&str] = &["qj", "jq", "zx", "xq", "qz", "vh", "hb", "bd", "dt"];
-const RUSSIAN_COMMON_BIGRAMS: &[&str] = &[
-    "ст", "но", "то", "на", "ен", "ов", "ни", "ра", "ко", "пр", "ве", "ет", "ми", "ир", "ри",
-];
-const RUSSIAN_AWKWARD_BIGRAMS: &[&str] = &["дщ", "щщ", "ъъ", "ьы", "ыы", "йй", "ьь", "ъы", "ыь"];
 
 fn en_to_ru_char(ch: char) -> char {
     match ch {
@@ -412,11 +297,11 @@ fn en_to_ru_char(ch: char) -> char {
         'm' => 'ь',
         'M' => 'Ь',
         ',' => ',',
-        '<' => '<',
+        '<' => 'Б',
         '.' => '.',
-        '>' => '>',
-        '/' => '/',
-        '?' => '?',
+        '>' => 'Ю',
+        '/' => '.',
+        '?' => ',',
         '@' => '"',
         '#' => '№',
         '$' => ';',
@@ -510,7 +395,7 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
 
-    fn convert(text: &str) -> Option<ConversionOutcome> {
+    fn convert(text: &str) -> ConversionOutcome {
         LayoutConversionEngine.convert_selected_text(text)
     }
 
@@ -537,69 +422,91 @@ mod tests {
 
     #[test]
     fn converts_english_layout_to_russian_with_symbols() {
-        let converted = convert("Ghbdtn, vbh!").unwrap();
+        let converted = convert("Ghbdtn, vbh!");
         assert_eq!(converted.converted_text, "Привет, мир!");
         assert_eq!(converted.direction, ConversionDirection::EnToRu);
     }
 
     #[test]
     fn converts_russian_layout_to_english_with_symbols() {
-        let converted = convert("руддщб цщкдв!").unwrap();
+        let converted = convert("руддщб цщкдв!");
         assert_eq!(converted.converted_text, "hello, world!");
         assert_eq!(converted.direction, ConversionDirection::RuToEn);
     }
 
     #[test]
     fn leaves_spaces_and_newlines_while_converting() {
-        let converted = convert("Ghbdtn,\nVbh!").unwrap();
+        let converted = convert("Ghbdtn,\nVbh!");
         assert_eq!(converted.converted_text, "Привет,\nМир!");
     }
 
     #[test]
-    fn reports_not_convertible_for_plain_digits() {
-        assert_eq!(convert("12345"), None);
+    fn leaves_plain_digits_unchanged() {
+        let converted = convert("12345");
+        assert_eq!(converted.converted_text, "12345");
+        assert_eq!(converted.direction, ConversionDirection::EnToRu);
     }
 
     #[test]
     fn converts_only_wrong_layout_segment_in_mixed_phrase() {
-        let converted = convert("Ghbdtn, мир!").unwrap();
-        assert_eq!(converted.converted_text, "Привет, мир!");
-        assert_eq!(converted.direction, ConversionDirection::EnToRu);
-    }
-
-    #[test]
-    fn preserves_correct_russian_segment_and_converts_latin_neighbors() {
-        let converted = convert("Привет, vb hfr?").unwrap();
-        assert_eq!(converted.converted_text, "Привет, ми рак?");
-        assert_eq!(converted.direction, ConversionDirection::EnToRu);
-    }
-
-    #[test]
-    fn does_not_break_already_correct_english_segment() {
-        let converted = convert("руддщ? / hello?").unwrap();
-        assert_eq!(converted.converted_text, "hello? / hello?");
-        assert_eq!(converted.direction, ConversionDirection::RuToEn);
-    }
-
-    #[test]
-    fn leaves_single_character_segments_unchanged() {
-        assert_eq!(convert("g мир"), None);
-    }
-
-    #[test]
-    fn keeps_ambiguous_short_segments_unchanged() {
-        assert_eq!(convert("gh ок"), None);
-    }
-
-    #[test]
-    fn reports_mixed_direction_when_multiple_segments_change_differently() {
-        let converted = convert("Ghbdtn hello руддщ").unwrap();
-        assert_eq!(converted.converted_text, "Привет hello hello");
+        let converted = convert("Ghbdtn, мир!");
+        assert_eq!(converted.converted_text, "Привет, vbh!");
         assert_eq!(converted.direction, ConversionDirection::Mixed);
     }
 
     #[test]
-    fn leaves_separator_only_fragments_unchanged() {
-        assert_eq!(convert("... / !!!"), None);
+    fn always_converts_each_text_segment_in_mixed_phrase() {
+        let converted = convert("Привет, vb hfr?");
+        assert_eq!(converted.converted_text, "Ghbdtn? ми рак,");
+        assert_eq!(converted.direction, ConversionDirection::Mixed);
+    }
+
+    #[test]
+    fn converts_both_sides_of_bidirectional_mixed_text() {
+        let converted = convert("руддщ? / hello?");
+        assert_eq!(converted.converted_text, "hello& / руддщ,");
+        assert_eq!(converted.direction, ConversionDirection::Mixed);
+    }
+
+    #[test]
+    fn converts_single_character_segments_too() {
+        let converted = convert("g мир");
+        assert_eq!(converted.converted_text, "п vbh");
+        assert_eq!(converted.direction, ConversionDirection::Mixed);
+    }
+
+    #[test]
+    fn converts_ambiguous_short_segments_instead_of_rejecting() {
+        let converted = convert("gh ок");
+        assert_eq!(converted.converted_text, "пр jr");
+        assert_eq!(converted.direction, ConversionDirection::Mixed);
+    }
+
+    #[test]
+    fn reports_mixed_direction_when_multiple_segments_change_differently() {
+        let converted = convert("Ghbdtn hello руддщ");
+        assert_eq!(converted.converted_text, "Привет руддщ hello");
+        assert_eq!(converted.direction, ConversionDirection::Mixed);
+    }
+
+    #[test]
+    fn leaves_separator_only_fragments_stable() {
+        let converted = convert("... / !!!");
+        assert_eq!(converted.converted_text, "... / !!!");
+        assert_eq!(converted.direction, ConversionDirection::EnToRu);
+    }
+
+    #[test]
+    fn converts_already_correct_english_text_when_user_explicitly_requests_it() {
+        let converted = convert("hello world");
+        assert_eq!(converted.converted_text, "руддщ цщкдв");
+        assert_eq!(converted.direction, ConversionDirection::EnToRu);
+    }
+
+    #[test]
+    fn converts_punctuation_next_to_text_segments() {
+        let converted = convert("ghbdtn? vbh/");
+        assert_eq!(converted.converted_text, "привет, мир.");
+        assert_eq!(converted.direction, ConversionDirection::EnToRu);
     }
 }

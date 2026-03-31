@@ -1,4 +1,5 @@
 mod clipboard;
+mod debug;
 mod engine;
 
 use crate::daemon::keyboard::{KeyboardController, ModifierState};
@@ -7,6 +8,8 @@ use clipboard::{SelectedTextOperation, SystemClipboard};
 use engine::LayoutConversionEngine;
 
 pub use engine::ConversionDirection;
+pub(crate) use debug::log_selected_text_debug;
+pub(crate) use debug::summarize_text;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SelectedTextSwitchResult {
@@ -15,7 +18,6 @@ pub enum SelectedTextSwitchResult {
         clipboard_restored: bool,
     },
     NoSelectedText,
-    NotConvertible,
 }
 
 #[derive(Default)]

@@ -3,7 +3,9 @@ use crate::daemon::keyboard::{
     ModifierState,
 };
 use crate::daemon::runtime::RuntimeState;
-use crate::daemon::selected_text::{SelectedTextSwitchResult, SelectedTextSwitchService};
+use crate::daemon::selected_text::{
+    log_selected_text_debug, SelectedTextSwitchResult, SelectedTextSwitchService,
+};
 use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
@@ -20,6 +22,7 @@ pub struct DaemonService {
     last_word_buffer: Vec<Keystroke>,
     selected_text_switcher: SelectedTextSwitchService,
     suppressed_hotkey_key: Option<evdev::Key>,
+    pending_selected_text_switch: bool,
 }
 
 impl DaemonService {
@@ -33,6 +36,7 @@ impl DaemonService {
             last_word_buffer: Vec::new(),
             selected_text_switcher: SelectedTextSwitchService::default(),
             suppressed_hotkey_key: None,
+            pending_selected_text_switch: false,
         })
     }
 
@@ -51,6 +55,7 @@ impl DaemonService {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
             }
+            self.maybe_run_pending_selected_text_switch()?;
             return Ok(());
         }
 
@@ -78,13 +83,26 @@ impl DaemonService {
         }
 
         if selected_text_hotkey_matches(config.selected_text_hotkey, self.modifiers, key, value) {
+            log_selected_text_debug(
+                "hotkey-matched",
+                &format!(
+                    "key={key:?} shift={} ctrl={} alt={}",
+                    self.modifiers.is_shift_pressed(),
+                    self.modifiers.is_ctrl_pressed(),
+                    self.modifiers.is_alt_pressed()
+                ),
+            );
             self.suppressed_hotkey_key = Some(key);
-            self.apply_selected_text_switch()?;
+            self.pending_selected_text_switch = true;
             return Ok(());
         }
 
         if value != 1 {
-            return self.keyboard.forward_event(key, value);
+            let result = self.keyboard.forward_event(key, value);
+            if result.is_ok() {
+                self.maybe_run_pending_selected_text_switch()?;
+            }
+            return result;
         }
 
         if key == undo_key_to_evdev_key(config.undo_key) {
@@ -122,19 +140,29 @@ impl DaemonService {
                 } else if !is_modifier(key) {
                     self.buffer.clear();
                 }
-                self.keyboard.forward_event(key, 1)
+                let result = self.keyboard.forward_event(key, 1);
+                if result.is_ok() {
+                    self.maybe_run_pending_selected_text_switch()?;
+                }
+                result
             }
         }
     }
 
     fn apply_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
-        match self
-            .selected_text_switcher
-            .switch_selected_text(&mut self.keyboard, self.modifiers)?
-        {
+        let result = self.keyboard.with_temporarily_released_grab(|keyboard| {
+            self.selected_text_switcher
+                .switch_selected_text(keyboard, self.modifiers)
+        })?;
+
+        match result {
             SelectedTextSwitchResult::Replaced {
                 clipboard_restored, ..
             } => {
+                log_selected_text_debug(
+                    "result",
+                    &format!("result=Replaced clipboard_restored={clipboard_restored}"),
+                );
                 self.buffer.clear();
                 self.last_word_buffer.clear();
                 if !clipboard_restored {
@@ -144,14 +172,29 @@ impl DaemonService {
                 }
             }
             SelectedTextSwitchResult::NoSelectedText => {
+                log_selected_text_debug("result", "result=NoSelectedText");
                 eprintln!("[selected-text] Нет выделенного текста.");
-            }
-            SelectedTextSwitchResult::NotConvertible => {
-                eprintln!("[selected-text] Не удалось определить направление конвертации.");
             }
         }
 
         Ok(())
+    }
+
+    fn maybe_run_pending_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
+        if !self.pending_selected_text_switch {
+            return Ok(());
+        }
+
+        if self.suppressed_hotkey_key.is_some() {
+            return Ok(());
+        }
+
+        self.pending_selected_text_switch = false;
+        log_selected_text_debug(
+            "hotkey-trigger",
+            "running selected-text switch after trigger key release",
+        );
+        self.apply_selected_text_switch()
     }
 
     fn apply_manual_correction(

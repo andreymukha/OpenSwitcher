@@ -58,6 +58,8 @@ pub enum SelectedTextError {
     ClipboardRead(#[source] arboard::Error),
     #[error("Не удалось записать текст в буфер обмена")]
     ClipboardWrite(#[source] arboard::Error),
+    #[error("Не удалось очистить буфер обмена")]
+    ClipboardClear(#[source] arboard::Error),
 }
 
 #[derive(Debug, Error)]

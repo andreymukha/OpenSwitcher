@@ -31,7 +31,7 @@ impl DaemonService {
             modifiers: ModifierState::default(),
             buffer: Vec::new(),
             last_word_buffer: Vec::new(),
-            selected_text_switcher: SelectedTextSwitchService,
+            selected_text_switcher: SelectedTextSwitchService::default(),
             suppressed_hotkey_key: None,
         })
     }

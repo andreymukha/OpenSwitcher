@@ -3,6 +3,7 @@ use crate::daemon::keyboard::{
     ModifierState,
 };
 use crate::daemon::runtime::RuntimeState;
+use crate::daemon::selected_text::{SelectedTextSwitchResult, SelectedTextSwitchService};
 use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
@@ -17,6 +18,8 @@ pub struct DaemonService {
     modifiers: ModifierState,
     buffer: Vec<Keystroke>,
     last_word_buffer: Vec<Keystroke>,
+    selected_text_switcher: SelectedTextSwitchService,
+    suppressed_hotkey_key: Option<evdev::Key>,
 }
 
 impl DaemonService {
@@ -28,6 +31,8 @@ impl DaemonService {
             modifiers: ModifierState::default(),
             buffer: Vec::new(),
             last_word_buffer: Vec::new(),
+            selected_text_switcher: SelectedTextSwitchService,
+            suppressed_hotkey_key: None,
         })
     }
 
@@ -42,6 +47,13 @@ impl DaemonService {
     }
 
     fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
+        if self.suppressed_hotkey_key == Some(key) {
+            if value == 0 {
+                self.suppressed_hotkey_key = None;
+            }
+            return Ok(());
+        }
+
         if self.runtime.is_capture_active()? {
             self.modifiers.update(key, value);
 
@@ -63,6 +75,12 @@ impl DaemonService {
         if self.modifiers.should_toggle_layout_shortcut(key, value) {
             self.runtime.set_layout(!self.runtime.current_layout());
             self.publish_status_changed()?;
+        }
+
+        if selected_text_hotkey_matches(config.selected_text_hotkey, self.modifiers, key, value) {
+            self.suppressed_hotkey_key = Some(key);
+            self.apply_selected_text_switch()?;
+            return Ok(());
         }
 
         if value != 1 {
@@ -109,6 +127,33 @@ impl DaemonService {
         }
     }
 
+    fn apply_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
+        match self
+            .selected_text_switcher
+            .switch_selected_text(&mut self.keyboard, self.modifiers)?
+        {
+            SelectedTextSwitchResult::Replaced {
+                clipboard_restored, ..
+            } => {
+                self.buffer.clear();
+                self.last_word_buffer.clear();
+                if !clipboard_restored {
+                    eprintln!(
+                        "[selected-text] Не удалось восстановить предыдущее содержимое буфера обмена."
+                    );
+                }
+            }
+            SelectedTextSwitchResult::NoSelectedText => {
+                eprintln!("[selected-text] Нет выделенного текста.");
+            }
+            SelectedTextSwitchResult::NotConvertible => {
+                eprintln!("[selected-text] Не удалось определить направление конвертации.");
+            }
+        }
+
+        Ok(())
+    }
+
     fn apply_manual_correction(
         &mut self,
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
@@ -135,4 +180,21 @@ impl DaemonService {
         emit_status_changed(&self.connection, &self.runtime)?;
         Ok(())
     }
+}
+
+fn selected_text_hotkey_matches(
+    hotkey: crate::model::SelectedTextHotkey,
+    modifiers: ModifierState,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    if value != 1 || key != undo_key_to_evdev_key(hotkey.trigger_key()) {
+        return false;
+    }
+
+    let shift = modifiers.is_shift_pressed();
+    let ctrl = modifiers.is_ctrl_pressed();
+    let alt = modifiers.is_alt_pressed();
+
+    shift == hotkey.uses_shift() && ctrl == hotkey.uses_ctrl() && alt == hotkey.uses_alt()
 }

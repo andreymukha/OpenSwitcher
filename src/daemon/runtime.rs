@@ -6,7 +6,8 @@ use crate::layout_switch::{
 };
 use crate::model::SystemContext;
 use crate::model::{
-    LayoutSwitchCaptureState, LayoutSwitchCombo, Settings, UndoKey, UpdateSettingsResult,
+    LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey, Settings, UndoKey,
+    UpdateSettingsResult,
 };
 use crate::system::SystemContextDetector;
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ pub struct RuntimeConfigSnapshot {
     pub backspace_ms: u64,
     pub typing_ms: u64,
     pub undo_key: UndoKey,
+    pub selected_text_hotkey: SelectedTextHotkey,
 }
 
 impl From<&AppConfig> for RuntimeConfigSnapshot {
@@ -30,6 +32,7 @@ impl From<&AppConfig> for RuntimeConfigSnapshot {
             backspace_ms: value.delays.backspace_ms as u64,
             typing_ms: value.delays.typing_ms as u64,
             undo_key: value.features.undo_key,
+            selected_text_hotkey: value.features.selected_text_switch_hotkey,
         }
     }
 }

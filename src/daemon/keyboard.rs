@@ -26,6 +26,7 @@ pub struct ModifierState {
     left_shift: bool,
     right_shift: bool,
     left_alt: bool,
+    right_alt: bool,
 }
 
 impl ModifierState {
@@ -37,6 +38,7 @@ impl ModifierState {
             Key::KEY_LEFTSHIFT => self.left_shift = pressed,
             Key::KEY_RIGHTSHIFT => self.right_shift = pressed,
             Key::KEY_LEFTALT => self.left_alt = pressed,
+            Key::KEY_RIGHTALT => self.right_alt = pressed,
             _ => {}
         }
     }
@@ -47,6 +49,10 @@ impl ModifierState {
 
     pub fn is_ctrl_pressed(&self) -> bool {
         self.left_ctrl || self.right_ctrl
+    }
+
+    pub fn is_alt_pressed(&self) -> bool {
+        self.left_alt || self.right_alt
     }
 
     pub fn should_toggle_layout_shortcut(&self, key: Key, value: i32) -> bool {
@@ -320,7 +326,60 @@ impl ModifierState {
         if self.left_alt {
             f(uinput::event::keyboard::Key::LeftAlt)?;
         }
+        if self.right_alt {
+            f(uinput::event::keyboard::Key::RightAlt)?;
+        }
 
+        Ok(())
+    }
+}
+
+impl KeyboardController {
+    pub fn send_copy_shortcut(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
+        self.send_shortcut(
+            modifiers,
+            &[uinput::event::keyboard::Key::LeftControl],
+            Some(&uinput::event::keyboard::Key::C),
+        )
+    }
+
+    pub fn send_paste_shortcut(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
+        self.send_shortcut(
+            modifiers,
+            &[uinput::event::keyboard::Key::LeftControl],
+            Some(&uinput::event::keyboard::Key::V),
+        )
+    }
+
+    fn send_shortcut(
+        &mut self,
+        modifiers: ModifierState,
+        shortcut_modifiers: &[uinput::event::keyboard::Key],
+        trigger_key: Option<&uinput::event::keyboard::Key>,
+    ) -> Result<(), SwitcherError> {
+        self.release_modifiers(modifiers)?;
+
+        for modifier in shortcut_modifiers {
+            self.virtual_device.press(modifier)?;
+        }
+
+        if let Some(key) = trigger_key {
+            self.virtual_device.press(key)?;
+        }
+
+        self.virtual_device.synchronize()?;
+        thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
+
+        if let Some(key) = trigger_key {
+            self.virtual_device.release(key)?;
+        }
+
+        for modifier in shortcut_modifiers.iter().rev() {
+            self.virtual_device.release(modifier)?;
+        }
+
+        self.virtual_device.synchronize()?;
+        self.restore_modifiers(modifiers)?;
         Ok(())
     }
 }

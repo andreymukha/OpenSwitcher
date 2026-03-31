@@ -1,5 +1,6 @@
 use crate::model::{
-    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSource, Settings, UndoKey,
+    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSource, SelectedTextHotkey, Settings,
+    UndoKey,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +23,7 @@ pub struct DomainState {
 pub struct ViewState {
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
+    pub selected_text_hotkey: SelectedTextHotkey,
     pub layout_switch: LayoutSwitchViewState,
     pub loading: bool,
     pub saving: bool,
@@ -140,6 +142,15 @@ impl DomainState {
         true
     }
 
+    pub fn update_selected_text_hotkey(&mut self, value: SelectedTextHotkey) -> bool {
+        if self.draft.selected_text_hotkey == value {
+            return false;
+        }
+
+        self.draft.selected_text_hotkey = value;
+        true
+    }
+
     pub fn unlock_layout_switch_override(&mut self) -> bool {
         if self.layout_switch_manual_override
             || !self
@@ -206,6 +217,7 @@ impl DomainState {
         ViewState {
             layout_delay_ms: self.draft.layout_delay_ms,
             undo_key: self.draft.undo_key,
+            selected_text_hotkey: self.draft.selected_text_hotkey,
             layout_switch: LayoutSwitchViewState {
                 combo: self.draft.layout_switch.combo,
                 combo_label: self.draft.layout_switch.combo.short_label().to_string(),

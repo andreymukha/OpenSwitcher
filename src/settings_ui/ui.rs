@@ -2,8 +2,11 @@ use super::dbus_client::SettingsDbusClient;
 use super::presenter::{PresenterEvent, SaveRequest, SettingsPresenter};
 use super::state::{LayoutSwitchActionsState, LayoutSwitchViewState, ViewState};
 use crate::error::SettingsClientError;
-use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState, LayoutSwitchCombo};
+use crate::model::{
+    LayoutSwitchCapturePhase, LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey,
+};
 use adw::prelude::*;
+use gtk::gdk;
 use gtk::glib::{self, SignalHandlerId};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -32,6 +35,43 @@ impl CaptureDialogState {
     fn clear(&mut self) {
         *self = Self::default();
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SelectedTextHotkeyDialogState {
+    candidate: Option<SelectedTextHotkey>,
+    error: Option<String>,
+    shift: bool,
+    ctrl: bool,
+    alt: bool,
+}
+
+impl SelectedTextHotkeyDialogState {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn set_modifier(&mut self, modifier: SelectedTextHotkeyModifier, pressed: bool) {
+        match modifier {
+            SelectedTextHotkeyModifier::Shift => self.shift = pressed,
+            SelectedTextHotkeyModifier::Ctrl => self.ctrl = pressed,
+            SelectedTextHotkeyModifier::Alt => self.alt = pressed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedTextHotkeyModifier {
+    Shift,
+    Ctrl,
+    Alt,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SelectedTextHotkeyTrigger {
+    Pause,
+    F12,
+    ScrollLock,
 }
 
 #[derive(Clone, Default)]
@@ -121,6 +161,54 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
         })
     };
     ui.set_undo_handler(undo_handler);
+
+    {
+        let ui = Rc::clone(&ui);
+        ui.selected_text_hotkey_row().connect_activated(move |_| {
+            ui.reset_selected_text_hotkey_dialog();
+            ui.open_selected_text_hotkey_dialog();
+        });
+    }
+
+    {
+        let ui = Rc::clone(&ui);
+        ui.selected_text_hotkey_dialog_cancel_button()
+            .connect_clicked(move |_| {
+                ui.reset_selected_text_hotkey_dialog();
+                ui.close_selected_text_hotkey_dialog();
+            });
+    }
+
+    {
+        let presenter = presenter.clone();
+        let ui = Rc::clone(&ui);
+        ui.selected_text_hotkey_dialog_ok_button()
+            .connect_clicked(move |_| {
+                let candidate = ui.selected_text_hotkey_dialog_state.borrow().candidate;
+                let Some(hotkey) = candidate else {
+                    return;
+                };
+
+                presenter.update_selected_text_hotkey(hotkey);
+                ui.reset_selected_text_hotkey_dialog();
+                ui.close_selected_text_hotkey_dialog();
+            });
+    }
+
+    {
+        let ui = Rc::clone(&ui);
+        ui.install_selected_text_hotkey_capture();
+    }
+
+    {
+        let ui = Rc::clone(&ui);
+        ui.selected_text_hotkey_dialog()
+            .connect_close_request(move |dialog| {
+                ui.reset_selected_text_hotkey_dialog();
+                dialog.hide();
+                glib::Propagation::Stop
+            });
+    }
 
     {
         let presenter = presenter.clone();
@@ -301,6 +389,87 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     undo_row.set_activatable_widget(Some(&undo_dropdown));
     group.add(&undo_row);
 
+    let selected_text_hotkey_row = adw::ActionRow::builder()
+        .title("Горячая клавиша для выделенного текста")
+        .subtitle("Копирует выделение, конвертирует раскладку и вставляет текст обратно")
+        .build();
+    let selected_text_hotkey_value_label = gtk::Label::new(Some("Shift+Pause"));
+    selected_text_hotkey_value_label.set_halign(gtk::Align::End);
+    selected_text_hotkey_value_label.set_valign(gtk::Align::Center);
+    selected_text_hotkey_value_label.add_css_class("monospace");
+    let selected_text_hotkey_value_icon = gtk::Image::from_icon_name("go-next-symbolic");
+    selected_text_hotkey_row.add_suffix(&selected_text_hotkey_value_icon);
+    selected_text_hotkey_row.add_suffix(&selected_text_hotkey_value_label);
+    group.add(&selected_text_hotkey_row);
+
+    let selected_text_hotkey_dialog = adw::Window::builder()
+        .title("Горячая клавиша для выделенного текста")
+        .default_width(360)
+        .default_height(220)
+        .modal(true)
+        .resizable(false)
+        .build();
+    selected_text_hotkey_dialog.set_transient_for(Some(parent_window));
+    selected_text_hotkey_dialog.set_hide_on_close(true);
+
+    let selected_hotkey_toolbar = adw::ToolbarView::new();
+    let selected_hotkey_header = adw::HeaderBar::new();
+    let selected_hotkey_title = adw::WindowTitle::new("Горячая клавиша", "Выделенный текст");
+    selected_hotkey_header.set_title_widget(Some(&selected_hotkey_title));
+    selected_hotkey_toolbar.add_top_bar(&selected_hotkey_header);
+
+    let selected_hotkey_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    selected_hotkey_box.set_margin_top(18);
+    selected_hotkey_box.set_margin_bottom(18);
+    selected_hotkey_box.set_margin_start(18);
+    selected_hotkey_box.set_margin_end(18);
+
+    let selected_hotkey_heading = gtk::Label::new(Some("Нажмите горячую клавишу..."));
+    selected_hotkey_heading.set_halign(gtk::Align::Start);
+    selected_hotkey_heading.add_css_class("title-3");
+    selected_hotkey_box.append(&selected_hotkey_heading);
+
+    let selected_hotkey_hint = gtk::Label::new(Some(
+        "Поддерживаются только сочетания Shift, Ctrl или Alt с Pause, F12 или ScrollLock.",
+    ));
+    selected_hotkey_hint.set_halign(gtk::Align::Start);
+    selected_hotkey_hint.set_wrap(true);
+    selected_hotkey_hint.add_css_class("dim-label");
+    selected_hotkey_box.append(&selected_hotkey_hint);
+
+    let selected_hotkey_current_title = gtk::Label::new(Some("Распознано"));
+    selected_hotkey_current_title.set_halign(gtk::Align::Start);
+    selected_hotkey_current_title.add_css_class("caption-heading");
+    selected_hotkey_box.append(&selected_hotkey_current_title);
+
+    let selected_text_hotkey_dialog_value_label = gtk::Label::new(Some("Пока не выбрана"));
+    selected_text_hotkey_dialog_value_label.set_halign(gtk::Align::Start);
+    selected_text_hotkey_dialog_value_label.add_css_class("monospace");
+    selected_text_hotkey_dialog_value_label.add_css_class("title-4");
+    selected_hotkey_box.append(&selected_text_hotkey_dialog_value_label);
+
+    let selected_text_hotkey_dialog_error_label = gtk::Label::new(None);
+    selected_text_hotkey_dialog_error_label.set_halign(gtk::Align::Start);
+    selected_text_hotkey_dialog_error_label.set_wrap(true);
+    selected_text_hotkey_dialog_error_label.add_css_class("error");
+    selected_text_hotkey_dialog_error_label.hide();
+    selected_hotkey_box.append(&selected_text_hotkey_dialog_error_label);
+
+    let selected_hotkey_actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let selected_hotkey_cancel_button = gtk::Button::with_label("Отмена");
+    let selected_hotkey_ok_button = gtk::Button::with_label("ОК");
+    selected_hotkey_ok_button.add_css_class("suggested-action");
+    selected_hotkey_ok_button.set_sensitive(false);
+    let selected_hotkey_spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    selected_hotkey_spacer.set_hexpand(true);
+    selected_hotkey_actions.append(&selected_hotkey_cancel_button);
+    selected_hotkey_actions.append(&selected_hotkey_spacer);
+    selected_hotkey_actions.append(&selected_hotkey_ok_button);
+    selected_hotkey_box.append(&selected_hotkey_actions);
+
+    selected_hotkey_toolbar.set_content(Some(&selected_hotkey_box));
+    selected_text_hotkey_dialog.set_content(Some(&selected_hotkey_toolbar));
+
     let layout_switch_value_row = adw::ActionRow::builder()
         .title("Комбинация переключения раскладки")
         .subtitle("Автоматически определяется демоном и используется для возврата раскладки назад")
@@ -415,6 +584,14 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         clamp,
         delay_spin,
         undo_dropdown,
+        selected_text_hotkey_row,
+        selected_text_hotkey_value_label,
+        selected_text_hotkey_value_icon,
+        selected_text_hotkey_dialog,
+        selected_text_hotkey_dialog_value_label,
+        selected_text_hotkey_dialog_error_label,
+        selected_text_hotkey_dialog_ok_button: selected_hotkey_ok_button,
+        selected_text_hotkey_dialog_cancel_button: selected_hotkey_cancel_button,
         layout_switch_value_row,
         layout_switch_value_label,
         layout_switch_value_icon,
@@ -434,6 +611,14 @@ struct FormWidgets {
     clamp: adw::Clamp,
     delay_spin: gtk::SpinButton,
     undo_dropdown: gtk::DropDown,
+    selected_text_hotkey_row: adw::ActionRow,
+    selected_text_hotkey_value_label: gtk::Label,
+    selected_text_hotkey_value_icon: gtk::Image,
+    selected_text_hotkey_dialog: adw::Window,
+    selected_text_hotkey_dialog_value_label: gtk::Label,
+    selected_text_hotkey_dialog_error_label: gtk::Label,
+    selected_text_hotkey_dialog_ok_button: gtk::Button,
+    selected_text_hotkey_dialog_cancel_button: gtk::Button,
     layout_switch_value_row: adw::ActionRow,
     layout_switch_value_label: gtk::Label,
     layout_switch_value_icon: gtk::Image,
@@ -459,6 +644,7 @@ struct SettingsWindow {
     presenter: RefCell<Option<SettingsPresenter>>,
     current_view_state: RefCell<ViewState>,
     capture_dialog_state: RefCell<CaptureDialogState>,
+    selected_text_hotkey_dialog_state: RefCell<SelectedTextHotkeyDialogState>,
     capture_timeout: RefCell<Option<glib::SourceId>>,
     capture_timeout_generation: Cell<u64>,
 }
@@ -533,6 +719,9 @@ impl SettingsWindow {
             presenter: RefCell::new(None),
             current_view_state: RefCell::new(initial_view_state()),
             capture_dialog_state: RefCell::new(CaptureDialogState::default()),
+            selected_text_hotkey_dialog_state: RefCell::new(
+                SelectedTextHotkeyDialogState::default(),
+            ),
             capture_timeout: RefCell::new(None),
             capture_timeout_generation: Cell::new(0),
         });
@@ -564,6 +753,7 @@ impl SettingsWindow {
         self.form.replace(Some(form));
         self.apply_view_state(&initial_view_state());
         self.update_capture_dialog_widgets();
+        self.update_selected_text_hotkey_dialog_widgets();
     }
 
     fn set_presenter(&self, presenter: SettingsPresenter) {
@@ -648,6 +838,11 @@ impl SettingsWindow {
         self.update_capture_dialog_widgets();
     }
 
+    fn reset_selected_text_hotkey_dialog(&self) {
+        self.selected_text_hotkey_dialog_state.borrow_mut().clear();
+        self.update_selected_text_hotkey_dialog_widgets();
+    }
+
     fn disarm_capture_timeout(&self) {
         self.capture_timeout_generation
             .set(self.capture_timeout_generation.get().wrapping_add(1));
@@ -726,6 +921,22 @@ impl SettingsWindow {
         self.update_capture_dialog_widgets();
     }
 
+    fn set_selected_text_hotkey_candidate(&self, hotkey: SelectedTextHotkey) {
+        let mut state = self.selected_text_hotkey_dialog_state.borrow_mut();
+        state.candidate = Some(hotkey);
+        state.error = None;
+        drop(state);
+        self.update_selected_text_hotkey_dialog_widgets();
+    }
+
+    fn set_selected_text_hotkey_error(&self, message: impl Into<String>) {
+        let mut state = self.selected_text_hotkey_dialog_state.borrow_mut();
+        state.candidate = None;
+        state.error = Some(message.into());
+        drop(state);
+        self.update_selected_text_hotkey_dialog_widgets();
+    }
+
     fn update_capture_dialog_widgets(&self) {
         let state = self.capture_dialog_state.borrow().clone();
         if let Some(form) = self.form.borrow().as_ref() {
@@ -748,6 +959,30 @@ impl SettingsWindow {
         }
     }
 
+    fn update_selected_text_hotkey_dialog_widgets(&self) {
+        let state = self.selected_text_hotkey_dialog_state.borrow().clone();
+        if let Some(form) = self.form.borrow().as_ref() {
+            match state.candidate {
+                Some(hotkey) => form
+                    .selected_text_hotkey_dialog_value_label
+                    .set_text(hotkey.short_label()),
+                None => form
+                    .selected_text_hotkey_dialog_value_label
+                    .set_text("Пока не выбрана"),
+            }
+
+            if let Some(error) = state.error.as_deref() {
+                form.selected_text_hotkey_dialog_error_label.set_text(error);
+                form.selected_text_hotkey_dialog_error_label.show();
+            } else {
+                form.selected_text_hotkey_dialog_error_label.hide();
+            }
+
+            form.selected_text_hotkey_dialog_ok_button
+                .set_sensitive(state.candidate.is_some());
+        }
+    }
+
     fn delay_spin(&self) -> gtk::SpinButton {
         self.form
             .borrow()
@@ -763,6 +998,42 @@ impl SettingsWindow {
             .as_ref()
             .expect("form widgets must be installed before access")
             .undo_dropdown
+            .clone()
+    }
+
+    fn selected_text_hotkey_row(&self) -> adw::ActionRow {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .selected_text_hotkey_row
+            .clone()
+    }
+
+    fn selected_text_hotkey_dialog(&self) -> adw::Window {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .selected_text_hotkey_dialog
+            .clone()
+    }
+
+    fn selected_text_hotkey_dialog_ok_button(&self) -> gtk::Button {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .selected_text_hotkey_dialog_ok_button
+            .clone()
+    }
+
+    fn selected_text_hotkey_dialog_cancel_button(&self) -> gtk::Button {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .selected_text_hotkey_dialog_cancel_button
             .clone()
     }
 
@@ -818,10 +1089,75 @@ impl SettingsWindow {
         }
     }
 
+    fn open_selected_text_hotkey_dialog(&self) {
+        if let Some(form) = self.form.borrow().as_ref() {
+            self.reset_selected_text_hotkey_dialog();
+            form.selected_text_hotkey_dialog.present();
+        }
+    }
+
     fn close_layout_switch_dialog(&self) {
         if let Some(form) = self.form.borrow().as_ref() {
             form.layout_switch_dialog.hide();
         }
+    }
+
+    fn close_selected_text_hotkey_dialog(&self) {
+        if let Some(form) = self.form.borrow().as_ref() {
+            form.selected_text_hotkey_dialog.hide();
+        }
+    }
+
+    fn install_selected_text_hotkey_capture(self: &Rc<Self>) {
+        let controller = gtk::EventControllerKey::new();
+
+        {
+            let ui = Rc::clone(self);
+            controller.connect_key_pressed(move |_, key, _, _| {
+                if key == gdk::Key::Escape {
+                    ui.reset_selected_text_hotkey_dialog();
+                    ui.close_selected_text_hotkey_dialog();
+                    return glib::Propagation::Stop;
+                }
+
+                if let Some(modifier) = selected_text_hotkey_modifier_from_key(key) {
+                    ui.selected_text_hotkey_dialog_state
+                        .borrow_mut()
+                        .set_modifier(modifier, true);
+                    return glib::Propagation::Stop;
+                }
+
+                if let Some(trigger) = selected_text_hotkey_trigger_from_key(key) {
+                    let state = ui.selected_text_hotkey_dialog_state.borrow().clone();
+                    match selected_text_hotkey_from_capture_state(&state, trigger) {
+                        Ok(hotkey) => ui.set_selected_text_hotkey_candidate(hotkey),
+                        Err(message) => ui.set_selected_text_hotkey_error(message),
+                    }
+                    return glib::Propagation::Stop;
+                }
+
+                ui.set_selected_text_hotkey_error(
+                    "Поддерживаются только сочетания Shift, Ctrl или Alt с Pause, F12 или ScrollLock.",
+                );
+                glib::Propagation::Stop
+            });
+        }
+
+        {
+            let ui = Rc::clone(self);
+            controller.connect_key_released(move |_, key, _, _| {
+                let Some(modifier) = selected_text_hotkey_modifier_from_key(key) else {
+                    return;
+                };
+
+                ui.selected_text_hotkey_dialog_state
+                    .borrow_mut()
+                    .set_modifier(modifier, false);
+            });
+        }
+
+        self.selected_text_hotkey_dialog()
+            .add_controller(controller);
     }
 
     fn apply_view_state(&self, state: &ViewState) {
@@ -850,6 +1186,14 @@ impl SettingsWindow {
 
             form.delay_spin.set_sensitive(state.form_enabled);
             form.undo_dropdown.set_sensitive(state.form_enabled);
+            form.selected_text_hotkey_row
+                .set_sensitive(state.form_enabled);
+            form.selected_text_hotkey_row
+                .set_activatable(state.form_enabled);
+            form.selected_text_hotkey_value_icon
+                .set_visible(state.form_enabled);
+            form.selected_text_hotkey_value_label
+                .set_text(state.selected_text_hotkey.short_label());
 
             form.layout_switch_value_label
                 .set_text(&state.layout_switch.combo_label);
@@ -916,6 +1260,7 @@ fn initial_view_state() -> ViewState {
     ViewState {
         layout_delay_ms: crate::model::Settings::default().layout_delay_ms,
         undo_key: crate::model::Settings::default().undo_key,
+        selected_text_hotkey: crate::model::Settings::default().selected_text_hotkey,
         layout_switch: LayoutSwitchViewState {
             combo: crate::model::Settings::default().layout_switch.combo,
             combo_label: crate::model::Settings::default()
@@ -941,6 +1286,58 @@ fn initial_view_state() -> ViewState {
         cancel_enabled: true,
         status_text: "Загрузка настроек из демона OpenSwitcher...",
     }
+}
+
+fn selected_text_hotkey_modifier_from_key(key: gdk::Key) -> Option<SelectedTextHotkeyModifier> {
+    match key {
+        gdk::Key::Shift_L | gdk::Key::Shift_R => Some(SelectedTextHotkeyModifier::Shift),
+        gdk::Key::Control_L | gdk::Key::Control_R => Some(SelectedTextHotkeyModifier::Ctrl),
+        gdk::Key::Alt_L | gdk::Key::Alt_R => Some(SelectedTextHotkeyModifier::Alt),
+        _ => None,
+    }
+}
+
+fn selected_text_hotkey_trigger_from_key(key: gdk::Key) -> Option<SelectedTextHotkeyTrigger> {
+    match key {
+        gdk::Key::Pause => Some(SelectedTextHotkeyTrigger::Pause),
+        gdk::Key::F12 => Some(SelectedTextHotkeyTrigger::F12),
+        gdk::Key::Scroll_Lock => Some(SelectedTextHotkeyTrigger::ScrollLock),
+        _ => None,
+    }
+}
+
+fn selected_text_hotkey_from_capture_state(
+    state: &SelectedTextHotkeyDialogState,
+    trigger: SelectedTextHotkeyTrigger,
+) -> Result<SelectedTextHotkey, &'static str> {
+    let modifier_count =
+        usize::from(state.shift) + usize::from(state.ctrl) + usize::from(state.alt);
+    if modifier_count != 1 {
+        return Err("Нужна ровно одна клавиша-модификатор: Shift, Ctrl или Alt.");
+    }
+
+    Ok(match (state.shift, state.ctrl, state.alt, trigger) {
+        (true, false, false, SelectedTextHotkeyTrigger::Pause) => SelectedTextHotkey::ShiftPause,
+        (false, true, false, SelectedTextHotkeyTrigger::Pause) => SelectedTextHotkey::CtrlPause,
+        (false, false, true, SelectedTextHotkeyTrigger::Pause) => SelectedTextHotkey::AltPause,
+        (true, false, false, SelectedTextHotkeyTrigger::F12) => SelectedTextHotkey::ShiftF12,
+        (false, true, false, SelectedTextHotkeyTrigger::F12) => SelectedTextHotkey::CtrlF12,
+        (false, false, true, SelectedTextHotkeyTrigger::F12) => SelectedTextHotkey::AltF12,
+        (true, false, false, SelectedTextHotkeyTrigger::ScrollLock) => {
+            SelectedTextHotkey::ShiftScrollLock
+        }
+        (false, true, false, SelectedTextHotkeyTrigger::ScrollLock) => {
+            SelectedTextHotkey::CtrlScrollLock
+        }
+        (false, false, true, SelectedTextHotkeyTrigger::ScrollLock) => {
+            SelectedTextHotkey::AltScrollLock
+        }
+        _ => {
+            return Err(
+                "Поддерживаются только сочетания Shift, Ctrl или Alt с Pause, F12 или ScrollLock.",
+            )
+        }
+    })
 }
 
 fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'static str, String) {

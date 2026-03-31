@@ -1,7 +1,9 @@
 use super::dbus_client::SettingsDbusClient;
 use super::state::{DomainState, ViewState};
 use crate::error::{SettingsClientError, UiError};
-use crate::model::{LayoutSwitchCaptureState, LayoutSwitchCombo, UndoKey, UpdateSettingsResult};
+use crate::model::{
+    LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey, UndoKey, UpdateSettingsResult,
+};
 use async_channel::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -86,6 +88,13 @@ impl SettingsPresenter {
 
     pub fn update_undo_key(&self, value: UndoKey) {
         let changed = self.with_state(|state| state.update_undo_key(value));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn update_selected_text_hotkey(&self, value: SelectedTextHotkey) {
+        let changed = self.with_state(|state| state.update_selected_text_hotkey(value));
         if changed {
             let _ = self.emit_view_state();
         }

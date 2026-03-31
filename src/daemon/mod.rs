@@ -1,6 +1,7 @@
 pub mod capture;
 pub mod keyboard;
 pub mod runtime;
+pub mod selected_text;
 pub mod service;
 pub mod switch_logic;
 

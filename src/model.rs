@@ -1,4 +1,6 @@
-use crate::error::{LayoutSwitchComboParseError, UndoKeyParseError, ValidationError};
+use crate::error::{
+    LayoutSwitchComboParseError, SelectedTextHotkeyParseError, UndoKeyParseError, ValidationError,
+};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use zvariant::Type;
@@ -25,6 +27,96 @@ impl UndoKey {
             Self::Pause => "Pause",
             Self::F12 => "F12",
             Self::ScrollLock => "ScrollLock",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[zvariant(signature = "s")]
+pub enum SelectedTextHotkey {
+    #[serde(rename = "ShiftPause")]
+    ShiftPause,
+    #[serde(rename = "CtrlPause")]
+    CtrlPause,
+    #[serde(rename = "AltPause")]
+    AltPause,
+    #[serde(rename = "ShiftF12")]
+    ShiftF12,
+    #[serde(rename = "CtrlF12")]
+    CtrlF12,
+    #[serde(rename = "AltF12")]
+    AltF12,
+    #[serde(rename = "ShiftScrollLock")]
+    ShiftScrollLock,
+    #[serde(rename = "CtrlScrollLock")]
+    CtrlScrollLock,
+    #[serde(rename = "AltScrollLock")]
+    AltScrollLock,
+}
+
+impl SelectedTextHotkey {
+    pub const ALL: [SelectedTextHotkey; 9] = [
+        SelectedTextHotkey::ShiftPause,
+        SelectedTextHotkey::CtrlPause,
+        SelectedTextHotkey::AltPause,
+        SelectedTextHotkey::ShiftF12,
+        SelectedTextHotkey::CtrlF12,
+        SelectedTextHotkey::AltF12,
+        SelectedTextHotkey::ShiftScrollLock,
+        SelectedTextHotkey::CtrlScrollLock,
+        SelectedTextHotkey::AltScrollLock,
+    ];
+
+    pub const fn trigger_key(self) -> UndoKey {
+        match self {
+            Self::ShiftPause | Self::CtrlPause | Self::AltPause => UndoKey::Pause,
+            Self::ShiftF12 | Self::CtrlF12 | Self::AltF12 => UndoKey::F12,
+            Self::ShiftScrollLock | Self::CtrlScrollLock | Self::AltScrollLock => {
+                UndoKey::ScrollLock
+            }
+        }
+    }
+
+    pub const fn uses_shift(self) -> bool {
+        matches!(
+            self,
+            Self::ShiftPause | Self::ShiftF12 | Self::ShiftScrollLock
+        )
+    }
+
+    pub const fn uses_ctrl(self) -> bool {
+        matches!(self, Self::CtrlPause | Self::CtrlF12 | Self::CtrlScrollLock)
+    }
+
+    pub const fn uses_alt(self) -> bool {
+        matches!(self, Self::AltPause | Self::AltF12 | Self::AltScrollLock)
+    }
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::ShiftPause => "ShiftPause",
+            Self::CtrlPause => "CtrlPause",
+            Self::AltPause => "AltPause",
+            Self::ShiftF12 => "ShiftF12",
+            Self::CtrlF12 => "CtrlF12",
+            Self::AltF12 => "AltF12",
+            Self::ShiftScrollLock => "ShiftScrollLock",
+            Self::CtrlScrollLock => "CtrlScrollLock",
+            Self::AltScrollLock => "AltScrollLock",
+        }
+    }
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::ShiftPause => "Shift+Pause",
+            Self::CtrlPause => "Ctrl+Pause",
+            Self::AltPause => "Alt+Pause",
+            Self::ShiftF12 => "Shift+F12",
+            Self::CtrlF12 => "Ctrl+F12",
+            Self::AltF12 => "Alt+F12",
+            Self::ShiftScrollLock => "Shift+ScrollLock",
+            Self::CtrlScrollLock => "Ctrl+ScrollLock",
+            Self::AltScrollLock => "Alt+ScrollLock",
         }
     }
 }
@@ -150,6 +242,12 @@ impl Default for UndoKey {
     }
 }
 
+impl Default for SelectedTextHotkey {
+    fn default() -> Self {
+        Self::ShiftPause
+    }
+}
+
 impl Default for LayoutSwitchCombo {
     fn default() -> Self {
         Self::ctrl_shift()
@@ -159,6 +257,12 @@ impl Default for LayoutSwitchCombo {
 impl std::fmt::Display for UndoKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Display for SelectedTextHotkey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.short_label())
     }
 }
 
@@ -177,6 +281,27 @@ impl FromStr for UndoKey {
             "F12" => Ok(Self::F12),
             "ScrollLock" => Ok(Self::ScrollLock),
             _ => Err(UndoKeyParseError::UnsupportedValue {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+impl FromStr for SelectedTextHotkey {
+    type Err = SelectedTextHotkeyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "ShiftPause" | "Shift+Pause" => Ok(Self::ShiftPause),
+            "CtrlPause" | "Ctrl+Pause" => Ok(Self::CtrlPause),
+            "AltPause" | "Alt+Pause" => Ok(Self::AltPause),
+            "ShiftF12" | "Shift+F12" => Ok(Self::ShiftF12),
+            "CtrlF12" | "Ctrl+F12" => Ok(Self::CtrlF12),
+            "AltF12" | "Alt+F12" => Ok(Self::AltF12),
+            "ShiftScrollLock" | "Shift+ScrollLock" => Ok(Self::ShiftScrollLock),
+            "CtrlScrollLock" | "Ctrl+ScrollLock" => Ok(Self::CtrlScrollLock),
+            "AltScrollLock" | "Alt+ScrollLock" => Ok(Self::AltScrollLock),
+            _ => Err(SelectedTextHotkeyParseError::UnsupportedValue {
                 value: value.to_string(),
             }),
         }
@@ -422,6 +547,7 @@ impl LayoutSwitchSetting {
 pub struct Settings {
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
+    pub selected_text_hotkey: SelectedTextHotkey,
     pub layout_switch: LayoutSwitchSetting,
 }
 
@@ -430,6 +556,7 @@ impl Default for Settings {
         Self {
             layout_delay_ms: 30,
             undo_key: UndoKey::default(),
+            selected_text_hotkey: SelectedTextHotkey::default(),
             layout_switch: LayoutSwitchSetting::default(),
         }
     }
@@ -453,6 +580,7 @@ impl Settings {
 pub struct SettingsDto {
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
+    pub selected_text_hotkey: SelectedTextHotkey,
     pub layout_switch: LayoutSwitchSetting,
 }
 
@@ -467,6 +595,7 @@ impl From<Settings> for SettingsDto {
         Self {
             layout_delay_ms: value.layout_delay_ms,
             undo_key: value.undo_key,
+            selected_text_hotkey: value.selected_text_hotkey,
             layout_switch: value.layout_switch,
         }
     }
@@ -479,6 +608,7 @@ impl TryFrom<SettingsDto> for Settings {
         Settings {
             layout_delay_ms: value.layout_delay_ms,
             undo_key: value.undo_key,
+            selected_text_hotkey: value.selected_text_hotkey,
             layout_switch: value.layout_switch,
         }
         .validate()
@@ -500,6 +630,7 @@ mod tests {
         let result = Settings {
             layout_delay_ms: 700,
             undo_key: UndoKey::Pause,
+            selected_text_hotkey: SelectedTextHotkey::default(),
             layout_switch: LayoutSwitchSetting::default(),
         }
         .validate();
@@ -519,6 +650,7 @@ mod tests {
         let dto = SettingsDto {
             layout_delay_ms: 30,
             undo_key: UndoKey::F12,
+            selected_text_hotkey: SelectedTextHotkey::AltPause,
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::alt_shift(),
                 source: LayoutSwitchSource::Manual,
@@ -528,6 +660,7 @@ mod tests {
 
         let settings = Settings::try_from(dto).unwrap();
         assert_eq!(settings.undo_key, UndoKey::F12);
+        assert_eq!(settings.selected_text_hotkey, SelectedTextHotkey::AltPause);
         assert_eq!(settings.layout_switch.combo, LayoutSwitchCombo::alt_shift());
     }
 
@@ -541,6 +674,26 @@ mod tests {
                 value: "Unknown".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parses_and_formats_supported_selected_text_hotkeys() {
+        let hotkeys = [
+            ("Shift+Pause", SelectedTextHotkey::ShiftPause),
+            ("Ctrl+Pause", SelectedTextHotkey::CtrlPause),
+            ("Alt+Pause", SelectedTextHotkey::AltPause),
+            ("Shift+F12", SelectedTextHotkey::ShiftF12),
+            ("Ctrl+F12", SelectedTextHotkey::CtrlF12),
+            ("Alt+F12", SelectedTextHotkey::AltF12),
+            ("Shift+ScrollLock", SelectedTextHotkey::ShiftScrollLock),
+            ("Ctrl+ScrollLock", SelectedTextHotkey::CtrlScrollLock),
+            ("Alt+ScrollLock", SelectedTextHotkey::AltScrollLock),
+        ];
+
+        for (raw, expected) in hotkeys {
+            assert_eq!(SelectedTextHotkey::from_str(raw).unwrap(), expected);
+            assert_eq!(expected.to_string(), raw);
+        }
     }
 
     #[test]

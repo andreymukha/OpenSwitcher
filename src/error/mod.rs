@@ -15,6 +15,12 @@ pub enum UndoKeyParseError {
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SelectedTextHotkeyParseError {
+    #[error("Неподдерживаемая горячая клавиша для выделенного текста: {value}")]
+    UnsupportedValue { value: String },
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum LayoutSwitchComboParseError {
     #[error("Неподдерживаемая комбинация переключения раскладки: {value}")]
     UnsupportedValue { value: String },
@@ -45,6 +51,16 @@ pub enum CaptureError {
 }
 
 #[derive(Debug, Error)]
+pub enum SelectedTextError {
+    #[error("Не удалось получить доступ к буферу обмена")]
+    ClipboardUnavailable(#[source] arboard::Error),
+    #[error("Не удалось прочитать текст из буфера обмена")]
+    ClipboardRead(#[source] arboard::Error),
+    #[error("Не удалось записать текст в буфер обмена")]
+    ClipboardWrite(#[source] arboard::Error),
+}
+
+#[derive(Debug, Error)]
 pub enum SwitcherError {
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -56,6 +72,8 @@ pub enum SwitcherError {
     Settings(#[from] SettingsError),
     #[error(transparent)]
     Capture(#[from] CaptureError),
+    #[error(transparent)]
+    SelectedText(#[from] SelectedTextError),
     #[error(transparent)]
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]

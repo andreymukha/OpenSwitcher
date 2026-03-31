@@ -3,8 +3,8 @@ use open_switcher::daemon::runtime::{ConfigService, RuntimeState};
 use open_switcher::dbus::{OpenSwitcherDbusApi, INTERFACE_NAME, OBJECT_PATH};
 use open_switcher::model::{
     AutoDetectedLayoutSwitch, LayoutSwitchCapturePhase, LayoutSwitchCaptureState,
-    LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, SettingsDto, UndoKey,
-    UpdateSettingsResult,
+    LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, SelectedTextHotkey, SettingsDto,
+    UndoKey, UpdateSettingsResult,
 };
 use std::error::Error;
 use std::path::PathBuf;
@@ -26,6 +26,7 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let initial: SettingsDto = proxy.call("GetSettings", &())?;
     assert_eq!(initial.layout_delay_ms, 30);
     assert_eq!(initial.undo_key, UndoKey::Pause);
+    assert_eq!(initial.selected_text_hotkey, SelectedTextHotkey::ShiftPause);
     assert_eq!(initial.layout_switch.combo, LayoutSwitchCombo::ctrl_shift());
 
     let result: UpdateSettingsResult = proxy.call(
@@ -33,6 +34,7 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
         &(SettingsDto {
             layout_delay_ms: 77,
             undo_key: UndoKey::F12,
+            selected_text_hotkey: SelectedTextHotkey::AltF12,
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::alt_shift(),
                 source: LayoutSwitchSource::Manual,
@@ -45,12 +47,17 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let updated: SettingsDto = proxy.call("GetSettings", &())?;
     assert_eq!(updated.layout_delay_ms, 77);
     assert_eq!(updated.undo_key, UndoKey::F12);
+    assert_eq!(updated.selected_text_hotkey, SelectedTextHotkey::AltF12);
     assert_eq!(updated.layout_switch.combo, LayoutSwitchCombo::alt_shift());
     assert_eq!(updated.layout_switch.source, LayoutSwitchSource::Manual);
 
     let config = AppConfig::load_or_create(&config_path)?;
     assert_eq!(config.layout.delay_ms, 77);
     assert_eq!(config.features.undo_key, UndoKey::F12);
+    assert_eq!(
+        config.features.selected_text_switch_hotkey,
+        SelectedTextHotkey::AltF12
+    );
     assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::alt_shift());
 
     Ok(())
@@ -72,6 +79,7 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
             &(SettingsDto {
                 layout_delay_ms: 999,
                 undo_key: UndoKey::Pause,
+                selected_text_hotkey: SelectedTextHotkey::ShiftPause,
                 layout_switch: LayoutSwitchSetting {
                     combo: LayoutSwitchCombo::ctrl_shift(),
                     source: LayoutSwitchSource::Manual,
@@ -87,6 +95,10 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
     let config = AppConfig::load_or_create(&config_path)?;
     assert_eq!(config.layout.delay_ms, 30);
     assert_eq!(config.features.undo_key, UndoKey::Pause);
+    assert_eq!(
+        config.features.selected_text_switch_hotkey,
+        SelectedTextHotkey::ShiftPause
+    );
 
     Ok(())
 }

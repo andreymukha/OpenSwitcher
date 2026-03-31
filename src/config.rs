@@ -1,7 +1,7 @@
 use crate::error::ConfigError;
 use crate::model::{
-    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, Settings,
-    UndoKey,
+    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource,
+    SelectedTextHotkey, Settings, UndoKey,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -31,6 +31,8 @@ pub struct DelaysConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeaturesConfig {
     pub undo_key: UndoKey,
+    #[serde(default)]
+    pub selected_text_switch_hotkey: SelectedTextHotkey,
 }
 
 impl Default for AppConfig {
@@ -48,6 +50,7 @@ impl Default for AppConfig {
             },
             features: FeaturesConfig {
                 undo_key: UndoKey::Pause,
+                selected_text_switch_hotkey: SelectedTextHotkey::default(),
             },
         }
     }
@@ -79,6 +82,7 @@ impl AppConfig {
         Settings {
             layout_delay_ms: self.layout.delay_ms,
             undo_key: self.features.undo_key,
+            selected_text_hotkey: self.features.selected_text_switch_hotkey,
             layout_switch: LayoutSwitchSetting {
                 combo: self.layout.switch_combo,
                 source: self.layout.switch_source,
@@ -93,6 +97,7 @@ impl AppConfig {
         self.layout.switch_source = settings.layout_switch.source;
         self.layout.auto_detected = settings.layout_switch.auto_detected;
         self.features.undo_key = settings.undo_key;
+        self.features.selected_text_switch_hotkey = settings.selected_text_hotkey;
     }
 }
 
@@ -201,6 +206,7 @@ mod tests {
             },
             features: FeaturesConfig {
                 undo_key: UndoKey::Pause,
+                selected_text_switch_hotkey: SelectedTextHotkey::default(),
             },
         };
 
@@ -224,6 +230,7 @@ mod tests {
             },
             features: FeaturesConfig {
                 undo_key: UndoKey::Pause,
+                selected_text_switch_hotkey: SelectedTextHotkey::default(),
             },
         };
 

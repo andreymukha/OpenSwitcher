@@ -20,6 +20,7 @@ const EXCLUDED_WORDS: &[&str] = &[
 pub fn manual_correction_plan(
     current_buffer: &[Keystroke],
     last_word_buffer: &[Keystroke],
+    last_word_followed_by_separator: bool,
 ) -> Option<CorrectionPlan> {
     if !current_buffer.is_empty() {
         return Some(CorrectionPlan {
@@ -31,7 +32,7 @@ pub fn manual_correction_plan(
     if !last_word_buffer.is_empty() {
         return Some(CorrectionPlan {
             buffer: last_word_buffer.to_vec(),
-            extra_backspaces: 1,
+            extra_backspaces: usize::from(last_word_followed_by_separator),
         });
     }
 
@@ -131,9 +132,29 @@ mod tests {
         let current = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
         let last = vec![stroke(Key::KEY_A)];
 
-        let plan = manual_correction_plan(&current, &last).unwrap();
+        let plan = manual_correction_plan(&current, &last, true).unwrap();
         assert_eq!(plan.buffer, current);
         assert_eq!(plan.extra_backspaces, 0);
+    }
+
+    #[test]
+    fn previous_word_without_separator_does_not_backspace_extra_char() {
+        let current = vec![];
+        let last = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
+
+        let plan = manual_correction_plan(&current, &last, false).unwrap();
+        assert_eq!(plan.buffer, last);
+        assert_eq!(plan.extra_backspaces, 0);
+    }
+
+    #[test]
+    fn previous_word_with_separator_backspaces_separator_too() {
+        let current = vec![];
+        let last = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
+
+        let plan = manual_correction_plan(&current, &last, true).unwrap();
+        assert_eq!(plan.buffer, last);
+        assert_eq!(plan.extra_backspaces, 1);
     }
 
     #[test]

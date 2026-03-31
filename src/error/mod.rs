@@ -76,6 +76,10 @@ pub enum SwitcherError {
     Capture(#[from] CaptureError),
     #[error(transparent)]
     SelectedText(#[from] SelectedTextError),
+    #[error("Selected text worker thread is unavailable")]
+    SelectedTextWorkerDisconnected,
+    #[error("Virtual keyboard lock is poisoned")]
+    VirtualKeyboardLockPoisoned,
     #[error(transparent)]
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]

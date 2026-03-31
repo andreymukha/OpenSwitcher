@@ -41,7 +41,8 @@ impl LayoutConversionEngine {
 
                     if segment.kind == SegmentKind::Separator {
                         if let Some(direction) = separator_direction {
-                            let converted_separator = convert_with_direction(segment.text, direction);
+                            let converted_separator =
+                                convert_separator_with_direction(segment.text, direction);
                             log_selected_text_debug(
                                 "separator-conversion",
                                 &format!(
@@ -213,6 +214,15 @@ fn next_text_direction(segments: &[Segment<'_>], start_index: usize) -> Option<C
     }
 
     None
+}
+
+fn convert_separator_with_direction(text: &str, direction: ConversionDirection) -> String {
+    match direction {
+        ConversionDirection::EnToRu | ConversionDirection::Mixed => {
+            map_text(text, en_to_ru_separator_char)
+        }
+        ConversionDirection::RuToEn => map_text(text, ru_to_en_separator_char),
+    }
 }
 
 fn convert_with_direction(text: &str, direction: ConversionDirection) -> String {
@@ -390,6 +400,27 @@ fn ru_to_en_char(ch: char) -> char {
     }
 }
 
+fn en_to_ru_separator_char(ch: char) -> char {
+    match ch {
+        ',' => 'б',
+        '<' => 'Б',
+        '.' => 'ю',
+        '>' => 'Ю',
+        _ => en_to_ru_char(ch),
+    }
+}
+
+fn ru_to_en_separator_char(ch: char) -> char {
+    match ch {
+        'б' => ',',
+        'Б' => '<',
+        'ю' => '.',
+        'Ю' => '>',
+        '/' => '|',
+        _ => ru_to_en_char(ch),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,7 +454,7 @@ mod tests {
     #[test]
     fn converts_english_layout_to_russian_with_symbols() {
         let converted = convert("Ghbdtn, vbh!");
-        assert_eq!(converted.converted_text, "Привет, мир!");
+        assert_eq!(converted.converted_text, "Приветб мир!");
         assert_eq!(converted.direction, ConversionDirection::EnToRu);
     }
 
@@ -437,7 +468,7 @@ mod tests {
     #[test]
     fn leaves_spaces_and_newlines_while_converting() {
         let converted = convert("Ghbdtn,\nVbh!");
-        assert_eq!(converted.converted_text, "Привет,\nМир!");
+        assert_eq!(converted.converted_text, "Приветб\nМир!");
     }
 
     #[test]
@@ -450,7 +481,7 @@ mod tests {
     #[test]
     fn converts_only_wrong_layout_segment_in_mixed_phrase() {
         let converted = convert("Ghbdtn, мир!");
-        assert_eq!(converted.converted_text, "Привет, vbh!");
+        assert_eq!(converted.converted_text, "Приветб vbh!");
         assert_eq!(converted.direction, ConversionDirection::Mixed);
     }
 
@@ -464,7 +495,7 @@ mod tests {
     #[test]
     fn converts_both_sides_of_bidirectional_mixed_text() {
         let converted = convert("руддщ? / hello?");
-        assert_eq!(converted.converted_text, "hello& / руддщ,");
+        assert_eq!(converted.converted_text, "hello& | руддщ,");
         assert_eq!(converted.direction, ConversionDirection::Mixed);
     }
 
@@ -508,5 +539,30 @@ mod tests {
         let converted = convert("ghbdtn? vbh/");
         assert_eq!(converted.converted_text, "привет, мир.");
         assert_eq!(converted.direction, ConversionDirection::EnToRu);
+    }
+
+    #[test]
+    fn converts_trailing_comma_and_dot_by_keyboard_position() {
+        let converted = convert("Ghbdtn,.");
+        assert_eq!(converted.converted_text, "Приветбю");
+        assert_eq!(converted.direction, ConversionDirection::EnToRu);
+    }
+
+    #[test]
+    fn converts_separator_symbols_by_keyboard_position_for_selected_text() {
+        let converted = convert_separator_with_direction(
+            "[]{};:'\",.<>/?@#$^&|\\",
+            ConversionDirection::EnToRu,
+        );
+        assert_eq!(converted, "хъХЪжЖэЭбюБЮ.,\"№;:?/\\");
+    }
+
+    #[test]
+    fn converts_russian_separator_symbols_back_to_english_positions() {
+        let converted = convert_separator_with_direction(
+            "хъХЪжЖэЭбюБЮ.,\"№;:?/\\",
+            ConversionDirection::RuToEn,
+        );
+        assert_eq!(converted, "[]{};:'\",.<>/?@#$^&|\\");
     }
 }

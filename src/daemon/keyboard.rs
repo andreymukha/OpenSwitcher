@@ -6,6 +6,8 @@ use evdev::{enumerate, Device, InputEvent, Key};
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -16,7 +18,22 @@ const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
 
 pub struct KeyboardController {
     real_device: Device,
-    virtual_device: uinput::Device,
+    virtual_device: SharedVirtualKeyboard,
+}
+
+pub struct SelectionKeyboardTransport {
+    virtual_device: SharedVirtualKeyboard,
+    modifiers: SharedModifierState,
+}
+
+#[derive(Clone)]
+struct SharedVirtualKeyboard {
+    inner: Arc<Mutex<uinput::Device>>,
+}
+
+#[derive(Clone, Default)]
+pub struct SharedModifierState {
+    bits: Arc<AtomicU8>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -27,6 +44,8 @@ pub struct ModifierState {
     right_shift: bool,
     left_alt: bool,
     right_alt: bool,
+    left_meta: bool,
+    right_meta: bool,
 }
 
 impl ModifierState {
@@ -39,6 +58,8 @@ impl ModifierState {
             Key::KEY_RIGHTSHIFT => self.right_shift = pressed,
             Key::KEY_LEFTALT => self.left_alt = pressed,
             Key::KEY_RIGHTALT => self.right_alt = pressed,
+            Key::KEY_LEFTMETA => self.left_meta = pressed,
+            Key::KEY_RIGHTMETA => self.right_meta = pressed,
             _ => {}
         }
     }
@@ -55,11 +76,93 @@ impl ModifierState {
         self.left_alt || self.right_alt
     }
 
-    pub fn should_toggle_layout_shortcut(&self, key: Key, value: i32) -> bool {
-        (key == Key::KEY_LEFTCTRL || key == Key::KEY_LEFTSHIFT)
-            && value == 1
-            && self.is_ctrl_pressed()
-            && self.is_shift_pressed()
+    pub fn is_meta_pressed(&self) -> bool {
+        self.left_meta || self.right_meta
+    }
+
+    pub fn matches_layout_switch_combo(
+        &self,
+        combo: LayoutSwitchCombo,
+        key: Key,
+        value: i32,
+    ) -> bool {
+        if value != 1 {
+            return false;
+        }
+
+        match combo {
+            LayoutSwitchCombo::CtrlShift => {
+                matches!(
+                    key,
+                    Key::KEY_LEFTCTRL
+                        | Key::KEY_RIGHTCTRL
+                        | Key::KEY_LEFTSHIFT
+                        | Key::KEY_RIGHTSHIFT
+                ) && self.is_ctrl_pressed()
+                    && self.is_shift_pressed()
+            }
+            LayoutSwitchCombo::AltShift => {
+                matches!(
+                    key,
+                    Key::KEY_LEFTALT
+                        | Key::KEY_RIGHTALT
+                        | Key::KEY_LEFTSHIFT
+                        | Key::KEY_RIGHTSHIFT
+                ) && self.is_alt_pressed()
+                    && self.is_shift_pressed()
+            }
+            LayoutSwitchCombo::CapsLock => key == Key::KEY_CAPSLOCK,
+            LayoutSwitchCombo::CtrlSpace => {
+                key == Key::KEY_SPACE && self.is_ctrl_pressed()
+            }
+            LayoutSwitchCombo::SuperSpace => {
+                key == Key::KEY_SPACE && self.is_meta_pressed()
+            }
+            LayoutSwitchCombo::LeftCtrlLeftShift => {
+                matches!(key, Key::KEY_LEFTCTRL | Key::KEY_LEFTSHIFT)
+                    && self.left_ctrl
+                    && self.left_shift
+            }
+            LayoutSwitchCombo::RightCtrlRightShift => {
+                matches!(key, Key::KEY_RIGHTCTRL | Key::KEY_RIGHTSHIFT)
+                    && self.right_ctrl
+                    && self.right_shift
+            }
+            LayoutSwitchCombo::LeftAltLeftShift => {
+                matches!(key, Key::KEY_LEFTALT | Key::KEY_LEFTSHIFT)
+                    && self.left_alt
+                    && self.left_shift
+            }
+            LayoutSwitchCombo::RightAltRightShift => {
+                matches!(key, Key::KEY_RIGHTALT | Key::KEY_RIGHTSHIFT)
+                    && self.right_alt
+                    && self.right_shift
+            }
+        }
+    }
+
+    fn to_bits(self) -> u8 {
+        (self.left_ctrl as u8)
+            | ((self.right_ctrl as u8) << 1)
+            | ((self.left_shift as u8) << 2)
+            | ((self.right_shift as u8) << 3)
+            | ((self.left_alt as u8) << 4)
+            | ((self.right_alt as u8) << 5)
+            | ((self.left_meta as u8) << 6)
+            | ((self.right_meta as u8) << 7)
+    }
+
+    fn from_bits(bits: u8) -> Self {
+        Self {
+            left_ctrl: bits & 0b000001 != 0,
+            right_ctrl: bits & 0b000010 != 0,
+            left_shift: bits & 0b000100 != 0,
+            right_shift: bits & 0b001000 != 0,
+            left_alt: bits & 0b010000 != 0,
+            right_alt: bits & 0b100000 != 0,
+            left_meta: bits & 0b1000000 != 0,
+            right_meta: bits & 0b10000000 != 0,
+        }
     }
 }
 
@@ -76,12 +179,8 @@ impl KeyboardController {
         thread::sleep(Duration::from_secs(1));
         real_device.grab()?;
 
-        let virtual_device = uinput::default()?
-            .name("Open-Switcher Virtual Device")?
-            .event(uinput::event::Keyboard::All)?
-            .create()?;
+        let virtual_device = create_virtual_keyboard("Open-Switcher Virtual Device")?;
 
-        thread::sleep(Duration::from_millis(500));
         println!("[OK] Open-Switcher запущен.");
 
         Ok(Self {
@@ -112,10 +211,20 @@ impl KeyboardController {
     }
 
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
-        self.virtual_device
-            .write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
-        self.virtual_device.synchronize()?;
-        Ok(())
+        self.virtual_device.with_device(|device| {
+            device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
+            device.synchronize()?;
+            Ok(())
+        })
+    }
+
+    pub fn type_separator(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.virtual_device.with_device(|device| {
+            device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
+            device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
+            device.synchronize()?;
+            Ok(())
+        })
     }
 
     pub fn apply_correction(
@@ -126,9 +235,11 @@ impl KeyboardController {
     ) -> Result<(), SwitcherError> {
         self.release_modifiers(modifiers)?;
         for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
-            self.virtual_device
-                .click(&uinput::event::keyboard::Key::BackSpace)?;
-            self.virtual_device.synchronize()?;
+            self.virtual_device.with_device(|device| {
+                device.click(&uinput::event::keyboard::Key::BackSpace)?;
+                device.synchronize()?;
+                Ok(())
+            })?;
             thread::sleep(Duration::from_millis(config.backspace_ms));
         }
 
@@ -137,25 +248,35 @@ impl KeyboardController {
 
         for stroke in &plan.buffer {
             if stroke.shift {
-                self.virtual_device
-                    .press(&uinput::event::keyboard::Key::LeftShift)?;
+                self.virtual_device.with_device(|device| {
+                    device.press(&uinput::event::keyboard::Key::LeftShift)?;
+                    Ok(())
+                })?;
             }
-            self.virtual_device
-                .write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 1)?;
-            self.virtual_device
-                .write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
+            self.virtual_device.with_device(|device| {
+                device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 1)?;
+                device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
+                Ok(())
+            })?;
             if stroke.shift {
-                self.virtual_device
-                    .release(&uinput::event::keyboard::Key::LeftShift)?;
+                self.virtual_device.with_device(|device| {
+                    device.release(&uinput::event::keyboard::Key::LeftShift)?;
+                    Ok(())
+                })?;
             }
-            self.virtual_device.synchronize()?;
+            self.virtual_device.with_device(|device| {
+                device.synchronize()?;
+                Ok(())
+            })?;
             thread::sleep(Duration::from_millis(config.typing_ms));
         }
 
         if plan.extra_backspaces > 0 {
-            self.virtual_device
-                .click(&uinput::event::keyboard::Key::Space)?;
-            self.virtual_device.synchronize()?;
+            self.virtual_device.with_device(|device| {
+                device.click(&uinput::event::keyboard::Key::Space)?;
+                device.synchronize()?;
+                Ok(())
+            })?;
         }
 
         self.restore_modifiers(modifiers)?;
@@ -163,42 +284,47 @@ impl KeyboardController {
     }
 
     fn release_modifiers(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        modifiers.for_each_pressed(|key| self.virtual_device.release(&key))?;
-        self.virtual_device.synchronize()?;
-        thread::sleep(Duration::from_millis(MODIFIER_SYNC_DELAY_MS));
-        Ok(())
+        release_modifiers(&mut self.virtual_device, modifiers)
     }
 
     fn restore_modifiers(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        modifiers.for_each_pressed(|key| self.virtual_device.press(&key))?;
-        self.virtual_device.synchronize()?;
-        Ok(())
+        restore_modifiers(&mut self.virtual_device, modifiers)
     }
 
     fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
         let (modifiers, trigger_key) = layout_switch_combo_sequence(combo);
 
-        for modifier in modifiers {
-            self.virtual_device.press(modifier)?;
-        }
+        self.virtual_device.with_device(|device| {
+            for modifier in modifiers {
+                device.press(modifier)?;
+            }
 
-        if let Some(key) = trigger_key {
-            self.virtual_device.press(key)?;
-        }
+            if let Some(key) = trigger_key {
+                device.press(key)?;
+            }
 
-        self.virtual_device.synchronize()?;
-        thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
+            device.synchronize()?;
+            thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
 
-        if let Some(key) = trigger_key {
-            self.virtual_device.release(key)?;
-        }
+            if let Some(key) = trigger_key {
+                device.release(key)?;
+            }
 
-        for modifier in modifiers.iter().rev() {
-            self.virtual_device.release(modifier)?;
-        }
+            for modifier in modifiers.iter().rev() {
+                device.release(modifier)?;
+            }
 
-        self.virtual_device.synchronize()?;
+            device.synchronize()?;
+            Ok(())
+        })?;
         Ok(())
+    }
+
+    pub fn selection_transport(&self, modifiers: SharedModifierState) -> SelectionKeyboardTransport {
+        SelectionKeyboardTransport {
+            virtual_device: self.virtual_device.clone(),
+            modifiers,
+        }
     }
 }
 
@@ -209,6 +335,18 @@ fn configured_keyboard_path() -> Option<PathBuf> {
     }
 
     Some(PathBuf::from(raw))
+}
+
+fn create_virtual_keyboard(name: &str) -> Result<SharedVirtualKeyboard, SwitcherError> {
+    let virtual_device = uinput::default()?
+        .name(name)?
+        .event(uinput::event::Keyboard::All)?
+        .create()?;
+
+    thread::sleep(Duration::from_millis(500));
+    Ok(SharedVirtualKeyboard {
+        inner: Arc::new(Mutex::new(virtual_device)),
+    })
 }
 
 pub fn is_russian_layout() -> Result<bool, SwitcherError> {
@@ -251,6 +389,8 @@ pub fn is_modifier(key: Key) -> bool {
             | Key::KEY_RIGHTSHIFT
             | Key::KEY_LEFTALT
             | Key::KEY_RIGHTALT
+            | Key::KEY_LEFTMETA
+            | Key::KEY_RIGHTMETA
             | Key::KEY_CAPSLOCK
     )
 }
@@ -346,8 +486,57 @@ impl ModifierState {
         if self.right_alt {
             f(uinput::event::keyboard::Key::RightAlt)?;
         }
+        if self.left_meta {
+            f(uinput::event::keyboard::Key::LeftMeta)?;
+        }
+        if self.right_meta {
+            f(uinput::event::keyboard::Key::RightMeta)?;
+        }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pressed(keys: &[(Key, i32)]) -> ModifierState {
+        let mut state = ModifierState::default();
+        for (key, value) in keys {
+            state.update(*key, *value);
+        }
+        state
+    }
+
+    #[test]
+    fn matches_alt_shift_combo_with_right_alt() {
+        let state = pressed(&[(Key::KEY_RIGHTALT, 1), (Key::KEY_LEFTSHIFT, 1)]);
+        assert!(state.matches_layout_switch_combo(
+            LayoutSwitchCombo::AltShift,
+            Key::KEY_LEFTSHIFT,
+            1
+        ));
+    }
+
+    #[test]
+    fn matches_right_ctrl_right_shift_combo() {
+        let state = pressed(&[(Key::KEY_RIGHTCTRL, 1), (Key::KEY_RIGHTSHIFT, 1)]);
+        assert!(state.matches_layout_switch_combo(
+            LayoutSwitchCombo::RightCtrlRightShift,
+            Key::KEY_RIGHTSHIFT,
+            1
+        ));
+    }
+
+    #[test]
+    fn matches_super_space_combo() {
+        let state = pressed(&[(Key::KEY_LEFTMETA, 1)]);
+        assert!(state.matches_layout_switch_combo(
+            LayoutSwitchCombo::SuperSpace,
+            Key::KEY_SPACE,
+            1
+        ));
     }
 }
 
@@ -374,29 +563,128 @@ impl KeyboardController {
         shortcut_modifiers: &[uinput::event::keyboard::Key],
         trigger_key: Option<&uinput::event::keyboard::Key>,
     ) -> Result<(), SwitcherError> {
-        self.release_modifiers(modifiers)?;
+        run_shortcut_on_shared_device(
+            &self.virtual_device,
+            modifiers,
+            shortcut_modifiers,
+            trigger_key,
+        )
+    }
+}
+
+impl SelectionKeyboardTransport {
+    pub fn send_copy_shortcut(&mut self) -> Result<(), SwitcherError> {
+        self.send_shortcut(
+            self.modifiers.snapshot(),
+            &[uinput::event::keyboard::Key::LeftControl],
+            Some(&uinput::event::keyboard::Key::C),
+        )
+    }
+
+    pub fn send_paste_shortcut(&mut self) -> Result<(), SwitcherError> {
+        self.send_shortcut(
+            self.modifiers.snapshot(),
+            &[uinput::event::keyboard::Key::LeftControl],
+            Some(&uinput::event::keyboard::Key::V),
+        )
+    }
+
+    fn send_shortcut(
+        &mut self,
+        modifiers: ModifierState,
+        shortcut_modifiers: &[uinput::event::keyboard::Key],
+        trigger_key: Option<&uinput::event::keyboard::Key>,
+    ) -> Result<(), SwitcherError> {
+        run_shortcut_on_shared_device(
+            &self.virtual_device,
+            modifiers,
+            shortcut_modifiers,
+            trigger_key,
+        )
+    }
+}
+
+fn release_modifiers(
+    virtual_device: &SharedVirtualKeyboard,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    virtual_device.with_device(|device| {
+        modifiers.for_each_pressed(|key| device.release(&key))?;
+        device.synchronize()?;
+        Ok(())
+    })?;
+    thread::sleep(Duration::from_millis(MODIFIER_SYNC_DELAY_MS));
+    Ok(())
+}
+
+fn restore_modifiers(
+    virtual_device: &SharedVirtualKeyboard,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    virtual_device.with_device(|device| {
+        modifiers.for_each_pressed(|key| device.press(&key))?;
+        device.synchronize()?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn run_shortcut_on_shared_device(
+    virtual_device: &SharedVirtualKeyboard,
+    modifiers: ModifierState,
+    shortcut_modifiers: &[uinput::event::keyboard::Key],
+    trigger_key: Option<&uinput::event::keyboard::Key>,
+) -> Result<(), SwitcherError> {
+    virtual_device.with_device(|device| {
+        modifiers.for_each_pressed(|key| device.release(&key))?;
+        device.synchronize()?;
+        thread::sleep(Duration::from_millis(MODIFIER_SYNC_DELAY_MS));
 
         for modifier in shortcut_modifiers {
-            self.virtual_device.press(modifier)?;
+            device.press(modifier)?;
         }
 
         if let Some(key) = trigger_key {
-            self.virtual_device.press(key)?;
+            device.press(key)?;
         }
 
-        self.virtual_device.synchronize()?;
+        device.synchronize()?;
         thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
 
         if let Some(key) = trigger_key {
-            self.virtual_device.release(key)?;
+            device.release(key)?;
         }
 
         for modifier in shortcut_modifiers.iter().rev() {
-            self.virtual_device.release(modifier)?;
+            device.release(modifier)?;
         }
 
-        self.virtual_device.synchronize()?;
-        self.restore_modifiers(modifiers)?;
+        device.synchronize()?;
+        modifiers.for_each_pressed(|key| device.press(&key))?;
+        device.synchronize()?;
         Ok(())
+    })
+}
+
+impl SharedVirtualKeyboard {
+    fn with_device<T>(
+        &self,
+        f: impl FnOnce(&mut uinput::Device) -> Result<T, SwitcherError>,
+    ) -> Result<T, SwitcherError> {
+        let mut device = self
+            .inner
+            .lock()
+            .map_err(|_| SwitcherError::VirtualKeyboardLockPoisoned)?;
+        f(&mut device)
+    }
+}
+
+impl SharedModifierState {
+    pub fn store(&self, modifiers: ModifierState) {
+        self.bits.store(modifiers.to_bits(), Ordering::SeqCst);
+    }
+
+    pub fn snapshot(&self) -> ModifierState {
+        ModifierState::from_bits(self.bits.load(Ordering::SeqCst))
     }
 }

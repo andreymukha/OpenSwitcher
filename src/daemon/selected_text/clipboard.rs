@@ -1,7 +1,7 @@
 use super::engine::{ConversionOutcome, LayoutConversionEngine};
 use super::SelectedTextSwitchResult;
 use super::{log_selected_text_debug, summarize_text};
-use crate::daemon::keyboard::{KeyboardController, ModifierState};
+use crate::daemon::keyboard::SelectionKeyboardTransport;
 use crate::error::{SelectedTextError, SwitcherError};
 use arboard::Clipboard;
 use std::thread;
@@ -21,8 +21,8 @@ pub(super) trait ClipboardAccess {
 }
 
 pub(super) trait SelectionTransport {
-    fn copy_selection(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError>;
-    fn paste_selection(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError>;
+    fn copy_selection(&mut self) -> Result<(), SwitcherError>;
+    fn paste_selection(&mut self) -> Result<(), SwitcherError>;
 }
 
 pub(super) struct SystemClipboard {
@@ -57,13 +57,13 @@ impl ClipboardAccess for SystemClipboard {
     }
 }
 
-impl SelectionTransport for KeyboardController {
-    fn copy_selection(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        self.send_copy_shortcut(modifiers)
+impl SelectionTransport for SelectionKeyboardTransport {
+    fn copy_selection(&mut self) -> Result<(), SwitcherError> {
+        self.send_copy_shortcut()
     }
 
-    fn paste_selection(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        self.send_paste_shortcut(modifiers)
+    fn paste_selection(&mut self) -> Result<(), SwitcherError> {
+        self.send_paste_shortcut()
     }
 }
 
@@ -87,7 +87,6 @@ impl SelectedTextOperation {
         clipboard: &mut impl ClipboardAccess,
         transport: &mut impl SelectionTransport,
         converter: &LayoutConversionEngine,
-        modifiers: ModifierState,
     ) -> Result<SelectedTextSwitchResult, SwitcherError> {
         let previous_clipboard = snapshot_clipboard(clipboard);
         let sentinel = unique_clipboard_sentinel();
@@ -102,7 +101,7 @@ impl SelectedTextOperation {
 
         clipboard.set_text(&sentinel)?;
         log_selected_text_debug("clipboard-set-sentinel", &format!("sentinel={sentinel}"));
-        transport.copy_selection(modifiers)?;
+        transport.copy_selection()?;
         log_selected_text_debug("copy-sent", "selection copy shortcut dispatched");
 
         let selected_text = match wait_for_copied_text(clipboard, &sentinel, &previous_clipboard)? {
@@ -134,7 +133,7 @@ impl SelectedTextOperation {
         );
         clipboard.set_text(&converted_text)?;
         log_selected_text_debug("clipboard-set-converted", &summarize_text(&converted_text));
-        transport.paste_selection(modifiers)?;
+        transport.paste_selection()?;
         log_selected_text_debug("paste-sent", "selection paste shortcut dispatched");
         wait_for_paste_settle();
 
@@ -418,12 +417,12 @@ mod tests {
     }
 
     impl SelectionTransport for TestTransport {
-        fn copy_selection(&mut self, _: ModifierState) -> Result<(), SwitcherError> {
+        fn copy_selection(&mut self) -> Result<(), SwitcherError> {
             self.copied = true;
             Ok(())
         }
 
-        fn paste_selection(&mut self, _: ModifierState) -> Result<(), SwitcherError> {
+        fn paste_selection(&mut self) -> Result<(), SwitcherError> {
             self.pasted = true;
             Ok(())
         }
@@ -449,7 +448,6 @@ mod tests {
                 &mut clipboard,
                 &mut transport,
                 &converter,
-                ModifierState::default(),
             )
             .unwrap();
 
@@ -479,7 +477,6 @@ mod tests {
                 &mut clipboard,
                 &mut transport,
                 &converter,
-                ModifierState::default(),
             )
             .unwrap();
 
@@ -511,7 +508,6 @@ mod tests {
                 &mut clipboard,
                 &mut transport,
                 &converter,
-                ModifierState::default(),
             )
             .unwrap();
 
@@ -549,7 +545,6 @@ mod tests {
                 &mut clipboard,
                 &mut transport,
                 &converter,
-                ModifierState::default(),
             )
             .unwrap();
 
@@ -586,7 +581,6 @@ mod tests {
                 &mut clipboard,
                 &mut transport,
                 &converter,
-                ModifierState::default(),
             )
             .unwrap();
 

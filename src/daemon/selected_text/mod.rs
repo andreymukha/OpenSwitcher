@@ -1,8 +1,9 @@
 mod clipboard;
 mod debug;
 mod engine;
+mod runner;
 
-use crate::daemon::keyboard::{KeyboardController, ModifierState};
+use crate::daemon::keyboard::SelectionKeyboardTransport;
 use crate::error::SwitcherError;
 use clipboard::{SelectedTextOperation, SystemClipboard};
 use engine::LayoutConversionEngine;
@@ -10,6 +11,7 @@ use engine::LayoutConversionEngine;
 pub use engine::ConversionDirection;
 pub(crate) use debug::log_selected_text_debug;
 pub(crate) use debug::summarize_text;
+pub use runner::SelectedTextJobRunner;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SelectedTextSwitchResult {
@@ -29,11 +31,9 @@ pub struct SelectedTextSwitchService {
 impl SelectedTextSwitchService {
     pub fn switch_selected_text(
         &self,
-        keyboard: &mut KeyboardController,
-        modifiers: ModifierState,
+        transport: &mut SelectionKeyboardTransport,
     ) -> Result<SelectedTextSwitchResult, SwitcherError> {
         let mut clipboard = SystemClipboard::new()?;
-        self.operation
-            .execute(&mut clipboard, keyboard, &self.converter, modifiers)
+        self.operation.execute(&mut clipboard, transport, &self.converter)
     }
 }

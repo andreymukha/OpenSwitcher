@@ -1,10 +1,10 @@
 use crate::daemon::keyboard::{
-    is_character, is_modifier, is_russian_layout, undo_key_to_evdev_key, KeyboardController,
-    ModifierState,
+    is_character, is_modifier, undo_key_to_evdev_key, KeyboardController, ModifierState,
+    SharedModifierState,
 };
 use crate::daemon::runtime::RuntimeState;
 use crate::daemon::selected_text::{
-    log_selected_text_debug, SelectedTextSwitchResult, SelectedTextSwitchService,
+    log_selected_text_debug, SelectedTextJobRunner,
 };
 use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
@@ -18,24 +18,37 @@ pub struct DaemonService {
     connection: Connection,
     keyboard: KeyboardController,
     modifiers: ModifierState,
+    shared_modifiers: SharedModifierState,
     buffer: Vec<Keystroke>,
     last_word_buffer: Vec<Keystroke>,
-    selected_text_switcher: SelectedTextSwitchService,
+    last_word_followed_by_separator: bool,
+    selected_text_runner: SelectedTextJobRunner,
     suppressed_hotkey_key: Option<evdev::Key>,
+    suppressed_separator_key: Option<evdev::Key>,
+    pending_auto_correction_separator: Option<evdev::Key>,
     pending_selected_text_switch: bool,
 }
 
 impl DaemonService {
     pub fn new(runtime: Arc<RuntimeState>, connection: Connection) -> Result<Self, SwitcherError> {
+        let keyboard = KeyboardController::open()?;
+        let shared_modifiers = SharedModifierState::default();
+        let selected_text_runner =
+            SelectedTextJobRunner::new(keyboard.selection_transport(shared_modifiers.clone()))?;
+
         Ok(Self {
             runtime,
             connection,
-            keyboard: KeyboardController::open()?,
+            keyboard,
             modifiers: ModifierState::default(),
+            shared_modifiers,
             buffer: Vec::new(),
             last_word_buffer: Vec::new(),
-            selected_text_switcher: SelectedTextSwitchService::default(),
+            last_word_followed_by_separator: false,
+            selected_text_runner,
             suppressed_hotkey_key: None,
+            suppressed_separator_key: None,
+            pending_auto_correction_separator: None,
             pending_selected_text_switch: false,
         })
     }
@@ -59,6 +72,17 @@ impl DaemonService {
             return Ok(());
         }
 
+        if self.suppressed_separator_key == Some(key) {
+            if value == 0 {
+                if self.pending_auto_correction_separator == Some(key) {
+                    self.pending_auto_correction_separator = None;
+                    self.finish_pending_auto_correction(key, &self.runtime.config_snapshot()?)?;
+                }
+                self.suppressed_separator_key = None;
+            }
+            return Ok(());
+        }
+
         if self.runtime.is_capture_active()? {
             self.modifiers.update(key, value);
 
@@ -69,6 +93,7 @@ impl DaemonService {
             if !self.runtime.is_capture_active()? {
                 self.buffer.clear();
                 self.last_word_buffer.clear();
+                self.last_word_followed_by_separator = false;
             }
 
             return Ok(());
@@ -76,8 +101,12 @@ impl DaemonService {
 
         let config = self.runtime.config_snapshot()?;
         self.modifiers.update(key, value);
+        self.shared_modifiers.store(self.modifiers);
 
-        if self.modifiers.should_toggle_layout_shortcut(key, value) {
+        if self
+            .modifiers
+            .matches_layout_switch_combo(config.layout_switch_combo, key, value)
+        {
             self.runtime.set_layout(!self.runtime.current_layout());
             self.publish_status_changed()?;
         }
@@ -107,9 +136,10 @@ impl DaemonService {
 
         if key == undo_key_to_evdev_key(config.undo_key) {
             let last_word_buffer = self.last_word_buffer.clone();
-            if self.apply_manual_correction(&config, &last_word_buffer)? && !self.buffer.is_empty()
-            {
+            let used_current_buffer = !self.buffer.is_empty();
+            if self.apply_manual_correction(&config, &last_word_buffer)? && used_current_buffer {
                 self.last_word_buffer = self.buffer.clone();
+                self.last_word_followed_by_separator = false;
                 self.buffer.clear();
             }
             return Ok(());
@@ -117,13 +147,19 @@ impl DaemonService {
 
         match key {
             evdev::Key::KEY_SPACE | evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
-                let is_russian = self.refresh_runtime_layout()?;
+                let is_russian = !self.runtime.current_layout();
+                let corrected = self.runtime.is_enabled()
+                    && !is_russian
+                    && should_switch(&self.buffer);
 
-                if self.runtime.is_enabled() && !is_russian && should_switch(&self.buffer) {
-                    self.apply_manual_correction(&config, &[])?;
+                if corrected {
+                    self.suppressed_separator_key = Some(key);
+                    self.pending_auto_correction_separator = Some(key);
+                    return Ok(());
                 }
 
                 self.last_word_buffer = self.buffer.clone();
+                self.last_word_followed_by_separator = true;
                 self.buffer.clear();
                 self.keyboard.forward_event(key, 1)
             }
@@ -150,34 +186,28 @@ impl DaemonService {
     }
 
     fn apply_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
-        let result = self.keyboard.with_temporarily_released_grab(|keyboard| {
-            self.selected_text_switcher
-                .switch_selected_text(keyboard, self.modifiers)
-        })?;
-
-        match result {
-            SelectedTextSwitchResult::Replaced {
-                clipboard_restored, ..
-            } => {
-                log_selected_text_debug(
-                    "result",
-                    &format!("result=Replaced clipboard_restored={clipboard_restored}"),
-                );
-                self.buffer.clear();
-                self.last_word_buffer.clear();
-                if !clipboard_restored {
-                    eprintln!(
-                        "[selected-text] Не удалось восстановить предыдущее содержимое буфера обмена."
-                    );
-                }
-            }
-            SelectedTextSwitchResult::NoSelectedText => {
-                log_selected_text_debug("result", "result=NoSelectedText");
-                eprintln!("[selected-text] Нет выделенного текста.");
-            }
+        if !self.selected_text_runner.try_start()? {
+            log_selected_text_debug("hotkey-skip", "selected-text job already running");
+            return Ok(());
         }
 
+        self.buffer.clear();
+        self.last_word_buffer.clear();
+        self.last_word_followed_by_separator = false;
+        log_selected_text_debug("job-started", "selected-text job dispatched to worker");
         Ok(())
+    }
+
+    fn finish_pending_auto_correction(
+        &mut self,
+        separator_key: evdev::Key,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+    ) -> Result<(), SwitcherError> {
+        self.apply_manual_correction(config, &[])?;
+        self.last_word_buffer = self.buffer.clone();
+        self.last_word_followed_by_separator = true;
+        self.buffer.clear();
+        self.keyboard.type_separator(separator_key)
     }
 
     fn maybe_run_pending_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
@@ -202,21 +232,19 @@ impl DaemonService {
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
         fallback_buffer: &[Keystroke],
     ) -> Result<bool, SwitcherError> {
-        let Some(plan) = manual_correction_plan(&self.buffer, fallback_buffer) else {
+        let Some(plan) = manual_correction_plan(
+            &self.buffer,
+            fallback_buffer,
+            self.last_word_followed_by_separator,
+        ) else {
             return Ok(false);
         };
 
         self.keyboard
             .apply_correction(&plan, config, self.modifiers)?;
-        self.refresh_runtime_layout()?;
+        self.runtime.set_layout(!self.runtime.current_layout());
         self.publish_status_changed()?;
         Ok(true)
-    }
-
-    fn refresh_runtime_layout(&self) -> Result<bool, SwitcherError> {
-        let is_russian = is_russian_layout()?;
-        self.runtime.set_layout(!is_russian);
-        Ok(is_russian)
     }
 
     fn publish_status_changed(&self) -> Result<(), SwitcherError> {

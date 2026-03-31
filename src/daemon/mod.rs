@@ -8,6 +8,7 @@ pub mod switch_logic;
 use crate::config::default_config_path;
 use crate::dbus::{OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
+use keyboard::is_russian_layout;
 use runtime::{ConfigService, RuntimeState};
 use service::DaemonService;
 use std::sync::Arc;
@@ -16,6 +17,11 @@ use zbus::blocking::ConnectionBuilder;
 pub fn run() -> Result<(), SwitcherError> {
     let config_service = ConfigService::load(default_config_path())?;
     let runtime = Arc::new(RuntimeState::new(config_service));
+    if let Ok(is_russian) = is_russian_layout() {
+        runtime.set_layout(!is_russian);
+    } else {
+        eprintln!("[layout] Не удалось определить текущую раскладку на старте. Использую cached default.");
+    }
     let dbus_api = OpenSwitcherDbusApi::new(runtime.clone());
 
     let connection = ConnectionBuilder::session()?

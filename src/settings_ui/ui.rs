@@ -5,11 +5,15 @@ use crate::error::SettingsClientError;
 use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState, LayoutSwitchCombo};
 use adw::prelude::*;
 use gtk::glib::{self, SignalHandlerId};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 const WINDOW_WIDTH: i32 = 520;
 const WINDOW_HEIGHT: i32 = 460;
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
+const CAPTURE_FOCUS_SETTLE_DELAY: Duration = Duration::from_millis(150);
+const CAPTURE_TIMEOUT_TOAST: &str = "Захват комбинации отменён по таймауту.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsWindowMode {
@@ -144,6 +148,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                 Ok(()) => {
                     ui.reset_capture_dialog();
                     ui.open_layout_switch_dialog();
+                    ui.arm_capture_timeout(presenter.clone());
                 }
                 Err(error) => ui.show_client_error(error, false),
             }
@@ -154,11 +159,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
         let presenter = presenter.clone();
         let ui = Rc::clone(&ui);
         ui.dialog_cancel_button().connect_clicked(move |_| {
-            ui.reset_capture_dialog();
-            if let Err(error) = presenter.cancel_layout_switch_capture() {
-                ui.show_client_error(error, false);
-            }
-            ui.close_layout_switch_dialog();
+            ui.cancel_capture_safely(&presenter, None);
         });
     }
 
@@ -171,6 +172,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                 return;
             };
 
+            ui.disarm_capture_timeout();
             match presenter.confirm_captured_layout_switch(combo) {
                 Ok(()) => {
                     ui.reset_capture_dialog();
@@ -187,6 +189,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
         ui.layout_switch_dialog()
             .connect_close_request(move |dialog| {
                 if ui.current_view_state().layout_switch.capture_active {
+                    ui.disarm_capture_timeout();
                     ui.reset_capture_dialog();
                     if let Err(error) = presenter.cancel_layout_switch_capture() {
                         ui.show_client_error(error, false);
@@ -195,6 +198,24 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                 dialog.hide();
                 glib::Propagation::Stop
             });
+    }
+
+    {
+        let presenter = presenter.clone();
+        let ui = Rc::clone(&ui);
+        let window = ui.window.clone();
+        window.connect_is_active_notify(move |_| {
+            SettingsWindow::schedule_focus_loss_check(Rc::clone(&ui), presenter.clone());
+        });
+    }
+
+    {
+        let presenter = presenter.clone();
+        let ui = Rc::clone(&ui);
+        let dialog = ui.layout_switch_dialog();
+        dialog.connect_is_active_notify(move |_| {
+            SettingsWindow::schedule_focus_loss_check(Rc::clone(&ui), presenter.clone());
+        });
     }
 
     {
@@ -320,8 +341,16 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     dialog_heading.add_css_class("title-3");
     dialog_box.append(&dialog_heading);
 
+    let dialog_warning_label = gtk::Label::new(Some(
+        "Ввод сейчас перехватывается. Нажмите комбинацию или Esc для отмены. Если ничего не делать, захват автоматически отменится через 60 секунд.",
+    ));
+    dialog_warning_label.set_halign(gtk::Align::Start);
+    dialog_warning_label.set_wrap(true);
+    dialog_warning_label.add_css_class("caption");
+    dialog_box.append(&dialog_warning_label);
+
     let dialog_capture_hint = gtk::Label::new(Some(
-        "Поддерживаются Ctrl+Shift, Alt+Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift. Esc — отмена.",
+        "Поддерживаются Ctrl+Shift, Alt+Shift, Right Alt+Right Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift.",
     ));
     dialog_capture_hint.set_halign(gtk::Align::Start);
     dialog_capture_hint.set_wrap(true);
@@ -430,6 +459,8 @@ struct SettingsWindow {
     presenter: RefCell<Option<SettingsPresenter>>,
     current_view_state: RefCell<ViewState>,
     capture_dialog_state: RefCell<CaptureDialogState>,
+    capture_timeout: RefCell<Option<glib::SourceId>>,
+    capture_timeout_generation: Cell<u64>,
 }
 
 impl SettingsWindow {
@@ -502,6 +533,8 @@ impl SettingsWindow {
             presenter: RefCell::new(None),
             current_view_state: RefCell::new(initial_view_state()),
             capture_dialog_state: RefCell::new(CaptureDialogState::default()),
+            capture_timeout: RefCell::new(None),
+            capture_timeout_generation: Cell::new(0),
         });
 
         if mode == SettingsWindowMode::Embedded {
@@ -540,6 +573,7 @@ impl SettingsWindow {
     fn apply_capture_state(&self, presenter: &SettingsPresenter, state: LayoutSwitchCaptureState) {
         match state.phase {
             LayoutSwitchCapturePhase::Idle => {
+                self.disarm_capture_timeout();
                 presenter.sync_layout_switch_capture_active(false);
                 self.reset_capture_dialog();
             }
@@ -562,11 +596,13 @@ impl SettingsWindow {
                 self.set_capture_error(message);
             }
             LayoutSwitchCapturePhase::Cancelled => {
+                self.disarm_capture_timeout();
                 presenter.sync_layout_switch_capture_active(false);
                 self.reset_capture_dialog();
                 self.close_layout_switch_dialog();
             }
             LayoutSwitchCapturePhase::Finished => {
+                self.disarm_capture_timeout();
                 presenter.sync_layout_switch_capture_active(false);
                 self.reset_capture_dialog();
             }
@@ -581,6 +617,7 @@ impl SettingsWindow {
     }
 
     fn discard_pending_changes(&self) {
+        self.disarm_capture_timeout();
         self.reset_capture_dialog();
         if let Some(presenter) = self.presenter.borrow().as_ref().cloned() {
             if self.current_view_state().layout_switch.capture_active {
@@ -609,6 +646,68 @@ impl SettingsWindow {
     fn reset_capture_dialog(&self) {
         self.capture_dialog_state.borrow_mut().clear();
         self.update_capture_dialog_widgets();
+    }
+
+    fn disarm_capture_timeout(&self) {
+        self.capture_timeout_generation
+            .set(self.capture_timeout_generation.get().wrapping_add(1));
+        if let Some(source_id) = self.capture_timeout.borrow_mut().take() {
+            source_id.remove();
+        }
+    }
+
+    fn arm_capture_timeout(self: &Rc<Self>, presenter: SettingsPresenter) {
+        if self.capture_timeout.borrow().is_some() {
+            return;
+        }
+
+        let generation = self.capture_timeout_generation.get().wrapping_add(1);
+        self.capture_timeout_generation.set(generation);
+
+        let ui = Rc::clone(self);
+        let source_id = glib::timeout_add_local_once(CAPTURE_TIMEOUT, move || {
+            ui.capture_timeout.borrow_mut().take();
+
+            if ui.capture_timeout_generation.get() != generation
+                || !ui.current_view_state().layout_switch.capture_active
+            {
+                return;
+            }
+
+            ui.cancel_capture_safely(&presenter, Some(CAPTURE_TIMEOUT_TOAST));
+        });
+
+        self.capture_timeout.borrow_mut().replace(source_id);
+    }
+
+    fn schedule_focus_loss_check(self: Rc<Self>, presenter: SettingsPresenter) {
+        glib::timeout_add_local_once(CAPTURE_FOCUS_SETTLE_DELAY, move || {
+            if !self.current_view_state().layout_switch.capture_active {
+                return;
+            }
+
+            let dialog = self.layout_switch_dialog();
+            if !self.window.is_active() && !dialog.is_active() {
+                self.cancel_capture_safely(&presenter, None);
+            }
+        });
+    }
+
+    fn cancel_capture_safely(&self, presenter: &SettingsPresenter, toast: Option<&str>) {
+        self.disarm_capture_timeout();
+        self.reset_capture_dialog();
+
+        if self.current_view_state().layout_switch.capture_active {
+            if let Err(error) = presenter.cancel_layout_switch_capture() {
+                self.show_client_error(error, false);
+            }
+        }
+
+        self.close_layout_switch_dialog();
+
+        if let Some(message) = toast {
+            self.show_toast(message);
+        }
     }
 
     fn set_capture_candidate(&self, combo: LayoutSwitchCombo) {
@@ -766,9 +865,9 @@ impl SettingsWindow {
 
             form.dialog_capture_hint
                 .set_text(if state.layout_switch.capture_active {
-                    state.layout_switch.capture_hint
+                    "Поддерживаемые варианты: Ctrl+Shift, Alt+Shift, Right Alt+Right Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift."
                 } else {
-                    "Нажмите поддерживаемую комбинацию. Esc — отмена."
+                    "Поддерживаемые варианты: Ctrl+Shift, Alt+Shift, Right Alt+Right Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift."
                 });
 
             if state.layout_switch.show_unlock_hint {

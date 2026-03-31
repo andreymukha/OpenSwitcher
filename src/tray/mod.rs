@@ -4,9 +4,9 @@ pub mod tray_service;
 use crate::error::SwitcherError;
 use crate::settings_ui::SettingsWindowController;
 use adw::prelude::*;
+use dbus_listener::DbusListener;
 use gtk::gio;
 use gtk::glib;
-use dbus_listener::DbusListener;
 use tray_service::{OpenSwitcherTray, TrayCommand};
 
 pub use tray_service::TrayState;

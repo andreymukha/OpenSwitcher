@@ -90,10 +90,6 @@ impl SelectedTextJobRunner {
     pub fn is_in_progress(&self) -> bool {
         self.in_progress.load(Ordering::SeqCst)
     }
-
-    pub fn is_worker_alive(&self) -> bool {
-        self.worker_alive.load(Ordering::SeqCst)
-    }
 }
 
 fn log_selected_text_job_result(result: &Result<SelectedTextSwitchResult, SwitcherError>) {

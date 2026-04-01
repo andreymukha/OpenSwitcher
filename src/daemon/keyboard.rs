@@ -280,33 +280,6 @@ impl KeyboardController {
         }
     }
 
-    pub fn with_temporarily_released_grab<T>(
-        &mut self,
-        f: impl FnOnce(&mut Self) -> Result<T, SwitcherError>,
-    ) -> Result<T, SwitcherError> {
-        self.real_device.release_grab()?;
-        log_input_debug(
-            "grab-released",
-            "keyboard grab temporarily released for critical operation",
-        );
-
-        let operation_result = f(self);
-        let regrab_result = self.real_device.grab();
-        if regrab_result.is_ok() {
-            log_input_debug(
-                "grab-acquired",
-                "keyboard grab reacquired after critical operation",
-            );
-        }
-
-        match (operation_result, regrab_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(regrab_error)) => Err(regrab_error),
-            (Err(error), Err(_regrab_error)) => Err(error),
-        }
-    }
-
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
         self.virtual_device.handle().forward_event(key, value)
     }
@@ -937,16 +910,6 @@ mod tests {
             Key::KEY_SPACE,
             1
         ));
-    }
-}
-
-impl KeyboardController {
-    pub fn send_copy_shortcut(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        self.virtual_device.handle().send_copy_shortcut(modifiers)
-    }
-
-    pub fn send_paste_shortcut(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        self.virtual_device.handle().send_paste_shortcut(modifiers)
     }
 }
 

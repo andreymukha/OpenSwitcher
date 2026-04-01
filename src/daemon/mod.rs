@@ -8,9 +8,10 @@ pub mod switch_logic;
 use crate::config::default_config_path;
 use crate::dbus::{OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
-use keyboard::is_russian_layout;
+use keyboard::{is_russian_layout, log_input_debug};
 use runtime::{log_layout_debug, ConfigService, RuntimeState};
 use service::DaemonService;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use zbus::blocking::ConnectionBuilder;
 
@@ -45,5 +46,20 @@ pub fn run() -> Result<(), SwitcherError> {
         .build()?;
 
     let mut service = DaemonService::new(runtime, connection)?;
-    service.run()
+    match panic::catch_unwind(AssertUnwindSafe(|| service.run())) {
+        Ok(result) => result,
+        Err(payload) => {
+            let reason = if let Some(text) = payload.downcast_ref::<&str>() {
+                *text
+            } else if let Some(text) = payload.downcast_ref::<String>() {
+                text.as_str()
+            } else {
+                "unknown panic payload"
+            };
+            log_input_debug("event-loop-panic", &format!("reason={reason}"));
+            eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
+            service.shutdown();
+            Err(SwitcherError::DaemonPanicked)
+        }
+    }
 }

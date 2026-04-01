@@ -4,34 +4,99 @@ use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, UndoKey};
 use evdev::{enumerate, Device, InputEvent, Key};
 use std::env;
+use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const INPUT_EVENT_KEYBOARD: i32 = 0x01;
 const MODIFIER_SYNC_DELAY_MS: u64 = 20;
 const LAYOUT_SWITCH_DELAY_MS: u64 = 20;
 const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
+const INPUT_DEBUG_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG";
+const INPUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG_FILE";
+const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+// Fast-path writer queue is bounded to avoid unbounded memory growth under load.
+// Transactional commands use the same total-order queue, but are represented as
+// single indivisible commands and are sent with blocking semantics because they
+// are rare and correctness matters more than shaving a few microseconds there.
+const WRITER_QUEUE_CAPACITY: usize = 1024;
+const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
 
 pub struct KeyboardController {
-    real_device: Device,
-    pointer_devices: Vec<Device>,
-    virtual_device: SharedVirtualKeyboard,
+    real_device: GrabbedKeyboardDevice,
+    pointer_watcher: PointerWatcher,
+    virtual_device: VirtualKeyboardWriter,
 }
 
 pub struct SelectionKeyboardTransport {
-    virtual_device: SharedVirtualKeyboard,
+    virtual_device: VirtualKeyboardHandle,
     modifiers: SharedModifierState,
 }
 
 #[derive(Clone)]
-struct SharedVirtualKeyboard {
-    inner: Arc<Mutex<uinput::Device>>,
+struct VirtualKeyboardHandle {
+    command_tx: mpsc::SyncSender<WriterCommand>,
+    alive: Arc<AtomicBool>,
+}
+
+struct VirtualKeyboardWriter {
+    handle: VirtualKeyboardHandle,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+enum WriterCommand {
+    Shutdown,
+    Fast(WriterFastCommand),
+    Transaction(WriterTransaction),
+}
+
+#[derive(Clone)]
+enum WriterFastCommand {
+    ForwardEvent {
+        key: Key,
+        value: i32,
+    },
+    TypeSeparator {
+        key: Key,
+    },
+}
+
+enum WriterTransactionKind {
+    ApplyCorrection {
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    },
+    CopyShortcut {
+        modifiers: ModifierState,
+    },
+    PasteShortcut {
+        modifiers: ModifierState,
+    },
+}
+
+enum WriterTransaction {
+    Execute {
+        kind: WriterTransactionKind,
+        reply: mpsc::Sender<Result<(), SwitcherError>>,
+    },
+}
+
+struct GrabbedKeyboardDevice {
+    device: Device,
+    grabbed: bool,
+}
+
+struct PointerWatcher {
+    click_flag: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Default)]
@@ -175,7 +240,7 @@ impl KeyboardController {
             .or_else(find_keyboard)
             .ok_or(SwitcherError::KeyboardNotFound)?;
         let pointer_paths = find_pointer_devices(&keyboard_path);
-        let mut real_device = Device::open(keyboard_path)?;
+        let mut real_device = GrabbedKeyboardDevice::open(keyboard_path)?;
         println!(
             "[INFO] Клавиатура: {}",
             real_device.name().unwrap_or("Unknown")
@@ -183,60 +248,56 @@ impl KeyboardController {
         thread::sleep(Duration::from_secs(1));
         real_device.grab()?;
 
-        let virtual_device = create_virtual_keyboard("Open-Switcher Virtual Device")?;
-        let pointer_devices = open_pointer_devices(pointer_paths);
+        let virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
+        let pointer_watcher = PointerWatcher::spawn(pointer_paths);
 
         println!("[OK] Open-Switcher запущен.");
+        log_input_debug("grab-acquired", "keyboard grab established at controller startup");
 
         Ok(Self {
             real_device,
-            pointer_devices,
+            pointer_watcher,
             virtual_device,
         })
     }
 
     pub fn fetch_events(&mut self) -> Result<Vec<InputEvent>, SwitcherError> {
-        Ok(self.real_device.fetch_events()?.collect())
+        self.real_device.fetch_events()
     }
 
-    pub fn drain_pointer_clicks(&mut self) -> Result<bool, SwitcherError> {
-        let mut saw_click = false;
+    pub fn take_pointer_click_invalidation(&self) -> bool {
+        self.pointer_watcher.take_click_invalidation()
+    }
 
-        for device in &mut self.pointer_devices {
-            loop {
-                match device.fetch_events() {
-                    Ok(events) => {
-                        let mut had_events = false;
-                        for event in events {
-                            had_events = true;
-                            if let evdev::InputEventKind::Key(key) = event.kind() {
-                                if is_pointer_click(key) && event.value() == 1 {
-                                    saw_click = true;
-                                }
-                            }
-                        }
-
-                        if !had_events {
-                            break;
-                        }
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(error.into()),
-                }
-            }
+    pub fn shutdown(&mut self) {
+        self.virtual_device.stop();
+        self.pointer_watcher.stop();
+        if let Err(error) = self.real_device.release_grab() {
+            log_input_debug("grab-release-error", &format!("error={error}"));
+            eprintln!("[input] Не удалось освободить grab клавиатуры: {error}");
+        } else {
+            log_input_debug("grab-released", "keyboard grab released during shutdown");
         }
-
-        Ok(saw_click)
     }
 
     pub fn with_temporarily_released_grab<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, SwitcherError>,
     ) -> Result<T, SwitcherError> {
-        self.real_device.ungrab()?;
+        self.real_device.release_grab()?;
+        log_input_debug(
+            "grab-released",
+            "keyboard grab temporarily released for critical operation",
+        );
 
         let operation_result = f(self);
-        let regrab_result = self.real_device.grab().map_err(SwitcherError::from);
+        let regrab_result = self.real_device.grab();
+        if regrab_result.is_ok() {
+            log_input_debug(
+                "grab-acquired",
+                "keyboard grab reacquired after critical operation",
+            );
+        }
 
         match (operation_result, regrab_result) {
             (Ok(value), Ok(())) => Ok(value),
@@ -247,20 +308,11 @@ impl KeyboardController {
     }
 
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
-        self.virtual_device.with_device(|device| {
-            device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
-            device.synchronize()?;
-            Ok(())
-        })
+        self.virtual_device.handle().forward_event(key, value)
     }
 
     pub fn type_separator(&mut self, key: Key) -> Result<(), SwitcherError> {
-        self.virtual_device.with_device(|device| {
-            device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
-            device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
-            device.synchronize()?;
-            Ok(())
-        })
+        self.virtual_device.handle().type_separator(key)
     }
 
     pub fn apply_correction(
@@ -269,98 +321,344 @@ impl KeyboardController {
         config: &RuntimeConfigSnapshot,
         modifiers: ModifierState,
     ) -> Result<(), SwitcherError> {
-        self.release_modifiers(modifiers)?;
-        for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
-            self.virtual_device.with_device(|device| {
-                device.click(&uinput::event::keyboard::Key::BackSpace)?;
-                device.synchronize()?;
-                Ok(())
-            })?;
-            thread::sleep(Duration::from_millis(config.backspace_ms));
-        }
-
-        self.switch_layout(config.layout_switch_combo)?;
-        thread::sleep(Duration::from_millis(config.layout_delay_ms));
-
-        for stroke in &plan.buffer {
-            if stroke.shift {
-                self.virtual_device.with_device(|device| {
-                    device.press(&uinput::event::keyboard::Key::LeftShift)?;
-                    Ok(())
-                })?;
-            }
-            self.virtual_device.with_device(|device| {
-                device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 1)?;
-                device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
-                Ok(())
-            })?;
-            if stroke.shift {
-                self.virtual_device.with_device(|device| {
-                    device.release(&uinput::event::keyboard::Key::LeftShift)?;
-                    Ok(())
-                })?;
-            }
-            self.virtual_device.with_device(|device| {
-                device.synchronize()?;
-                Ok(())
-            })?;
-            thread::sleep(Duration::from_millis(config.typing_ms));
-        }
-
-        if plan.extra_backspaces > 0 {
-            self.virtual_device.with_device(|device| {
-                device.click(&uinput::event::keyboard::Key::Space)?;
-                device.synchronize()?;
-                Ok(())
-            })?;
-        }
-
-        self.restore_modifiers(modifiers)?;
-        Ok(())
-    }
-
-    fn release_modifiers(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        release_modifiers(&mut self.virtual_device, modifiers)
-    }
-
-    fn restore_modifiers(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        restore_modifiers(&mut self.virtual_device, modifiers)
-    }
-
-    fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
-        let (modifiers, trigger_key) = layout_switch_combo_sequence(combo);
-
-        self.virtual_device.with_device(|device| {
-            for modifier in modifiers {
-                device.press(modifier)?;
-            }
-
-            if let Some(key) = trigger_key {
-                device.press(key)?;
-            }
-
-            device.synchronize()?;
-            thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
-
-            if let Some(key) = trigger_key {
-                device.release(key)?;
-            }
-
-            for modifier in modifiers.iter().rev() {
-                device.release(modifier)?;
-            }
-
-            device.synchronize()?;
-            Ok(())
-        })?;
-        Ok(())
+        self.virtual_device
+            .handle()
+            .apply_correction(plan.clone(), config.clone(), modifiers)
     }
 
     pub fn selection_transport(&self, modifiers: SharedModifierState) -> SelectionKeyboardTransport {
         SelectionKeyboardTransport {
-            virtual_device: self.virtual_device.clone(),
+            virtual_device: self.virtual_device.handle(),
             modifiers,
         }
+    }
+
+    pub fn is_writer_alive(&self) -> bool {
+        self.virtual_device.handle().is_alive()
+    }
+}
+
+impl GrabbedKeyboardDevice {
+    fn open(path: PathBuf) -> Result<Self, SwitcherError> {
+        Ok(Self {
+            device: Device::open(path)?,
+            grabbed: false,
+        })
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.device.name()
+    }
+
+    fn grab(&mut self) -> Result<(), SwitcherError> {
+        if self.grabbed {
+            return Ok(());
+        }
+
+        self.device.grab()?;
+        self.grabbed = true;
+        Ok(())
+    }
+
+    fn release_grab(&mut self) -> Result<(), SwitcherError> {
+        if !self.grabbed {
+            return Ok(());
+        }
+
+        self.device.ungrab()?;
+        self.grabbed = false;
+        Ok(())
+    }
+
+    fn fetch_events(&mut self) -> Result<Vec<InputEvent>, SwitcherError> {
+        Ok(self.device.fetch_events()?.collect())
+    }
+}
+
+impl Drop for GrabbedKeyboardDevice {
+    fn drop(&mut self) {
+        if !self.grabbed {
+            return;
+        }
+
+        match self.device.ungrab() {
+            Ok(()) => log_input_debug("grab-released", "keyboard grab released in Drop"),
+            Err(error) => {
+                log_input_debug("grab-release-error", &format!("during_drop=true error={error}"));
+                eprintln!("[input] Не удалось освободить grab клавиатуры в Drop: {error}");
+            }
+        }
+        self.grabbed = false;
+    }
+}
+
+impl PointerWatcher {
+    fn spawn(paths: Vec<PathBuf>) -> Self {
+        let click_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        if paths.is_empty() {
+            log_input_debug("pointer-watcher-start", "devices=0 mode=disabled");
+            return Self {
+                click_flag,
+                stop_flag,
+                handle: None,
+            };
+        }
+
+        let worker_click_flag = Arc::clone(&click_flag);
+        let worker_stop_flag = Arc::clone(&stop_flag);
+        let handle = thread::spawn(move || {
+            let mut devices = open_pointer_devices(paths);
+            log_input_debug(
+                "pointer-watcher-start",
+                &format!("devices={}", devices.len()),
+            );
+
+            while !worker_stop_flag.load(Ordering::SeqCst) {
+                let mut index = 0usize;
+                while index < devices.len() {
+                    let mut remove_device = false;
+                    let device = &mut devices[index];
+                    let device_name = device.name().unwrap_or("unknown").to_string();
+                    loop {
+                        match device.fetch_events() {
+                            Ok(events) => {
+                                let mut had_events = false;
+                                for event in events {
+                                    had_events = true;
+                                    if let evdev::InputEventKind::Key(key) = event.kind() {
+                                        if is_pointer_click(key) && event.value() == 1 {
+                                            worker_click_flag.store(true, Ordering::SeqCst);
+                                            log_input_debug(
+                                                "pointer-click",
+                                                &format!("device={device_name} key={key:?}"),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !had_events {
+                                    break;
+                                }
+                            }
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                            Err(error) => {
+                                log_input_debug(
+                                    "pointer-read-error",
+                                    &format!("device={device_name} error={error}"),
+                                );
+                                remove_device = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if remove_device {
+                        devices.remove(index);
+                    } else {
+                        index += 1;
+                    }
+                }
+
+                thread::sleep(POINTER_POLL_INTERVAL);
+            }
+
+            log_input_debug("pointer-watcher-stop", "reason=shutdown");
+        });
+
+        Self {
+            click_flag,
+            stop_flag,
+            handle: Some(handle),
+        }
+    }
+
+    fn take_click_invalidation(&self) -> bool {
+        self.click_flag.swap(false, Ordering::SeqCst)
+    }
+
+    fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl VirtualKeyboardWriter {
+    fn new(name: &str) -> Result<Self, SwitcherError> {
+        let device = create_virtual_keyboard(name)?;
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker_alive = Arc::clone(&alive);
+
+        let join_handle = thread::spawn(move || {
+            log_input_debug("writer-start", "virtual keyboard writer thread started");
+            let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_virtual_keyboard_writer_loop(device, command_rx)
+            }));
+
+            match loop_result {
+                Ok(Ok(())) => {
+                    log_input_debug("writer-stop", "virtual keyboard writer thread stopped");
+                }
+                Ok(Err(error)) => {
+                    log_input_debug("writer-error", &format!("error={error}"));
+                    eprintln!("[input] Ошибка writer path виртуальной клавиатуры: {error}");
+                }
+                Err(payload) => {
+                    let reason = if let Some(text) = payload.downcast_ref::<&str>() {
+                        *text
+                    } else if let Some(text) = payload.downcast_ref::<String>() {
+                        text.as_str()
+                    } else {
+                        "unknown panic payload"
+                    };
+                    log_input_debug("writer-panic", &format!("reason={reason}"));
+                    eprintln!("[input] Writer path виртуальной клавиатуры аварийно завершился: {reason}");
+                }
+            }
+
+            worker_alive.store(false, Ordering::SeqCst);
+        });
+
+        Ok(Self {
+            handle: VirtualKeyboardHandle { command_tx, alive },
+            join_handle: Some(join_handle),
+        })
+    }
+
+    fn handle(&self) -> VirtualKeyboardHandle {
+        self.handle.clone()
+    }
+
+    fn stop(&mut self) {
+        if self.handle.alive.load(Ordering::SeqCst) {
+            let _ = self.handle.command_tx.send(WriterCommand::Shutdown);
+        }
+
+        if let Some(join_handle) = self.join_handle.take() {
+            let _ = join_handle.join();
+        }
+    }
+}
+
+impl Drop for VirtualKeyboardWriter {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl VirtualKeyboardHandle {
+    fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+
+    fn ensure_alive(&self) -> Result<(), SwitcherError> {
+        if self.is_alive() {
+            Ok(())
+        } else {
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        }
+    }
+
+    fn forward_event(&self, key: Key, value: i32) -> Result<(), SwitcherError> {
+        self.ensure_alive()?;
+        self.send_fast_command(WriterFastCommand::ForwardEvent { key, value })
+    }
+
+    fn type_separator(&self, key: Key) -> Result<(), SwitcherError> {
+        self.ensure_alive()?;
+        self.send_fast_command(WriterFastCommand::TypeSeparator { key })
+    }
+
+    fn apply_correction(
+        &self,
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    ) -> Result<(), SwitcherError> {
+        self.run_transaction(WriterTransactionKind::ApplyCorrection {
+            plan,
+            config,
+            modifiers,
+        })
+    }
+
+    fn send_copy_shortcut(&self, modifiers: ModifierState) -> Result<(), SwitcherError> {
+        self.run_transaction(WriterTransactionKind::CopyShortcut { modifiers })
+    }
+
+    fn send_paste_shortcut(&self, modifiers: ModifierState) -> Result<(), SwitcherError> {
+        self.run_transaction(WriterTransactionKind::PasteShortcut { modifiers })
+    }
+
+    fn run_transaction(&self, kind: WriterTransactionKind) -> Result<(), SwitcherError> {
+        self.ensure_alive()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.command_tx
+            .send(WriterCommand::Transaction(WriterTransaction::Execute {
+                kind,
+                reply: reply_tx,
+            }))
+            .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?;
+        reply_rx
+            .recv()
+            .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?
+    }
+
+    fn send_fast_command(&self, command: WriterFastCommand) -> Result<(), SwitcherError> {
+        let started = Instant::now();
+        let mut yielded = false;
+
+        loop {
+            match self.command_tx.try_send(WriterCommand::Fast(command.clone())) {
+                Ok(()) => {
+                    if yielded {
+                        log_input_debug(
+                            "writer-backpressure-recovered",
+                            &format!("elapsed_us={}", started.elapsed().as_micros()),
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if started.elapsed() >= FAST_PATH_SATURATION_RETRY_WINDOW {
+                        log_input_debug(
+                            "writer-backpressure-failed",
+                            &format!(
+                                "elapsed_us={} retry_window_us={}",
+                                started.elapsed().as_micros(),
+                                FAST_PATH_SATURATION_RETRY_WINDOW.as_micros()
+                            ),
+                        );
+                        return Err(SwitcherError::VirtualKeyboardWriterSaturated);
+                    }
+
+                    if !yielded {
+                        log_input_debug(
+                            "writer-backpressure",
+                            &format!(
+                                "retry_window_us={}",
+                                FAST_PATH_SATURATION_RETRY_WINDOW.as_micros()
+                            ),
+                        );
+                        yielded = true;
+                    }
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PointerWatcher {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -388,16 +686,14 @@ fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<Device> {
     devices
 }
 
-fn create_virtual_keyboard(name: &str) -> Result<SharedVirtualKeyboard, SwitcherError> {
+fn create_virtual_keyboard(name: &str) -> Result<uinput::Device, SwitcherError> {
     let virtual_device = uinput::default()?
         .name(name)?
         .event(uinput::event::Keyboard::All)?
         .create()?;
 
     thread::sleep(Duration::from_millis(500));
-    Ok(SharedVirtualKeyboard {
-        inner: Arc::new(Mutex::new(virtual_device)),
-    })
+    Ok(virtual_device)
 }
 
 fn set_nonblocking(device: &Device) -> io::Result<()> {
@@ -646,141 +942,215 @@ mod tests {
 
 impl KeyboardController {
     pub fn send_copy_shortcut(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        self.send_shortcut(
-            modifiers,
-            &[uinput::event::keyboard::Key::LeftControl],
-            Some(&uinput::event::keyboard::Key::C),
-        )
+        self.virtual_device.handle().send_copy_shortcut(modifiers)
     }
 
     pub fn send_paste_shortcut(&mut self, modifiers: ModifierState) -> Result<(), SwitcherError> {
-        self.send_shortcut(
-            modifiers,
-            &[uinput::event::keyboard::Key::LeftControl],
-            Some(&uinput::event::keyboard::Key::V),
-        )
-    }
-
-    fn send_shortcut(
-        &mut self,
-        modifiers: ModifierState,
-        shortcut_modifiers: &[uinput::event::keyboard::Key],
-        trigger_key: Option<&uinput::event::keyboard::Key>,
-    ) -> Result<(), SwitcherError> {
-        run_shortcut_on_shared_device(
-            &self.virtual_device,
-            modifiers,
-            shortcut_modifiers,
-            trigger_key,
-        )
+        self.virtual_device.handle().send_paste_shortcut(modifiers)
     }
 }
 
 impl SelectionKeyboardTransport {
     pub fn send_copy_shortcut(&mut self) -> Result<(), SwitcherError> {
-        self.send_shortcut(
-            self.modifiers.snapshot(),
-            &[uinput::event::keyboard::Key::LeftControl],
-            Some(&uinput::event::keyboard::Key::C),
-        )
+        // Take a fresh modifier snapshot for each shortcut so copy/paste does not
+        // replay stale modifier state across the whole selected-text operation.
+        self.virtual_device
+            .send_copy_shortcut(self.modifiers.snapshot())
     }
 
     pub fn send_paste_shortcut(&mut self) -> Result<(), SwitcherError> {
-        self.send_shortcut(
-            self.modifiers.snapshot(),
-            &[uinput::event::keyboard::Key::LeftControl],
-            Some(&uinput::event::keyboard::Key::V),
-        )
-    }
-
-    fn send_shortcut(
-        &mut self,
-        modifiers: ModifierState,
-        shortcut_modifiers: &[uinput::event::keyboard::Key],
-        trigger_key: Option<&uinput::event::keyboard::Key>,
-    ) -> Result<(), SwitcherError> {
-        run_shortcut_on_shared_device(
-            &self.virtual_device,
-            modifiers,
-            shortcut_modifiers,
-            trigger_key,
-        )
+        self.virtual_device
+            .send_paste_shortcut(self.modifiers.snapshot())
     }
 }
 
 fn release_modifiers(
-    virtual_device: &SharedVirtualKeyboard,
+    device: &mut uinput::Device,
     modifiers: ModifierState,
 ) -> Result<(), SwitcherError> {
-    virtual_device.with_device(|device| {
-        modifiers.for_each_pressed(|key| device.release(&key))?;
-        device.synchronize()?;
-        Ok(())
-    })?;
+    modifiers.for_each_pressed(|key| device.release(&key))?;
+    device.synchronize()?;
     thread::sleep(Duration::from_millis(MODIFIER_SYNC_DELAY_MS));
     Ok(())
 }
 
 fn restore_modifiers(
-    virtual_device: &SharedVirtualKeyboard,
+    device: &mut uinput::Device,
     modifiers: ModifierState,
 ) -> Result<(), SwitcherError> {
-    virtual_device.with_device(|device| {
-        modifiers.for_each_pressed(|key| device.press(&key))?;
-        device.synchronize()?;
-        Ok(())
-    })?;
+    modifiers.for_each_pressed(|key| device.press(&key))?;
+    device.synchronize()?;
     Ok(())
 }
 
-fn run_shortcut_on_shared_device(
-    virtual_device: &SharedVirtualKeyboard,
+fn run_shortcut(
+    device: &mut uinput::Device,
     modifiers: ModifierState,
     shortcut_modifiers: &[uinput::event::keyboard::Key],
     trigger_key: Option<&uinput::event::keyboard::Key>,
 ) -> Result<(), SwitcherError> {
-    virtual_device.with_device(|device| {
-        modifiers.for_each_pressed(|key| device.release(&key))?;
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(MODIFIER_SYNC_DELAY_MS));
+    release_modifiers(device, modifiers)?;
 
-        for modifier in shortcut_modifiers {
-            device.press(modifier)?;
-        }
+    for modifier in shortcut_modifiers {
+        device.press(modifier)?;
+    }
 
-        if let Some(key) = trigger_key {
-            device.press(key)?;
-        }
+    if let Some(key) = trigger_key {
+        device.press(key)?;
+    }
 
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
+    device.synchronize()?;
+    thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
 
-        if let Some(key) = trigger_key {
-            device.release(key)?;
-        }
+    if let Some(key) = trigger_key {
+        device.release(key)?;
+    }
 
-        for modifier in shortcut_modifiers.iter().rev() {
-            device.release(modifier)?;
-        }
+    for modifier in shortcut_modifiers.iter().rev() {
+        device.release(modifier)?;
+    }
 
-        device.synchronize()?;
-        modifiers.for_each_pressed(|key| device.press(&key))?;
-        device.synchronize()?;
-        Ok(())
-    })
+    device.synchronize()?;
+    restore_modifiers(device, modifiers)?;
+    Ok(())
 }
 
-impl SharedVirtualKeyboard {
-    fn with_device<T>(
-        &self,
-        f: impl FnOnce(&mut uinput::Device) -> Result<T, SwitcherError>,
-    ) -> Result<T, SwitcherError> {
-        let mut device = self
-            .inner
-            .lock()
-            .map_err(|_| SwitcherError::VirtualKeyboardLockPoisoned)?;
-        f(&mut device)
+fn run_layout_switch(
+    device: &mut uinput::Device,
+    combo: LayoutSwitchCombo,
+) -> Result<(), SwitcherError> {
+    let (modifiers, trigger_key) = layout_switch_combo_sequence(combo);
+
+    for modifier in modifiers {
+        device.press(modifier)?;
     }
+
+    if let Some(key) = trigger_key {
+        device.press(key)?;
+    }
+
+    device.synchronize()?;
+    thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
+
+    if let Some(key) = trigger_key {
+        device.release(key)?;
+    }
+
+    for modifier in modifiers.iter().rev() {
+        device.release(modifier)?;
+    }
+
+    device.synchronize()?;
+    Ok(())
+}
+
+fn run_correction(
+    device: &mut uinput::Device,
+    plan: &CorrectionPlan,
+    config: &RuntimeConfigSnapshot,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    release_modifiers(device, modifiers)?;
+    for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
+        device.click(&uinput::event::keyboard::Key::BackSpace)?;
+        device.synchronize()?;
+        thread::sleep(Duration::from_millis(config.backspace_ms));
+    }
+
+    run_layout_switch(device, config.layout_switch_combo)?;
+    thread::sleep(Duration::from_millis(config.layout_delay_ms));
+
+    for stroke in &plan.buffer {
+        if stroke.shift {
+            device.press(&uinput::event::keyboard::Key::LeftShift)?;
+        }
+        device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 1)?;
+        device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
+        if stroke.shift {
+            device.release(&uinput::event::keyboard::Key::LeftShift)?;
+        }
+        device.synchronize()?;
+        thread::sleep(Duration::from_millis(config.typing_ms));
+    }
+
+    if plan.extra_backspaces > 0 {
+        device.click(&uinput::event::keyboard::Key::Space)?;
+        device.synchronize()?;
+    }
+
+    restore_modifiers(device, modifiers)?;
+    Ok(())
+}
+
+fn run_virtual_keyboard_writer_loop(
+    mut device: uinput::Device,
+    command_rx: mpsc::Receiver<WriterCommand>,
+) -> Result<(), SwitcherError> {
+    for command in command_rx {
+        match command {
+            WriterCommand::Shutdown => break,
+            WriterCommand::Fast(command) => match command {
+                WriterFastCommand::ForwardEvent { key, value } => {
+                    device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
+                    device.synchronize()?;
+                }
+                WriterFastCommand::TypeSeparator { key } => {
+                    device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
+                    device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
+                    device.synchronize()?;
+                }
+            },
+            WriterCommand::Transaction(transaction) => match transaction {
+                WriterTransaction::Execute { kind, reply } => {
+                    let result = match kind {
+                        WriterTransactionKind::ApplyCorrection {
+                            plan,
+                            config,
+                            modifiers,
+                        } => run_correction(&mut device, &plan, &config, modifiers),
+                        WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
+                            &mut device,
+                            modifiers,
+                            &[uinput::event::keyboard::Key::LeftControl],
+                            Some(&uinput::event::keyboard::Key::C),
+                        ),
+                        WriterTransactionKind::PasteShortcut { modifiers } => run_shortcut(
+                            &mut device,
+                            modifiers,
+                            &[uinput::event::keyboard::Key::LeftControl],
+                            Some(&uinput::event::keyboard::Key::V),
+                        ),
+                    };
+                    let _ = reply.send(result);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn log_input_debug(stage: &str, details: &str) {
+    if !input_debug_enabled() {
+        return;
+    }
+
+    let line = format!("[input-debug] stage={stage} {details}");
+    eprintln!("{line}");
+
+    let path = env::var(INPUT_DEBUG_FILE_ENV)
+        .unwrap_or_else(|_| "/tmp/open-switcher-input-debug.log".to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn input_debug_enabled() -> bool {
+    matches!(
+        env::var(INPUT_DEBUG_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
 }
 
 impl SharedModifierState {

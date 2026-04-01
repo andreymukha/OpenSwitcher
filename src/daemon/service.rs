@@ -1,6 +1,6 @@
 use crate::daemon::keyboard::{
-    is_character, is_modifier, is_russian_layout, undo_key_to_evdev_key, KeyboardController, ModifierState,
-    SharedModifierState,
+    is_character, is_modifier, is_russian_layout, log_input_debug, undo_key_to_evdev_key,
+    KeyboardController, ModifierState, SharedModifierState,
 };
 use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{
@@ -11,7 +11,11 @@ use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed}
 use crate::error::SwitcherError;
 use evdev::InputEventKind;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use zbus::blocking::Connection;
+
+const EVENT_LOOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+const EVENT_LOOP_HEARTBEAT_EVENTS: u64 = 500;
 
 #[derive(Default)]
 struct WordContext {
@@ -59,20 +63,60 @@ impl DaemonService {
     }
 
     pub fn run(&mut self) -> Result<(), SwitcherError> {
+        log_input_debug("event-loop-start", "daemon input loop started");
+        let mut processed_events = 0u64;
+        let mut last_heartbeat = Instant::now();
+
         loop {
-            for event in self.keyboard.fetch_events()? {
+            if self.keyboard.take_pointer_click_invalidation() {
+                log_input_debug("pointer-invalidation", "word context invalidated by pointer click");
+                self.invalidate_word_context();
+            }
+
+            let events = match self.keyboard.fetch_events() {
+                Ok(events) => events,
+                Err(error) => {
+                    log_input_debug("keyboard-read-error", &format!("error={error}"));
+                    self.shutdown();
+                    return Err(error);
+                }
+            };
+
+            for event in events {
                 if let InputEventKind::Key(key) = event.kind() {
-                    self.handle_key_event(key, event.value())?;
+                    if let Err(error) = self.handle_key_event(key, event.value()) {
+                        log_input_debug(
+                            "event-handler-error",
+                            &format!("key={key:?} value={} error={error}", event.value()),
+                        );
+                        self.shutdown();
+                        return Err(error);
+                    }
+                    processed_events += 1;
+                    if processed_events % EVENT_LOOP_HEARTBEAT_EVENTS == 0
+                        || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
+                    {
+                        log_input_debug(
+                            "event-loop-heartbeat",
+                            &format!(
+                                "events_processed={processed_events} selected_text_in_progress={} writer_alive={}",
+                                self.selected_text_runner.is_in_progress(),
+                                self.keyboard.is_writer_alive()
+                            ),
+                        );
+                        last_heartbeat = Instant::now();
+                    }
                 }
             }
         }
     }
 
-    fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
-        if self.keyboard.drain_pointer_clicks()? {
-            self.invalidate_word_context();
-        }
+    pub fn shutdown(&mut self) {
+        log_input_debug("event-loop-stop", "daemon input loop stopping");
+        self.keyboard.shutdown();
+    }
 
+    fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;

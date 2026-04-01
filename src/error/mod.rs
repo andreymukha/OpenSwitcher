@@ -78,8 +78,12 @@ pub enum SwitcherError {
     SelectedText(#[from] SelectedTextError),
     #[error("Selected text worker thread is unavailable")]
     SelectedTextWorkerDisconnected,
-    #[error("Virtual keyboard lock is poisoned")]
-    VirtualKeyboardLockPoisoned,
+    #[error("Daemon input loop panicked")]
+    DaemonPanicked,
+    #[error("Virtual keyboard writer is unavailable")]
+    VirtualKeyboardWriterDisconnected,
+    #[error("Virtual keyboard writer queue is saturated")]
+    VirtualKeyboardWriterSaturated,
     #[error(transparent)]
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]

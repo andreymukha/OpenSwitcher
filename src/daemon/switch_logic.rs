@@ -116,7 +116,28 @@ fn is_likely_english(word: &str) -> bool {
     }
 
     let eng_vowels = clean_word.chars().filter(|c| "aeiouy".contains(*c)).count();
-    eng_vowels >= 2 && clean_word.len() <= 5
+    if eng_vowels >= 2 && clean_word.len() <= 5 {
+        return true;
+    }
+
+    let common_english_bigrams = [
+        "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "se", "ed", "te", "st",
+        "el", "le", "ti", "io", "ou", "ll", "oo",
+    ];
+    let common_english_suffixes = ["ed", "ing", "tion", "ment", "ly", "er", "est"];
+
+    if common_english_suffixes
+        .iter()
+        .any(|suffix| clean_word.ends_with(suffix))
+        && eng_vowels >= 2
+    {
+        return true;
+    }
+
+    eng_vowels >= 1
+        && common_english_bigrams
+            .iter()
+            .any(|bigram| clean_word.contains(bigram))
 }
 
 #[cfg(test)]
@@ -166,6 +187,32 @@ mod tests {
     #[test]
     fn common_english_word_does_not_trigger_switch() {
         let buffer = vec![stroke(Key::KEY_C), stroke(Key::KEY_A), stroke(Key::KEY_R)];
+        assert!(!should_switch(&buffer));
+    }
+
+    #[test]
+    fn longer_english_word_does_not_trigger_switch() {
+        let buffer = vec![
+            stroke(Key::KEY_S),
+            stroke(Key::KEY_E),
+            stroke(Key::KEY_L),
+            stroke(Key::KEY_E),
+            stroke(Key::KEY_C),
+            stroke(Key::KEY_T),
+            stroke(Key::KEY_E),
+            stroke(Key::KEY_D),
+        ];
+        assert!(!should_switch(&buffer));
+    }
+
+    #[test]
+    fn common_short_english_word_does_not_trigger_switch() {
+        let buffer = vec![
+            stroke(Key::KEY_T),
+            stroke(Key::KEY_E),
+            stroke(Key::KEY_X),
+            stroke(Key::KEY_T),
+        ];
         assert!(!should_switch(&buffer));
     }
 }

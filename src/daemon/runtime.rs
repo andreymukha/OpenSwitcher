@@ -10,9 +10,15 @@ use crate::model::{
     UpdateSettingsResult,
 };
 use crate::system::SystemContextDetector;
+use std::env;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
+
+const LAYOUT_DEBUG_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG";
+const LAYOUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG_FILE";
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
@@ -451,8 +457,19 @@ impl RuntimeState {
     }
 
     pub fn set_layout(&self, layout_is_english: bool) {
-        self.layout_is_english
-            .store(layout_is_english, Ordering::SeqCst);
+        self.set_layout_with_reason(layout_is_english, "unspecified");
+    }
+
+    pub fn set_layout_with_reason(&self, layout_is_english: bool, reason: &str) {
+        let previous = self.layout_is_english.swap(layout_is_english, Ordering::SeqCst);
+        log_layout_debug(
+            "set-layout",
+            &format!(
+                "reason={reason} previous={} next={}",
+                layout_label(previous),
+                layout_label(layout_is_english)
+            ),
+        );
     }
 
     pub fn get_settings(&self) -> Result<Settings, SettingsError> {
@@ -520,5 +537,35 @@ impl RuntimeState {
             .lock()
             .map_err(|_| CaptureError::LockPoisoned)?;
         Ok(session.handle_key_event(key, value))
+    }
+}
+
+pub(crate) fn log_layout_debug(stage: &str, details: &str) {
+    if !layout_debug_enabled() {
+        return;
+    }
+
+    let line = format!("[layout-debug] stage={stage} {details}");
+    eprintln!("{line}");
+
+    let path = env::var(LAYOUT_DEBUG_FILE_ENV)
+        .unwrap_or_else(|_| "/tmp/open-switcher-layout-debug.log".to_string());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn layout_debug_enabled() -> bool {
+    matches!(
+        env::var(LAYOUT_DEBUG_ENV).as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn layout_label(is_english: bool) -> &'static str {
+    if is_english {
+        "EN"
+    } else {
+        "RU"
     }
 }

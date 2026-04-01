@@ -1564,6 +1564,7 @@ dependencies = [
  "gtk4",
  "ksni",
  "libadwaita",
+ "libc",
  "serde",
  "tempfile",
  "thiserror",

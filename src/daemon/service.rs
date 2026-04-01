@@ -1,8 +1,8 @@
 use crate::daemon::keyboard::{
-    is_character, is_modifier, undo_key_to_evdev_key, KeyboardController, ModifierState,
+    is_character, is_modifier, is_russian_layout, undo_key_to_evdev_key, KeyboardController, ModifierState,
     SharedModifierState,
 };
-use crate::daemon::runtime::RuntimeState;
+use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{
     log_selected_text_debug, SelectedTextJobRunner,
 };
@@ -13,6 +13,13 @@ use evdev::InputEventKind;
 use std::sync::Arc;
 use zbus::blocking::Connection;
 
+#[derive(Default)]
+struct WordContext {
+    valid: bool,
+    word_before_cursor: Vec<Keystroke>,
+    followed_by_separator: bool,
+}
+
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
     connection: Connection,
@@ -20,8 +27,7 @@ pub struct DaemonService {
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
     buffer: Vec<Keystroke>,
-    last_word_buffer: Vec<Keystroke>,
-    last_word_followed_by_separator: bool,
+    word_context: WordContext,
     selected_text_runner: SelectedTextJobRunner,
     suppressed_hotkey_key: Option<evdev::Key>,
     suppressed_separator_key: Option<evdev::Key>,
@@ -43,8 +49,7 @@ impl DaemonService {
             modifiers: ModifierState::default(),
             shared_modifiers,
             buffer: Vec::new(),
-            last_word_buffer: Vec::new(),
-            last_word_followed_by_separator: false,
+            word_context: WordContext::default(),
             selected_text_runner,
             suppressed_hotkey_key: None,
             suppressed_separator_key: None,
@@ -64,6 +69,10 @@ impl DaemonService {
     }
 
     fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
+        if self.keyboard.drain_pointer_clicks()? {
+            self.invalidate_word_context();
+        }
+
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
@@ -91,9 +100,7 @@ impl DaemonService {
             }
 
             if !self.runtime.is_capture_active()? {
-                self.buffer.clear();
-                self.last_word_buffer.clear();
-                self.last_word_followed_by_separator = false;
+                self.invalidate_word_context();
             }
 
             return Ok(());
@@ -103,12 +110,33 @@ impl DaemonService {
         self.modifiers.update(key, value);
         self.shared_modifiers.store(self.modifiers);
 
+        if value == 1 && self.pending_auto_correction_separator.is_some() && !is_modifier(key) {
+            let separator_key = self.pending_auto_correction_separator.take().unwrap();
+            self.suppressed_separator_key = None;
+            self.finish_pending_auto_correction(separator_key, &config)?;
+        }
+
         if self
             .modifiers
             .matches_layout_switch_combo(config.layout_switch_combo, key, value)
         {
-            self.runtime.set_layout(!self.runtime.current_layout());
+            log_layout_debug(
+                "observed-layout-shortcut",
+                &format!(
+                    "combo={:?} key={key:?} value={value} shift={} ctrl={} alt={} layout_before={}",
+                    config.layout_switch_combo,
+                    self.modifiers.is_shift_pressed(),
+                    self.modifiers.is_ctrl_pressed(),
+                    self.modifiers.is_alt_pressed(),
+                    if self.runtime.current_layout() { "EN" } else { "RU" }
+                ),
+            );
+            self.runtime.set_layout_with_reason(
+                !self.runtime.current_layout(),
+                "user-layout-shortcut",
+            );
             self.publish_status_changed()?;
+            self.invalidate_word_context();
         }
 
         if selected_text_hotkey_matches(config.selected_text_hotkey, self.modifiers, key, value) {
@@ -135,18 +163,24 @@ impl DaemonService {
         }
 
         if key == undo_key_to_evdev_key(config.undo_key) {
-            let last_word_buffer = self.last_word_buffer.clone();
+            let word_before_cursor = if self.can_correct_word_before_cursor() {
+                self.word_context.word_before_cursor.clone()
+            } else {
+                Vec::new()
+            };
             let used_current_buffer = !self.buffer.is_empty();
-            if self.apply_manual_correction(&config, &last_word_buffer)? && used_current_buffer {
-                self.last_word_buffer = self.buffer.clone();
-                self.last_word_followed_by_separator = false;
-                self.buffer.clear();
+            if self.apply_manual_correction(&config, &word_before_cursor)? {
+                if used_current_buffer {
+                    self.word_context.valid = true;
+                    self.word_context.word_before_cursor.clear();
+                    self.word_context.followed_by_separator = false;
+                }
             }
             return Ok(());
         }
 
         match key {
-            evdev::Key::KEY_SPACE | evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
+            evdev::Key::KEY_SPACE => {
                 let is_russian = !self.runtime.current_layout();
                 let corrected = self.runtime.is_enabled()
                     && !is_russian
@@ -158,23 +192,39 @@ impl DaemonService {
                     return Ok(());
                 }
 
-                self.last_word_buffer = self.buffer.clone();
-                self.last_word_followed_by_separator = true;
+                self.word_context.valid = !self.buffer.is_empty();
+                self.word_context.word_before_cursor = self.buffer.clone();
+                self.word_context.followed_by_separator = true;
                 self.buffer.clear();
                 self.keyboard.forward_event(key, 1)
             }
+            evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
+                self.invalidate_word_context();
+                self.keyboard.forward_event(key, 1)
+            }
             evdev::Key::KEY_BACKSPACE => {
-                self.buffer.pop();
+                if !self.buffer.is_empty() {
+                    self.buffer.pop();
+                } else if self.word_context.valid && self.word_context.followed_by_separator {
+                    self.buffer = self.word_context.word_before_cursor.clone();
+                    self.word_context.followed_by_separator = false;
+                }
                 self.keyboard.forward_event(key, 1)
             }
             _ => {
-                if is_character(key) {
+                let plain_character_input = is_character(key)
+                    && !self.modifiers.is_ctrl_pressed()
+                    && !self.modifiers.is_alt_pressed()
+                    && !self.modifiers.is_meta_pressed();
+
+                if plain_character_input {
+                    self.word_context.valid = true;
                     self.buffer.push(Keystroke {
                         key,
                         shift: self.modifiers.is_shift_pressed(),
                     });
                 } else if !is_modifier(key) {
-                    self.buffer.clear();
+                    self.invalidate_word_context();
                 }
                 let result = self.keyboard.forward_event(key, 1);
                 if result.is_ok() {
@@ -191,9 +241,7 @@ impl DaemonService {
             return Ok(());
         }
 
-        self.buffer.clear();
-        self.last_word_buffer.clear();
-        self.last_word_followed_by_separator = false;
+        self.invalidate_word_context();
         log_selected_text_debug("job-started", "selected-text job dispatched to worker");
         Ok(())
     }
@@ -204,8 +252,9 @@ impl DaemonService {
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
     ) -> Result<(), SwitcherError> {
         self.apply_manual_correction(config, &[])?;
-        self.last_word_buffer = self.buffer.clone();
-        self.last_word_followed_by_separator = true;
+        self.word_context.valid = !self.buffer.is_empty();
+        self.word_context.word_before_cursor = self.buffer.clone();
+        self.word_context.followed_by_separator = true;
         self.buffer.clear();
         self.keyboard.type_separator(separator_key)
     }
@@ -235,21 +284,60 @@ impl DaemonService {
         let Some(plan) = manual_correction_plan(
             &self.buffer,
             fallback_buffer,
-            self.last_word_followed_by_separator,
+            self.word_context.followed_by_separator,
         ) else {
             return Ok(false);
         };
 
         self.keyboard
             .apply_correction(&plan, config, self.modifiers)?;
-        self.runtime.set_layout(!self.runtime.current_layout());
+        match is_russian_layout() {
+            Ok(is_russian) => {
+                log_layout_debug(
+                    "manual-correction-sync",
+                    &format!("source=xset is_russian={is_russian}"),
+                );
+                self.runtime
+                    .set_layout_with_reason(!is_russian, "manual-correction-xset-sync");
+            }
+            Err(error) => {
+                log_layout_debug(
+                    "manual-correction-sync",
+                    &format!("source=xset failed=true error={error}"),
+                );
+                self.runtime
+                    .set_layout_with_reason(!self.runtime.current_layout(), "manual-correction-fallback-toggle");
+            }
+        }
         self.publish_status_changed()?;
         Ok(true)
     }
 
     fn publish_status_changed(&self) -> Result<(), SwitcherError> {
+        log_layout_debug(
+            "status-signal",
+            &format!(
+                "enabled={} current_layout={}",
+                self.runtime.is_enabled(),
+                if self.runtime.current_layout() { "EN" } else { "RU" }
+            ),
+        );
         emit_status_changed(&self.connection, &self.runtime)?;
         Ok(())
+    }
+
+    fn invalidate_word_context(&mut self) {
+        self.buffer.clear();
+        self.word_context.valid = false;
+        self.word_context.word_before_cursor.clear();
+        self.word_context.followed_by_separator = false;
+    }
+
+    fn can_correct_word_before_cursor(&self) -> bool {
+        self.word_context.valid
+            && self.buffer.is_empty()
+            && self.word_context.followed_by_separator
+            && !self.word_context.word_before_cursor.is_empty()
     }
 }
 

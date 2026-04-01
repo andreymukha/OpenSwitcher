@@ -211,11 +211,9 @@ fn wait_for_copied_text(
                             ),
                         );
                     }
-                    thread::sleep(COPY_POLL_INTERVAL);
-                    continue;
                 }
 
-                if stable_for >= COPY_CHANGE_STABLE_FOR {
+                if !should_ignore && stable_for >= COPY_CHANGE_STABLE_FOR {
                     log_selected_text_debug(
                         "copy-poll-change",
                         &format!(
@@ -592,5 +590,24 @@ mod tests {
             }
         );
         assert_eq!(clipboard.current_text.as_deref(), Some("Привет"));
+    }
+
+    #[test]
+    fn times_out_when_clipboard_never_changes_from_previous_text() {
+        let converter = LayoutConversionEngine;
+        let operation = SelectedTextOperation;
+        let mut clipboard = TestClipboard::with_current_text("old clipboard");
+        let mut transport = TestTransport::default();
+
+        let started = Instant::now();
+        let result = operation
+            .execute(&mut clipboard, &mut transport, &converter)
+            .unwrap();
+
+        assert!(transport.copied);
+        assert!(!transport.pasted);
+        assert_eq!(result, SelectedTextSwitchResult::NoSelectedText);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(clipboard.current_text.as_deref(), Some("old clipboard"));
     }
 }

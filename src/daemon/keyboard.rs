@@ -4,6 +4,8 @@ use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, UndoKey};
 use evdev::{enumerate, Device, InputEvent, Key};
 use std::env;
+use std::io;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -18,6 +20,7 @@ const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
 
 pub struct KeyboardController {
     real_device: Device,
+    pointer_devices: Vec<Device>,
     virtual_device: SharedVirtualKeyboard,
 }
 
@@ -171,6 +174,7 @@ impl KeyboardController {
         let keyboard_path = configured_keyboard_path()
             .or_else(find_keyboard)
             .ok_or(SwitcherError::KeyboardNotFound)?;
+        let pointer_paths = find_pointer_devices(&keyboard_path);
         let mut real_device = Device::open(keyboard_path)?;
         println!(
             "[INFO] Клавиатура: {}",
@@ -180,17 +184,49 @@ impl KeyboardController {
         real_device.grab()?;
 
         let virtual_device = create_virtual_keyboard("Open-Switcher Virtual Device")?;
+        let pointer_devices = open_pointer_devices(pointer_paths);
 
         println!("[OK] Open-Switcher запущен.");
 
         Ok(Self {
             real_device,
+            pointer_devices,
             virtual_device,
         })
     }
 
     pub fn fetch_events(&mut self) -> Result<Vec<InputEvent>, SwitcherError> {
         Ok(self.real_device.fetch_events()?.collect())
+    }
+
+    pub fn drain_pointer_clicks(&mut self) -> Result<bool, SwitcherError> {
+        let mut saw_click = false;
+
+        for device in &mut self.pointer_devices {
+            loop {
+                match device.fetch_events() {
+                    Ok(events) => {
+                        let mut had_events = false;
+                        for event in events {
+                            had_events = true;
+                            if let evdev::InputEventKind::Key(key) = event.kind() {
+                                if is_pointer_click(key) && event.value() == 1 {
+                                    saw_click = true;
+                                }
+                            }
+                        }
+
+                        if !had_events {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+
+        Ok(saw_click)
     }
 
     pub fn with_temporarily_released_grab<T>(
@@ -337,6 +373,21 @@ fn configured_keyboard_path() -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
+fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<Device> {
+    let mut devices = Vec::new();
+
+    for path in paths {
+        let Ok(device) = Device::open(&path) else {
+            continue;
+        };
+        if set_nonblocking(&device).is_ok() {
+            devices.push(device);
+        }
+    }
+
+    devices
+}
+
 fn create_virtual_keyboard(name: &str) -> Result<SharedVirtualKeyboard, SwitcherError> {
     let virtual_device = uinput::default()?
         .name(name)?
@@ -347,6 +398,21 @@ fn create_virtual_keyboard(name: &str) -> Result<SharedVirtualKeyboard, Switcher
     Ok(SharedVirtualKeyboard {
         inner: Arc::new(Mutex::new(virtual_device)),
     })
+}
+
+fn set_nonblocking(device: &Device) -> io::Result<()> {
+    let fd = device.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 pub fn is_russian_layout() -> Result<bool, SwitcherError> {
@@ -461,6 +527,44 @@ fn find_keyboard() -> Option<PathBuf> {
     }
 
     None
+}
+
+fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    for (path, device) in enumerate() {
+        if &path == excluded_keyboard_path {
+            continue;
+        }
+
+        let name = device.name().unwrap_or("");
+        if name.contains("Camera") {
+            continue;
+        }
+
+        let Some(keys) = device.supported_keys() else {
+            continue;
+        };
+
+        if keys.contains(Key::BTN_LEFT)
+            || keys.contains(Key::BTN_RIGHT)
+            || keys.contains(Key::BTN_MIDDLE)
+            || keys.contains(Key::BTN_SIDE)
+            || keys.contains(Key::BTN_EXTRA)
+            || keys.contains(Key::BTN_TOUCH)
+            || keys.contains(Key::BTN_TOOL_FINGER)
+            || keys.contains(Key::BTN_TOOL_DOUBLETAP)
+        {
+            paths.push(path);
+        }
+    }
+
+    paths
+}
+
+fn is_pointer_click(key: Key) -> bool {
+    let code = key.code();
+    (Key::BTN_LEFT.code()..=Key::BTN_TOOL_DOUBLETAP.code()).contains(&code)
 }
 
 impl ModifierState {

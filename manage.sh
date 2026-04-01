@@ -52,6 +52,26 @@ logfile_for() {
     esac
 }
 
+apply_default_debug_env() {
+    local component="$1"
+
+    if [[ "$component" != "daemon" ]]; then
+        return 0
+    fi
+
+    if [[ "${OPEN_SWITCHER_DEFAULT_DEBUG:-1}" == "0" ]]; then
+        return 0
+    fi
+
+    export RUST_BACKTRACE="${RUST_BACKTRACE:-1}"
+    export OPEN_SWITCHER_LAYOUT_DEBUG="${OPEN_SWITCHER_LAYOUT_DEBUG:-1}"
+    export OPEN_SWITCHER_LAYOUT_DEBUG_FILE="${OPEN_SWITCHER_LAYOUT_DEBUG_FILE:-$LOG_DIR/layout-debug.log}"
+    export OPEN_SWITCHER_SELECTED_TEXT_DEBUG="${OPEN_SWITCHER_SELECTED_TEXT_DEBUG:-1}"
+    export OPEN_SWITCHER_SELECTED_TEXT_DEBUG_FILE="${OPEN_SWITCHER_SELECTED_TEXT_DEBUG_FILE:-$LOG_DIR/selected-text-debug.log}"
+    export OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG="${OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG:-1}"
+    export OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG_FILE="${OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG_FILE:-$LOG_DIR/daemon-capture-debug.log}"
+}
+
 process_name_for() {
     case "$1" in
         daemon) printf '%s\n' 'open-switcher' ;;
@@ -116,6 +136,7 @@ start_component() {
 
     require_binary "$component"
     ensure_dbus_address
+    apply_default_debug_env "$component"
 
     if is_running "$pidfile"; then
         echo "$component уже запущен (PID $(cat "$pidfile"))."

@@ -1,4 +1,5 @@
 /target
+.run/
 **/*.rs.bk
 *.log
 /daemon.log

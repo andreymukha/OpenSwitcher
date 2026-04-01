@@ -1,4 +1,5 @@
 use crate::daemon::runtime::RuntimeState;
+use crate::daemon::runtime::log_layout_debug;
 use crate::error::{DbusError, SettingsError};
 use crate::model::{LayoutSwitchCaptureState, Settings, SettingsDto, UpdateSettingsResult};
 use std::sync::Arc;
@@ -151,6 +152,14 @@ pub fn emit_status_changed(
     connection: &Connection,
     runtime: &RuntimeState,
 ) -> Result<(), DbusError> {
+    log_layout_debug(
+        "dbus-emit-status",
+        &format!(
+            "enabled={} current_layout={}",
+            runtime.is_enabled(),
+            if runtime.current_layout() { "EN" } else { "RU" }
+        ),
+    );
     let ctxt = SignalContext::new(connection.inner(), OBJECT_PATH).map_err(DbusError::Signal)?;
     zbus::block_on(OpenSwitcherDbusApi::status_changed(
         &ctxt,

@@ -34,6 +34,7 @@ async-channel = "2.5"
 thiserror = "1.0"
 dirs = "5.0"
 arboard = "3.4"
+libc = "0.2"
 gtk = { package = "gtk4", version = "0.9", optional = true }
 adw = { package = "libadwaita", version = "0.7", features = ["v1_4"], optional = true }
 

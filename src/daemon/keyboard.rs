@@ -3,6 +3,7 @@ use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, UndoKey};
 use evdev::{enumerate, Device, InputEvent, Key};
+use std::collections::HashSet;
 use std::env;
 use std::fs::OpenOptions;
 use std::io;
@@ -21,6 +22,7 @@ const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
 const INPUT_DEBUG_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG";
 const INPUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG_FILE";
 const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
 // Transactional commands use the same total-order queue, but are represented as
 // single indivisible commands and are sent with blocking semantics because they
@@ -31,6 +33,7 @@ const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
 pub struct KeyboardController {
     real_device: GrabbedKeyboardDevice,
     pointer_watcher: PointerWatcher,
+    input_target_watcher: InputTargetWatcher,
     virtual_device: VirtualKeyboardWriter,
 }
 
@@ -58,13 +61,8 @@ enum WriterCommand {
 
 #[derive(Clone)]
 enum WriterFastCommand {
-    ForwardEvent {
-        key: Key,
-        value: i32,
-    },
-    TypeSeparator {
-        key: Key,
-    },
+    ForwardEvent { key: Key, value: i32 },
+    TypeSeparator { key: Key },
 }
 
 enum WriterTransactionKind {
@@ -97,6 +95,24 @@ struct PointerWatcher {
     click_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+}
+
+struct InputTargetWatcher {
+    changed_flag: Arc<AtomicBool>,
+    stop_flag: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+struct PointerDeviceState {
+    device: Device,
+    pressed_buttons: HashSet<Key>,
+}
+
+struct ActiveWindowMonitor {
+    conn: x11rb::rust_connection::RustConnection,
+    root: u32,
+    active_window_atom: u32,
+    current_window: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -172,20 +188,13 @@ impl ModifierState {
             LayoutSwitchCombo::AltShift => {
                 matches!(
                     key,
-                    Key::KEY_LEFTALT
-                        | Key::KEY_RIGHTALT
-                        | Key::KEY_LEFTSHIFT
-                        | Key::KEY_RIGHTSHIFT
+                    Key::KEY_LEFTALT | Key::KEY_RIGHTALT | Key::KEY_LEFTSHIFT | Key::KEY_RIGHTSHIFT
                 ) && self.is_alt_pressed()
                     && self.is_shift_pressed()
             }
             LayoutSwitchCombo::CapsLock => key == Key::KEY_CAPSLOCK,
-            LayoutSwitchCombo::CtrlSpace => {
-                key == Key::KEY_SPACE && self.is_ctrl_pressed()
-            }
-            LayoutSwitchCombo::SuperSpace => {
-                key == Key::KEY_SPACE && self.is_meta_pressed()
-            }
+            LayoutSwitchCombo::CtrlSpace => key == Key::KEY_SPACE && self.is_ctrl_pressed(),
+            LayoutSwitchCombo::SuperSpace => key == Key::KEY_SPACE && self.is_meta_pressed(),
             LayoutSwitchCombo::LeftCtrlLeftShift => {
                 matches!(key, Key::KEY_LEFTCTRL | Key::KEY_LEFTSHIFT)
                     && self.left_ctrl
@@ -206,6 +215,20 @@ impl ModifierState {
                     && self.right_alt
                     && self.right_shift
             }
+        }
+    }
+
+    pub fn keeps_layout_switch_combo_active(&self, combo: LayoutSwitchCombo) -> bool {
+        match combo {
+            LayoutSwitchCombo::CtrlShift => self.is_ctrl_pressed() && self.is_shift_pressed(),
+            LayoutSwitchCombo::AltShift => self.is_alt_pressed() && self.is_shift_pressed(),
+            LayoutSwitchCombo::CapsLock => false,
+            LayoutSwitchCombo::CtrlSpace => self.is_ctrl_pressed(),
+            LayoutSwitchCombo::SuperSpace => self.is_meta_pressed(),
+            LayoutSwitchCombo::LeftCtrlLeftShift => self.left_ctrl && self.left_shift,
+            LayoutSwitchCombo::RightCtrlRightShift => self.right_ctrl && self.right_shift,
+            LayoutSwitchCombo::LeftAltLeftShift => self.left_alt && self.left_shift,
+            LayoutSwitchCombo::RightAltRightShift => self.right_alt && self.right_shift,
         }
     }
 
@@ -250,13 +273,18 @@ impl KeyboardController {
 
         let virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
         let pointer_watcher = PointerWatcher::spawn(pointer_paths);
+        let input_target_watcher = InputTargetWatcher::spawn();
 
         println!("[OK] Open-Switcher запущен.");
-        log_input_debug("grab-acquired", "keyboard grab established at controller startup");
+        log_input_debug(
+            "grab-acquired",
+            "keyboard grab established at controller startup",
+        );
 
         Ok(Self {
             real_device,
             pointer_watcher,
+            input_target_watcher,
             virtual_device,
         })
     }
@@ -269,9 +297,14 @@ impl KeyboardController {
         self.pointer_watcher.take_click_invalidation()
     }
 
+    pub fn take_input_target_invalidation(&self) -> bool {
+        self.input_target_watcher.take_change_invalidation()
+    }
+
     pub fn shutdown(&mut self) {
         self.virtual_device.stop();
         self.pointer_watcher.stop();
+        self.input_target_watcher.stop();
         if let Err(error) = self.real_device.release_grab() {
             log_input_debug("grab-release-error", &format!("error={error}"));
             eprintln!("[input] Не удалось освободить grab клавиатуры: {error}");
@@ -299,7 +332,10 @@ impl KeyboardController {
             .apply_correction(plan.clone(), config.clone(), modifiers)
     }
 
-    pub fn selection_transport(&self, modifiers: SharedModifierState) -> SelectionKeyboardTransport {
+    pub fn selection_transport(
+        &self,
+        modifiers: SharedModifierState,
+    ) -> SelectionKeyboardTransport {
         SelectionKeyboardTransport {
             virtual_device: self.virtual_device.handle(),
             modifiers,
@@ -357,7 +393,10 @@ impl Drop for GrabbedKeyboardDevice {
         match self.device.ungrab() {
             Ok(()) => log_input_debug("grab-released", "keyboard grab released in Drop"),
             Err(error) => {
-                log_input_debug("grab-release-error", &format!("during_drop=true error={error}"));
+                log_input_debug(
+                    "grab-release-error",
+                    &format!("during_drop=true error={error}"),
+                );
                 eprintln!("[input] Не удалось освободить grab клавиатуры в Drop: {error}");
             }
         }
@@ -393,20 +432,25 @@ impl PointerWatcher {
                 while index < devices.len() {
                     let mut remove_device = false;
                     let device = &mut devices[index];
-                    let device_name = device.name().unwrap_or("unknown").to_string();
+                    let device_name = device.device.name().unwrap_or("unknown").to_string();
                     loop {
-                        match device.fetch_events() {
+                        match device.device.fetch_events() {
                             Ok(events) => {
                                 let mut had_events = false;
                                 for event in events {
                                     had_events = true;
                                     if let evdev::InputEventKind::Key(key) = event.kind() {
-                                        if is_pointer_click(key) && event.value() == 1 {
+                                        if is_pointer_click(key)
+                                            && event.value() == 1
+                                            && device.pressed_buttons.insert(key)
+                                        {
                                             worker_click_flag.store(true, Ordering::SeqCst);
                                             log_input_debug(
                                                 "pointer-click",
                                                 &format!("device={device_name} key={key:?}"),
                                             );
+                                        } else if is_pointer_click(key) && event.value() == 0 {
+                                            device.pressed_buttons.remove(&key);
                                         }
                                     }
                                 }
@@ -459,6 +503,93 @@ impl PointerWatcher {
     }
 }
 
+impl InputTargetWatcher {
+    fn spawn() -> Self {
+        let changed_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let Ok(mut monitor) = ActiveWindowMonitor::connect() else {
+            log_input_debug(
+                "input-target-watcher-disabled",
+                "reason=x11-active-window-unavailable",
+            );
+            return Self {
+                changed_flag,
+                stop_flag,
+                handle: None,
+            };
+        };
+
+        let worker_changed_flag = Arc::clone(&changed_flag);
+        let worker_stop_flag = Arc::clone(&stop_flag);
+        let handle = thread::spawn(move || {
+            log_input_debug(
+                "input-target-watcher-start",
+                &format!(
+                    "source=_NET_ACTIVE_WINDOW initial_window={}",
+                    format_x11_window(monitor.current_window)
+                ),
+            );
+
+            while !worker_stop_flag.load(Ordering::SeqCst) {
+                let mut had_events = false;
+
+                loop {
+                    match monitor.poll_change() {
+                        Ok(Some((previous_window, current_window))) => {
+                            had_events = true;
+                            worker_changed_flag.store(true, Ordering::SeqCst);
+                            log_input_debug(
+                                "input-target-changed",
+                                &format!(
+                                    "source=_NET_ACTIVE_WINDOW previous={} current={}",
+                                    format_x11_window(previous_window),
+                                    format_x11_window(current_window)
+                                ),
+                            );
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            log_input_debug(
+                                "input-target-read-error",
+                                &format!("source=_NET_ACTIVE_WINDOW error={error}"),
+                            );
+                            log_input_debug(
+                                "input-target-watcher-stop",
+                                "reason=watcher-error",
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                if !had_events {
+                    thread::sleep(INPUT_TARGET_POLL_INTERVAL);
+                }
+            }
+
+            log_input_debug("input-target-watcher-stop", "reason=shutdown");
+        });
+
+        Self {
+            changed_flag,
+            stop_flag,
+            handle: Some(handle),
+        }
+    }
+
+    fn take_change_invalidation(&self) -> bool {
+        self.changed_flag.swap(false, Ordering::SeqCst)
+    }
+
+    fn stop(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl VirtualKeyboardWriter {
     fn new(name: &str) -> Result<Self, SwitcherError> {
         let device = create_virtual_keyboard(name)?;
@@ -489,7 +620,9 @@ impl VirtualKeyboardWriter {
                         "unknown panic payload"
                     };
                     log_input_debug("writer-panic", &format!("reason={reason}"));
-                    eprintln!("[input] Writer path виртуальной клавиатуры аварийно завершился: {reason}");
+                    eprintln!(
+                        "[input] Writer path виртуальной клавиатуры аварийно завершился: {reason}"
+                    );
                 }
             }
 
@@ -586,7 +719,10 @@ impl VirtualKeyboardHandle {
         let mut yielded = false;
 
         loop {
-            match self.command_tx.try_send(WriterCommand::Fast(command.clone())) {
+            match self
+                .command_tx
+                .try_send(WriterCommand::Fast(command.clone()))
+            {
                 Ok(()) => {
                     if yielded {
                         log_input_debug(
@@ -635,6 +771,93 @@ impl Drop for PointerWatcher {
     }
 }
 
+impl Drop for InputTargetWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl ActiveWindowMonitor {
+    fn connect() -> io::Result<Self> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
+
+        let (conn, screen_num) =
+            x11rb::connect(None).map_err(|error| io::Error::other(error.to_string()))?;
+        let root = conn.setup().roots[screen_num].root;
+        let active_window_atom = conn
+            .intern_atom(false, b"_NET_ACTIVE_WINDOW")
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .reply()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .atom;
+
+        conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::default().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?
+        .check()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        conn.flush()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        let current_window = Self::query_active_window(&conn, root, active_window_atom)?;
+        Ok(Self {
+            conn,
+            root,
+            active_window_atom,
+            current_window,
+        })
+    }
+
+    fn poll_change(&mut self) -> io::Result<Option<(Option<u32>, Option<u32>)>> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::Event;
+
+        loop {
+            let Some(event) = self
+                .conn
+                .poll_for_event()
+                .map_err(|error| io::Error::other(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+
+            match event {
+                Event::PropertyNotify(property)
+                    if property.window == self.root && property.atom == self.active_window_atom =>
+                {
+                    let previous_window = self.current_window;
+                    let current_window =
+                        Self::query_active_window(&self.conn, self.root, self.active_window_atom)?;
+                    if current_window != previous_window {
+                        self.current_window = current_window;
+                        return Ok(Some((previous_window, current_window)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn query_active_window(
+        conn: &x11rb::rust_connection::RustConnection,
+        root: u32,
+        active_window_atom: u32,
+    ) -> io::Result<Option<u32>> {
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
+
+        let reply = conn
+            .get_property(false, root, active_window_atom, AtomEnum::WINDOW, 0, 1)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .reply()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+
+        Ok(reply.value32().and_then(|mut values| values.next()))
+    }
+}
+
 fn configured_keyboard_path() -> Option<PathBuf> {
     let raw = env::var_os(KEYBOARD_PATH_ENV)?;
     if raw.is_empty() {
@@ -644,7 +867,7 @@ fn configured_keyboard_path() -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
-fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<Device> {
+fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<PointerDeviceState> {
     let mut devices = Vec::new();
 
     for path in paths {
@@ -652,7 +875,10 @@ fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<Device> {
             continue;
         };
         if set_nonblocking(&device).is_ok() {
-            devices.push(device);
+            devices.push(PointerDeviceState {
+                device,
+                pressed_buttons: HashSet::new(),
+            });
         }
     }
 
@@ -746,38 +972,6 @@ pub fn undo_key_to_evdev_key(key: UndoKey) -> Key {
     }
 }
 
-fn layout_switch_combo_sequence(
-    combo: LayoutSwitchCombo,
-) -> (
-    &'static [uinput::event::keyboard::Key],
-    Option<&'static uinput::event::keyboard::Key>,
-) {
-    use uinput::event::keyboard::Key;
-
-    static CTRL_SHIFT: [Key; 2] = [Key::LeftControl, Key::LeftShift];
-    static ALT_SHIFT: [Key; 2] = [Key::LeftAlt, Key::LeftShift];
-    static CTRL_SPACE: [Key; 1] = [Key::LeftControl];
-    static SUPER_SPACE: [Key; 1] = [Key::LeftMeta];
-    static LEFT_CTRL_LEFT_SHIFT: [Key; 2] = [Key::LeftControl, Key::LeftShift];
-    static RIGHT_CTRL_RIGHT_SHIFT: [Key; 2] = [Key::RightControl, Key::RightShift];
-    static LEFT_ALT_LEFT_SHIFT: [Key; 2] = [Key::LeftAlt, Key::LeftShift];
-    static RIGHT_ALT_RIGHT_SHIFT: [Key; 2] = [Key::RightAlt, Key::RightShift];
-    static SPACE: Key = Key::Space;
-    static CAPS_LOCK: Key = Key::CapsLock;
-
-    match combo {
-        LayoutSwitchCombo::CtrlShift => (&CTRL_SHIFT, None),
-        LayoutSwitchCombo::AltShift => (&ALT_SHIFT, None),
-        LayoutSwitchCombo::CapsLock => (&[], Some(&CAPS_LOCK)),
-        LayoutSwitchCombo::CtrlSpace => (&CTRL_SPACE, Some(&SPACE)),
-        LayoutSwitchCombo::SuperSpace => (&SUPER_SPACE, Some(&SPACE)),
-        LayoutSwitchCombo::LeftCtrlLeftShift => (&LEFT_CTRL_LEFT_SHIFT, None),
-        LayoutSwitchCombo::RightCtrlRightShift => (&RIGHT_CTRL_RIGHT_SHIFT, None),
-        LayoutSwitchCombo::LeftAltLeftShift => (&LEFT_ALT_LEFT_SHIFT, None),
-        LayoutSwitchCombo::RightAltRightShift => (&RIGHT_ALT_RIGHT_SHIFT, None),
-    }
-}
-
 fn find_keyboard() -> Option<PathBuf> {
     for (path, device) in enumerate() {
         let name = device.name().unwrap_or("");
@@ -810,6 +1004,16 @@ fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
         if name.contains("Camera") {
             continue;
         }
+        if is_noisy_virtual_pointer_device(name) {
+            log_input_debug(
+                "pointer-device-ignored",
+                &format!(
+                    "reason=noisy-virtual-pointer path={} name={name}",
+                    path.display()
+                ),
+            );
+            continue;
+        }
 
         let Some(keys) = device.supported_keys() else {
             continue;
@@ -834,6 +1038,17 @@ fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
 fn is_pointer_click(key: Key) -> bool {
     let code = key.code();
     (Key::BTN_LEFT.code()..=Key::BTN_TOOL_DOUBLETAP.code()).contains(&code)
+}
+
+fn is_noisy_virtual_pointer_device(name: &str) -> bool {
+    name.contains("VirtualBox mouse integration")
+}
+
+fn format_x11_window(window: Option<u32>) -> String {
+    match window {
+        Some(window) => format!("0x{window:x}"),
+        None => "none".to_string(),
+    }
 }
 
 impl ModifierState {
@@ -978,56 +1193,46 @@ fn run_shortcut(
     Ok(())
 }
 
-fn run_layout_switch(
-    device: &mut uinput::Device,
-    combo: LayoutSwitchCombo,
-) -> Result<(), SwitcherError> {
-    let (modifiers, trigger_key) = layout_switch_combo_sequence(combo);
-
-    for modifier in modifiers {
-        device.press(modifier)?;
-    }
-
-    if let Some(key) = trigger_key {
-        device.press(key)?;
-    }
-
-    device.synchronize()?;
-    thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
-
-    if let Some(key) = trigger_key {
-        device.release(key)?;
-    }
-
-    for modifier in modifiers.iter().rev() {
-        device.release(modifier)?;
-    }
-
-    device.synchronize()?;
-    Ok(())
-}
+use crate::daemon::layout_switcher::{LayoutSwitcher, UinputLayoutSwitcher, X11LayoutSwitcher};
 
 fn run_correction(
     device: &mut uinput::Device,
     plan: &CorrectionPlan,
     config: &RuntimeConfigSnapshot,
     modifiers: ModifierState,
+    x11_switcher: &mut Option<X11LayoutSwitcher>,
 ) -> Result<(), SwitcherError> {
     release_modifiers(device, modifiers)?;
     for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
-        device.click(&uinput::event::keyboard::Key::BackSpace)?;
+        device.press(&uinput::event::keyboard::Key::BackSpace)?;
+        device.synchronize()?;
+        thread::sleep(Duration::from_millis(2));
+        device.release(&uinput::event::keyboard::Key::BackSpace)?;
         device.synchronize()?;
         thread::sleep(Duration::from_millis(config.backspace_ms));
     }
 
-    run_layout_switch(device, config.layout_switch_combo)?;
+    if let Some(switcher) = x11_switcher {
+        if let Err(e) = switcher.switch_layout(config.layout_switch_combo) {
+            log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
+            let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
+            uinput_switcher.switch_layout(config.layout_switch_combo)?;
+        }
+    } else {
+        let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
+        uinput_switcher.switch_layout(config.layout_switch_combo)?;
+    }
     thread::sleep(Duration::from_millis(config.layout_delay_ms));
 
     for stroke in &plan.buffer {
         if stroke.shift {
             device.press(&uinput::event::keyboard::Key::LeftShift)?;
+            device.synchronize()?;
+            thread::sleep(Duration::from_millis(1));
         }
         device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 1)?;
+        device.synchronize()?;
+        thread::sleep(Duration::from_millis(2));
         device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
         if stroke.shift {
             device.release(&uinput::event::keyboard::Key::LeftShift)?;
@@ -1037,7 +1242,10 @@ fn run_correction(
     }
 
     if plan.extra_backspaces > 0 {
-        device.click(&uinput::event::keyboard::Key::Space)?;
+        device.press(&uinput::event::keyboard::Key::Space)?;
+        device.synchronize()?;
+        thread::sleep(Duration::from_millis(2));
+        device.release(&uinput::event::keyboard::Key::Space)?;
         device.synchronize()?;
     }
 
@@ -1049,6 +1257,16 @@ fn run_virtual_keyboard_writer_loop(
     mut device: uinput::Device,
     command_rx: mpsc::Receiver<WriterCommand>,
 ) -> Result<(), SwitcherError> {
+    let mut x11_switcher = X11LayoutSwitcher::new().ok();
+    if x11_switcher.is_some() {
+        log_input_debug("x11-layout-switcher", "successfully initialized");
+    } else {
+        log_input_debug(
+            "x11-layout-switcher",
+            "failed to initialize, falling back to uinput",
+        );
+    }
+
     for command in command_rx {
         match command {
             WriterCommand::Shutdown => break,
@@ -1059,6 +1277,8 @@ fn run_virtual_keyboard_writer_loop(
                 }
                 WriterFastCommand::TypeSeparator { key } => {
                     device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
+                    device.synchronize()?;
+                    thread::sleep(Duration::from_millis(2));
                     device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
                     device.synchronize()?;
                 }
@@ -1070,7 +1290,13 @@ fn run_virtual_keyboard_writer_loop(
                             plan,
                             config,
                             modifiers,
-                        } => run_correction(&mut device, &plan, &config, modifiers),
+                        } => run_correction(
+                            &mut device,
+                            &plan,
+                            &config,
+                            modifiers,
+                            &mut x11_switcher,
+                        ),
                         WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
                             &mut device,
                             modifiers,
@@ -1086,7 +1312,7 @@ fn run_virtual_keyboard_writer_loop(
                     };
                     let _ = reply.send(result);
                 }
-            }
+            },
         }
     }
 

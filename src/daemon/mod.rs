@@ -1,5 +1,6 @@
 pub mod capture;
 pub mod keyboard;
+pub mod layout_switcher;
 pub mod runtime;
 pub mod selected_text;
 pub mod service;
@@ -36,7 +37,9 @@ pub fn run() -> Result<(), SwitcherError> {
         runtime.set_layout_with_reason(!is_russian, "startup-xset-sync");
     } else {
         log_layout_debug("startup-sync", "source=xset failed=true");
-        eprintln!("[layout] Не удалось определить текущую раскладку на старте. Использую cached default.");
+        eprintln!(
+            "[layout] Не удалось определить текущую раскладку на старте. Использую cached default."
+        );
     }
     let dbus_api = OpenSwitcherDbusApi::new(runtime.clone());
 

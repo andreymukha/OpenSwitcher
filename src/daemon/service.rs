@@ -3,9 +3,7 @@ use crate::daemon::keyboard::{
     KeyboardController, ModifierState, SharedModifierState,
 };
 use crate::daemon::runtime::{log_layout_debug, RuntimeState};
-use crate::daemon::selected_text::{
-    log_selected_text_debug, SelectedTextJobRunner,
-};
+use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
 use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
@@ -34,7 +32,9 @@ pub struct DaemonService {
     word_context: WordContext,
     selected_text_runner: SelectedTextJobRunner,
     suppressed_hotkey_key: Option<evdev::Key>,
+    suppressed_undo_key: Option<evdev::Key>,
     suppressed_separator_key: Option<evdev::Key>,
+    layout_shortcut_latched: bool,
     pending_auto_correction_separator: Option<evdev::Key>,
     pending_selected_text_switch: bool,
 }
@@ -56,7 +56,9 @@ impl DaemonService {
             word_context: WordContext::default(),
             selected_text_runner,
             suppressed_hotkey_key: None,
+            suppressed_undo_key: None,
             suppressed_separator_key: None,
+            layout_shortcut_latched: false,
             pending_auto_correction_separator: None,
             pending_selected_text_switch: false,
         })
@@ -68,11 +70,6 @@ impl DaemonService {
         let mut last_heartbeat = Instant::now();
 
         loop {
-            if self.keyboard.take_pointer_click_invalidation() {
-                log_input_debug("pointer-invalidation", "word context invalidated by pointer click");
-                self.invalidate_word_context();
-            }
-
             let events = match self.keyboard.fetch_events() {
                 Ok(events) => events,
                 Err(error) => {
@@ -81,6 +78,22 @@ impl DaemonService {
                     return Err(error);
                 }
             };
+
+            if self.keyboard.take_input_target_invalidation() {
+                log_input_debug(
+                    "input-target-invalidation",
+                    "word context invalidated by active input target change",
+                );
+                self.invalidate_word_context();
+            }
+
+            if self.keyboard.take_pointer_click_invalidation() {
+                log_input_debug(
+                    "pointer-invalidation",
+                    "word context invalidated by pointer click",
+                );
+                self.invalidate_word_context();
+            }
 
             for event in events {
                 if let InputEventKind::Key(key) = event.kind() {
@@ -93,7 +106,7 @@ impl DaemonService {
                         return Err(error);
                     }
                     processed_events += 1;
-                    if processed_events % EVENT_LOOP_HEARTBEAT_EVENTS == 0
+                    if processed_events.is_multiple_of(EVENT_LOOP_HEARTBEAT_EVENTS)
                         || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
                     {
                         log_input_debug(
@@ -122,6 +135,13 @@ impl DaemonService {
                 self.suppressed_hotkey_key = None;
             }
             self.maybe_run_pending_selected_text_switch()?;
+            return Ok(());
+        }
+
+        if self.suppressed_undo_key == Some(key) {
+            if value == 0 {
+                self.suppressed_undo_key = None;
+            }
             return Ok(());
         }
 
@@ -154,16 +174,47 @@ impl DaemonService {
         self.modifiers.update(key, value);
         self.shared_modifiers.store(self.modifiers);
 
+        if self.layout_shortcut_latched
+            && !self
+                .modifiers
+                .keeps_layout_switch_combo_active(config.layout_switch_combo)
+        {
+            self.layout_shortcut_latched = false;
+            log_layout_debug(
+                "layout-shortcut-unlatched",
+                &format!("combo={:?}", config.layout_switch_combo),
+            );
+        }
+
         if value == 1 && self.pending_auto_correction_separator.is_some() && !is_modifier(key) {
             let separator_key = self.pending_auto_correction_separator.take().unwrap();
-            self.suppressed_separator_key = None;
+            // Keep swallowing the physical separator release even if we had to
+            // finish the correction early because the next key arrived first.
+            // Otherwise a late real key-up can leak back into the normal path
+            // after we already replayed the separator virtually.
+            self.suppressed_separator_key = Some(separator_key);
             self.finish_pending_auto_correction(separator_key, &config)?;
+            if key == undo_key_to_evdev_key(config.undo_key) {
+                return Ok(());
+            }
         }
 
         if self
             .modifiers
             .matches_layout_switch_combo(config.layout_switch_combo, key, value)
         {
+            if self.layout_shortcut_latched {
+                log_layout_debug(
+                    "layout-shortcut-repeat-ignored",
+                    &format!(
+                        "combo={:?} key={key:?} value={value}",
+                        config.layout_switch_combo
+                    ),
+                );
+                return Ok(());
+            }
+
+            self.layout_shortcut_latched = true;
             log_layout_debug(
                 "observed-layout-shortcut",
                 &format!(
@@ -172,13 +223,15 @@ impl DaemonService {
                     self.modifiers.is_shift_pressed(),
                     self.modifiers.is_ctrl_pressed(),
                     self.modifiers.is_alt_pressed(),
-                    if self.runtime.current_layout() { "EN" } else { "RU" }
+                    if self.runtime.current_layout() {
+                        "EN"
+                    } else {
+                        "RU"
+                    }
                 ),
             );
-            self.runtime.set_layout_with_reason(
-                !self.runtime.current_layout(),
-                "user-layout-shortcut",
-            );
+            self.runtime
+                .set_layout_with_reason(!self.runtime.current_layout(), "user-layout-shortcut");
             self.publish_status_changed()?;
             self.invalidate_word_context();
         }
@@ -198,7 +251,7 @@ impl DaemonService {
             return Ok(());
         }
 
-        if value != 1 {
+        if value == 0 {
             let result = self.keyboard.forward_event(key, value);
             if result.is_ok() {
                 self.maybe_run_pending_selected_text_switch()?;
@@ -206,19 +259,18 @@ impl DaemonService {
             return result;
         }
 
-        if key == undo_key_to_evdev_key(config.undo_key) {
+        if value == 1 && key == undo_key_to_evdev_key(config.undo_key) {
+            self.suppressed_undo_key = Some(key);
             let word_before_cursor = if self.can_correct_word_before_cursor() {
                 self.word_context.word_before_cursor.clone()
             } else {
                 Vec::new()
             };
             let used_current_buffer = !self.buffer.is_empty();
-            if self.apply_manual_correction(&config, &word_before_cursor)? {
-                if used_current_buffer {
-                    self.word_context.valid = true;
-                    self.word_context.word_before_cursor.clear();
-                    self.word_context.followed_by_separator = false;
-                }
+            if self.apply_manual_correction(&config, &word_before_cursor)? && used_current_buffer {
+                self.word_context.valid = true;
+                self.word_context.word_before_cursor.clear();
+                self.word_context.followed_by_separator = false;
             }
             return Ok(());
         }
@@ -226,9 +278,8 @@ impl DaemonService {
         match key {
             evdev::Key::KEY_SPACE => {
                 let is_russian = !self.runtime.current_layout();
-                let corrected = self.runtime.is_enabled()
-                    && !is_russian
-                    && should_switch(&self.buffer);
+                let corrected =
+                    self.runtime.is_enabled() && !is_russian && should_switch(&self.buffer);
 
                 if corrected {
                     self.suppressed_separator_key = Some(key);
@@ -240,11 +291,11 @@ impl DaemonService {
                 self.word_context.word_before_cursor = self.buffer.clone();
                 self.word_context.followed_by_separator = true;
                 self.buffer.clear();
-                self.keyboard.forward_event(key, 1)
+                self.keyboard.forward_event(key, value)
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
                 self.invalidate_word_context();
-                self.keyboard.forward_event(key, 1)
+                self.keyboard.forward_event(key, value)
             }
             evdev::Key::KEY_BACKSPACE => {
                 if !self.buffer.is_empty() {
@@ -253,7 +304,7 @@ impl DaemonService {
                     self.buffer = self.word_context.word_before_cursor.clone();
                     self.word_context.followed_by_separator = false;
                 }
-                self.keyboard.forward_event(key, 1)
+                self.keyboard.forward_event(key, value)
             }
             _ => {
                 let plain_character_input = is_character(key)
@@ -262,15 +313,20 @@ impl DaemonService {
                     && !self.modifiers.is_meta_pressed();
 
                 if plain_character_input {
+                    // Once we are typing the current word again, the cursor is no longer
+                    // "after a finished word". Keep only the active buffer state.
                     self.word_context.valid = true;
-                    self.buffer.push(Keystroke {
+                    self.word_context.followed_by_separator = false;
+                    self.word_context.word_before_cursor.clear();
+                    let stroke = Keystroke {
                         key,
                         shift: self.modifiers.is_shift_pressed(),
-                    });
+                    };
+                    self.buffer.push(stroke);
                 } else if !is_modifier(key) {
                     self.invalidate_word_context();
                 }
-                let result = self.keyboard.forward_event(key, 1);
+                let result = self.keyboard.forward_event(key, value);
                 if result.is_ok() {
                     self.maybe_run_pending_selected_text_switch()?;
                 }
@@ -332,9 +388,7 @@ impl DaemonService {
         ) else {
             return Ok(false);
         };
-
-        self.keyboard
-            .apply_correction(&plan, config, self.modifiers)?;
+        self.keyboard.apply_correction(&plan, config, self.modifiers)?;
         match is_russian_layout() {
             Ok(is_russian) => {
                 log_layout_debug(
@@ -349,8 +403,10 @@ impl DaemonService {
                     "manual-correction-sync",
                     &format!("source=xset failed=true error={error}"),
                 );
-                self.runtime
-                    .set_layout_with_reason(!self.runtime.current_layout(), "manual-correction-fallback-toggle");
+                self.runtime.set_layout_with_reason(
+                    !self.runtime.current_layout(),
+                    "manual-correction-fallback-toggle",
+                );
             }
         }
         self.publish_status_changed()?;
@@ -363,7 +419,11 @@ impl DaemonService {
             &format!(
                 "enabled={} current_layout={}",
                 self.runtime.is_enabled(),
-                if self.runtime.current_layout() { "EN" } else { "RU" }
+                if self.runtime.current_layout() {
+                    "EN"
+                } else {
+                    "RU"
+                }
             ),
         );
         emit_status_changed(&self.connection, &self.runtime)?;

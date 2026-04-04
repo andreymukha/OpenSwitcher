@@ -27,7 +27,10 @@ impl SelectedTextJobRunner {
             let service = SelectedTextSwitchService::default();
 
             for () in command_rx {
-                log_input_debug("selected-text-worker-job-start", "worker received selected-text job");
+                log_input_debug(
+                    "selected-text-worker-job-start",
+                    "worker received selected-text job",
+                );
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
                     service.switch_selected_text(&mut transport)
                 }));
@@ -35,7 +38,10 @@ impl SelectedTextJobRunner {
                 match result {
                     Ok(result) => {
                         log_selected_text_job_result(&result);
-                        log_input_debug("selected-text-worker-job-finish", "worker completed selected-text job");
+                        log_input_debug(
+                            "selected-text-worker-job-finish",
+                            "worker completed selected-text job",
+                        );
                     }
                     Err(payload) => {
                         let reason = if let Some(text) = payload.downcast_ref::<&str>() {

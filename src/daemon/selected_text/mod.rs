@@ -8,9 +8,9 @@ use crate::error::SwitcherError;
 use clipboard::{SelectedTextOperation, SystemClipboard};
 use engine::LayoutConversionEngine;
 
-pub use engine::ConversionDirection;
 pub(crate) use debug::log_selected_text_debug;
 pub(crate) use debug::summarize_text;
+pub use engine::ConversionDirection;
 pub use runner::SelectedTextJobRunner;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +34,7 @@ impl SelectedTextSwitchService {
         transport: &mut SelectionKeyboardTransport,
     ) -> Result<SelectedTextSwitchResult, SwitcherError> {
         let mut clipboard = SystemClipboard::new()?;
-        self.operation.execute(&mut clipboard, transport, &self.converter)
+        self.operation
+            .execute(&mut clipboard, transport, &self.converter)
     }
 }

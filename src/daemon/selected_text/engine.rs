@@ -19,10 +19,7 @@ pub(super) struct LayoutConversionEngine;
 impl LayoutConversionEngine {
     pub(super) fn convert_selected_text(&self, text: &str) -> ConversionOutcome {
         let segments = segment_text(text);
-        log_selected_text_debug(
-            "segment-start",
-            &format!("input={}", summarize_text(text)),
-        );
+        log_selected_text_debug("segment-start", &format!("input={}", summarize_text(text)));
         log_selected_text_debug(
             "segment-list",
             &format!("segments={}", summarize_segments(&segments)),
@@ -176,7 +173,10 @@ struct SegmentEvaluation {
 }
 
 fn evaluate_segment_conversion(segment: &str) -> SegmentEvaluation {
-    let latin_letter_count = segment.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let latin_letter_count = segment
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
     let cyrillic_letter_count = segment.chars().filter(|ch| is_cyrillic_letter(*ch)).count();
 
     let (direction, reason) = if cyrillic_letter_count > latin_letter_count {
@@ -206,7 +206,10 @@ fn summarize_segments(segments: &[Segment<'_>]) -> String {
         .join(" | ")
 }
 
-fn next_text_direction(segments: &[Segment<'_>], start_index: usize) -> Option<ConversionDirection> {
+fn next_text_direction(
+    segments: &[Segment<'_>],
+    start_index: usize,
+) -> Option<ConversionDirection> {
     for segment in &segments[start_index..] {
         if segment.kind == SegmentKind::Text {
             return Some(evaluate_segment_conversion(segment.text).direction);

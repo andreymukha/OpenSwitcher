@@ -14,12 +14,50 @@ use zbus::blocking::Connection;
 
 const EVENT_LOOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_LOOP_HEARTBEAT_EVENTS: u64 = 500;
+const STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS: u8 = 3;
 
 #[derive(Default)]
 struct WordContext {
     valid: bool,
     word_before_cursor: Vec<Keystroke>,
     followed_by_separator: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupLayoutResyncState {
+    Pending { attempts_remaining: u8 },
+    Completed,
+    Exhausted,
+}
+
+impl StartupLayoutResyncState {
+    fn pending() -> Self {
+        Self::Pending {
+            attempts_remaining: STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS,
+        }
+    }
+
+    fn is_pending(self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
+
+    fn complete(&mut self) {
+        *self = Self::Completed;
+    }
+
+    fn record_failure(&mut self) -> u8 {
+        match self {
+            Self::Pending { attempts_remaining } if *attempts_remaining > 1 => {
+                *attempts_remaining -= 1;
+                *attempts_remaining
+            }
+            Self::Pending { .. } => {
+                *self = Self::Exhausted;
+                0
+            }
+            Self::Completed | Self::Exhausted => 0,
+        }
+    }
 }
 
 pub struct DaemonService {
@@ -37,6 +75,7 @@ pub struct DaemonService {
     layout_shortcut_latched: bool,
     pending_auto_correction_separator: Option<evdev::Key>,
     pending_selected_text_switch: bool,
+    startup_layout_resync: StartupLayoutResyncState,
 }
 
 impl DaemonService {
@@ -61,6 +100,7 @@ impl DaemonService {
             layout_shortcut_latched: false,
             pending_auto_correction_separator: None,
             pending_selected_text_switch: false,
+            startup_layout_resync: StartupLayoutResyncState::pending(),
         })
     }
 
@@ -232,6 +272,7 @@ impl DaemonService {
             );
             self.runtime
                 .set_layout_with_reason(!self.runtime.current_layout(), "user-layout-shortcut");
+            self.startup_layout_resync.complete();
             self.publish_status_changed()?;
             self.invalidate_word_context();
         }
@@ -277,6 +318,7 @@ impl DaemonService {
 
         match key {
             evdev::Key::KEY_SPACE => {
+                self.refresh_startup_layout_before_autocorrect()?;
                 let is_russian = !self.runtime.current_layout();
                 let corrected =
                     self.runtime.is_enabled() && !is_russian && should_switch(&self.buffer);
@@ -388,7 +430,8 @@ impl DaemonService {
         ) else {
             return Ok(false);
         };
-        self.keyboard.apply_correction(&plan, config, self.modifiers)?;
+        self.keyboard
+            .apply_correction(&plan, config, self.modifiers)?;
         match is_russian_layout() {
             Ok(is_russian) => {
                 log_layout_debug(
@@ -409,6 +452,7 @@ impl DaemonService {
                 );
             }
         }
+        self.startup_layout_resync.complete();
         self.publish_status_changed()?;
         Ok(true)
     }
@@ -442,6 +486,99 @@ impl DaemonService {
             && self.buffer.is_empty()
             && self.word_context.followed_by_separator
             && !self.word_context.word_before_cursor.is_empty()
+    }
+
+    fn refresh_startup_layout_before_autocorrect(&mut self) -> Result<(), SwitcherError> {
+        if !self.startup_layout_resync.is_pending() {
+            return Ok(());
+        }
+
+        match is_russian_layout() {
+            Ok(is_russian) => {
+                self.startup_layout_resync.complete();
+                log_layout_debug(
+                    "startup-resync",
+                    &format!("source=xset is_russian={is_russian}"),
+                );
+                let layout_is_english = !is_russian;
+                if self.runtime.current_layout() != layout_is_english {
+                    self.runtime.set_layout_with_reason(
+                        layout_is_english,
+                        "startup-first-input-xset-resync",
+                    );
+                    self.publish_status_changed()?;
+                }
+            }
+            Err(error) => {
+                let attempts_remaining = self.startup_layout_resync.record_failure();
+                log_layout_debug(
+                    "startup-resync",
+                    &format!(
+                        "source=xset failed=true error={error} attempts_remaining={attempts_remaining}"
+                    ),
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_layout_resync_starts_pending() {
+        let state = StartupLayoutResyncState::pending();
+
+        assert_eq!(
+            state,
+            StartupLayoutResyncState::Pending {
+                attempts_remaining: STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS,
+            }
+        );
+        assert!(state.is_pending());
+    }
+
+    #[test]
+    fn startup_layout_resync_failures_decrement_until_exhausted() {
+        let mut state = StartupLayoutResyncState::pending();
+
+        assert_eq!(
+            state.record_failure(),
+            STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS - 1
+        );
+        assert_eq!(
+            state,
+            StartupLayoutResyncState::Pending {
+                attempts_remaining: STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS - 1,
+            }
+        );
+
+        assert_eq!(state.record_failure(), 1);
+        assert_eq!(
+            state,
+            StartupLayoutResyncState::Pending {
+                attempts_remaining: 1,
+            }
+        );
+
+        assert_eq!(state.record_failure(), 0);
+        assert_eq!(state, StartupLayoutResyncState::Exhausted);
+        assert!(!state.is_pending());
+    }
+
+    #[test]
+    fn startup_layout_resync_completion_stops_future_retries() {
+        let mut state = StartupLayoutResyncState::pending();
+
+        state.complete();
+
+        assert_eq!(state, StartupLayoutResyncState::Completed);
+        assert!(!state.is_pending());
+        assert_eq!(state.record_failure(), 0);
+        assert_eq!(state, StartupLayoutResyncState::Completed);
     }
 }
 

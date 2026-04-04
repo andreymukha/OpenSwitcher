@@ -554,10 +554,7 @@ impl InputTargetWatcher {
                                 "input-target-read-error",
                                 &format!("source=_NET_ACTIVE_WINDOW error={error}"),
                             );
-                            log_input_debug(
-                                "input-target-watcher-stop",
-                                "reason=watcher-error",
-                            );
+                            log_input_debug("input-target-watcher-stop", "reason=watcher-error");
                             return;
                         }
                     }

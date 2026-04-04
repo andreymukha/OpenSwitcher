@@ -197,9 +197,9 @@ fn wait_for_copied_text(
                 );
                 let should_ignore = elapsed < COPY_MIN_ACCEPT_DELAY || matches_previous;
 
-                if should_ignore {
-                    if is_new_candidate || attempt == 1 || attempt % 20 == 0 {
-                        log_selected_text_debug(
+                if should_ignore && (is_new_candidate || attempt == 1 || attempt.is_multiple_of(20))
+                {
+                    log_selected_text_debug(
                             "copy-poll-ignore",
                             &format!(
                                 "attempt={attempt} elapsed_ms={} stable_ms={} observed_sentinel={} matches_previous={} text={}",
@@ -210,7 +210,6 @@ fn wait_for_copied_text(
                                 summarize_text(&text)
                             ),
                         );
-                    }
                 }
 
                 if !should_ignore && stable_for >= COPY_CHANGE_STABLE_FOR {
@@ -231,7 +230,7 @@ fn wait_for_copied_text(
                 observed_sentinel = true;
                 candidate_text = None;
                 candidate_changed_at = None;
-                if attempt == 1 || attempt % 20 == 0 {
+                if attempt == 1 || attempt.is_multiple_of(20) {
                     log_selected_text_debug(
                         "copy-poll-wait",
                         &format!(
@@ -242,7 +241,7 @@ fn wait_for_copied_text(
                 }
             }
             Err(error) => {
-                if attempt == 1 || attempt % 20 == 0 {
+                if attempt == 1 || attempt.is_multiple_of(20) {
                     log_selected_text_debug(
                         "copy-poll-error",
                         &format!(
@@ -442,11 +441,7 @@ mod tests {
         let mut transport = TestTransport::default();
 
         let result = operation
-            .execute(
-                &mut clipboard,
-                &mut transport,
-                &converter,
-            )
+            .execute(&mut clipboard, &mut transport, &converter)
             .unwrap();
 
         assert!(transport.copied);
@@ -471,11 +466,7 @@ mod tests {
         let mut transport = TestTransport::default();
 
         let result = operation
-            .execute(
-                &mut clipboard,
-                &mut transport,
-                &converter,
-            )
+            .execute(&mut clipboard, &mut transport, &converter)
             .unwrap();
 
         assert!(transport.copied);
@@ -502,11 +493,7 @@ mod tests {
         let mut transport = TestTransport::default();
 
         let result = operation
-            .execute(
-                &mut clipboard,
-                &mut transport,
-                &converter,
-            )
+            .execute(&mut clipboard, &mut transport, &converter)
             .unwrap();
 
         assert!(transport.copied);
@@ -539,11 +526,7 @@ mod tests {
         let mut transport = TestTransport::default();
 
         let result = operation
-            .execute(
-                &mut clipboard,
-                &mut transport,
-                &converter,
-            )
+            .execute(&mut clipboard, &mut transport, &converter)
             .unwrap();
 
         assert_eq!(
@@ -575,11 +558,7 @@ mod tests {
         let mut transport = TestTransport::default();
 
         let result = operation
-            .execute(
-                &mut clipboard,
-                &mut transport,
-                &converter,
-            )
+            .execute(&mut clipboard, &mut transport, &converter)
             .unwrap();
 
         assert_eq!(

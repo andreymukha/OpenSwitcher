@@ -461,7 +461,9 @@ impl RuntimeState {
     }
 
     pub fn set_layout_with_reason(&self, layout_is_english: bool, reason: &str) {
-        let previous = self.layout_is_english.swap(layout_is_english, Ordering::SeqCst);
+        let previous = self
+            .layout_is_english
+            .swap(layout_is_english, Ordering::SeqCst);
         log_layout_debug(
             "set-layout",
             &format!(

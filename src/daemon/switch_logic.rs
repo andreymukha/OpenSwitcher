@@ -121,8 +121,8 @@ fn is_likely_english(word: &str) -> bool {
     }
 
     let common_english_bigrams = [
-        "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "se", "ed", "te", "st",
-        "el", "le", "ti", "io", "ou", "ll", "oo",
+        "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "se", "ed", "te", "st", "el",
+        "le", "ti", "io", "ou", "ll", "oo",
     ];
     let common_english_suffixes = ["ed", "ing", "tion", "ment", "ly", "er", "est"];
 

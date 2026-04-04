@@ -1,5 +1,5 @@
-use crate::daemon::runtime::RuntimeState;
 use crate::daemon::runtime::log_layout_debug;
+use crate::daemon::runtime::RuntimeState;
 use crate::error::{DbusError, SettingsError};
 use crate::model::{LayoutSwitchCaptureState, Settings, SettingsDto, UpdateSettingsResult};
 use std::sync::Arc;

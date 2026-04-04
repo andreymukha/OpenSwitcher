@@ -10,8 +10,10 @@ pub const LAYOUT_DELAY_MAX_MS: u32 = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
+#[derive(Default)]
 pub enum UndoKey {
     #[serde(rename = "Pause")]
+    #[default]
     Pause,
     #[serde(rename = "F12")]
     F12,
@@ -33,8 +35,10 @@ impl UndoKey {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
+#[derive(Default)]
 pub enum SelectedTextHotkey {
     #[serde(rename = "ShiftPause")]
+    #[default]
     ShiftPause,
     #[serde(rename = "CtrlPause")]
     CtrlPause,
@@ -233,18 +237,6 @@ impl LayoutSwitchCombo {
             Self::LeftAltLeftShift => "grp:lalt_lshift_toggle",
             Self::RightAltRightShift => "grp:ralt_rshift_toggle",
         }
-    }
-}
-
-impl Default for UndoKey {
-    fn default() -> Self {
-        Self::Pause
-    }
-}
-
-impl Default for SelectedTextHotkey {
-    fn default() -> Self {
-        Self::ShiftPause
     }
 }
 

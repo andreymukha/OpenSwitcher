@@ -1004,16 +1004,6 @@ fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
         if name.contains("Camera") {
             continue;
         }
-        if is_noisy_virtual_pointer_device(name) {
-            log_input_debug(
-                "pointer-device-ignored",
-                &format!(
-                    "reason=noisy-virtual-pointer path={} name={name}",
-                    path.display()
-                ),
-            );
-            continue;
-        }
 
         let Some(keys) = device.supported_keys() else {
             continue;
@@ -1038,10 +1028,6 @@ fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
 fn is_pointer_click(key: Key) -> bool {
     let code = key.code();
     (Key::BTN_LEFT.code()..=Key::BTN_TOOL_DOUBLETAP.code()).contains(&code)
-}
-
-fn is_noisy_virtual_pointer_device(name: &str) -> bool {
-    name.contains("VirtualBox mouse integration")
 }
 
 fn format_x11_window(window: Option<u32>) -> String {

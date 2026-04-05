@@ -1,6 +1,12 @@
 use crate::config::AppConfig;
 use crate::daemon::capture::LayoutSwitchCaptureSession;
 use crate::error::{CaptureError, ConfigError, SettingsError};
+use crate::layout_backend::{
+    compatibility_from_setup, feature_availability_for, legacy_backend_factory,
+    legacy_current_layout_bool, legacy_layout_state_from_bool, BackendCapabilities,
+    CurrentLayoutState, FeatureAvailability, LayoutBackend, LayoutBackendRegistry,
+    LayoutBackendRegistryResult, LayoutCompatibility, LayoutSetup,
+};
 use crate::layout_switch::{
     failed_detection_fallback, DesktopSettingsReader, LayoutSwitchAutoDetector,
 };
@@ -15,10 +21,13 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 
 const LAYOUT_DEBUG_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG";
 const LAYOUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG_FILE";
+const BACKGROUND_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
@@ -144,10 +153,15 @@ impl ConfigService {
 mod tests {
     use super::*;
     use crate::error::LayoutAutoDetectError;
+    use crate::layout_backend::{
+        AppLayoutKind, BackendCapabilities, CurrentLayoutState, LayoutBackendError,
+        LayoutBackendOperation, LayoutCode, LayoutStateSink, SystemLayout,
+    };
     use crate::model::{
         AutoDetectedLayoutSwitch, DesktopEnvironment, DetectionConfidence, DetectionStrategy,
         DistroKind, LayoutSwitchSetting, LayoutSwitchSource, SessionType,
     };
+    use std::io;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -209,6 +223,122 @@ mod tests {
             session_type: SessionType::Wayland,
             desktop_environment: DesktopEnvironment::Gnome,
             distro: DistroKind::Ubuntu,
+        }
+    }
+
+    enum SnapshotOutcome {
+        State(CurrentLayoutState),
+        Error,
+    }
+
+    struct SnapshotBackend {
+        snapshot: SnapshotOutcome,
+    }
+
+    impl LayoutBackend for SnapshotBackend {
+        fn id(&self) -> &'static str {
+            "test-backend"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::default()
+        }
+
+        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::DetectSetup,
+            ))
+        }
+
+        fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
+            match &self.snapshot {
+                SnapshotOutcome::State(snapshot) => Ok(snapshot.clone()),
+                SnapshotOutcome::Error => Err(LayoutBackendError::runtime(
+                    self.id(),
+                    LayoutBackendOperation::CurrentLayoutSnapshot,
+                    io::Error::other("backend down"),
+                )),
+            }
+        }
+
+        fn switch_to(
+            &mut self,
+            _target: &crate::layout_backend::SystemLayout,
+        ) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchTo,
+            ))
+        }
+
+        fn switch_next(&mut self) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchNext,
+            ))
+        }
+
+        fn start_monitoring(&mut self, _sink: LayoutStateSink) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::StartMonitoring,
+            ))
+        }
+    }
+
+    fn english_layout() -> SystemLayout {
+        SystemLayout {
+            backend_key: "us".to_string(),
+            normalized_code: LayoutCode::Us,
+            display_name: "English".to_string(),
+            kind: AppLayoutKind::English,
+            index: Some(0),
+        }
+    }
+
+    fn russian_layout() -> SystemLayout {
+        SystemLayout {
+            backend_key: "ru".to_string(),
+            normalized_code: LayoutCode::Ru,
+            display_name: "Russian".to_string(),
+            kind: AppLayoutKind::Russian,
+            index: Some(1),
+        }
+    }
+
+    fn known_layout_state(layout: SystemLayout) -> CurrentLayoutState {
+        CurrentLayoutState::Known {
+            layout,
+            trustworthy: true,
+        }
+    }
+
+    fn test_runtime_with_backend(
+        initial_layout_state: CurrentLayoutState,
+        backend: Box<dyn LayoutBackend>,
+    ) -> RuntimeState {
+        RuntimeState {
+            enabled: AtomicBool::new(true),
+            layout_state: RwLock::new(initial_layout_state),
+            backend: Mutex::new(Some(backend)),
+            layout_setup: RwLock::new(LayoutSetup::Unsupported {
+                reason: "test".to_string(),
+            }),
+            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
+            feature_availability: RwLock::new(FeatureAvailability {
+                auto_switch: false,
+                manual_word_fix: false,
+                selected_text_switch: true,
+                reason: Some("test".to_string()),
+            }),
+            config_service: ConfigService {
+                config_path: PathBuf::from("test-config.toml"),
+                inner: RwLock::new(AppConfig::default()),
+            },
+            capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
+            background_sync_started: AtomicBool::new(false),
+            pending_status_change: AtomicBool::new(false),
         }
     }
 
@@ -423,22 +553,180 @@ undo_key = "Pause"
         let persisted = std::fs::read_to_string(&path).unwrap();
         assert!(persisted.contains("keys = ["));
     }
+
+    #[test]
+    fn sync_with_backend_reports_update_and_replaces_cached_state() {
+        let initial = known_layout_state(english_layout());
+        let expected = known_layout_state(russian_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(expected.clone()),
+            }),
+        );
+
+        let outcome = runtime.sync_with_backend();
+
+        assert_eq!(
+            outcome,
+            BackendSyncResult::Updated {
+                previous: initial,
+                current: expected.clone(),
+            }
+        );
+        assert_eq!(runtime.current_layout_state(), expected);
+    }
+
+    #[test]
+    fn sync_with_backend_reports_unchanged_when_snapshot_matches_cache() {
+        let initial = known_layout_state(english_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(initial.clone()),
+            }),
+        );
+
+        let outcome = runtime.sync_with_backend();
+
+        assert_eq!(outcome, BackendSyncResult::Unchanged);
+        assert_eq!(runtime.current_layout_state(), initial);
+    }
+
+    #[test]
+    fn sync_with_backend_reports_skipped_and_preserves_state_on_backend_error() {
+        let initial = known_layout_state(english_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::Error,
+            }),
+        );
+
+        let outcome = runtime.sync_with_backend();
+
+        assert_eq!(outcome, BackendSyncResult::Skipped);
+        assert_eq!(runtime.current_layout_state(), initial);
+    }
+
+    #[test]
+    fn periodic_sync_tick_delegates_to_backend_sync() {
+        let initial = known_layout_state(english_layout());
+        let expected = known_layout_state(russian_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(expected.clone()),
+            }),
+        );
+
+        let outcome = runtime.periodic_sync_tick();
+
+        assert_eq!(
+            outcome,
+            BackendSyncResult::Updated {
+                previous: initial,
+                current: expected.clone(),
+            }
+        );
+        assert_eq!(runtime.current_layout_state(), expected);
+    }
+
+    #[test]
+    fn background_sync_polling_is_enabled_only_for_non_observing_backends() {
+        assert!(background_sync_polling_enabled(BackendCapabilities {
+            can_read_current_layout: true,
+            can_observe_layout_changes: false,
+            ..Default::default()
+        }));
+
+        assert!(!background_sync_polling_enabled(BackendCapabilities {
+            can_read_current_layout: true,
+            can_observe_layout_changes: true,
+            ..Default::default()
+        }));
+
+        assert!(!background_sync_polling_enabled(BackendCapabilities {
+            can_read_current_layout: false,
+            can_observe_layout_changes: false,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn sync_with_backend_marks_status_change_pending_only_for_updates() {
+        let initial = known_layout_state(english_layout());
+        let expected = known_layout_state(russian_layout());
+        let runtime = test_runtime_with_backend(
+            initial,
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(expected),
+            }),
+        );
+
+        assert!(!runtime.take_pending_status_change());
+        assert!(matches!(
+            runtime.sync_with_backend(),
+            BackendSyncResult::Updated { .. }
+        ));
+        assert!(runtime.take_pending_status_change());
+        assert!(!runtime.take_pending_status_change());
+    }
+
+    #[test]
+    fn unchanged_sync_does_not_mark_status_change_pending() {
+        let initial = known_layout_state(english_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(initial),
+            }),
+        );
+
+        assert_eq!(runtime.sync_with_backend(), BackendSyncResult::Unchanged);
+        assert!(!runtime.take_pending_status_change());
+    }
 }
 
 pub struct RuntimeState {
     enabled: AtomicBool,
-    layout_is_english: AtomicBool,
+    layout_state: RwLock<CurrentLayoutState>,
+    backend: Mutex<Option<Box<dyn LayoutBackend>>>,
+    layout_setup: RwLock<LayoutSetup>,
+    layout_compatibility: RwLock<LayoutCompatibility>,
+    feature_availability: RwLock<FeatureAvailability>,
     config_service: ConfigService,
     capture_session: Mutex<LayoutSwitchCaptureSession>,
+    background_sync_started: AtomicBool,
+    pending_status_change: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendSyncResult {
+    Updated {
+        previous: CurrentLayoutState,
+        current: CurrentLayoutState,
+    },
+    Unchanged,
+    Skipped,
 }
 
 impl RuntimeState {
     pub fn new(config_service: ConfigService) -> Self {
+        let (backend, layout_state, layout_setup, layout_compatibility, feature_availability) =
+            Self::initialize_layout_backend();
+
         Self {
             enabled: AtomicBool::new(true),
-            layout_is_english: AtomicBool::new(true),
+            layout_state: RwLock::new(layout_state),
+            backend: Mutex::new(backend),
+            layout_setup: RwLock::new(layout_setup),
+            layout_compatibility: RwLock::new(layout_compatibility),
+            feature_availability: RwLock::new(feature_availability),
             config_service,
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
+            background_sync_started: AtomicBool::new(false),
+            pending_status_change: AtomicBool::new(false),
         }
     }
 
@@ -453,7 +741,11 @@ impl RuntimeState {
     }
 
     pub fn current_layout(&self) -> bool {
-        self.layout_is_english.load(Ordering::SeqCst)
+        let state = self
+            .layout_state
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        legacy_current_layout_bool(&state)
     }
 
     pub fn set_layout(&self, layout_is_english: bool) {
@@ -461,15 +753,151 @@ impl RuntimeState {
     }
 
     pub fn set_layout_with_reason(&self, layout_is_english: bool, reason: &str) {
-        let previous = self
-            .layout_is_english
-            .swap(layout_is_english, Ordering::SeqCst);
+        let mut state = self
+            .layout_state
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = legacy_current_layout_bool(&state);
+        let next_state = legacy_layout_state_from_bool(layout_is_english);
+        if *state != next_state {
+            *state = next_state;
+        }
         log_layout_debug(
             "set-layout",
             &format!(
                 "reason={reason} previous={} next={}",
                 layout_label(previous),
                 layout_label(layout_is_english)
+            ),
+        );
+    }
+
+    pub fn current_layout_state(&self) -> CurrentLayoutState {
+        self.layout_state
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn layout_setup(&self) -> LayoutSetup {
+        self.layout_setup
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn layout_compatibility(&self) -> LayoutCompatibility {
+        *self
+            .layout_compatibility
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn feature_availability(&self) -> FeatureAvailability {
+        self.feature_availability
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn sync_with_backend(&self) -> BackendSyncResult {
+        let snapshot = {
+            let mut backend_guard = self
+                .backend
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(backend) = backend_guard.as_mut() else {
+                return BackendSyncResult::Skipped;
+            };
+
+            match backend.current_layout_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    log_layout_debug("backend-sync-skip", &format!("error={error}"));
+                    return BackendSyncResult::Skipped;
+                }
+            }
+        };
+
+        let mut state = self
+            .layout_state
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+
+        if *state == snapshot {
+            return BackendSyncResult::Unchanged;
+        }
+
+        let previous = state.clone();
+        *state = snapshot.clone();
+        self.pending_status_change.store(true, Ordering::SeqCst);
+        log_layout_debug(
+            "backend-sync-update",
+            &format!("previous={previous:?} next={snapshot:?}"),
+        );
+        BackendSyncResult::Updated {
+            previous,
+            current: snapshot,
+        }
+    }
+
+    pub fn periodic_sync_tick(&self) -> BackendSyncResult {
+        self.sync_with_backend()
+    }
+
+    pub fn take_pending_status_change(&self) -> bool {
+        self.pending_status_change.swap(false, Ordering::SeqCst)
+    }
+
+    pub fn clear_pending_status_change(&self) {
+        self.pending_status_change.store(false, Ordering::SeqCst);
+    }
+
+    pub fn start_background_sync_polling(self: &Arc<Self>) {
+        let capabilities = {
+            let backend_guard = self
+                .backend
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(backend) = backend_guard.as_ref() else {
+                return;
+            };
+            backend.capabilities()
+        };
+
+        if !background_sync_polling_enabled(capabilities) {
+            return;
+        }
+
+        if self
+            .background_sync_started
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let runtime = Arc::clone(self);
+        if let Err(error) = thread::Builder::new()
+            .name("layout-backend-poll".to_string())
+            .spawn(move || loop {
+                thread::sleep(BACKGROUND_SYNC_POLL_INTERVAL);
+                let _ = runtime.periodic_sync_tick();
+            })
+        {
+            self.background_sync_started.store(false, Ordering::SeqCst);
+            log_layout_debug(
+                "background-sync-start",
+                &format!("failed=true error={error}"),
+            );
+            return;
+        }
+
+        log_layout_debug(
+            "background-sync-start",
+            &format!(
+                "enabled=true interval_ms={}",
+                BACKGROUND_SYNC_POLL_INTERVAL.as_millis()
             ),
         );
     }
@@ -540,6 +968,69 @@ impl RuntimeState {
             .map_err(|_| CaptureError::LockPoisoned)?;
         Ok(session.handle_key_event(key, value))
     }
+
+    fn initialize_layout_backend() -> (
+        Option<Box<dyn LayoutBackend>>,
+        CurrentLayoutState,
+        LayoutSetup,
+        LayoutCompatibility,
+        FeatureAvailability,
+    ) {
+        let mut registry = LayoutBackendRegistry::new();
+        registry.register_factory(legacy_backend_factory);
+
+        match registry.pick_backend() {
+            LayoutBackendRegistryResult::Backend(backend) => {
+                let capabilities = backend.capabilities();
+                let layout_setup = match backend.detect_setup() {
+                    Ok(setup) => setup,
+                    Err(error) => LayoutSetup::Unsupported {
+                        reason: error.to_string(),
+                    },
+                };
+                let layout_compatibility = compatibility_from_setup(&layout_setup);
+                let feature_availability =
+                    feature_availability_for(layout_compatibility, capabilities);
+                let layout_state = match backend.current_layout_snapshot() {
+                    Ok(state) => state,
+                    Err(error) => CurrentLayoutState::Unknown {
+                        reason: error.to_string(),
+                    },
+                };
+
+                (
+                    Some(backend),
+                    layout_state,
+                    layout_setup,
+                    layout_compatibility,
+                    feature_availability,
+                )
+            }
+            LayoutBackendRegistryResult::Unsupported { reason } => {
+                let layout_state = CurrentLayoutState::Unknown {
+                    reason: reason.clone(),
+                };
+                let layout_setup = LayoutSetup::Unsupported {
+                    reason: reason.clone(),
+                };
+                let layout_compatibility = compatibility_from_setup(&layout_setup);
+                let feature_availability =
+                    feature_availability_for(layout_compatibility, Default::default());
+
+                (
+                    None,
+                    layout_state,
+                    layout_setup,
+                    layout_compatibility,
+                    feature_availability,
+                )
+            }
+        }
+    }
+}
+
+fn background_sync_polling_enabled(capabilities: BackendCapabilities) -> bool {
+    capabilities.can_read_current_layout && !capabilities.can_observe_layout_changes
 }
 
 pub(crate) fn log_layout_debug(stage: &str, details: &str) {

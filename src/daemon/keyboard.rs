@@ -21,6 +21,7 @@ const LAYOUT_SWITCH_DELAY_MS: u64 = 20;
 const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
 const INPUT_DEBUG_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG";
 const INPUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG_FILE";
+pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
@@ -293,6 +294,13 @@ impl KeyboardController {
         self.real_device.fetch_events()
     }
 
+    pub fn fetch_events_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Vec<InputEvent>, SwitcherError> {
+        self.real_device.fetch_events_timeout(timeout)
+    }
+
     pub fn take_pointer_click_invalidation(&self) -> bool {
         self.pointer_watcher.take_click_invalidation()
     }
@@ -381,6 +389,17 @@ impl GrabbedKeyboardDevice {
 
     fn fetch_events(&mut self) -> Result<Vec<InputEvent>, SwitcherError> {
         Ok(self.device.fetch_events()?.collect())
+    }
+
+    fn fetch_events_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Vec<InputEvent>, SwitcherError> {
+        if !wait_for_device_input(&self.device, timeout)? {
+            return Ok(Vec::new());
+        }
+
+        self.fetch_events()
     }
 }
 
@@ -905,6 +924,31 @@ fn set_nonblocking(device: &Device) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+fn wait_for_device_input(device: &Device, timeout: Duration) -> io::Result<bool> {
+    let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let mut poll_fd = libc::pollfd {
+        fd: device.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+
+    loop {
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result > 0 {
+            return Ok((poll_fd.revents & libc::POLLIN) != 0);
+        }
+        if result == 0 {
+            return Ok(false);
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
 }
 
 pub fn is_russian_layout() -> Result<bool, SwitcherError> {

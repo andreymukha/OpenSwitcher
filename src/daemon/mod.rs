@@ -9,8 +9,8 @@ pub mod switch_logic;
 use crate::config::default_config_path;
 use crate::dbus::{OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
-use keyboard::{is_russian_layout, log_input_debug};
-use runtime::{log_layout_debug, ConfigService, RuntimeState};
+use keyboard::log_input_debug;
+use runtime::{log_layout_debug, BackendSyncResult, ConfigService, RuntimeState};
 use service::DaemonService;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -29,18 +29,21 @@ pub fn run() -> Result<(), SwitcherError> {
             &format!("layout_switch_combo=unavailable error={error}"),
         ),
     }
-    if let Ok(is_russian) = is_russian_layout() {
-        log_layout_debug(
-            "startup-sync",
-            &format!("source=xset is_russian={is_russian}"),
-        );
-        runtime.set_layout_with_reason(!is_russian, "startup-xset-sync");
-    } else {
-        log_layout_debug("startup-sync", "source=xset failed=true");
-        eprintln!(
-            "[layout] Не удалось определить текущую раскладку на старте. Использую cached default."
-        );
+    match runtime.sync_with_backend() {
+        BackendSyncResult::Updated { current, .. } => {
+            log_layout_debug(
+                "startup-sync",
+                &format!("source=backend current={current:?}"),
+            );
+        }
+        BackendSyncResult::Unchanged => {
+            log_layout_debug("startup-sync", "source=backend unchanged=true");
+        }
+        BackendSyncResult::Skipped => {
+            log_layout_debug("startup-sync", "source=backend skipped=true");
+        }
     }
+    runtime.start_background_sync_polling();
     let dbus_api = OpenSwitcherDbusApi::new(runtime.clone());
 
     let connection = ConnectionBuilder::session()?

@@ -1,12 +1,13 @@
 use crate::daemon::keyboard::{
-    is_character, is_modifier, is_russian_layout, log_input_debug, undo_key_to_evdev_key,
-    KeyboardController, ModifierState, SharedModifierState,
+    is_character, is_modifier, log_input_debug, undo_key_to_evdev_key, KeyboardController,
+    ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
 };
-use crate::daemon::runtime::{log_layout_debug, RuntimeState};
+use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
 use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
+use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
 use evdev::InputEventKind;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,6 +61,34 @@ impl StartupLayoutResyncState {
     }
 }
 
+fn automatic_layout_actions_allowed(sync_result: &BackendSyncResult) -> bool {
+    !matches!(sync_result, BackendSyncResult::Skipped)
+}
+
+fn next_layout_for_user_shortcut(
+    sync_result: &BackendSyncResult,
+    current_layout_kind: AppLayoutKind,
+    legacy_layout_is_english: bool,
+) -> Option<bool> {
+    match sync_result {
+        BackendSyncResult::Updated { .. } | BackendSyncResult::Unchanged => {
+            match current_layout_kind {
+                AppLayoutKind::English => Some(false),
+                AppLayoutKind::Russian => Some(true),
+                AppLayoutKind::Other | AppLayoutKind::Unknown => None,
+            }
+        }
+        BackendSyncResult::Skipped => match current_layout_kind {
+            AppLayoutKind::English | AppLayoutKind::Russian => Some(!legacy_layout_is_english),
+            AppLayoutKind::Other | AppLayoutKind::Unknown => None,
+        },
+    }
+}
+
+fn should_publish_pending_status_change(has_pending_status_change: bool) -> bool {
+    has_pending_status_change
+}
+
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
     connection: Connection,
@@ -110,7 +139,7 @@ impl DaemonService {
         let mut last_heartbeat = Instant::now();
 
         loop {
-            let events = match self.keyboard.fetch_events() {
+            let events = match self.keyboard.fetch_events_timeout(INPUT_EVENT_WAIT_TIMEOUT) {
                 Ok(events) => events,
                 Err(error) => {
                     log_input_debug("keyboard-read-error", &format!("error={error}"));
@@ -118,6 +147,10 @@ impl DaemonService {
                     return Err(error);
                 }
             };
+
+            if should_publish_pending_status_change(self.runtime.take_pending_status_change()) {
+                self.publish_status_changed()?;
+            }
 
             if self.keyboard.take_input_target_invalidation() {
                 log_input_debug(
@@ -255,6 +288,9 @@ impl DaemonService {
             }
 
             self.layout_shortcut_latched = true;
+            let shortcut_sync = self.runtime.sync_with_backend();
+            let current_layout_kind = self.current_layout_kind();
+            let legacy_layout_is_english = self.runtime.current_layout();
             log_layout_debug(
                 "observed-layout-shortcut",
                 &format!(
@@ -270,8 +306,19 @@ impl DaemonService {
                     }
                 ),
             );
+            let Some(next_layout_is_english) = next_layout_for_user_shortcut(
+                &shortcut_sync,
+                current_layout_kind,
+                legacy_layout_is_english,
+            ) else {
+                log_layout_debug(
+                    "layout-shortcut-skip",
+                    &format!("sync={shortcut_sync:?} current_layout_kind={current_layout_kind:?}"),
+                );
+                return Ok(());
+            };
             self.runtime
-                .set_layout_with_reason(!self.runtime.current_layout(), "user-layout-shortcut");
+                .set_layout_with_reason(next_layout_is_english, "user-layout-shortcut");
             self.startup_layout_resync.complete();
             self.publish_status_changed()?;
             self.invalidate_word_context();
@@ -318,10 +365,13 @@ impl DaemonService {
 
         match key {
             evdev::Key::KEY_SPACE => {
-                self.refresh_startup_layout_before_autocorrect()?;
-                let is_russian = !self.runtime.current_layout();
-                let corrected =
-                    self.runtime.is_enabled() && !is_russian && should_switch(&self.buffer);
+                let startup_sync_ready = self.refresh_startup_layout_before_autocorrect()?;
+                let features = self.runtime.feature_availability();
+                let corrected = self.runtime.is_enabled()
+                    && features.auto_switch
+                    && startup_sync_ready
+                    && matches!(self.current_layout_kind(), AppLayoutKind::English)
+                    && should_switch(&self.buffer);
 
                 if corrected {
                     self.suppressed_separator_key = Some(key);
@@ -378,6 +428,14 @@ impl DaemonService {
     }
 
     fn apply_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
+        if !self.runtime.feature_availability().selected_text_switch {
+            log_selected_text_debug(
+                "hotkey-skip",
+                "selected-text switching disabled by backend policy",
+            );
+            return Ok(());
+        }
+
         if !self.selected_text_runner.try_start()? {
             log_selected_text_debug("hotkey-skip", "selected-text job already running");
             return Ok(());
@@ -423,6 +481,27 @@ impl DaemonService {
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
         fallback_buffer: &[Keystroke],
     ) -> Result<bool, SwitcherError> {
+        let features = self.runtime.feature_availability();
+        if !features.manual_word_fix {
+            return Ok(false);
+        }
+
+        let pre_correction_sync = self.runtime.sync_with_backend();
+        if !automatic_layout_actions_allowed(&pre_correction_sync) {
+            log_layout_debug(
+                "manual-correction-sync",
+                "source=backend skipped=true phase=before-correction",
+            );
+            return Ok(false);
+        }
+
+        if !matches!(
+            self.current_layout_kind(),
+            AppLayoutKind::English | AppLayoutKind::Russian
+        ) {
+            return Ok(false);
+        }
+
         let Some(plan) = manual_correction_plan(
             &self.buffer,
             fallback_buffer,
@@ -432,28 +511,30 @@ impl DaemonService {
         };
         self.keyboard
             .apply_correction(&plan, config, self.modifiers)?;
-        match is_russian_layout() {
-            Ok(is_russian) => {
+        match self.runtime.sync_with_backend() {
+            BackendSyncResult::Updated { current, .. } => {
                 log_layout_debug(
                     "manual-correction-sync",
-                    &format!("source=xset is_russian={is_russian}"),
+                    &format!("source=backend updated=true current={current:?}"),
                 );
-                self.runtime
-                    .set_layout_with_reason(!is_russian, "manual-correction-xset-sync");
+                self.startup_layout_resync.complete();
+                self.publish_status_changed()?;
             }
-            Err(error) => {
+            BackendSyncResult::Unchanged => {
                 log_layout_debug(
                     "manual-correction-sync",
-                    &format!("source=xset failed=true error={error}"),
+                    "source=backend updated=false current=unchanged",
                 );
-                self.runtime.set_layout_with_reason(
-                    !self.runtime.current_layout(),
-                    "manual-correction-fallback-toggle",
+                self.startup_layout_resync.complete();
+                self.publish_status_changed()?;
+            }
+            BackendSyncResult::Skipped => {
+                log_layout_debug(
+                    "manual-correction-sync",
+                    "source=backend skipped=true phase=after-correction fallback=disabled",
                 );
             }
         }
-        self.startup_layout_resync.complete();
-        self.publish_status_changed()?;
         Ok(true)
     }
 
@@ -471,6 +552,7 @@ impl DaemonService {
             ),
         );
         emit_status_changed(&self.connection, &self.runtime)?;
+        self.runtime.clear_pending_status_change();
         Ok(())
     }
 
@@ -488,39 +570,49 @@ impl DaemonService {
             && !self.word_context.word_before_cursor.is_empty()
     }
 
-    fn refresh_startup_layout_before_autocorrect(&mut self) -> Result<(), SwitcherError> {
+    fn refresh_startup_layout_before_autocorrect(&mut self) -> Result<bool, SwitcherError> {
         if !self.startup_layout_resync.is_pending() {
-            return Ok(());
+            return Ok(true);
         }
 
-        match is_russian_layout() {
-            Ok(is_russian) => {
+        let layout_before = self.runtime.current_layout();
+
+        match self.runtime.sync_with_backend() {
+            BackendSyncResult::Updated { current, .. } => {
                 self.startup_layout_resync.complete();
                 log_layout_debug(
                     "startup-resync",
-                    &format!("source=xset is_russian={is_russian}"),
+                    &format!("source=backend updated=true current={current:?}"),
                 );
-                let layout_is_english = !is_russian;
-                if self.runtime.current_layout() != layout_is_english {
-                    self.runtime.set_layout_with_reason(
-                        layout_is_english,
-                        "startup-first-input-xset-resync",
-                    );
+                if self.runtime.current_layout() != layout_before {
                     self.publish_status_changed()?;
                 }
+                Ok(true)
             }
-            Err(error) => {
+            BackendSyncResult::Unchanged => {
+                self.startup_layout_resync.complete();
+                log_layout_debug(
+                    "startup-resync",
+                    "source=backend updated=false current=unchanged",
+                );
+                Ok(true)
+            }
+            BackendSyncResult::Skipped => {
                 let attempts_remaining = self.startup_layout_resync.record_failure();
                 log_layout_debug(
                     "startup-resync",
-                    &format!(
-                        "source=xset failed=true error={error} attempts_remaining={attempts_remaining}"
-                    ),
+                    &format!("source=backend skipped=true attempts_remaining={attempts_remaining}"),
                 );
+                Ok(false)
             }
         }
+    }
 
-        Ok(())
+    fn current_layout_kind(&self) -> AppLayoutKind {
+        match self.runtime.current_layout_state() {
+            CurrentLayoutState::Known { layout, .. } => layout.kind,
+            CurrentLayoutState::Unknown { .. } => AppLayoutKind::Unknown,
+        }
     }
 }
 
@@ -579,6 +671,62 @@ mod tests {
         assert!(!state.is_pending());
         assert_eq!(state.record_failure(), 0);
         assert_eq!(state, StartupLayoutResyncState::Completed);
+    }
+
+    #[test]
+    fn automatic_layout_actions_are_blocked_when_backend_sync_is_skipped() {
+        assert!(!automatic_layout_actions_allowed(
+            &BackendSyncResult::Skipped
+        ));
+        assert!(automatic_layout_actions_allowed(
+            &BackendSyncResult::Unchanged
+        ));
+    }
+
+    #[test]
+    fn shortcut_fallback_is_allowed_only_for_known_en_ru_layouts() {
+        assert_eq!(
+            next_layout_for_user_shortcut(
+                &BackendSyncResult::Skipped,
+                AppLayoutKind::English,
+                true,
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            next_layout_for_user_shortcut(
+                &BackendSyncResult::Skipped,
+                AppLayoutKind::Russian,
+                false,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            next_layout_for_user_shortcut(
+                &BackendSyncResult::Skipped,
+                AppLayoutKind::Unknown,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn shortcut_does_not_guess_layout_for_other_when_sync_succeeds() {
+        assert_eq!(
+            next_layout_for_user_shortcut(
+                &BackendSyncResult::Unchanged,
+                AppLayoutKind::Other,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn pending_status_change_requests_publish_from_service() {
+        assert!(should_publish_pending_status_change(true));
+        assert!(!should_publish_pending_status_change(false));
     }
 }
 

@@ -2,6 +2,7 @@ pub mod config;
 pub mod daemon;
 pub mod dbus;
 pub mod error;
+pub mod layout_backend;
 pub mod layout_switch;
 pub mod model;
 #[cfg(feature = "settings-ui")]

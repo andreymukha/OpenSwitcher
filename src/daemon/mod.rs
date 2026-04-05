@@ -15,6 +15,24 @@ use service::DaemonService;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use zbus::blocking::ConnectionBuilder;
+use zbus::blocking::fdo::DBusProxy;
+use zbus::blocking::Connection;
+
+const TRAY_SERVICE_NAME: &str = "org.oswitch.tray";
+
+struct SessionBusTrayPresenceProbe {
+    connection: Connection,
+}
+
+impl runtime::TrayPresenceProbe for SessionBusTrayPresenceProbe {
+    fn tray_is_present(&self) -> Result<bool, std::io::Error> {
+        let proxy = DBusProxy::new(&self.connection).map_err(std::io::Error::other)?;
+        let name = TRAY_SERVICE_NAME.try_into().unwrap();
+        proxy
+            .name_has_owner(name)
+            .map_err(std::io::Error::other)
+    }
+}
 
 pub fn run() -> Result<(), SwitcherError> {
     let config_service = ConfigService::load(default_config_path())?;
@@ -44,6 +62,10 @@ pub fn run() -> Result<(), SwitcherError> {
         }
     }
     runtime.start_background_sync_polling();
+    let tray_probe = SessionBusTrayPresenceProbe {
+        connection: Connection::session()?,
+    };
+    runtime.start_tray_watchdog(tray_probe);
     let dbus_api = OpenSwitcherDbusApi::new(runtime.clone());
 
     let connection = ConnectionBuilder::session()?

@@ -4,6 +4,7 @@ use crate::error::{SettingsClientError, UiError};
 use crate::model::{
     LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey, UndoKey, UpdateSettingsResult,
 };
+use crate::system::UserServiceController;
 use async_channel::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,6 +16,7 @@ pub enum PresenterEvent {
     SaveFailed(SettingsClientError),
     SaveSucceeded(UpdateSettingsResult),
     CaptureStateChanged(LayoutSwitchCaptureState),
+    AutostartFailed(SettingsClientError),
 }
 
 pub enum SaveRequest {
@@ -29,6 +31,7 @@ pub struct SettingsPresenter {
 
 struct PresenterInner {
     client: SettingsDbusClient,
+    services: UserServiceController,
     state: Mutex<DomainState>,
     event_tx: Sender<PresenterEvent>,
 }
@@ -38,6 +41,7 @@ impl SettingsPresenter {
         Self {
             inner: Arc::new(PresenterInner {
                 client,
+                services: UserServiceController::from_system(),
                 state: Mutex::new(DomainState::new()),
                 event_tx,
             }),
@@ -69,6 +73,19 @@ impl SettingsPresenter {
         thread::spawn(move || match presenter.inner.client.load_settings() {
             Ok(settings) => {
                 presenter.with_state(|state| state.apply_loaded(settings));
+                match presenter.inner.services.is_autostart_enabled() {
+                    Ok(enabled) => {
+                        presenter.with_state(|state| {
+                            state.set_autostart_enabled(enabled);
+                        });
+                    }
+                    Err(error) => {
+                        let _ = presenter
+                            .send_event(PresenterEvent::AutostartFailed(
+                                SettingsClientError::ServiceManager(error),
+                            ));
+                    }
+                }
                 let _ = presenter.emit_view_state();
             }
             Err(error) => {
@@ -98,6 +115,35 @@ impl SettingsPresenter {
         if changed {
             let _ = self.emit_view_state();
         }
+    }
+
+    pub fn set_autostart_enabled(&self, enabled: bool) {
+        let changed = self.with_state(|state| state.begin_autostart_change(enabled));
+        if !changed {
+            return;
+        }
+
+        let _ = self.emit_view_state();
+        let presenter = self.clone();
+        thread::spawn(move || {
+            let result = if enabled {
+                presenter.inner.services.enable_autostart()
+            } else {
+                presenter.inner.services.disable_autostart()
+            };
+
+            match result {
+                Ok(()) => presenter.with_state(|state| state.finish_autostart_change(enabled)),
+                Err(error) => {
+                    presenter.with_state(DomainState::autostart_change_failed);
+                    let _ = presenter.send_event(PresenterEvent::AutostartFailed(
+                        SettingsClientError::ServiceManager(error),
+                    ));
+                }
+            }
+
+            let _ = presenter.emit_view_state();
+        });
     }
 
     pub fn unlock_layout_switch_override(&self) {

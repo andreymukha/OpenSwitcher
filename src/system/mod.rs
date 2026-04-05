@@ -1,3 +1,5 @@
+pub mod user_services;
+
 use crate::error::SystemContextError;
 use crate::model::{DesktopEnvironment, DistroKind, SessionType, SystemContext};
 use std::env;
@@ -5,6 +7,10 @@ use std::fs;
 use std::path::Path;
 
 pub struct SystemContextDetector;
+
+pub use user_services::{
+    UserServiceController, DAEMON_UNIT, TRAY_UNIT,
+};
 
 impl SystemContextDetector {
     pub fn detect_current() -> Result<SystemContext, SystemContextError> {

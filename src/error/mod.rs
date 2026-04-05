@@ -121,3 +121,18 @@ pub enum LayoutAutoDetectError {
     #[error("setxkbmap returned a non-zero exit status")]
     SetXkbMapFailed { stderr: String },
 }
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum ServiceManagerError {
+    #[error("Failed to execute command: {command:?}")]
+    SpawnFailed {
+        command: Vec<String>,
+        message: String,
+    },
+    #[error("Command failed: {command:?} (code={code:?})")]
+    CommandFailed {
+        command: Vec<String>,
+        code: Option<i32>,
+        stderr: String,
+    },
+}

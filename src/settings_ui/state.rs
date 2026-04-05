@@ -15,12 +15,16 @@ pub struct DomainState {
     loaded: Option<Settings>,
     draft: Settings,
     request_state: RequestState,
+    autostart_enabled: bool,
+    autostart_busy: bool,
     layout_switch_manual_override: bool,
     layout_switch_capture_active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewState {
+    pub autostart_enabled: bool,
+    pub autostart_busy: bool,
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
     pub selected_text_hotkey: SelectedTextHotkey,
@@ -61,6 +65,8 @@ impl DomainState {
             loaded: None,
             draft,
             request_state: RequestState::Loading,
+            autostart_enabled: false,
+            autostart_busy: false,
             layout_switch_manual_override: false,
             layout_switch_capture_active: false,
         }
@@ -70,6 +76,7 @@ impl DomainState {
         self.loaded = Some(settings);
         self.draft = settings;
         self.request_state = RequestState::Idle;
+        self.autostart_busy = false;
         self.layout_switch_manual_override = false;
         self.layout_switch_capture_active = false;
     }
@@ -105,6 +112,33 @@ impl DomainState {
 
     pub fn save_failed(&mut self) {
         self.request_state = RequestState::Idle;
+    }
+
+    pub fn set_autostart_enabled(&mut self, enabled: bool) -> bool {
+        if self.autostart_enabled == enabled {
+            return false;
+        }
+
+        self.autostart_enabled = enabled;
+        true
+    }
+
+    pub fn begin_autostart_change(&mut self, _enabled: bool) -> bool {
+        if self.autostart_busy || self.request_state == RequestState::Loading {
+            return false;
+        }
+
+        self.autostart_busy = true;
+        true
+    }
+
+    pub fn finish_autostart_change(&mut self, enabled: bool) {
+        self.autostart_enabled = enabled;
+        self.autostart_busy = false;
+    }
+
+    pub fn autostart_change_failed(&mut self) {
+        self.autostart_busy = false;
     }
 
     pub fn discard_changes(&mut self) -> bool {
@@ -215,6 +249,8 @@ impl DomainState {
             .unwrap_or(false);
 
         ViewState {
+            autostart_enabled: self.autostart_enabled,
+            autostart_busy: self.autostart_busy,
             layout_delay_ms: self.draft.layout_delay_ms,
             undo_key: self.draft.undo_key,
             selected_text_hotkey: self.draft.selected_text_hotkey,
@@ -288,5 +324,28 @@ mod tests {
 
         state.begin_save();
         assert!(!state.view_state().save_enabled);
+    }
+
+    #[test]
+    fn autostart_checkbox_is_not_part_of_dirty_settings_state() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.set_autostart_enabled(true);
+
+        let view = state.view_state();
+        assert!(view.autostart_enabled);
+        assert!(!view.dirty);
+        assert!(!view.save_enabled);
+    }
+
+    #[test]
+    fn autostart_toggle_can_be_temporarily_busy_without_disabling_form_dirty_logic() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        assert!(state.begin_autostart_change(true));
+
+        let view = state.view_state();
+        assert!(view.autostart_busy);
+        assert!(view.cancel_enabled);
     }
 }

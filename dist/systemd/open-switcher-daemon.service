@@ -1,0 +1,9 @@
+[Unit]
+Description=OpenSwitcher daemon
+
+[Service]
+ExecStart=open-switcher-daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

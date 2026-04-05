@@ -2,17 +2,19 @@
 
 OpenSwitcher — Linux desktop utility на Rust для автоматического переключения раскладки клавиатуры.
 
-Сейчас проект состоит из трёх независимых программ, связанных через D-Bus:
+Сейчас проект состоит из трёх программ:
 
-- `open-switcher` — демон, единственный источник истины для настроек
-- `open-switcher-tray` — tray-клиент
-- `open-switcher-settings` — окно настроек на GTK4 + libadwaita
+- `open-switcher` — daemon, единственный источник истины для настроек
+- `open-switcher-tray` — основной пользовательский entrypoint и tray-клиент
+- `open-switcher-settings` — служебное окно настроек на GTK4 + libadwaita
 
 Важно:
 
 - `config.toml` читает и пишет только демон
 - tray и settings UI работают с демоном только через D-Bus
 - GUI не работает с конфигом напрямую
+- пользовательская связка приложения — это `daemon + tray`
+- `open-switcher-settings` не входит в обязательную пару и может запускаться отдельно как служебная утилита
 
 ## Зависимости
 
@@ -48,6 +50,59 @@ cargo test --lib --test dbus_api
 ```
 
 ## Запуск
+
+Основной пользовательский запуск:
+
+```bash
+open-switcher-tray
+```
+
+Tray при старте проверяет daemon, при необходимости пытается поднять его через `systemctl --user start open-switcher-daemon.service`, и завершается, если daemon не удалось восстановить.
+
+### User-level systemd автозапуск
+
+OpenSwitcher использует только `systemd --user` units.
+
+Файлы поставки:
+
+- `dist/systemd/open-switcher-daemon.service`
+- `dist/systemd/open-switcher-tray.service`
+- `dist/open-switcher.desktop`
+
+Установка user units:
+
+```bash
+mkdir -p ~/.config/systemd/user
+install -m 0644 dist/systemd/open-switcher-daemon.service ~/.config/systemd/user/
+install -m 0644 dist/systemd/open-switcher-tray.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+Ручное включение автозапуска:
+
+```bash
+systemctl --user enable --now open-switcher-daemon.service
+systemctl --user enable --now open-switcher-tray.service
+```
+
+Ручное отключение автозапуска:
+
+```bash
+systemctl --user disable --now open-switcher-tray.service
+systemctl --user disable --now open-switcher-daemon.service
+```
+
+Desktop entry запускает только tray:
+
+```bash
+install -Dm0644 dist/open-switcher.desktop ~/.local/share/applications/open-switcher.desktop
+```
+
+Важно:
+
+- `~/.config/autostart` для OpenSwitcher не используется
+- официальный сценарий автозапуска — только `systemd --user`
+- `open-switcher-settings` не добавляется в автозапуск
 
 Демон:
 
@@ -140,8 +195,8 @@ gdbus call \
 ## Локальный сценарий проверки
 
 1. Собрать проект через `cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings`.
-2. Запустить `./target/debug/open-switcher`.
-3. Запустить `./target/debug/open-switcher-tray`.
+2. Запустить `./target/debug/open-switcher-tray`.
+3. Убедиться, что tray сам поднял daemon или daemon уже работает через `systemd --user`.
 4. При необходимости открыть `./target/debug/open-switcher-settings`.
 5. Проверить `GetSettings` и `UpdateSettings` через `gdbus`.
 6. Убедиться, что `~/.config/open-switcher/config.toml` обновляет именно демон.
@@ -153,6 +208,7 @@ gdbus call \
 Причина:
 
 - уже запущен другой экземпляр `open-switcher`
+- или daemon уже поднят через `systemd --user`
 
 Что проверить:
 
@@ -180,9 +236,29 @@ pkill -f '/target/.*/open-switcher($| )'
 
 Что делать:
 
-1. Убедиться, что `./target/debug/open-switcher` действительно запущен.
+1. Убедиться, что tray действительно запущен или поднять daemon вручную через `systemctl --user start open-switcher-daemon.service`.
 2. Проверить, что имя есть на session bus.
-3. Только после этого запускать tray и settings UI.
+3. Только после этого вызывать `gdbus` или открывать settings UI.
+
+### Tray завершился сразу после старта
+
+Чаще всего это означает, что:
+
+- уже работает другой экземпляр `open-switcher-tray`
+- tray не смог восстановить daemon через `systemctl --user`
+
+Что проверить:
+
+```bash
+systemctl --user status open-switcher-daemon.service
+systemctl --user status open-switcher-tray.service
+gdbus call \
+  --session \
+  --dest org.freedesktop.DBus \
+  --object-path /org/freedesktop/DBus \
+  --method org.freedesktop.DBus.NameHasOwner \
+  org.oswitch.tray
+```
 
 ### Не собирается settings UI
 

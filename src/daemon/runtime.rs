@@ -1,6 +1,6 @@
 use crate::config::AppConfig;
 use crate::daemon::capture::LayoutSwitchCaptureSession;
-use crate::error::{CaptureError, ConfigError, SettingsError};
+use crate::error::{CaptureError, ConfigError, ServiceManagerError, SettingsError};
 use crate::layout_backend::{
     compatibility_from_setup, feature_availability_for, legacy_backend_factory,
     legacy_current_layout_bool, legacy_layout_state_from_bool, BackendCapabilities,
@@ -15,7 +15,7 @@ use crate::model::{
     LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey, Settings, UndoKey,
     UpdateSettingsResult,
 };
-use crate::system::SystemContextDetector;
+use crate::system::{SystemContextDetector, UserServiceController};
 use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -28,6 +28,9 @@ use std::time::Duration;
 const LAYOUT_DEBUG_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG";
 const LAYOUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG_FILE";
 const BACKGROUND_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(300);
+pub const TRAY_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
+pub const TRAY_RECOVERY_DELAY: Duration = Duration::from_millis(500);
+pub const MAX_TRAY_RECOVERY_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
@@ -701,6 +704,73 @@ undo_key = "Pause"
         runtime.request_exit();
         assert!(runtime.should_exit());
     }
+
+    #[test]
+    fn tray_watchdog_attempts_restart_three_times_then_requests_exit() {
+        let runtime = Arc::new(test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        ));
+        let bus = FakeTrayPresence { present: false };
+        let starter = FakeTrayStarter {
+            results: Arc::new(Mutex::new(vec![
+                Err(crate::error::ServiceManagerError::CommandFailed {
+                    command: vec!["systemctl".into()],
+                    code: Some(1),
+                    stderr: "fail-1".into(),
+                }),
+                Err(crate::error::ServiceManagerError::CommandFailed {
+                    command: vec!["systemctl".into()],
+                    code: Some(1),
+                    stderr: "fail-2".into(),
+                }),
+                Err(crate::error::ServiceManagerError::CommandFailed {
+                    command: vec!["systemctl".into()],
+                    code: Some(1),
+                    stderr: "fail-3".into(),
+                }),
+            ])),
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+
+        run_tray_watchdog_iteration(
+            runtime.clone(),
+            &bus,
+            &starter,
+            3,
+            Duration::ZERO,
+        );
+
+        assert!(runtime.should_exit());
+        assert_eq!(starter.calls.load(Ordering::SeqCst), 3);
+    }
+
+    struct FakeTrayPresence {
+        present: bool,
+    }
+
+    impl TrayPresenceProbe for FakeTrayPresence {
+        fn tray_is_present(&self) -> Result<bool, std::io::Error> {
+            Ok(self.present)
+        }
+    }
+
+    struct FakeTrayStarter {
+        results: Arc<Mutex<Vec<Result<(), crate::error::ServiceManagerError>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TrayServiceStarter for FakeTrayStarter {
+        fn start_tray_service(&self) -> Result<(), crate::error::ServiceManagerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.results
+                .lock()
+                .unwrap()
+                .remove(0)
+        }
+    }
 }
 
 pub struct RuntimeState {
@@ -725,6 +795,74 @@ pub enum BackendSyncResult {
     },
     Unchanged,
     Skipped,
+}
+
+pub trait TrayPresenceProbe {
+    fn tray_is_present(&self) -> Result<bool, std::io::Error>;
+}
+
+pub trait TrayServiceStarter {
+    fn start_tray_service(&self) -> Result<(), ServiceManagerError>;
+}
+
+impl<R: crate::system::user_services::CommandRunner> TrayServiceStarter for UserServiceController<R> {
+    fn start_tray_service(&self) -> Result<(), ServiceManagerError> {
+        UserServiceController::start_tray_service(self)
+    }
+}
+
+pub fn run_tray_watchdog_iteration(
+    runtime: Arc<RuntimeState>,
+    probe: &impl TrayPresenceProbe,
+    starter: &impl TrayServiceStarter,
+    attempts: usize,
+    delay: Duration,
+) {
+    let tray_present = match probe.tray_is_present() {
+        Ok(present) => present,
+        Err(error) => {
+            log_layout_debug("tray-watchdog-probe", &format!("error={error}"));
+            false
+        }
+    };
+
+    if tray_present {
+        return;
+    }
+
+    for attempt in 0..attempts {
+        match starter.start_tray_service() {
+            Ok(()) => match probe.tray_is_present() {
+                Ok(true) => {
+                    log_layout_debug(
+                        "tray-watchdog-recovery",
+                        &format!("recovered=true attempts={}", attempt + 1),
+                    );
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    log_layout_debug(
+                        "tray-watchdog-probe",
+                        &format!("attempt={} error={error}", attempt + 1),
+                    );
+                }
+            },
+            Err(error) => {
+                log_layout_debug(
+                    "tray-watchdog-start",
+                    &format!("attempt={} error={error}", attempt + 1),
+                );
+            }
+        }
+
+        if attempt + 1 < attempts && !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+
+    log_layout_debug("tray-watchdog-exit", "recovery_failed=true");
+    runtime.request_exit();
 }
 
 impl RuntimeState {
@@ -931,6 +1069,32 @@ impl RuntimeState {
                 BACKGROUND_SYNC_POLL_INTERVAL.as_millis()
             ),
         );
+    }
+
+    pub fn start_tray_watchdog(self: &Arc<Self>, probe: impl TrayPresenceProbe + Send + Sync + 'static) {
+        let runtime = Arc::clone(self);
+        let services = UserServiceController::from_system();
+        if let Err(error) = thread::Builder::new()
+            .name("tray-watchdog".to_string())
+            .spawn(move || loop {
+                if runtime.should_exit() {
+                    break;
+                }
+                thread::sleep(TRAY_WATCHDOG_INTERVAL);
+                if runtime.should_exit() {
+                    break;
+                }
+                run_tray_watchdog_iteration(
+                    Arc::clone(&runtime),
+                    &probe,
+                    &services,
+                    MAX_TRAY_RECOVERY_ATTEMPTS,
+                    TRAY_RECOVERY_DELAY,
+                );
+            })
+        {
+            log_layout_debug("tray-watchdog-start", &format!("failed=true error={error}"));
+        }
     }
 
     pub fn get_settings(&self) -> Result<Settings, SettingsError> {

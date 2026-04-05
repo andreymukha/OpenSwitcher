@@ -1,4 +1,4 @@
-use crate::error::ValidationError;
+use crate::error::{ServiceManagerError, ValidationError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -9,6 +9,8 @@ pub enum SettingsClientError {
     Proxy(#[source] zbus::Error),
     #[error("Демон вернул ошибку")]
     Daemon(#[source] zbus::Error),
+    #[error("Не удалось управлять user-сервисами OpenSwitcher")]
+    ServiceManager(#[source] ServiceManagerError),
     #[error(transparent)]
     Validation(#[from] ValidationError),
 }

@@ -1,4 +1,5 @@
 pub mod dbus_listener;
+pub mod single_instance;
 pub mod tray_service;
 
 use crate::error::SwitcherError;
@@ -7,12 +8,40 @@ use adw::prelude::*;
 use dbus_listener::DbusListener;
 use gtk::gio;
 use gtk::glib;
+use single_instance::{
+    acquire_tray_instance, TrayInstanceError,
+};
 use tray_service::{OpenSwitcherTray, TrayCommand};
+use zbus::blocking::Connection;
 
 pub use tray_service::TrayState;
 pub fn run() -> Result<(), SwitcherError> {
-    let client = DbusListener::new()?;
-    let initial_state = client.initial_state()?;
+    let connection = Connection::session()?;
+    match acquire_tray_instance(&connection) {
+        Ok(()) => {}
+        Err(TrayInstanceError::AlreadyRunning) => {
+            eprintln!("[tray] Another tray instance is already running, exiting.");
+            return Ok(());
+        }
+        Err(TrayInstanceError::Dbus(error)) => {
+            eprintln!("[tray] Failed to acquire tray single-instance guard: {error}");
+            return Ok(());
+        }
+    }
+
+    let client = DbusListener::from_connection(connection);
+    if let Err(err) = client.ensure_daemon_running() {
+        eprintln!("[tray] Failed to ensure daemon is running: {err}");
+        return Ok(());
+    }
+
+    let initial_state = match client.initial_state() {
+        Ok(state) => state,
+        Err(err) => {
+            eprintln!("[tray] Failed to fetch initial daemon state: {err}");
+            return Ok(());
+        }
+    };
     let initialized = std::rc::Rc::new(std::cell::Cell::new(false));
     let hold_guard = std::rc::Rc::new(std::cell::RefCell::new(None::<gio::ApplicationHoldGuard>));
     let app = adw::Application::builder()
@@ -65,12 +94,12 @@ fn spawn_tray_backend(
     command_tx: async_channel::Sender<TrayCommand>,
 ) {
     let (state_tx, state_rx) = std::sync::mpsc::channel();
-    let tray = OpenSwitcherTray::new(client.clone(), initial_state, command_tx);
+    let tray = OpenSwitcherTray::new(client.clone(), initial_state, command_tx.clone());
     let service = ksni::TrayService::new(tray);
     let handle = service.handle();
     service.spawn();
 
-    client.spawn_listener(state_tx);
+    client.spawn_listener(state_tx, command_tx.clone());
 
     std::thread::spawn(move || {
         for state in state_rx {

@@ -1,0 +1,10 @@
+[Unit]
+Description=OpenSwitcher tray
+After=open-switcher-daemon.service
+
+[Service]
+ExecStart=open-switcher-tray
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

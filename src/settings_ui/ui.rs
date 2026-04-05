@@ -148,6 +148,15 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     };
     ui.set_delay_handler(delay_handler);
 
+    let autostart_handler = {
+        let presenter = presenter.clone();
+        let autostart_switch = ui.autostart_switch();
+        autostart_switch.connect_active_notify(move |switch| {
+            presenter.set_autostart_enabled(switch.is_active());
+        })
+    };
+    ui.set_autostart_handler(autostart_handler);
+
     let undo_handler = {
         let presenter = presenter.clone();
         let undo_dropdown = ui.undo_dropdown();
@@ -332,6 +341,9 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     PresenterEvent::CaptureStateChanged(state) => {
                         ui.apply_capture_state(&presenter_for_events, state)
                     }
+                    PresenterEvent::AutostartFailed(error) => {
+                        ui.show_client_error(error, false)
+                    }
                 }
             }
         });
@@ -353,6 +365,17 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         .title("Основные настройки")
         .description("Настройки получает и сохраняет только демон через D-Bus.")
         .build();
+
+    let autostart_row = adw::ActionRow::builder()
+        .title("Автозапуск")
+        .subtitle("Запускать daemon и tray через systemd --user")
+        .build();
+    let autostart_switch = gtk::Switch::builder()
+        .valign(gtk::Align::Center)
+        .build();
+    autostart_row.add_suffix(&autostart_switch);
+    autostart_row.set_activatable_widget(Some(&autostart_switch));
+    group.add(&autostart_row);
 
     let delay_row = adw::ActionRow::builder()
         .title("Задержка переключения раскладки")
@@ -582,6 +605,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
 
     FormWidgets {
         clamp,
+        autostart_switch,
         delay_spin,
         undo_dropdown,
         selected_text_hotkey_row,
@@ -602,6 +626,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         dialog_ok_button,
         dialog_cancel_button,
         layout_switch_hint_label,
+        autostart_handler: None,
         delay_handler: None,
         undo_handler: None,
     }
@@ -609,6 +634,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
 
 struct FormWidgets {
     clamp: adw::Clamp,
+    autostart_switch: gtk::Switch,
     delay_spin: gtk::SpinButton,
     undo_dropdown: gtk::DropDown,
     selected_text_hotkey_row: adw::ActionRow,
@@ -629,6 +655,7 @@ struct FormWidgets {
     dialog_ok_button: gtk::Button,
     dialog_cancel_button: gtk::Button,
     layout_switch_hint_label: gtk::Label,
+    autostart_handler: Option<SignalHandlerId>,
     delay_handler: Option<SignalHandlerId>,
     undo_handler: Option<SignalHandlerId>,
 }
@@ -823,6 +850,12 @@ impl SettingsWindow {
         }
     }
 
+    fn set_autostart_handler(&self, handler: SignalHandlerId) {
+        if let Some(form) = self.form.borrow_mut().as_mut() {
+            form.autostart_handler = Some(handler);
+        }
+    }
+
     fn set_undo_handler(&self, handler: SignalHandlerId) {
         if let Some(form) = self.form.borrow_mut().as_mut() {
             form.undo_handler = Some(handler);
@@ -989,6 +1022,15 @@ impl SettingsWindow {
             .as_ref()
             .expect("form widgets must be installed before access")
             .delay_spin
+            .clone()
+    }
+
+    fn autostart_switch(&self) -> gtk::Switch {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .autostart_switch
             .clone()
     }
 
@@ -1164,6 +1206,14 @@ impl SettingsWindow {
         *self.current_view_state.borrow_mut() = state.clone();
 
         if let Some(form) = self.form.borrow().as_ref() {
+            if let Some(autostart_handler) = &form.autostart_handler {
+                form.autostart_switch.block_signal(autostart_handler);
+            }
+            form.autostart_switch.set_active(state.autostart_enabled);
+            if let Some(autostart_handler) = &form.autostart_handler {
+                form.autostart_switch.unblock_signal(autostart_handler);
+            }
+
             if let Some(delay_handler) = &form.delay_handler {
                 form.delay_spin.block_signal(delay_handler);
             }
@@ -1184,6 +1234,8 @@ impl SettingsWindow {
                 form.undo_dropdown.unblock_signal(undo_handler);
             }
 
+            form.autostart_switch
+                .set_sensitive(state.loaded && !state.autostart_busy);
             form.delay_spin.set_sensitive(state.form_enabled);
             form.undo_dropdown.set_sensitive(state.form_enabled);
             form.selected_text_hotkey_row
@@ -1258,6 +1310,8 @@ impl SettingsWindow {
 
 fn initial_view_state() -> ViewState {
     ViewState {
+        autostart_enabled: false,
+        autostart_busy: false,
         layout_delay_ms: crate::model::Settings::default().layout_delay_ms,
         undo_key: crate::model::Settings::default().undo_key,
         selected_text_hotkey: crate::model::Settings::default().selected_text_hotkey,
@@ -1361,6 +1415,12 @@ fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'stati
                 "Демон отклонил сохранение"
             },
             source.to_string(),
+        ),
+        SettingsClientError::ServiceManager(source) => (
+            "Не удалось изменить автозапуск",
+            format!(
+                "OpenSwitcher не смог выполнить команду systemd user-сервисов.\n\n{source}"
+            ),
         ),
         SettingsClientError::Validation(error) => ("Некорректные значения", error.to_string()),
     }

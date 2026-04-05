@@ -17,6 +17,7 @@ pub const INTERFACE_NAME: &str = "org.oswitch.core";
 )]
 pub trait OpenSwitcher {
     fn toggle(&self) -> zbus::Result<()>;
+    fn request_exit(&self) -> zbus::Result<()>;
     fn get_settings(&self) -> zbus::Result<SettingsDto>;
     fn update_settings(&self, settings: SettingsDto) -> zbus::Result<UpdateSettingsResult>;
     fn start_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
@@ -53,6 +54,10 @@ impl OpenSwitcherDbusApi {
         let layout = self.runtime.current_layout();
         zbus::block_on(Self::status_changed(&ctxt, enabled, layout))
             .map_err(|err| DbusError::Signal(err).into())
+    }
+
+    pub fn request_exit(&self) {
+        self.runtime.request_exit();
     }
 
     pub fn get_settings(&self) -> fdo::Result<SettingsDto> {

@@ -320,6 +320,7 @@ mod tests {
     ) -> RuntimeState {
         RuntimeState {
             enabled: AtomicBool::new(true),
+            should_exit: AtomicBool::new(false),
             layout_state: RwLock::new(initial_layout_state),
             backend: Mutex::new(Some(backend)),
             layout_setup: RwLock::new(LayoutSetup::Unsupported {
@@ -686,10 +687,25 @@ undo_key = "Pause"
         assert_eq!(runtime.sync_with_backend(), BackendSyncResult::Unchanged);
         assert!(!runtime.take_pending_status_change());
     }
+
+    #[test]
+    fn request_exit_sets_exit_flag() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+
+        assert!(!runtime.should_exit());
+        runtime.request_exit();
+        assert!(runtime.should_exit());
+    }
 }
 
 pub struct RuntimeState {
     enabled: AtomicBool,
+    should_exit: AtomicBool,
     layout_state: RwLock<CurrentLayoutState>,
     backend: Mutex<Option<Box<dyn LayoutBackend>>>,
     layout_setup: RwLock<LayoutSetup>,
@@ -718,6 +734,7 @@ impl RuntimeState {
 
         Self {
             enabled: AtomicBool::new(true),
+            should_exit: AtomicBool::new(false),
             layout_state: RwLock::new(layout_state),
             backend: Mutex::new(backend),
             layout_setup: RwLock::new(layout_setup),
@@ -732,6 +749,14 @@ impl RuntimeState {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
+    }
+
+    pub fn request_exit(&self) {
+        self.should_exit.store(true, Ordering::SeqCst);
+    }
+
+    pub fn should_exit(&self) -> bool {
+        self.should_exit.load(Ordering::SeqCst)
     }
 
     pub fn toggle_enabled(&self) -> bool {
@@ -881,7 +906,13 @@ impl RuntimeState {
         if let Err(error) = thread::Builder::new()
             .name("layout-backend-poll".to_string())
             .spawn(move || loop {
+                if runtime.should_exit() {
+                    break;
+                }
                 thread::sleep(BACKGROUND_SYNC_POLL_INTERVAL);
+                if runtime.should_exit() {
+                    break;
+                }
                 let _ = runtime.periodic_sync_tick();
             })
         {

@@ -75,9 +75,13 @@ impl Tray for OpenSwitcherTray {
             StandardItem {
                 label: "Выход".into(),
                 activate: Box::new(|this: &mut OpenSwitcherTray| {
+                    if let Err(err) = this.dbus.request_exit() {
+                        eprintln!("[tray] Failed to request daemon shutdown: {err}");
+                        return;
+                    }
+
                     if let Err(err) = this.command_tx.try_send(TrayCommand::Quit) {
                         eprintln!("[tray] Failed to request tray shutdown: {err}");
-                        std::process::exit(1);
                     }
                 }),
                 ..Default::default()

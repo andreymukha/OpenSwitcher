@@ -34,6 +34,12 @@ impl DbusListener {
         Ok(())
     }
 
+    pub fn request_exit(&self) -> Result<(), SwitcherError> {
+        let proxy = OpenSwitcherProxyBlocking::new(&self.connection)?;
+        proxy.request_exit()?;
+        Ok(())
+    }
+
     pub fn spawn_listener(&self, tx: mpsc::Sender<TrayState>) {
         let connection = self.connection.clone();
         thread::spawn(move || loop {

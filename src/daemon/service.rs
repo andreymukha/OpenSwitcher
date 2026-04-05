@@ -139,6 +139,11 @@ impl DaemonService {
         let mut last_heartbeat = Instant::now();
 
         loop {
+            if self.runtime.should_exit() {
+                self.shutdown();
+                return Ok(());
+            }
+
             let events = match self.keyboard.fetch_events_timeout(INPUT_EVENT_WAIT_TIMEOUT) {
                 Ok(events) => events,
                 Err(error) => {

@@ -17,6 +17,22 @@ DAEMON_PIDFILE="$PID_DIR/daemon.pid"
 TRAY_PIDFILE="$PID_DIR/tray.pid"
 SETTINGS_PIDFILE="$PID_DIR/settings.pid"
 
+SYSTEMD_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+APPLICATIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+SYSTEMD_BIN_DIR="${OPEN_SWITCHER_SYSTEMD_BINDIR:-$HOME/.local/bin}"
+
+DAEMON_UNIT="open-switcher-daemon.service"
+TRAY_UNIT="open-switcher-tray.service"
+DESKTOP_FILE="open-switcher.desktop"
+
+DAEMON_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$DAEMON_UNIT"
+TRAY_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$TRAY_UNIT"
+DESKTOP_FILE_SOURCE="$SCRIPT_DIR/dist/$DESKTOP_FILE"
+
+INSTALLED_DAEMON_BIN="$SYSTEMD_BIN_DIR/open-switcher-daemon"
+INSTALLED_TRAY_BIN="$SYSTEMD_BIN_DIR/open-switcher-tray"
+INSTALLED_SETTINGS_BIN="$SYSTEMD_BIN_DIR/open-switcher-settings"
+
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
 ensure_dbus_address() {
@@ -279,28 +295,132 @@ build_binaries() {
         --bin open-switcher-settings
 }
 
+ensure_systemd_command() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "systemctl не найден в PATH." >&2
+        exit 1
+    fi
+}
+
+run_systemctl_user() {
+    ensure_dbus_address
+    ensure_systemd_command
+    systemctl --user "$@"
+}
+
+run_journalctl_user() {
+    ensure_dbus_address
+    if ! command -v journalctl >/dev/null 2>&1; then
+        echo "journalctl не найден в PATH." >&2
+        exit 1
+    fi
+    journalctl --user "$@"
+}
+
+ensure_dist_file() {
+    local path="$1"
+    if [[ ! -f "$path" ]]; then
+        echo "Файл не найден: $path" >&2
+        exit 1
+    fi
+}
+
+install_systemd_runtime() {
+    require_binary daemon
+    require_binary tray
+
+    mkdir -p "$SYSTEMD_UNIT_DIR" "$APPLICATIONS_DIR" "$SYSTEMD_BIN_DIR"
+
+    ensure_dist_file "$DAEMON_UNIT_SOURCE"
+    ensure_dist_file "$TRAY_UNIT_SOURCE"
+    ensure_dist_file "$DESKTOP_FILE_SOURCE"
+
+    install -m 0755 "$DAEMON_BIN" "$INSTALLED_DAEMON_BIN"
+    install -m 0755 "$TRAY_BIN" "$INSTALLED_TRAY_BIN"
+    if [[ -x "$SETTINGS_BIN" ]]; then
+        install -m 0755 "$SETTINGS_BIN" "$INSTALLED_SETTINGS_BIN"
+    fi
+
+    install -m 0644 "$DAEMON_UNIT_SOURCE" "$SYSTEMD_UNIT_DIR/$DAEMON_UNIT"
+    install -m 0644 "$TRAY_UNIT_SOURCE" "$SYSTEMD_UNIT_DIR/$TRAY_UNIT"
+    install -m 0644 "$DESKTOP_FILE_SOURCE" "$APPLICATIONS_DIR/$DESKTOP_FILE"
+
+    run_systemctl_user daemon-reload
+
+    echo "systemd user-файлы установлены:"
+    echo "  units: $SYSTEMD_UNIT_DIR"
+    echo "  desktop: $APPLICATIONS_DIR/$DESKTOP_FILE"
+    echo "  binaries: $SYSTEMD_BIN_DIR"
+}
+
+show_systemd_status() {
+    local unit active enabled
+    for unit in "$DAEMON_UNIT" "$TRAY_UNIT"; do
+        active="$(run_systemctl_user is-active "$unit" 2>/dev/null || true)"
+        enabled="$(run_systemctl_user is-enabled "$unit" 2>/dev/null || true)"
+        [[ -n "$active" ]] || active="unknown"
+        [[ -n "$enabled" ]] || enabled="unknown"
+        echo "$unit: active=$active enabled=$enabled"
+    done
+}
+
+show_systemd_logs() {
+    local target="${1:-all}"
+
+    case "$target" in
+        daemon)
+            run_journalctl_user -u "$DAEMON_UNIT" -n 40 --no-pager
+            ;;
+        tray)
+            run_journalctl_user -u "$TRAY_UNIT" -n 40 --no-pager
+            ;;
+        all)
+            run_journalctl_user -u "$DAEMON_UNIT" -u "$TRAY_UNIT" -n 60 --no-pager
+            ;;
+        *)
+            echo "Неизвестный компонент для systemd logs: $target" >&2
+            exit 1
+            ;;
+    esac
+}
+
 usage() {
     cat <<EOF
-Использование: ./manage.sh <команда>
+Использование:
+  ./manage.sh dev <команда>
+  ./manage.sh systemd <команда>
+  ./manage.sh <команда>            # алиасы на dev-режим
 
-Команды:
-  build       Собрать open-switcher, tray и settings
-  start       Запустить демон и tray
-  stop        Остановить демон, tray и settings
-  restart     Перезапустить демон и tray
-  status      Показать статус процессов
-  logs        Показать последние логи всех компонентов
-  logs <name> Показать лог одного компонента: daemon | tray | settings
-  settings    Открыть окно настроек
+dev-команды:
+  dev build             Собрать open-switcher, tray и settings
+  dev start             Запустить daemon и tray из target/
+  dev stop              Остановить daemon, tray и settings из dev-режима
+  dev restart           Перезапустить daemon и tray из dev-режима
+  dev status            Показать статус dev-процессов
+  dev logs [name]       Показать dev-логи: daemon | tray | settings | all
+  dev settings          Открыть окно настроек из target/
+
+systemd-команды:
+  systemd install       Установить user units, desktop entry и бинарники в ~/.local
+  systemd start         Запустить $DAEMON_UNIT и $TRAY_UNIT
+  systemd stop          Остановить $TRAY_UNIT и $DAEMON_UNIT
+  systemd restart       Перезапустить $DAEMON_UNIT и $TRAY_UNIT
+  systemd status        Показать active/enabled статус user units
+  systemd logs [name]   Показать journalctl-логи: daemon | tray | all
+  systemd enable        Включить автозапуск user units
+  systemd disable       Выключить автозапуск user units
 
 Переменные окружения:
   OPEN_SWITCHER_PROFILE=debug|release   По умолчанию: debug
+  OPEN_SWITCHER_SYSTEMD_BINDIR=/path    Куда ставить бинарники для systemd install
 EOF
 }
 
-command="${1:-}"
+run_dev_command() {
+    local command="${1:-}"
+    local arg="${2:-}"
 
-case "$command" in
+    case "$command" in
     build)
         build_binaries
         ;;
@@ -324,7 +444,7 @@ case "$command" in
         show_status
         ;;
     logs)
-        show_logs "${2:-all}"
+        show_logs "${arg:-all}"
         ;;
     settings)
         start_component settings
@@ -333,7 +453,75 @@ case "$command" in
         usage
         ;;
     *)
-        echo "Неизвестная команда: $command" >&2
+        echo "Неизвестная dev-команда: $command" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+}
+
+run_systemd_command() {
+    local command="${1:-}"
+    local arg="${2:-}"
+
+    case "$command" in
+    install)
+        install_systemd_runtime
+        ;;
+    start)
+        run_systemctl_user start "$DAEMON_UNIT"
+        run_systemctl_user start "$TRAY_UNIT"
+        ;;
+    stop)
+        run_systemctl_user stop "$TRAY_UNIT" || true
+        run_systemctl_user stop "$DAEMON_UNIT" || true
+        ;;
+    restart)
+        run_systemctl_user restart "$DAEMON_UNIT"
+        run_systemctl_user restart "$TRAY_UNIT"
+        ;;
+    status)
+        show_systemd_status
+        ;;
+    logs)
+        show_systemd_logs "${arg:-all}"
+        ;;
+    enable)
+        run_systemctl_user enable "$DAEMON_UNIT"
+        run_systemctl_user enable "$TRAY_UNIT"
+        ;;
+    disable)
+        run_systemctl_user disable "$TRAY_UNIT"
+        run_systemctl_user disable "$DAEMON_UNIT"
+        ;;
+    ""|-h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Неизвестная systemd-команда: $command" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+}
+
+namespace="${1:-}"
+
+case "$namespace" in
+    dev)
+        run_dev_command "${2:-}" "${3:-}"
+        ;;
+    systemd)
+        run_systemd_command "${2:-}" "${3:-}"
+        ;;
+    build|start|stop|restart|status|logs|settings|"")
+        run_dev_command "${1:-}" "${2:-}"
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Неизвестная команда: $namespace" >&2
         usage >&2
         exit 1
         ;;

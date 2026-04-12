@@ -839,7 +839,14 @@ impl SettingsWindow {
 
         let form_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         form_container.set_vexpand(true);
-        content_box.append(&form_container);
+
+        let form_scroller = gtk::ScrolledWindow::new();
+        form_scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+        form_scroller.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+        form_scroller.set_hexpand(true);
+        form_scroller.set_vexpand(true);
+        form_scroller.set_child(Some(&form_container));
+        content_box.append(&form_scroller);
 
         let actions_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
         content_box.append(&actions_separator);

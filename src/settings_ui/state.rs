@@ -24,6 +24,7 @@ pub struct DomainState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingSave {
     pub settings: Settings,
+    pub autostart_change: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,18 +114,31 @@ impl DomainState {
         self.request_state = RequestState::Saving;
         Some(PendingSave {
             settings: self.settings_for_save(),
+            autostart_change: self
+                .loaded_autostart_enabled
+                .filter(|loaded| *loaded != self.autostart_enabled)
+                .map(|_| self.autostart_enabled),
         })
     }
 
     pub fn save_succeeded(&mut self, snapshot: PendingSave) {
-        self.loaded = Some(snapshot.settings);
-        self.request_state = RequestState::Idle;
-        self.layout_switch_manual_override = false;
-        self.layout_switch_capture_active = false;
+        self.save_persisted_settings_succeeded(snapshot.settings);
+        if let Some(enabled) = snapshot.autostart_change {
+            self.loaded_autostart_enabled = Some(enabled);
+            self.autostart_enabled = enabled;
+        }
     }
 
     pub fn save_failed(&mut self) {
         self.request_state = RequestState::Idle;
+    }
+
+    pub fn save_persisted_settings_succeeded(&mut self, settings: Settings) {
+        self.loaded = Some(settings);
+        self.draft = settings;
+        self.request_state = RequestState::Idle;
+        self.layout_switch_manual_override = false;
+        self.layout_switch_capture_active = false;
     }
 
     pub fn set_autostart_enabled(&mut self, enabled: bool) -> bool {
@@ -141,13 +155,21 @@ impl DomainState {
             return false;
         };
 
-        if self.draft == loaded {
+        let autostart_dirty = self
+            .loaded_autostart_enabled
+            .map(|enabled| enabled != self.autostart_enabled)
+            .unwrap_or(false);
+
+        if self.draft == loaded && !autostart_dirty {
             self.layout_switch_manual_override = false;
             self.layout_switch_capture_active = false;
             return false;
         }
 
         self.draft = loaded;
+        if let Some(enabled) = self.loaded_autostart_enabled {
+            self.autostart_enabled = enabled;
+        }
         self.layout_switch_manual_override = false;
         self.layout_switch_capture_active = false;
         true
@@ -204,24 +226,6 @@ impl DomainState {
         }
 
         self.draft.fix_accidental_caps_lock = value;
-        true
-    }
-
-    pub fn confirm_autostart_enabled(&mut self, enabled: bool) {
-        self.loaded_autostart_enabled = Some(enabled);
-        self.autostart_enabled = enabled;
-    }
-
-    pub fn revert_autostart_enabled(&mut self) -> bool {
-        let Some(enabled) = self.loaded_autostart_enabled else {
-            return false;
-        };
-
-        if self.autostart_enabled == enabled {
-            return false;
-        }
-
-        self.autostart_enabled = enabled;
         true
     }
 
@@ -287,7 +291,11 @@ impl DomainState {
             .loaded
             .map(|settings| settings != self.draft)
             .unwrap_or(false);
-        let dirty = settings_dirty;
+        let autostart_dirty = self
+            .loaded_autostart_enabled
+            .map(|enabled| enabled != self.autostart_enabled)
+            .unwrap_or(false);
+        let dirty = settings_dirty || autostart_dirty;
 
         ViewState {
             autostart_enabled: self.autostart_enabled,
@@ -371,7 +379,7 @@ mod tests {
     }
 
     #[test]
-    fn autostart_checkbox_is_not_part_of_dirty_settings_state() {
+    fn autostart_checkbox_is_part_of_dirty_settings_state() {
         let mut state = DomainState::new();
         state.apply_loaded(Settings::default());
         state.apply_loaded_autostart(false);
@@ -379,20 +387,23 @@ mod tests {
 
         let view = state.view_state();
         assert!(view.autostart_enabled);
-        assert!(!view.dirty);
-        assert!(!view.save_enabled);
+        assert!(view.dirty);
+        assert!(view.save_enabled);
     }
 
     #[test]
-    fn begin_save_includes_new_persisted_fix_settings() {
+    fn begin_save_includes_new_persisted_fix_settings_and_autostart_change() {
         let mut state = DomainState::new();
         state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+        state.set_autostart_enabled(true);
         state.update_auto_switch_enabled(false);
         state.update_fix_two_capitals(true);
         state.update_fix_accidental_caps_lock(true);
 
         let snapshot = state.begin_save().expect("save snapshot should exist");
 
+        assert_eq!(snapshot.autostart_change, Some(true));
         assert!(!snapshot.settings.auto_switch_enabled);
         assert!(snapshot.settings.fix_two_capitals);
         assert!(snapshot.settings.fix_accidental_caps_lock);
@@ -400,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn discard_changes_restores_only_persisted_settings() {
+    fn discard_changes_restores_persisted_settings_and_autostart_checkbox() {
         let mut state = DomainState::new();
         state.apply_loaded(Settings::default());
         state.apply_loaded_autostart(false);
@@ -408,7 +419,7 @@ mod tests {
         state.update_fix_two_capitals(true);
 
         assert!(state.discard_changes());
-        assert!(state.view_state().autostart_enabled);
+        assert!(!state.view_state().autostart_enabled);
         assert!(!state.view_state().fix_two_capitals);
         assert!(!state.view_state().dirty);
     }

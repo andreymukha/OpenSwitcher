@@ -50,10 +50,13 @@ impl OpenSwitcherDbusApi {
 #[dbus_interface(name = "org.oswitch.core")]
 impl OpenSwitcherDbusApi {
     pub fn toggle(&self, #[zbus(signal_context)] ctxt: SignalContext<'_>) -> fdo::Result<()> {
-        let enabled = self.runtime.toggle_enabled();
+        let enabled = self
+            .runtime
+            .toggle_enabled_result()
+            .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
         let layout = self.runtime.current_layout();
         zbus::block_on(Self::status_changed(&ctxt, enabled, layout))
-            .map_err(|err| DbusError::Signal(err).into())
+            .map_err(|err| fdo::Error::from(DbusError::Signal(err)))
     }
 
     pub fn request_exit(&self) {
@@ -64,15 +67,32 @@ impl OpenSwitcherDbusApi {
         self.runtime
             .get_settings()
             .map(SettingsDto::from)
-            .map_err(|err| DbusError::from(err).into())
+            .map_err(|err| fdo::Error::from(DbusError::from(err)))
     }
 
-    pub fn update_settings(&self, settings: SettingsDto) -> fdo::Result<UpdateSettingsResult> {
+    pub fn update_settings(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+        settings: SettingsDto,
+    ) -> fdo::Result<UpdateSettingsResult> {
         let settings = Settings::try_from(settings)
             .map_err(|err| fdo::Error::from(DbusError::from(SettingsError::from(err))))?;
-        self.runtime
+        let enabled_before = self.runtime.is_enabled();
+        let result = self
+            .runtime
             .update_settings(settings)
-            .map_err(|err| DbusError::from(err).into())
+            .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
+
+        if self.runtime.is_enabled() != enabled_before {
+            zbus::block_on(Self::status_changed(
+                &ctxt,
+                self.runtime.is_enabled(),
+                self.runtime.current_layout(),
+            ))
+            .map_err(|err| fdo::Error::from(DbusError::Signal(err)))?;
+        }
+
+        Ok(result)
     }
 
     pub fn start_layout_switch_capture(

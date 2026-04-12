@@ -156,6 +156,13 @@ impl ConfigService {
             .map(|config| RuntimeConfigSnapshot::from(&*config))
             .map_err(|_| SettingsError::LockPoisoned)
     }
+
+    pub fn auto_switch_enabled(&self) -> Result<bool, SettingsError> {
+        self.inner
+            .read()
+            .map(|config| config.features.auto_switch_enabled)
+            .map_err(|_| SettingsError::LockPoisoned)
+    }
 }
 
 #[cfg(test)]
@@ -327,8 +334,14 @@ mod tests {
         initial_layout_state: CurrentLayoutState,
         backend: Box<dyn LayoutBackend>,
     ) -> RuntimeState {
+        let config_service = ConfigService {
+            config_path: PathBuf::from("test-config.toml"),
+            inner: RwLock::new(AppConfig::default()),
+        };
+        let enabled = config_service.auto_switch_enabled().unwrap_or(true);
+
         RuntimeState {
-            enabled: AtomicBool::new(true),
+            enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
             layout_state: RwLock::new(initial_layout_state),
             backend: Mutex::new(Some(backend)),
@@ -342,10 +355,7 @@ mod tests {
                 selected_text_switch: true,
                 reason: Some("test".to_string()),
             }),
-            config_service: ConfigService {
-                config_path: PathBuf::from("test-config.toml"),
-                inner: RwLock::new(AppConfig::default()),
-            },
+            config_service,
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -868,9 +878,10 @@ impl RuntimeState {
     pub fn new(config_service: ConfigService) -> Self {
         let (backend, layout_state, layout_setup, layout_compatibility, feature_availability) =
             Self::initialize_layout_backend();
+        let enabled = config_service.auto_switch_enabled().unwrap_or(true);
 
         Self {
-            enabled: AtomicBool::new(true),
+            enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
             layout_state: RwLock::new(layout_state),
             backend: Mutex::new(backend),
@@ -897,9 +908,17 @@ impl RuntimeState {
     }
 
     pub fn toggle_enabled(&self) -> bool {
-        let enabled = !self.enabled.load(Ordering::SeqCst);
-        self.enabled.store(enabled, Ordering::SeqCst);
-        enabled
+        self.toggle_enabled_result().unwrap_or_else(|error| {
+            log_layout_debug("toggle-enabled", &format!("error={error}"));
+            self.is_enabled()
+        })
+    }
+
+    pub fn toggle_enabled_result(&self) -> Result<bool, SettingsError> {
+        let mut settings = self.get_settings()?;
+        settings.auto_switch_enabled = !settings.auto_switch_enabled;
+        self.update_settings(settings)?;
+        Ok(settings.auto_switch_enabled)
     }
 
     pub fn current_layout(&self) -> bool {
@@ -1107,7 +1126,10 @@ impl RuntimeState {
         &self,
         settings: Settings,
     ) -> Result<UpdateSettingsResult, SettingsError> {
-        self.config_service.update_settings(settings)
+        let result = self.config_service.update_settings(settings)?;
+        self.enabled
+            .store(settings.auto_switch_enabled, Ordering::SeqCst);
+        Ok(result)
     }
 
     pub fn config_snapshot(&self) -> Result<RuntimeConfigSnapshot, SettingsError> {

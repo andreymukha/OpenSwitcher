@@ -4,6 +4,7 @@ use evdev::Key;
 pub struct Keystroke {
     pub key: Key,
     pub shift: bool,
+    pub caps_lock: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,14 +31,14 @@ pub fn manual_correction_plan(
 ) -> Option<CorrectionPlan> {
     if !current_buffer.is_empty() {
         return Some(CorrectionPlan {
-            buffer: current_buffer.to_vec(),
+            buffer: normalize_strokes_for_replay(current_buffer),
             extra_backspaces: 0,
         });
     }
 
     if !last_word_buffer.is_empty() {
         return Some(CorrectionPlan {
-            buffer: last_word_buffer.to_vec(),
+            buffer: normalize_strokes_for_replay(last_word_buffer),
             extra_backspaces: usize::from(last_word_followed_by_separator),
         });
     }
@@ -50,8 +51,9 @@ pub fn same_layout_case_correction_plan(
     fix_two_capitals: bool,
     fix_accidental_caps_lock: bool,
 ) -> Option<CorrectionPlan> {
+    let normalized = normalize_strokes_for_replay(buffer);
     let corrected = apply_case_fixes_to_strokes(buffer, fix_two_capitals, fix_accidental_caps_lock);
-    (corrected != buffer).then_some(CorrectionPlan {
+    (corrected != normalized).then_some(CorrectionPlan {
         buffer: corrected,
         extra_backspaces: 0,
     })
@@ -106,44 +108,48 @@ fn normalize_word_for_switch_heuristics(word: &str) -> String {
     word.chars().flat_map(|ch| ch.to_lowercase()).collect()
 }
 
+pub fn visible_char_for_keystroke(stroke: &Keystroke) -> Option<char> {
+    key_to_char(stroke.key, stroke.shift, stroke.caps_lock)
+}
+
 fn keys_to_string(keys: &[Keystroke]) -> String {
     let mut result = String::with_capacity(keys.len());
     for stroke in keys {
-        if let Some(ch) = key_to_char(stroke.key, stroke.shift) {
+        if let Some(ch) = visible_char_for_keystroke(stroke) {
             result.push(ch);
         }
     }
     result
 }
 
-fn key_to_char(key: Key, shift: bool) -> Option<char> {
+fn key_to_char(key: Key, shift: bool, caps_lock: bool) -> Option<char> {
     match key {
-        Key::KEY_A => Some(letter('a', shift)),
-        Key::KEY_B => Some(letter('b', shift)),
-        Key::KEY_C => Some(letter('c', shift)),
-        Key::KEY_D => Some(letter('d', shift)),
-        Key::KEY_E => Some(letter('e', shift)),
-        Key::KEY_F => Some(letter('f', shift)),
-        Key::KEY_G => Some(letter('g', shift)),
-        Key::KEY_H => Some(letter('h', shift)),
-        Key::KEY_I => Some(letter('i', shift)),
-        Key::KEY_J => Some(letter('j', shift)),
-        Key::KEY_K => Some(letter('k', shift)),
-        Key::KEY_L => Some(letter('l', shift)),
-        Key::KEY_M => Some(letter('m', shift)),
-        Key::KEY_N => Some(letter('n', shift)),
-        Key::KEY_O => Some(letter('o', shift)),
-        Key::KEY_P => Some(letter('p', shift)),
-        Key::KEY_Q => Some(letter('q', shift)),
-        Key::KEY_R => Some(letter('r', shift)),
-        Key::KEY_S => Some(letter('s', shift)),
-        Key::KEY_T => Some(letter('t', shift)),
-        Key::KEY_U => Some(letter('u', shift)),
-        Key::KEY_V => Some(letter('v', shift)),
-        Key::KEY_W => Some(letter('w', shift)),
-        Key::KEY_X => Some(letter('x', shift)),
-        Key::KEY_Y => Some(letter('y', shift)),
-        Key::KEY_Z => Some(letter('z', shift)),
+        Key::KEY_A => Some(letter('a', shift, caps_lock)),
+        Key::KEY_B => Some(letter('b', shift, caps_lock)),
+        Key::KEY_C => Some(letter('c', shift, caps_lock)),
+        Key::KEY_D => Some(letter('d', shift, caps_lock)),
+        Key::KEY_E => Some(letter('e', shift, caps_lock)),
+        Key::KEY_F => Some(letter('f', shift, caps_lock)),
+        Key::KEY_G => Some(letter('g', shift, caps_lock)),
+        Key::KEY_H => Some(letter('h', shift, caps_lock)),
+        Key::KEY_I => Some(letter('i', shift, caps_lock)),
+        Key::KEY_J => Some(letter('j', shift, caps_lock)),
+        Key::KEY_K => Some(letter('k', shift, caps_lock)),
+        Key::KEY_L => Some(letter('l', shift, caps_lock)),
+        Key::KEY_M => Some(letter('m', shift, caps_lock)),
+        Key::KEY_N => Some(letter('n', shift, caps_lock)),
+        Key::KEY_O => Some(letter('o', shift, caps_lock)),
+        Key::KEY_P => Some(letter('p', shift, caps_lock)),
+        Key::KEY_Q => Some(letter('q', shift, caps_lock)),
+        Key::KEY_R => Some(letter('r', shift, caps_lock)),
+        Key::KEY_S => Some(letter('s', shift, caps_lock)),
+        Key::KEY_T => Some(letter('t', shift, caps_lock)),
+        Key::KEY_U => Some(letter('u', shift, caps_lock)),
+        Key::KEY_V => Some(letter('v', shift, caps_lock)),
+        Key::KEY_W => Some(letter('w', shift, caps_lock)),
+        Key::KEY_X => Some(letter('x', shift, caps_lock)),
+        Key::KEY_Y => Some(letter('y', shift, caps_lock)),
+        Key::KEY_Z => Some(letter('z', shift, caps_lock)),
         Key::KEY_0 => Some('0'),
         Key::KEY_1 => Some('1'),
         Key::KEY_2 => Some('2'),
@@ -155,26 +161,49 @@ fn key_to_char(key: Key, shift: bool) -> Option<char> {
         Key::KEY_8 => Some('8'),
         Key::KEY_9 => Some('9'),
         Key::KEY_SPACE => Some(' '),
-        Key::KEY_DOT => Some('.'),
-        Key::KEY_COMMA => Some(','),
-        Key::KEY_SEMICOLON => Some(';'),
-        Key::KEY_APOSTROPHE => Some('\''),
-        Key::KEY_GRAVE => Some('`'),
-        Key::KEY_LEFTBRACE => Some('['),
-        Key::KEY_RIGHTBRACE => Some(']'),
-        Key::KEY_SLASH => Some('/'),
-        Key::KEY_MINUS => Some('-'),
-        Key::KEY_EQUAL => Some('='),
+        Key::KEY_DOT => Some(if shift { '>' } else { '.' }),
+        Key::KEY_COMMA => Some(if shift { '<' } else { ',' }),
+        Key::KEY_SEMICOLON => Some(if shift { ':' } else { ';' }),
+        Key::KEY_APOSTROPHE => Some(if shift { '"' } else { '\'' }),
+        Key::KEY_GRAVE => Some(if shift { '~' } else { '`' }),
+        Key::KEY_LEFTBRACE => Some(if shift { '{' } else { '[' }),
+        Key::KEY_RIGHTBRACE => Some(if shift { '}' } else { ']' }),
+        Key::KEY_SLASH => Some(if shift { '?' } else { '/' }),
+        Key::KEY_MINUS => Some(if shift { '_' } else { '-' }),
+        Key::KEY_EQUAL => Some(if shift { '+' } else { '=' }),
         _ => None,
     }
 }
 
-fn letter(base: char, shift: bool) -> char {
-    if shift {
+fn letter(base: char, shift: bool, caps_lock: bool) -> char {
+    if shift ^ caps_lock {
         base.to_ascii_uppercase()
     } else {
         base
     }
+}
+
+fn normalize_strokes_for_replay(buffer: &[Keystroke]) -> Vec<Keystroke> {
+    buffer
+        .iter()
+        .map(|stroke| match letter_case_for_stroke(stroke) {
+            Some(LetterCase::Upper) => Keystroke {
+                key: stroke.key,
+                shift: true,
+                caps_lock: false,
+            },
+            Some(LetterCase::Lower) => Keystroke {
+                key: stroke.key,
+                shift: false,
+                caps_lock: false,
+            },
+            None => Keystroke {
+                key: stroke.key,
+                shift: stroke.shift,
+                caps_lock: false,
+            },
+        })
+        .collect()
 }
 
 fn count_russian_vowels(keys: &[Keystroke]) -> usize {
@@ -233,23 +262,25 @@ pub fn apply_case_fixes_to_strokes(
     fix_two_capitals: bool,
     fix_accidental_caps_lock: bool,
 ) -> Vec<Keystroke> {
+    let normalized = normalize_strokes_for_replay(buffer);
     let Some(pattern) = buffer
         .iter()
         .map(letter_case_for_stroke)
         .collect::<Option<Vec<_>>>()
     else {
-        return buffer.to_vec();
+        return normalized;
     };
 
     let Some(corrected_pattern) =
         corrected_case_pattern(&pattern, fix_two_capitals, fix_accidental_caps_lock)
     else {
-        return buffer.to_vec();
+        return normalized;
     };
 
-    let mut corrected = buffer.to_vec();
+    let mut corrected = normalized;
     for (stroke, case) in corrected.iter_mut().zip(corrected_pattern) {
         stroke.shift = matches!(case, LetterCase::Upper);
+        stroke.caps_lock = false;
     }
     corrected
 }
@@ -324,7 +355,7 @@ fn letter_case_for_stroke(stroke: &Keystroke) -> Option<LetterCase> {
         return None;
     }
 
-    Some(if stroke.shift {
+    Some(if stroke.shift ^ stroke.caps_lock {
         LetterCase::Upper
     } else {
         LetterCase::Lower
@@ -390,7 +421,11 @@ mod tests {
     use super::*;
 
     fn stroke(key: Key) -> Keystroke {
-        Keystroke { key, shift: false }
+        Keystroke {
+            key,
+            shift: false,
+            caps_lock: false,
+        }
     }
 
     #[test]
@@ -449,26 +484,32 @@ mod tests {
             Keystroke {
                 key: Key::KEY_G,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_H,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_B,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_D,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_T,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_N,
                 shift: false,
+                caps_lock: false,
             },
         ];
 
@@ -482,26 +523,32 @@ mod tests {
             Keystroke {
                 key: Key::KEY_G,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_H,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_B,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_D,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_T,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_N,
                 shift: false,
+                caps_lock: false,
             },
         ];
 
@@ -516,6 +563,42 @@ mod tests {
     fn russian_like_word_triggers_switch() {
         let buffer = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
         assert!(should_switch(&buffer));
+    }
+
+    #[test]
+    fn same_layout_case_fix_handles_physical_caps_lock_pattern() {
+        let buffer = vec![
+            Keystroke {
+                key: Key::KEY_H,
+                shift: true,
+                caps_lock: true,
+            },
+            Keystroke {
+                key: Key::KEY_E,
+                shift: false,
+                caps_lock: true,
+            },
+            Keystroke {
+                key: Key::KEY_L,
+                shift: false,
+                caps_lock: true,
+            },
+            Keystroke {
+                key: Key::KEY_L,
+                shift: false,
+                caps_lock: true,
+            },
+            Keystroke {
+                key: Key::KEY_O,
+                shift: false,
+                caps_lock: true,
+            },
+        ];
+
+        assert_eq!(keys_to_string(&buffer), "hELLO");
+
+        let plan = same_layout_case_correction_plan(&buffer, false, true).unwrap();
+        assert_eq!(keys_to_string(&plan.buffer), "Hello");
     }
 
     #[test]
@@ -556,18 +639,22 @@ mod tests {
             Keystroke {
                 key: Key::KEY_T,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_E,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_X,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_T,
                 shift: false,
+                caps_lock: false,
             },
         ];
 
@@ -580,18 +667,22 @@ mod tests {
             Keystroke {
                 key: Key::KEY_T,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_E,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_X,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_T,
                 shift: false,
+                caps_lock: false,
             },
             stroke(Key::KEY_DOT),
         ];
@@ -618,26 +709,32 @@ mod tests {
             Keystroke {
                 key: Key::KEY_G,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_H,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_B,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_D,
                 shift: true,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_T,
                 shift: false,
+                caps_lock: false,
             },
             Keystroke {
                 key: Key::KEY_N,
                 shift: true,
+                caps_lock: false,
             },
         ];
 

@@ -2,7 +2,7 @@ use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, UndoKey};
-use evdev::{enumerate, Device, InputEvent, Key};
+use evdev::{enumerate, Device, InputEvent, Key, LedType};
 use std::collections::HashSet;
 use std::env;
 use std::fs::OpenOptions;
@@ -136,6 +136,7 @@ pub struct ModifierState {
     right_alt: bool,
     left_meta: bool,
     right_meta: bool,
+    caps_lock_active: bool,
 }
 
 impl ModifierState {
@@ -150,8 +151,17 @@ impl ModifierState {
             Key::KEY_RIGHTALT => self.right_alt = pressed,
             Key::KEY_LEFTMETA => self.left_meta = pressed,
             Key::KEY_RIGHTMETA => self.right_meta = pressed,
+            Key::KEY_CAPSLOCK if value == 1 => self.caps_lock_active = !self.caps_lock_active,
             _ => {}
         }
+    }
+
+    pub fn set_caps_lock_active(&mut self, active: bool) {
+        self.caps_lock_active = active;
+    }
+
+    pub fn is_caps_lock_active(&self) -> bool {
+        self.caps_lock_active
     }
 
     pub fn is_shift_pressed(&self) -> bool {
@@ -259,6 +269,7 @@ impl ModifierState {
             right_alt: bits & 0b100000 != 0,
             left_meta: bits & 0b1000000 != 0,
             right_meta: bits & 0b10000000 != 0,
+            caps_lock_active: false,
         }
     }
 }
@@ -369,6 +380,10 @@ impl KeyboardController {
     pub fn is_writer_alive(&self) -> bool {
         self.virtual_device.handle().is_alive()
     }
+
+    pub fn caps_lock_active(&self) -> bool {
+        self.real_device.caps_lock_active().unwrap_or(false)
+    }
 }
 
 impl GrabbedKeyboardDevice {
@@ -416,6 +431,10 @@ impl GrabbedKeyboardDevice {
         }
 
         self.fetch_events()
+    }
+
+    fn caps_lock_active(&self) -> Result<bool, SwitcherError> {
+        Ok(self.device.get_led_state()?.contains(LedType::LED_CAPSL))
     }
 }
 
@@ -1182,6 +1201,25 @@ mod tests {
             1
         ));
     }
+
+    #[test]
+    fn replay_shift_uses_caps_lock_to_preserve_visible_case() {
+        let lowercase_target = crate::daemon::switch_logic::Keystroke {
+            key: Key::KEY_H,
+            shift: false,
+            caps_lock: false,
+        };
+        let uppercase_target = crate::daemon::switch_logic::Keystroke {
+            key: Key::KEY_H,
+            shift: true,
+            caps_lock: false,
+        };
+
+        assert!(replay_shift_for_stroke(&lowercase_target, true));
+        assert!(!replay_shift_for_stroke(&uppercase_target, true));
+        assert!(!replay_shift_for_stroke(&lowercase_target, false));
+        assert!(replay_shift_for_stroke(&uppercase_target, false));
+    }
 }
 
 impl SelectionKeyboardTransport {
@@ -1251,6 +1289,53 @@ fn run_shortcut(
 
 use crate::daemon::layout_switcher::{LayoutSwitcher, UinputLayoutSwitcher, X11LayoutSwitcher};
 
+fn replay_shift_for_stroke(stroke: &crate::daemon::switch_logic::Keystroke, caps_lock: bool) -> bool {
+    if is_case_sensitive_letter_key(stroke.key) {
+        stroke.shift ^ caps_lock
+    } else {
+        stroke.shift
+    }
+}
+
+fn is_case_sensitive_letter_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::KEY_A
+            | Key::KEY_B
+            | Key::KEY_C
+            | Key::KEY_D
+            | Key::KEY_E
+            | Key::KEY_F
+            | Key::KEY_G
+            | Key::KEY_H
+            | Key::KEY_I
+            | Key::KEY_J
+            | Key::KEY_K
+            | Key::KEY_L
+            | Key::KEY_M
+            | Key::KEY_N
+            | Key::KEY_O
+            | Key::KEY_P
+            | Key::KEY_Q
+            | Key::KEY_R
+            | Key::KEY_S
+            | Key::KEY_T
+            | Key::KEY_U
+            | Key::KEY_V
+            | Key::KEY_W
+            | Key::KEY_X
+            | Key::KEY_Y
+            | Key::KEY_Z
+            | Key::KEY_GRAVE
+            | Key::KEY_LEFTBRACE
+            | Key::KEY_RIGHTBRACE
+            | Key::KEY_SEMICOLON
+            | Key::KEY_APOSTROPHE
+            | Key::KEY_COMMA
+            | Key::KEY_DOT
+    )
+}
+
 fn run_correction(
     device: &mut uinput::Device,
     plan: &CorrectionPlan,
@@ -1284,7 +1369,8 @@ fn run_correction(
     }
 
     for stroke in &plan.buffer {
-        if stroke.shift {
+        let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
+        if effective_shift {
             device.press(&uinput::event::keyboard::Key::LeftShift)?;
             device.synchronize()?;
             thread::sleep(Duration::from_millis(1));
@@ -1293,7 +1379,7 @@ fn run_correction(
         device.synchronize()?;
         thread::sleep(Duration::from_millis(2));
         device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
-        if stroke.shift {
+        if effective_shift {
             device.release(&uinput::event::keyboard::Key::LeftShift)?;
         }
         device.synchronize()?;

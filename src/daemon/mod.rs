@@ -9,6 +9,7 @@ pub mod switch_logic;
 use crate::config::default_config_path;
 use crate::dbus::{OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
+use crate::system::is_dev_runtime_mode;
 use keyboard::log_input_debug;
 use runtime::{log_layout_debug, BackendSyncResult, ConfigService, RuntimeState};
 use service::DaemonService;
@@ -62,10 +63,14 @@ pub fn run() -> Result<(), SwitcherError> {
         }
     }
     runtime.start_background_sync_polling();
-    let tray_probe = SessionBusTrayPresenceProbe {
-        connection: Connection::session()?,
-    };
-    runtime.start_tray_watchdog(tray_probe);
+    if !is_dev_runtime_mode() {
+        let tray_probe = SessionBusTrayPresenceProbe {
+            connection: Connection::session()?,
+        };
+        runtime.start_tray_watchdog(tray_probe);
+    } else {
+        log_layout_debug("tray-watchdog-start", "enabled=false reason=dev-runtime-mode");
+    }
     let dbus_api = OpenSwitcherDbusApi::new(runtime.clone());
 
     let connection = ConnectionBuilder::session()?

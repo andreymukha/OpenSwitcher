@@ -56,21 +56,21 @@ impl<R: CommandRunner> UserServiceController<R> {
     pub fn enable_autostart(&self) -> Result<(), ServiceManagerError> {
         self.run(["systemctl", "--user", "enable", DAEMON_UNIT])?;
         self.run(["systemctl", "--user", "enable", TRAY_UNIT])?;
-        self.run(["systemctl", "--user", "start", DAEMON_UNIT])?;
-        self.run(["systemctl", "--user", "start", TRAY_UNIT])?;
         Ok(())
     }
 
     pub fn disable_autostart(&self) -> Result<(), ServiceManagerError> {
         self.run(["systemctl", "--user", "disable", DAEMON_UNIT])?;
         self.run(["systemctl", "--user", "disable", TRAY_UNIT])?;
-        self.run(["systemctl", "--user", "stop", TRAY_UNIT])?;
-        self.run(["systemctl", "--user", "stop", DAEMON_UNIT])?;
         Ok(())
     }
 
     pub fn is_autostart_enabled(&self) -> Result<bool, ServiceManagerError> {
-        Ok(self.run(["systemctl", "--user", "is-enabled", DAEMON_UNIT])?.trim() == "enabled")
+        match self.run(["systemctl", "--user", "is-enabled", DAEMON_UNIT]) {
+            Ok(output) => Ok(output.trim() == "enabled"),
+            Err(ServiceManagerError::CommandFailed { code: Some(1 | 4), .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn start_daemon_service(&self) -> Result<(), ServiceManagerError> {
@@ -159,10 +159,8 @@ mod tests {
     }
 
     #[test]
-    fn enable_autostart_enables_and_starts_daemon_and_tray() {
+    fn enable_autostart_only_enables_daemon_and_tray() {
         let mut runner = FakeCommandRunner::default();
-        runner.push_ok("");
-        runner.push_ok("");
         runner.push_ok("");
         runner.push_ok("");
 
@@ -184,16 +182,32 @@ mod tests {
                     "enable".to_string(),
                     "open-switcher-tray.service".to_string(),
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn disable_autostart_only_disables_daemon_and_tray() {
+        let mut runner = FakeCommandRunner::default();
+        runner.push_ok("");
+        runner.push_ok("");
+
+        let services = UserServiceController::new(runner.clone());
+        services.disable_autostart().unwrap();
+
+        assert_eq!(
+            runner.commands(),
+            vec![
                 vec![
                     "systemctl".to_string(),
                     "--user".to_string(),
-                    "start".to_string(),
+                    "disable".to_string(),
                     "open-switcher-daemon.service".to_string(),
                 ],
                 vec![
                     "systemctl".to_string(),
                     "--user".to_string(),
-                    "start".to_string(),
+                    "disable".to_string(),
                     "open-switcher-tray.service".to_string(),
                 ],
             ]
@@ -207,6 +221,24 @@ mod tests {
 
         let services = UserServiceController::new(runner);
         assert!(services.is_autostart_enabled().unwrap());
+    }
+
+    #[test]
+    fn disabled_daemon_unit_is_reported_as_autostart_off() {
+        let mut runner = FakeCommandRunner::default();
+        runner.push_err(1, "");
+
+        let services = UserServiceController::new(runner);
+        assert!(!services.is_autostart_enabled().unwrap());
+    }
+
+    #[test]
+    fn missing_daemon_unit_is_reported_as_autostart_off() {
+        let mut runner = FakeCommandRunner::default();
+        runner.push_err(4, "");
+
+        let services = UserServiceController::new(runner);
+        assert!(!services.is_autostart_enabled().unwrap());
     }
 
     #[test]

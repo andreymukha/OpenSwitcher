@@ -1,5 +1,6 @@
 [Unit]
 Description=OpenSwitcher tray
+Wants=open-switcher-daemon.service
 After=open-switcher-daemon.service
 
 [Service]

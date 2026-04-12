@@ -1234,8 +1234,7 @@ impl SettingsWindow {
                 form.undo_dropdown.unblock_signal(undo_handler);
             }
 
-            form.autostart_switch
-                .set_sensitive(state.loaded && !state.autostart_busy);
+            form.autostart_switch.set_sensitive(state.form_enabled);
             form.delay_spin.set_sensitive(state.form_enabled);
             form.undo_dropdown.set_sensitive(state.form_enabled);
             form.selected_text_hotkey_row
@@ -1311,7 +1310,6 @@ impl SettingsWindow {
 fn initial_view_state() -> ViewState {
     ViewState {
         autostart_enabled: false,
-        autostart_busy: false,
         layout_delay_ms: crate::model::Settings::default().layout_delay_ms,
         undo_key: crate::model::Settings::default().undo_key,
         selected_text_hotkey: crate::model::Settings::default().selected_text_hotkey,

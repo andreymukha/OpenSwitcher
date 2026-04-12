@@ -8,6 +8,7 @@ PID_DIR="$RUN_DIR/pids"
 
 PROFILE="${OPEN_SWITCHER_PROFILE:-debug}"
 TARGET_DIR="$SCRIPT_DIR/target/$PROFILE"
+DEV_RUNTIME_MODE="dev"
 
 DAEMON_BIN="$TARGET_DIR/open-switcher"
 TRAY_BIN="$TARGET_DIR/open-switcher-tray"
@@ -161,7 +162,7 @@ start_component() {
         return 0
     fi
 
-    nohup "$binary" >"$logfile" 2>&1 &
+    OPEN_SWITCHER_RUNTIME_MODE="$DEV_RUNTIME_MODE" nohup "$binary" >"$logfile" 2>&1 &
     local pid=$!
     echo "$pid" >"$pidfile"
     sleep 1
@@ -325,6 +326,21 @@ ensure_dist_file() {
     fi
 }
 
+escape_sed_replacement() {
+    printf '%s' "$1" | sed 's/[&|]/\\&/g'
+}
+
+install_rewritten_file() {
+    local source="$1"
+    local destination="$2"
+    local search="$3"
+    local replacement="$4"
+
+    local escaped_replacement
+    escaped_replacement="$(escape_sed_replacement "$replacement")"
+    sed "s|$search|$escaped_replacement|" "$source" >"$destination"
+}
+
 install_systemd_runtime() {
     require_binary daemon
     require_binary tray
@@ -334,6 +350,7 @@ install_systemd_runtime() {
     ensure_dist_file "$DAEMON_UNIT_SOURCE"
     ensure_dist_file "$TRAY_UNIT_SOURCE"
     ensure_dist_file "$DESKTOP_FILE_SOURCE"
+    ensure_systemd_command
 
     install -m 0755 "$DAEMON_BIN" "$INSTALLED_DAEMON_BIN"
     install -m 0755 "$TRAY_BIN" "$INSTALLED_TRAY_BIN"
@@ -341,9 +358,21 @@ install_systemd_runtime() {
         install -m 0755 "$SETTINGS_BIN" "$INSTALLED_SETTINGS_BIN"
     fi
 
-    install -m 0644 "$DAEMON_UNIT_SOURCE" "$SYSTEMD_UNIT_DIR/$DAEMON_UNIT"
-    install -m 0644 "$TRAY_UNIT_SOURCE" "$SYSTEMD_UNIT_DIR/$TRAY_UNIT"
-    install -m 0644 "$DESKTOP_FILE_SOURCE" "$APPLICATIONS_DIR/$DESKTOP_FILE"
+    install_rewritten_file \
+        "$DAEMON_UNIT_SOURCE" \
+        "$SYSTEMD_UNIT_DIR/$DAEMON_UNIT" \
+        '^ExecStart=open-switcher-daemon$' \
+        "ExecStart=$INSTALLED_DAEMON_BIN"
+    install_rewritten_file \
+        "$TRAY_UNIT_SOURCE" \
+        "$SYSTEMD_UNIT_DIR/$TRAY_UNIT" \
+        '^ExecStart=open-switcher-tray$' \
+        "ExecStart=$INSTALLED_TRAY_BIN"
+    install_rewritten_file \
+        "$DESKTOP_FILE_SOURCE" \
+        "$APPLICATIONS_DIR/$DESKTOP_FILE" \
+        '^Exec=systemctl --user start open-switcher-tray\.service$' \
+        "Exec=$(command -v systemctl) --user start $TRAY_UNIT"
 
     run_systemctl_user daemon-reload
 

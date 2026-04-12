@@ -76,7 +76,7 @@ impl SettingsPresenter {
                 match presenter.inner.services.is_autostart_enabled() {
                     Ok(enabled) => {
                         presenter.with_state(|state| {
-                            state.set_autostart_enabled(enabled);
+                            state.apply_loaded_autostart(enabled);
                         });
                     }
                     Err(error) => {
@@ -118,32 +118,12 @@ impl SettingsPresenter {
     }
 
     pub fn set_autostart_enabled(&self, enabled: bool) {
-        let changed = self.with_state(|state| state.begin_autostart_change(enabled));
+        let changed = self.with_state(|state| state.set_autostart_enabled(enabled));
         if !changed {
             return;
         }
 
         let _ = self.emit_view_state();
-        let presenter = self.clone();
-        thread::spawn(move || {
-            let result = if enabled {
-                presenter.inner.services.enable_autostart()
-            } else {
-                presenter.inner.services.disable_autostart()
-            };
-
-            match result {
-                Ok(()) => presenter.with_state(|state| state.finish_autostart_change(enabled)),
-                Err(error) => {
-                    presenter.with_state(DomainState::autostart_change_failed);
-                    let _ = presenter.send_event(PresenterEvent::AutostartFailed(
-                        SettingsClientError::ServiceManager(error),
-                    ));
-                }
-            }
-
-            let _ = presenter.emit_view_state();
-        });
     }
 
     pub fn unlock_layout_switch_override(&self) {
@@ -223,7 +203,7 @@ impl SettingsPresenter {
         let saving_view_state = self.with_state(|state| state.view_state());
         let _ = self.send_event(PresenterEvent::ViewStateChanged(saving_view_state.clone()));
 
-        if let Err(error) = snapshot.validate() {
+        if let Err(error) = snapshot.settings.validate() {
             self.with_state(DomainState::save_failed);
             let reset_view_state = self.with_state(|state| state.view_state());
             let _ = self.send_event(PresenterEvent::ViewStateChanged(reset_view_state.clone()));
@@ -233,9 +213,26 @@ impl SettingsPresenter {
 
         let presenter = self.clone();
         thread::spawn(
-            move || match presenter.inner.client.save_settings(snapshot) {
+            move || match presenter.inner.client.save_settings(snapshot.settings) {
                 Ok(result) => {
-                    presenter.with_state(DomainState::save_succeeded);
+                    if let Some(enabled) = snapshot.autostart_change {
+                        let service_result = if enabled {
+                            presenter.inner.services.enable_autostart()
+                        } else {
+                            presenter.inner.services.disable_autostart()
+                        };
+
+                        if let Err(error) = service_result {
+                            presenter.with_state(DomainState::save_failed);
+                            let _ = presenter.emit_view_state();
+                            let _ = presenter.send_event(PresenterEvent::SaveFailed(
+                                SettingsClientError::ServiceManager(error),
+                            ));
+                            return;
+                        }
+                    }
+
+                    presenter.with_state(|state| state.save_succeeded(snapshot));
                     let _ = presenter.emit_view_state();
                     let _ = presenter.send_event(PresenterEvent::SaveSucceeded(result));
                 }

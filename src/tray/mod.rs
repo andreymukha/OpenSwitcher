@@ -15,6 +15,8 @@ use tray_service::{OpenSwitcherTray, TrayCommand};
 use zbus::blocking::Connection;
 
 pub use tray_service::TrayState;
+pub const TRAY_APPLICATION_ID: &str = "org.oswitch.tray.app";
+
 pub fn run() -> Result<(), SwitcherError> {
     let connection = Connection::session()?;
     match acquire_tray_instance(&connection) {
@@ -35,7 +37,7 @@ pub fn run() -> Result<(), SwitcherError> {
         return Ok(());
     }
 
-    let initial_state = match client.initial_state() {
+    let initial_state = match client.initial_state_with_retry() {
         Ok(state) => state,
         Err(err) => {
             eprintln!("[tray] Failed to fetch initial daemon state: {err}");
@@ -45,7 +47,7 @@ pub fn run() -> Result<(), SwitcherError> {
     let initialized = std::rc::Rc::new(std::cell::Cell::new(false));
     let hold_guard = std::rc::Rc::new(std::cell::RefCell::new(None::<gio::ApplicationHoldGuard>));
     let app = adw::Application::builder()
-        .application_id("org.oswitch.tray")
+        .application_id(TRAY_APPLICATION_ID)
         .build();
 
     {
@@ -86,6 +88,17 @@ pub fn run() -> Result<(), SwitcherError> {
     app.run();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TRAY_APPLICATION_ID;
+    use crate::tray::single_instance::TRAY_SERVICE_NAME;
+
+    #[test]
+    fn tray_application_id_does_not_reuse_single_instance_dbus_name() {
+        assert_ne!(TRAY_APPLICATION_ID, TRAY_SERVICE_NAME);
+    }
 }
 
 fn spawn_tray_backend(

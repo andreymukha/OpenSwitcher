@@ -1,5 +1,5 @@
 [Desktop Entry]
 Type=Application
 Name=OpenSwitcher
-Exec=open-switcher-tray
+Exec=systemctl --user start open-switcher-tray.service
 Categories=Utility;

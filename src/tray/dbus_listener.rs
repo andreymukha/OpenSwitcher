@@ -1,5 +1,6 @@
 use crate::dbus::OpenSwitcherProxyBlocking;
 use crate::error::SwitcherError;
+use crate::system::is_dev_runtime_mode;
 use crate::system::UserServiceController;
 use crate::tray::single_instance::{
     start_daemon_with_retry, DAEMON_RECOVERY_DELAY, MAX_DAEMON_RECOVERY_ATTEMPTS,
@@ -14,6 +15,8 @@ use zbus::blocking::fdo::DBusProxy;
 use zbus::names::BusName;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const INITIAL_STATE_RETRY_ATTEMPTS: usize = 3;
+const INITIAL_STATE_RETRY_DELAY: Duration = Duration::from_millis(1000);
 
 #[derive(Clone)]
 pub struct DbusListener {
@@ -42,6 +45,15 @@ impl DbusListener {
         })
     }
 
+    pub fn initial_state_with_retry(&self) -> Result<TrayState, SwitcherError> {
+        fetch_initial_state_with_retry(
+            || self.daemon_is_available(),
+            || self.initial_state(),
+            INITIAL_STATE_RETRY_ATTEMPTS,
+            INITIAL_STATE_RETRY_DELAY,
+        )
+    }
+
     pub fn toggle(&self) -> Result<(), SwitcherError> {
         let proxy = OpenSwitcherProxyBlocking::new(&self.connection)?;
         proxy.toggle()?;
@@ -64,6 +76,10 @@ impl DbusListener {
     }
 
     pub fn ensure_daemon_running(&self) -> Result<(), SwitcherError> {
+        if is_dev_runtime_mode() {
+            return Ok(());
+        }
+
         if self.daemon_is_available()? {
             return Ok(());
         }
@@ -81,6 +97,7 @@ impl DbusListener {
     pub fn spawn_listener(&self, tx: mpsc::Sender<TrayState>, command_tx: async_channel::Sender<TrayCommand>) {
         let connection = self.connection.clone();
         let services = self.services.clone();
+        let dev_runtime_mode = is_dev_runtime_mode();
         thread::spawn(move || loop {
             let daemon_available = match DBusProxy::new(&connection) {
                 Ok(proxy) => match proxy.name_has_owner(
@@ -98,7 +115,7 @@ impl DbusListener {
                 }
             };
 
-            if !daemon_available {
+            if !daemon_available && !dev_runtime_mode {
                 eprintln!("[tray] Daemon is unavailable, attempting recovery...");
                 if let Err(err) = start_daemon_with_retry(
                     &services,
@@ -164,5 +181,102 @@ impl DbusListener {
                 );
             }
         }
+    }
+}
+
+fn fetch_initial_state_with_retry<FCheck, FFetch>(
+    mut daemon_is_available: FCheck,
+    mut initial_state: FFetch,
+    attempts: usize,
+    delay: Duration,
+) -> Result<TrayState, SwitcherError>
+where
+    FCheck: FnMut() -> Result<bool, SwitcherError>,
+    FFetch: FnMut() -> Result<TrayState, SwitcherError>,
+{
+    assert!(attempts > 0, "initial state retry requires at least one attempt");
+
+    let mut last_error = None;
+
+    for attempt in 0..attempts {
+        match daemon_is_available() {
+            Ok(true) => match initial_state() {
+                Ok(state) => return Ok(state),
+                Err(error) => last_error = Some(error),
+            },
+            Ok(false) => {}
+            Err(error) => last_error = Some(error),
+        }
+
+        if attempt + 1 < attempts && !delay.is_zero() {
+            thread::sleep(delay);
+        }
+    }
+
+    Err(last_error
+        .unwrap_or_else(|| std::io::Error::other("OpenSwitcher daemon did not become available in time").into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    #[test]
+    fn initial_state_retry_waits_for_daemon_to_appear() {
+        let availability = RefCell::new(VecDeque::from([Ok(false), Ok(false), Ok(true)]));
+        let fetch_calls = Cell::new(0);
+
+        let state = fetch_initial_state_with_retry(
+            || {
+                availability
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("availability result must be queued")
+            },
+            || {
+                fetch_calls.set(fetch_calls.get() + 1);
+                Ok(TrayState {
+                    enabled: true,
+                    layout_is_english: false,
+                })
+            },
+            3,
+            Duration::ZERO,
+        )
+        .unwrap();
+
+        assert!(state.enabled);
+        assert!(!state.layout_is_english);
+        assert_eq!(fetch_calls.get(), 1);
+        assert!(availability.borrow().is_empty());
+    }
+
+    #[test]
+    fn initial_state_retry_stops_after_bounded_attempts_when_daemon_is_missing() {
+        let availability_calls = Cell::new(0);
+        let fetch_calls = Cell::new(0);
+
+        let error = fetch_initial_state_with_retry(
+            || {
+                availability_calls.set(availability_calls.get() + 1);
+                Ok(false)
+            },
+            || {
+                fetch_calls.set(fetch_calls.get() + 1);
+                Ok(TrayState {
+                    enabled: true,
+                    layout_is_english: true,
+                })
+            },
+            3,
+            Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, SwitcherError::Io(_)));
+        assert_eq!(availability_calls.get(), 3);
+        assert_eq!(fetch_calls.get(), 0);
     }
 }

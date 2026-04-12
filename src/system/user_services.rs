@@ -17,13 +17,12 @@ impl CommandRunner for ProcessCommandRunner {
             .split_first()
             .expect("command runner requires a non-empty command");
         let owned_command = command.iter().map(|part| (*part).to_string()).collect();
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|error| ServiceManagerError::SpawnFailed {
+        let output = Command::new(program).args(args).output().map_err(|error| {
+            ServiceManagerError::SpawnFailed {
                 command: owned_command,
                 message: error.to_string(),
-            })?;
+            }
+        })?;
 
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
@@ -68,7 +67,9 @@ impl<R: CommandRunner> UserServiceController<R> {
     pub fn is_autostart_enabled(&self) -> Result<bool, ServiceManagerError> {
         match self.run(["systemctl", "--user", "is-enabled", DAEMON_UNIT]) {
             Ok(output) => Ok(output.trim() == "enabled"),
-            Err(ServiceManagerError::CommandFailed { code: Some(1 | 4), .. }) => Ok(false),
+            Err(ServiceManagerError::CommandFailed {
+                code: Some(1 | 4), ..
+            }) => Ok(false),
             Err(error) => Err(error),
         }
     }

@@ -2,7 +2,7 @@
 
 OpenSwitcher — Linux desktop utility на Rust для автоматического переключения раскладки клавиатуры.
 
-Сейчас проект состоит из трёх программ:
+Проект собирается в три бинаря:
 
 - `open-switcher` — daemon, единственный источник истины для настроек
 - `open-switcher-tray` — основной пользовательский entrypoint и tray-клиент
@@ -15,6 +15,7 @@ OpenSwitcher — Linux desktop utility на Rust для автоматическ
 - GUI не работает с конфигом напрямую
 - пользовательская связка приложения — это `daemon + tray`
 - `open-switcher-settings` не входит в обязательную пару и может запускаться отдельно как служебная утилита
+- официальный lifecycle `daemon + tray` построен вокруг `systemd --user`
 
 ## Зависимости
 
@@ -54,10 +55,11 @@ cargo test --lib --test dbus_api
 Основной пользовательский запуск:
 
 ```bash
-open-switcher-tray
+systemctl --user start open-switcher-tray.service
 ```
 
-Tray при старте проверяет daemon, при необходимости пытается поднять его через `systemctl --user start open-switcher-daemon.service`, и завершается, если daemon не удалось восстановить.
+Desktop entry запускает tray через `systemctl --user`, а tray user unit тянет daemon user unit.
+Если tray стартует раньше, чем daemon успеет опубликовать D-Bus имя, tray делает bounded retry на чтение initial state.
 
 ### User-level systemd автозапуск
 
@@ -78,21 +80,31 @@ install -m 0644 dist/systemd/open-switcher-tray.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-Ручное включение автозапуска:
+Ручное включение автозапуска на будущие сессии:
 
 ```bash
-systemctl --user enable --now open-switcher-daemon.service
-systemctl --user enable --now open-switcher-tray.service
+systemctl --user enable open-switcher-daemon.service
+systemctl --user enable open-switcher-tray.service
 ```
 
-Ручное отключение автозапуска:
+Ручное отключение автозапуска на будущие сессии:
 
 ```bash
-systemctl --user disable --now open-switcher-tray.service
-systemctl --user disable --now open-switcher-daemon.service
+systemctl --user disable open-switcher-tray.service
+systemctl --user disable open-switcher-daemon.service
 ```
 
-Desktop entry запускает только tray:
+Запуск/остановка текущей сессии:
+
+```bash
+systemctl --user start open-switcher-daemon.service
+systemctl --user start open-switcher-tray.service
+
+systemctl --user stop open-switcher-tray.service
+systemctl --user stop open-switcher-daemon.service
+```
+
+Desktop entry устанавливается как пользовательский launcher и запускает tray через `systemctl --user`:
 
 ```bash
 install -Dm0644 dist/open-switcher.desktop ~/.local/share/applications/open-switcher.desktop
@@ -125,19 +137,29 @@ Tray:
 Для удобства можно использовать `manage.sh`:
 
 ```bash
-./manage.sh build
-./manage.sh start
-./manage.sh status
-./manage.sh logs
-./manage.sh settings
-./manage.sh stop
+./manage.sh dev build
+./manage.sh dev start
+./manage.sh dev status
+./manage.sh dev logs
+./manage.sh dev settings
+./manage.sh dev stop
 ```
 
 Если нужен `release`, можно передать:
 
 ```bash
-OPEN_SWITCHER_PROFILE=release ./manage.sh build
-OPEN_SWITCHER_PROFILE=release ./manage.sh start
+OPEN_SWITCHER_PROFILE=release ./manage.sh dev build
+OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
+```
+
+Для systemd-runtime:
+
+```bash
+./manage.sh systemd install
+./manage.sh systemd start
+./manage.sh systemd status
+./manage.sh systemd logs
+./manage.sh systemd stop
 ```
 
 ## Конфиг
@@ -194,12 +216,12 @@ gdbus call \
 
 ## Локальный сценарий проверки
 
-1. Собрать проект через `cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings`.
-2. Запустить `./target/debug/open-switcher-tray`.
-3. Убедиться, что tray сам поднял daemon или daemon уже работает через `systemd --user`.
-4. При необходимости открыть `./target/debug/open-switcher-settings`.
-5. Проверить `GetSettings` и `UpdateSettings` через `gdbus`.
-6. Убедиться, что `~/.config/open-switcher/config.toml` обновляет именно демон.
+1. Собрать проект через `./manage.sh dev build`.
+2. Проверить dev-сценарий через `./manage.sh dev start`.
+3. При необходимости открыть `./manage.sh dev settings`.
+4. Проверить `GetSettings` и `UpdateSettings` через `gdbus`.
+5. Убедиться, что `~/.config/open-switcher/config.toml` обновляет именно демон.
+6. Отдельно проверить systemd-сценарий через `./manage.sh systemd install` и `./manage.sh systemd start`.
 
 ## Типичные проблемы
 
@@ -246,6 +268,7 @@ pkill -f '/target/.*/open-switcher($| )'
 
 - уже работает другой экземпляр `open-switcher-tray`
 - tray не смог восстановить daemon через `systemctl --user`
+- tray был запущен вне `systemd`, а потом поверх него стартовал `open-switcher-tray.service`
 
 Что проверить:
 

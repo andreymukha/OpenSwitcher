@@ -34,9 +34,7 @@ pub fn is_dev_runtime_mode() -> bool {
     current_runtime_mode() == RuntimeMode::Dev
 }
 
-pub use user_services::{
-    UserServiceController, DAEMON_UNIT, TRAY_UNIT,
-};
+pub use user_services::{UserServiceController, DAEMON_UNIT, TRAY_UNIT};
 
 impl SystemContextDetector {
     pub fn detect_current() -> Result<SystemContext, SystemContextError> {

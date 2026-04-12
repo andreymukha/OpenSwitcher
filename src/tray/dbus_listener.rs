@@ -10,8 +10,8 @@ use crate::tray::TrayState;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use zbus::blocking::Connection;
 use zbus::blocking::fdo::DBusProxy;
+use zbus::blocking::Connection;
 use zbus::names::BusName;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
@@ -94,21 +94,25 @@ impl DbusListener {
         Ok(())
     }
 
-    pub fn spawn_listener(&self, tx: mpsc::Sender<TrayState>, command_tx: async_channel::Sender<TrayCommand>) {
+    pub fn spawn_listener(
+        &self,
+        tx: mpsc::Sender<TrayState>,
+        command_tx: async_channel::Sender<TrayCommand>,
+    ) {
         let connection = self.connection.clone();
         let services = self.services.clone();
         let dev_runtime_mode = is_dev_runtime_mode();
         thread::spawn(move || loop {
             let daemon_available = match DBusProxy::new(&connection) {
-                Ok(proxy) => match proxy.name_has_owner(
-                    crate::dbus::SERVICE_NAME.try_into().unwrap(),
-                ) {
-                    Ok(has_owner) => has_owner,
-                    Err(err) => {
-                        eprintln!("[tray] Failed to query daemon owner on D-Bus: {err}");
-                        false
+                Ok(proxy) => {
+                    match proxy.name_has_owner(crate::dbus::SERVICE_NAME.try_into().unwrap()) {
+                        Ok(has_owner) => has_owner,
+                        Err(err) => {
+                            eprintln!("[tray] Failed to query daemon owner on D-Bus: {err}");
+                            false
+                        }
                     }
-                },
+                }
                 Err(err) => {
                     eprintln!("[tray] Failed to create org.freedesktop.DBus proxy: {err}");
                     false
@@ -194,7 +198,10 @@ where
     FCheck: FnMut() -> Result<bool, SwitcherError>,
     FFetch: FnMut() -> Result<TrayState, SwitcherError>,
 {
-    assert!(attempts > 0, "initial state retry requires at least one attempt");
+    assert!(
+        attempts > 0,
+        "initial state retry requires at least one attempt"
+    );
 
     let mut last_error = None;
 
@@ -213,8 +220,9 @@ where
         }
     }
 
-    Err(last_error
-        .unwrap_or_else(|| std::io::Error::other("OpenSwitcher daemon did not become available in time").into()))
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::other("OpenSwitcher daemon did not become available in time").into()
+    }))
 }
 
 #[cfg(test)]

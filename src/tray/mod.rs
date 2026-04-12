@@ -8,9 +8,7 @@ use adw::prelude::*;
 use dbus_listener::DbusListener;
 use gtk::gio;
 use gtk::glib;
-use single_instance::{
-    acquire_tray_instance, TrayInstanceError,
-};
+use single_instance::{acquire_tray_instance, TrayInstanceError};
 use tray_service::{OpenSwitcherTray, TrayCommand};
 use zbus::blocking::Connection;
 

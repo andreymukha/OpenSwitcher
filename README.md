@@ -1,25 +1,74 @@
 # OpenSwitcher
 
-OpenSwitcher — Linux desktop utility на Rust для автоматического переключения раскладки клавиатуры.
+OpenSwitcher is a Linux desktop keyboard layout switcher written in Rust.
 
-Проект собирается в три бинаря:
+The project focuses on day-to-day EN/RU typing workflows:
+- automatic correction of the last word when it was typed in the wrong layout
+- manual correction of the current or previous word
+- selected-text layout conversion
+- lightweight tray control and a separate settings window
 
-- `open-switcher` — daemon, единственный источник истины для настроек
-- `open-switcher-tray` — основной пользовательский entrypoint и tray-клиент
-- `open-switcher-settings` — служебное окно настроек на GTK4 + libadwaita
+This repository contains the full local development history of the project.
 
-Важно:
+## What The App Consists Of
 
-- `config.toml` читает и пишет только демон
-- tray и settings UI работают с демоном только через D-Bus
-- GUI не работает с конфигом напрямую
-- пользовательская связка приложения — это `daemon + tray`
-- `open-switcher-settings` не входит в обязательную пару и может запускаться отдельно как служебная утилита
-- официальный lifecycle `daemon + tray` построен вокруг `systemd --user`
+OpenSwitcher is split into three binaries:
 
-## Зависимости
+- `open-switcher`  
+  The daemon. It owns configuration, input handling, layout correction, and the D-Bus API.
+- `open-switcher-tray`  
+  The main user-facing entrypoint. It provides the tray icon, status menu, and talks to the daemon over D-Bus.
+- `open-switcher-settings`  
+  A GTK4 + libadwaita settings window. It is a service tool, not part of the mandatory runtime pair.
 
-Для Linux Mint / Ubuntu-подобной системы:
+## Runtime Model
+
+For users, OpenSwitcher is one application built from two cooperating processes:
+
+- `daemon`
+- `tray`
+
+Those two are expected to run together.
+
+Current runtime model:
+- the official user-facing startup path is the tray
+- the official autostart path is `systemd --user`
+- `tray + daemon` are treated as one application lifecycle
+- the settings window is optional and can be started separately
+
+## Current Features
+
+- Auto-switch the last word on word commit when it looks like wrong-layout EN/RU input
+- Manual correction hotkey for the current or previous word
+- Selected-text layout conversion
+- Case correction options:
+  - fix two uppercase letters at the beginning of a word
+  - fix accidental Caps Lock pattern
+- Settings UI for system, correction, and hotkey options
+- User-level `systemd` integration for daemon + tray
+- Tray menu with status and control actions
+
+## Current Scope And Limitations
+
+- Linux only
+- Main supported typing scenario is EN/RU
+- Layout/backend support is still conservative and backend-driven
+- The current backend layer is designed for expansion, but support is not yet broad across all desktop environments
+- Tray support depends on the desktop environment providing a compatible StatusNotifier/AppIndicator host
+- The settings UI is built behind the `settings-ui` Cargo feature
+
+## Requirements
+
+### Runtime environment
+
+- Linux desktop session
+- session D-Bus
+- `systemd --user` for the official autostart/runtime model
+- a tray host compatible with the tray implementation used by the project
+
+### Build dependencies
+
+For Linux Mint / Ubuntu-like systems:
 
 ```bash
 sudo apt-get update
@@ -30,93 +79,128 @@ sudo apt-get install -y \
   libadwaita-1-dev
 ```
 
-## Сборка
+## Building
 
-Проверка всех бинарников:
+Check all binaries:
 
 ```bash
 cargo check --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
 ```
 
-Полная локальная сборка:
+Build everything locally:
 
 ```bash
 cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
 ```
 
-Тесты:
+Run tests:
 
 ```bash
-cargo test --lib --test dbus_api
+cargo test -q --lib
+cargo test --test dbus_api
 ```
 
-## Запуск
+## Development Workflow
 
-Основной пользовательский запуск:
+The repository ships with `manage.sh`, which supports two explicit modes:
+
+- `dev`  
+  Direct local binaries from `target/`
+- `systemd`  
+  Real user-service runtime through `systemctl --user`
+
+Old top-level commands are kept as aliases for `dev`, but the preferred form is the explicit namespace.
+
+### `dev` mode
+
+Build:
 
 ```bash
-systemctl --user start open-switcher-tray.service
+./manage.sh dev build
 ```
 
-Desktop entry запускает tray через `systemctl --user`, а tray user unit тянет daemon user unit.
-Если tray стартует раньше, чем daemon успеет опубликовать D-Bus имя, tray делает bounded retry на чтение initial state.
+Start daemon + tray from the local build:
 
-### User-level systemd автозапуск
+```bash
+./manage.sh dev start
+```
 
-OpenSwitcher использует только `systemd --user` units.
+Useful helpers:
 
-Файлы поставки:
+```bash
+./manage.sh dev status
+./manage.sh dev logs
+./manage.sh dev settings
+./manage.sh dev stop
+```
+
+Use a release profile if needed:
+
+```bash
+OPEN_SWITCHER_PROFILE=release ./manage.sh dev build
+OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
+```
+
+## `systemd --user` Runtime
+
+This is the official runtime model for the published app.
+
+Install user units, desktop entry, and locally installed binaries:
+
+```bash
+./manage.sh systemd install
+```
+
+Start the app through user services:
+
+```bash
+./manage.sh systemd start
+```
+
+Inspect runtime state:
+
+```bash
+./manage.sh systemd status
+./manage.sh systemd logs
+```
+
+Stop the current session:
+
+```bash
+./manage.sh systemd stop
+```
+
+Enable or disable autostart for future sessions:
+
+```bash
+./manage.sh systemd enable
+./manage.sh systemd disable
+```
+
+### What gets installed
+
+Distribution assets in the repository:
 
 - `dist/systemd/open-switcher-daemon.service`
 - `dist/systemd/open-switcher-tray.service`
 - `dist/open-switcher.desktop`
 
-Установка user units:
+Installed by `./manage.sh systemd install` into:
 
-```bash
-mkdir -p ~/.config/systemd/user
-install -m 0644 dist/systemd/open-switcher-daemon.service ~/.config/systemd/user/
-install -m 0644 dist/systemd/open-switcher-tray.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-```
+- `~/.config/systemd/user/`
+- `~/.local/share/applications/`
+- `~/.local/bin/`
 
-Ручное включение автозапуска на будущие сессии:
+Notes:
+- the desktop entry starts the tray service through `systemctl --user`
+- the tray unit pulls in the daemon unit
+- `~/.config/autostart` is not used
 
-```bash
-systemctl --user enable open-switcher-daemon.service
-systemctl --user enable open-switcher-tray.service
-```
+## Direct Binary Runs
 
-Ручное отключение автозапуска на будущие сессии:
+If you want to run the binaries manually from the build tree:
 
-```bash
-systemctl --user disable open-switcher-tray.service
-systemctl --user disable open-switcher-daemon.service
-```
-
-Запуск/остановка текущей сессии:
-
-```bash
-systemctl --user start open-switcher-daemon.service
-systemctl --user start open-switcher-tray.service
-
-systemctl --user stop open-switcher-tray.service
-systemctl --user stop open-switcher-daemon.service
-```
-
-Desktop entry устанавливается как пользовательский launcher и запускает tray через `systemctl --user`:
-
-```bash
-install -Dm0644 dist/open-switcher.desktop ~/.local/share/applications/open-switcher.desktop
-```
-
-Важно:
-
-- `~/.config/autostart` для OpenSwitcher не используется
-- официальный сценарий автозапуска — только `systemd --user`
-- `open-switcher-settings` не добавляется в автозапуск
-
-Демон:
+Daemon:
 
 ```bash
 ./target/debug/open-switcher
@@ -128,53 +212,30 @@ Tray:
 ./target/debug/open-switcher-tray
 ```
 
-Окно настроек:
+Settings:
 
 ```bash
 ./target/debug/open-switcher-settings
 ```
 
-Для удобства можно использовать `manage.sh`:
+## Configuration
 
-```bash
-./manage.sh dev build
-./manage.sh dev start
-./manage.sh dev status
-./manage.sh dev logs
-./manage.sh dev settings
-./manage.sh dev stop
-```
-
-Если нужен `release`, можно передать:
-
-```bash
-OPEN_SWITCHER_PROFILE=release ./manage.sh dev build
-OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
-```
-
-Для systemd-runtime:
-
-```bash
-./manage.sh systemd install
-./manage.sh systemd start
-./manage.sh systemd status
-./manage.sh systemd logs
-./manage.sh systemd stop
-```
-
-## Конфиг
-
-Путь к конфигу:
+Configuration file path:
 
 ```text
 ~/.config/open-switcher/config.toml
 ```
 
-Конфигом управляет только демон.
+Important behavior:
+- only the daemon reads and writes the config file
+- tray and settings talk to the daemon over D-Bus
+- the settings window does not write the config directly
 
-## Быстрая проверка D-Bus
+## D-Bus Notes
 
-Получить текущие настройки:
+The daemon exposes the session D-Bus name `org.oswitch.core`.
+
+Quick inspection:
 
 ```bash
 gdbus call \
@@ -184,18 +245,7 @@ gdbus call \
   --method org.oswitch.core.GetSettings
 ```
 
-Обновить настройки:
-
-```bash
-gdbus call \
-  --session \
-  --dest org.oswitch.core \
-  --object-path /org/oswitch/core \
-  --method org.oswitch.core.UpdateSettings \
-  "(uint32 77, 'F12')"
-```
-
-Подписаться на сигналы состояния:
+Watch status and settings-related signals:
 
 ```bash
 gdbus monitor \
@@ -204,35 +254,26 @@ gdbus monitor \
   --object-path /org/oswitch/core
 ```
 
-Переключить состояние демона:
+## Practical Smoke Test
 
-```bash
-gdbus call \
-  --session \
-  --dest org.oswitch.core \
-  --object-path /org/oswitch/core \
-  --method org.oswitch.core.Toggle
-```
+Recommended local sanity-check order:
 
-## Локальный сценарий проверки
+1. `./manage.sh dev build`
+2. `./manage.sh dev start`
+3. `./manage.sh dev settings`
+4. `./manage.sh dev stop`
+5. `./manage.sh systemd install`
+6. `./manage.sh systemd start`
+7. `./manage.sh systemd status`
+8. `./manage.sh systemd logs`
 
-1. Собрать проект через `./manage.sh dev build`.
-2. Проверить dev-сценарий через `./manage.sh dev start`.
-3. При необходимости открыть `./manage.sh dev settings`.
-4. Проверить `GetSettings` и `UpdateSettings` через `gdbus`.
-5. Убедиться, что `~/.config/open-switcher/config.toml` обновляет именно демон.
-6. Отдельно проверить systemd-сценарий через `./manage.sh systemd install` и `./manage.sh systemd start`.
+## Troubleshooting
 
-## Типичные проблемы
+### `Dbus(NameTaken)` or `The name org.oswitch.core is already owned`
 
-### `Dbus(NameTaken)` или `The name org.oswitch.core is already owned`
+That usually means another daemon instance is already running.
 
-Причина:
-
-- уже запущен другой экземпляр `open-switcher`
-- или daemon уже поднят через `systemd --user`
-
-Что проверить:
+Check:
 
 ```bash
 gdbus call \
@@ -243,96 +284,28 @@ gdbus call \
   org.oswitch.core
 ```
 
-Если нужно освободить имя:
+### `ServiceUnknown` on D-Bus calls
+
+That usually means the daemon is not running or exited during startup.
+
+Check:
 
 ```bash
-pkill -f '/target/.*/open-switcher($| )'
+./manage.sh dev status
+./manage.sh systemd status
+./manage.sh systemd logs
 ```
 
-### `ServiceUnknown` при вызове `gdbus`
+### Tray icon does not appear
 
-Причина:
+Likely causes:
+- the tray process is not running
+- the desktop environment does not expose a compatible tray host
+- the tray was started in a different way than expected for the current mode
 
-- демон не запущен
-- или завершился сразу после старта
-
-Что делать:
-
-1. Убедиться, что tray действительно запущен или поднять daemon вручную через `systemctl --user start open-switcher-daemon.service`.
-2. Проверить, что имя есть на session bus.
-3. Только после этого вызывать `gdbus` или открывать settings UI.
-
-### Tray завершился сразу после старта
-
-Чаще всего это означает, что:
-
-- уже работает другой экземпляр `open-switcher-tray`
-- tray не смог восстановить daemon через `systemctl --user`
-- tray был запущен вне `systemd`, а потом поверх него стартовал `open-switcher-tray.service`
-
-Что проверить:
+Check:
 
 ```bash
-systemctl --user status open-switcher-daemon.service
-systemctl --user status open-switcher-tray.service
-gdbus call \
-  --session \
-  --dest org.freedesktop.DBus \
-  --object-path /org/freedesktop/DBus \
-  --method org.freedesktop.DBus.NameHasOwner \
-  org.oswitch.tray
+./manage.sh dev status
+./manage.sh systemd status
 ```
-
-### Не собирается settings UI
-
-Чаще всего не хватает системных GTK/libadwaita пакетов.
-
-Установить:
-
-```bash
-sudo apt-get install -y \
-  build-essential \
-  pkg-config \
-  libgtk-4-dev \
-  libadwaita-1-dev
-```
-
-### Tray или settings UI не видят демон
-
-Проверь окружение session D-Bus:
-
-```bash
-echo "$DBUS_SESSION_BUS_ADDRESS"
-```
-
-Если запускаешь из нестандартной сессии или через скрипт, убедись, что клиент и демон работают в одной пользовательской session bus.
-
-### Демон стартует, но не работает с клавиатурой
-
-Проверь:
-
-- доступ к `/dev/input/event*`
-- доступ к `uinput`
-- что процесс действительно нашёл физическую клавиатуру
-
-Полезно запустить демон напрямую и посмотреть его stdout/stderr:
-
-```bash
-./target/debug/open-switcher
-```
-
-### `xset` не возвращает корректную раскладку
-
-Проверь переменные окружения:
-
-```bash
-echo "$DISPLAY"
-echo "$XAUTHORITY"
-```
-
-Для X11 они должны указывать на реальную пользовательскую сессию.
-
-## Документация
-
-- Актуальная схема проекта: [docs/architecture.md](/home/fly/projects/open-switcher/docs/architecture.md)
-- Историческое ТЗ и исходное описание проекта: [docs/technical-spec.md](/home/fly/projects/open-switcher/docs/technical-spec.md)

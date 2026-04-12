@@ -30,9 +30,19 @@ pub struct DelaysConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeaturesConfig {
+    #[serde(default = "default_auto_switch_enabled")]
+    pub auto_switch_enabled: bool,
+    #[serde(default)]
+    pub fix_two_capitals: bool,
+    #[serde(default)]
+    pub fix_accidental_caps_lock: bool,
     pub undo_key: UndoKey,
     #[serde(default)]
     pub selected_text_switch_hotkey: SelectedTextHotkey,
+}
+
+fn default_auto_switch_enabled() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -49,6 +59,9 @@ impl Default for AppConfig {
                 typing_ms: 0,
             },
             features: FeaturesConfig {
+                auto_switch_enabled: true,
+                fix_two_capitals: false,
+                fix_accidental_caps_lock: false,
                 undo_key: UndoKey::Pause,
                 selected_text_switch_hotkey: SelectedTextHotkey::default(),
             },
@@ -80,6 +93,9 @@ impl AppConfig {
 
     pub fn settings(&self) -> Settings {
         Settings {
+            auto_switch_enabled: self.features.auto_switch_enabled,
+            fix_two_capitals: self.features.fix_two_capitals,
+            fix_accidental_caps_lock: self.features.fix_accidental_caps_lock,
             layout_delay_ms: self.layout.delay_ms,
             undo_key: self.features.undo_key,
             selected_text_hotkey: self.features.selected_text_switch_hotkey,
@@ -92,6 +108,9 @@ impl AppConfig {
     }
 
     pub fn apply_settings(&mut self, settings: Settings) {
+        self.features.auto_switch_enabled = settings.auto_switch_enabled;
+        self.features.fix_two_capitals = settings.fix_two_capitals;
+        self.features.fix_accidental_caps_lock = settings.fix_accidental_caps_lock;
         self.layout.delay_ms = settings.layout_delay_ms;
         self.layout.switch_combo = settings.layout_switch.combo;
         self.layout.switch_source = settings.layout_switch.source;
@@ -205,6 +224,9 @@ mod tests {
                 typing_ms: 0,
             },
             features: FeaturesConfig {
+                auto_switch_enabled: true,
+                fix_two_capitals: false,
+                fix_accidental_caps_lock: false,
                 undo_key: UndoKey::Pause,
                 selected_text_switch_hotkey: SelectedTextHotkey::default(),
             },
@@ -229,6 +251,9 @@ mod tests {
                 typing_ms: 0,
             },
             features: FeaturesConfig {
+                auto_switch_enabled: true,
+                fix_two_capitals: false,
+                fix_accidental_caps_lock: false,
                 undo_key: UndoKey::Pause,
                 selected_text_switch_hotkey: SelectedTextHotkey::default(),
             },
@@ -241,5 +266,31 @@ mod tests {
                 field: "layout.switch_combo"
             }
         ));
+    }
+
+    #[test]
+    fn missing_new_feature_flags_in_config_default_to_supported_values() {
+        let parsed: AppConfigFile = toml::from_str(
+            r#"
+[layout]
+switch_combo = "CtrlShift"
+switch_source = "Unknown"
+delay_ms = 30
+
+[delays]
+backspace_ms = 0
+typing_ms = 0
+
+[features]
+undo_key = "Pause"
+selected_text_switch_hotkey = "ShiftPause"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::try_from(parsed).unwrap();
+        assert!(config.features.auto_switch_enabled);
+        assert!(!config.features.fix_two_capitals);
+        assert!(!config.features.fix_accidental_caps_lock);
     }
 }

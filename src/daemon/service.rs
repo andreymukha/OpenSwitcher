@@ -373,6 +373,7 @@ impl DaemonService {
                 let startup_sync_ready = self.refresh_startup_layout_before_autocorrect()?;
                 let features = self.runtime.feature_availability();
                 let corrected = self.runtime.is_enabled()
+                    && config.auto_switch_enabled
                     && features.auto_switch
                     && startup_sync_ready
                     && matches!(self.current_layout_kind(), AppLayoutKind::English)
@@ -511,6 +512,8 @@ impl DaemonService {
             &self.buffer,
             fallback_buffer,
             self.word_context.followed_by_separator,
+            config.fix_two_capitals,
+            config.fix_accidental_caps_lock,
         ) else {
             return Ok(false);
         };

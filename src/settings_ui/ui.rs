@@ -12,8 +12,9 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-const WINDOW_WIDTH: i32 = 520;
-const WINDOW_HEIGHT: i32 = 460;
+const WINDOW_WIDTH: i32 = 760;
+const WINDOW_HEIGHT: i32 = 520;
+const PAGE_MAX_WIDTH: i32 = 560;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
 const CAPTURE_FOCUS_SETTLE_DELAY: Duration = Duration::from_millis(150);
 const CAPTURE_TIMEOUT_TOAST: &str = "Захват комбинации отменён по таймауту.";
@@ -156,6 +157,33 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
         })
     };
     ui.set_autostart_handler(autostart_handler);
+
+    let auto_switch_handler = {
+        let presenter = presenter.clone();
+        let auto_switch = ui.auto_switch_switch();
+        auto_switch.connect_active_notify(move |switch| {
+            presenter.update_auto_switch_enabled(switch.is_active());
+        })
+    };
+    ui.set_auto_switch_handler(auto_switch_handler);
+
+    let fix_two_capitals_handler = {
+        let presenter = presenter.clone();
+        let fix_two_capitals = ui.fix_two_capitals_switch();
+        fix_two_capitals.connect_active_notify(move |switch| {
+            presenter.update_fix_two_capitals(switch.is_active());
+        })
+    };
+    ui.set_fix_two_capitals_handler(fix_two_capitals_handler);
+
+    let fix_accidental_caps_lock_handler = {
+        let presenter = presenter.clone();
+        let fix_accidental_caps_lock = ui.fix_accidental_caps_lock_switch();
+        fix_accidental_caps_lock.connect_active_notify(move |switch| {
+            presenter.update_fix_accidental_caps_lock(switch.is_active());
+        })
+    };
+    ui.set_fix_accidental_caps_lock_handler(fix_accidental_caps_lock_handler);
 
     let undo_handler = {
         let presenter = presenter.clone();
@@ -341,9 +369,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     PresenterEvent::CaptureStateChanged(state) => {
                         ui.apply_capture_state(&presenter_for_events, state)
                     }
-                    PresenterEvent::AutostartFailed(error) => {
-                        ui.show_client_error(error, false)
-                    }
+                    PresenterEvent::AutostartFailed(error) => ui.show_client_error(error, false),
                 }
             }
         });
@@ -353,29 +379,21 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
 }
 
 fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
-    let clamp = adw::Clamp::new();
-    clamp.set_margin_top(8);
-    clamp.set_margin_bottom(12);
-    clamp.set_margin_start(12);
-    clamp.set_margin_end(12);
-    clamp.set_maximum_size(WINDOW_WIDTH);
-
-    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let group = adw::PreferencesGroup::builder()
-        .title("Основные настройки")
-        .description("Настройки получает и сохраняет только демон через D-Bus.")
-        .build();
-
     let autostart_row = adw::ActionRow::builder()
         .title("Автозапуск")
         .subtitle("Запускать daemon и tray через systemd --user")
         .build();
-    let autostart_switch = gtk::Switch::builder()
-        .valign(gtk::Align::Center)
-        .build();
+    let autostart_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
     autostart_row.add_suffix(&autostart_switch);
     autostart_row.set_activatable_widget(Some(&autostart_switch));
-    group.add(&autostart_row);
+
+    let auto_switch_row = adw::ActionRow::builder()
+        .title("Автопереключение")
+        .subtitle("Автоматически исправлять последнее слово при нажатии пробела")
+        .build();
+    let auto_switch_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    auto_switch_row.add_suffix(&auto_switch_switch);
+    auto_switch_row.set_activatable_widget(Some(&auto_switch_switch));
 
     let delay_row = adw::ActionRow::builder()
         .title("Задержка переключения раскладки")
@@ -396,7 +414,22 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     delay_spin.set_width_chars(5);
     delay_row.add_suffix(&delay_spin);
     delay_row.set_activatable_widget(Some(&delay_spin));
-    group.add(&delay_row);
+
+    let fix_two_capitals_row = adw::ActionRow::builder()
+        .title("Исправлять две заглавные буквы в начале слова")
+        .subtitle("Например: ПРивет -> Привет")
+        .build();
+    let fix_two_capitals_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    fix_two_capitals_row.add_suffix(&fix_two_capitals_switch);
+    fix_two_capitals_row.set_activatable_widget(Some(&fix_two_capitals_switch));
+
+    let fix_accidental_caps_lock_row = adw::ActionRow::builder()
+        .title("Исправлять случайно нажатый Caps Lock")
+        .subtitle("Например: hELLO -> Hello")
+        .build();
+    let fix_accidental_caps_lock_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    fix_accidental_caps_lock_row.add_suffix(&fix_accidental_caps_lock_switch);
+    fix_accidental_caps_lock_row.set_activatable_widget(Some(&fix_accidental_caps_lock_switch));
 
     let undo_row = adw::ActionRow::builder()
         .title("Клавиша ручного исправления")
@@ -410,7 +443,6 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     undo_dropdown.set_valign(gtk::Align::Center);
     undo_row.add_suffix(&undo_dropdown);
     undo_row.set_activatable_widget(Some(&undo_dropdown));
-    group.add(&undo_row);
 
     let selected_text_hotkey_row = adw::ActionRow::builder()
         .title("Горячая клавиша для выделенного текста")
@@ -423,7 +455,6 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     let selected_text_hotkey_value_icon = gtk::Image::from_icon_name("go-next-symbolic");
     selected_text_hotkey_row.add_suffix(&selected_text_hotkey_value_icon);
     selected_text_hotkey_row.add_suffix(&selected_text_hotkey_value_label);
-    group.add(&selected_text_hotkey_row);
 
     let selected_text_hotkey_dialog = adw::Window::builder()
         .title("Горячая клавиша для выделенного текста")
@@ -504,7 +535,6 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     let layout_switch_value_icon = gtk::Image::from_icon_name("go-next-symbolic");
     layout_switch_value_row.add_suffix(&layout_switch_value_icon);
     layout_switch_value_row.add_suffix(&layout_switch_value_label);
-    group.add(&layout_switch_value_row);
 
     let layout_switch_dialog = adw::Window::builder()
         .title("Выбор комбинации раскладки")
@@ -598,15 +628,49 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     layout_switch_hint_label.set_margin_start(12);
     layout_switch_hint_label.set_margin_end(12);
     layout_switch_hint_label.hide();
-    group.add(&layout_switch_hint_label);
+    let general_page = build_general_page(
+        &autostart_row,
+        &auto_switch_row,
+        &delay_row,
+        &fix_two_capitals_row,
+        &fix_accidental_caps_lock_row,
+    );
+    let hotkeys_page = build_hotkeys_page(
+        &undo_row,
+        &selected_text_hotkey_row,
+        &layout_switch_value_row,
+        &layout_switch_hint_label,
+    );
 
-    content.append(&group);
-    clamp.set_child(Some(&content));
+    let stack = gtk::Stack::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .transition_type(gtk::StackTransitionType::SlideLeftRight)
+        .build();
+    stack.add_titled(&general_page, Some("general"), "Общие");
+    stack.add_titled(&hotkeys_page, Some("hotkeys"), "Горячие клавиши");
+    stack.set_visible_child_name("general");
+
+    let sidebar = gtk::StackSidebar::new();
+    sidebar.set_stack(&stack);
+    sidebar.set_vexpand(true);
+    sidebar.set_width_request(180);
+
+    let container = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    container.set_margin_top(8);
+    container.set_margin_bottom(12);
+    container.set_margin_start(12);
+    container.set_margin_end(12);
+    container.append(&sidebar);
+    container.append(&stack);
 
     FormWidgets {
-        clamp,
+        container,
         autostart_switch,
+        auto_switch_switch,
         delay_spin,
+        fix_two_capitals_switch,
+        fix_accidental_caps_lock_switch,
         undo_dropdown,
         selected_text_hotkey_row,
         selected_text_hotkey_value_label,
@@ -627,15 +691,79 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         dialog_cancel_button,
         layout_switch_hint_label,
         autostart_handler: None,
+        auto_switch_handler: None,
         delay_handler: None,
+        fix_two_capitals_handler: None,
+        fix_accidental_caps_lock_handler: None,
         undo_handler: None,
     }
 }
 
+fn build_general_page(
+    autostart_row: &adw::ActionRow,
+    auto_switch_row: &adw::ActionRow,
+    delay_row: &adw::ActionRow,
+    fix_two_capitals_row: &adw::ActionRow,
+    fix_accidental_caps_lock_row: &adw::ActionRow,
+) -> adw::Clamp {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    let system_group = adw::PreferencesGroup::builder()
+        .title("Система")
+        .description("Параметры запуска и поведения автопереключения.")
+        .build();
+    system_group.add(autostart_row);
+    system_group.add(auto_switch_row);
+    system_group.add(delay_row);
+
+    let corrections_group = adw::PreferencesGroup::builder()
+        .title("Исправления")
+        .description("Параметры коррекции регистра для уже исправленного слова.")
+        .build();
+    corrections_group.add(fix_two_capitals_row);
+    corrections_group.add(fix_accidental_caps_lock_row);
+
+    content.append(&system_group);
+    content.append(&corrections_group);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(PAGE_MAX_WIDTH);
+    clamp.set_child(Some(&content));
+    clamp
+}
+
+fn build_hotkeys_page(
+    undo_row: &adw::ActionRow,
+    selected_text_hotkey_row: &adw::ActionRow,
+    layout_switch_value_row: &adw::ActionRow,
+    layout_switch_hint_label: &gtk::Label,
+) -> adw::Clamp {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    let group = adw::PreferencesGroup::builder()
+        .title("Горячие клавиши")
+        .description("Настройка существующих горячих клавиш OpenSwitcher.")
+        .build();
+    group.add(undo_row);
+    group.add(selected_text_hotkey_row);
+    group.add(layout_switch_value_row);
+    group.add(layout_switch_hint_label);
+
+    content.append(&group);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(PAGE_MAX_WIDTH);
+    clamp.set_child(Some(&content));
+    clamp
+}
+
 struct FormWidgets {
-    clamp: adw::Clamp,
+    container: gtk::Box,
     autostart_switch: gtk::Switch,
+    auto_switch_switch: gtk::Switch,
     delay_spin: gtk::SpinButton,
+    fix_two_capitals_switch: gtk::Switch,
+    fix_accidental_caps_lock_switch: gtk::Switch,
     undo_dropdown: gtk::DropDown,
     selected_text_hotkey_row: adw::ActionRow,
     selected_text_hotkey_value_label: gtk::Label,
@@ -656,7 +784,10 @@ struct FormWidgets {
     dialog_cancel_button: gtk::Button,
     layout_switch_hint_label: gtk::Label,
     autostart_handler: Option<SignalHandlerId>,
+    auto_switch_handler: Option<SignalHandlerId>,
     delay_handler: Option<SignalHandlerId>,
+    fix_two_capitals_handler: Option<SignalHandlerId>,
+    fix_accidental_caps_lock_handler: Option<SignalHandlerId>,
     undo_handler: Option<SignalHandlerId>,
 }
 
@@ -690,7 +821,7 @@ impl SettingsWindow {
         let toast_overlay = adw::ToastOverlay::new();
         let toolbar = adw::ToolbarView::new();
         let header = adw::HeaderBar::new();
-        let title = adw::WindowTitle::new("Настройки OpenSwitcher", "Общие");
+        let title = adw::WindowTitle::new("Настройки OpenSwitcher", "");
         header.set_title_widget(Some(&title));
         toolbar.add_top_bar(&header);
 
@@ -707,6 +838,7 @@ impl SettingsWindow {
         content_box.append(&status_label);
 
         let form_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        form_container.set_vexpand(true);
         content_box.append(&form_container);
 
         let actions_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
@@ -776,7 +908,7 @@ impl SettingsWindow {
     }
 
     fn install_form(&self, form: FormWidgets) {
-        self.form_container.append(&form.clamp);
+        self.form_container.append(&form.container);
         self.form.replace(Some(form));
         self.apply_view_state(&initial_view_state());
         self.update_capture_dialog_widgets();
@@ -844,9 +976,27 @@ impl SettingsWindow {
         }
     }
 
+    fn set_auto_switch_handler(&self, handler: SignalHandlerId) {
+        if let Some(form) = self.form.borrow_mut().as_mut() {
+            form.auto_switch_handler = Some(handler);
+        }
+    }
+
     fn set_delay_handler(&self, handler: SignalHandlerId) {
         if let Some(form) = self.form.borrow_mut().as_mut() {
             form.delay_handler = Some(handler);
+        }
+    }
+
+    fn set_fix_two_capitals_handler(&self, handler: SignalHandlerId) {
+        if let Some(form) = self.form.borrow_mut().as_mut() {
+            form.fix_two_capitals_handler = Some(handler);
+        }
+    }
+
+    fn set_fix_accidental_caps_lock_handler(&self, handler: SignalHandlerId) {
+        if let Some(form) = self.form.borrow_mut().as_mut() {
+            form.fix_accidental_caps_lock_handler = Some(handler);
         }
     }
 
@@ -1016,12 +1166,39 @@ impl SettingsWindow {
         }
     }
 
+    fn auto_switch_switch(&self) -> gtk::Switch {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .auto_switch_switch
+            .clone()
+    }
+
     fn delay_spin(&self) -> gtk::SpinButton {
         self.form
             .borrow()
             .as_ref()
             .expect("form widgets must be installed before access")
             .delay_spin
+            .clone()
+    }
+
+    fn fix_two_capitals_switch(&self) -> gtk::Switch {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .fix_two_capitals_switch
+            .clone()
+    }
+
+    fn fix_accidental_caps_lock_switch(&self) -> gtk::Switch {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .fix_accidental_caps_lock_switch
             .clone()
     }
 
@@ -1214,12 +1391,43 @@ impl SettingsWindow {
                 form.autostart_switch.unblock_signal(autostart_handler);
             }
 
+            if let Some(auto_switch_handler) = &form.auto_switch_handler {
+                form.auto_switch_switch.block_signal(auto_switch_handler);
+            }
+            form.auto_switch_switch
+                .set_active(state.auto_switch_enabled);
+            if let Some(auto_switch_handler) = &form.auto_switch_handler {
+                form.auto_switch_switch.unblock_signal(auto_switch_handler);
+            }
+
             if let Some(delay_handler) = &form.delay_handler {
                 form.delay_spin.block_signal(delay_handler);
             }
             form.delay_spin.set_value(state.layout_delay_ms as f64);
             if let Some(delay_handler) = &form.delay_handler {
                 form.delay_spin.unblock_signal(delay_handler);
+            }
+
+            if let Some(fix_two_capitals_handler) = &form.fix_two_capitals_handler {
+                form.fix_two_capitals_switch
+                    .block_signal(fix_two_capitals_handler);
+            }
+            form.fix_two_capitals_switch
+                .set_active(state.fix_two_capitals);
+            if let Some(fix_two_capitals_handler) = &form.fix_two_capitals_handler {
+                form.fix_two_capitals_switch
+                    .unblock_signal(fix_two_capitals_handler);
+            }
+
+            if let Some(fix_accidental_caps_lock_handler) = &form.fix_accidental_caps_lock_handler {
+                form.fix_accidental_caps_lock_switch
+                    .block_signal(fix_accidental_caps_lock_handler);
+            }
+            form.fix_accidental_caps_lock_switch
+                .set_active(state.fix_accidental_caps_lock);
+            if let Some(fix_accidental_caps_lock_handler) = &form.fix_accidental_caps_lock_handler {
+                form.fix_accidental_caps_lock_switch
+                    .unblock_signal(fix_accidental_caps_lock_handler);
             }
 
             if let Some(undo_handler) = &form.undo_handler {
@@ -1235,7 +1443,12 @@ impl SettingsWindow {
             }
 
             form.autostart_switch.set_sensitive(state.form_enabled);
+            form.auto_switch_switch.set_sensitive(state.form_enabled);
             form.delay_spin.set_sensitive(state.form_enabled);
+            form.fix_two_capitals_switch
+                .set_sensitive(state.form_enabled);
+            form.fix_accidental_caps_lock_switch
+                .set_sensitive(state.form_enabled);
             form.undo_dropdown.set_sensitive(state.form_enabled);
             form.selected_text_hotkey_row
                 .set_sensitive(state.form_enabled);
@@ -1310,6 +1523,9 @@ impl SettingsWindow {
 fn initial_view_state() -> ViewState {
     ViewState {
         autostart_enabled: false,
+        auto_switch_enabled: crate::model::Settings::default().auto_switch_enabled,
+        fix_two_capitals: crate::model::Settings::default().fix_two_capitals,
+        fix_accidental_caps_lock: crate::model::Settings::default().fix_accidental_caps_lock,
         layout_delay_ms: crate::model::Settings::default().layout_delay_ms,
         undo_key: crate::model::Settings::default().undo_key,
         selected_text_hotkey: crate::model::Settings::default().selected_text_hotkey,
@@ -1416,9 +1632,7 @@ fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'stati
         ),
         SettingsClientError::ServiceManager(source) => (
             "Не удалось изменить автозапуск",
-            format!(
-                "OpenSwitcher не смог выполнить команду systemd user-сервисов.\n\n{source}"
-            ),
+            format!("OpenSwitcher не смог выполнить команду systemd user-сервисов.\n\n{source}"),
         ),
         SettingsClientError::Validation(error) => ("Некорректные значения", error.to_string()),
     }

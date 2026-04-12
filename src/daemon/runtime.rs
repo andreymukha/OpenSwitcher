@@ -34,6 +34,9 @@ pub const MAX_TRAY_RECOVERY_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
+    pub auto_switch_enabled: bool,
+    pub fix_two_capitals: bool,
+    pub fix_accidental_caps_lock: bool,
     pub layout_switch_combo: LayoutSwitchCombo,
     pub layout_delay_ms: u64,
     pub backspace_ms: u64,
@@ -45,6 +48,9 @@ pub struct RuntimeConfigSnapshot {
 impl From<&AppConfig> for RuntimeConfigSnapshot {
     fn from(value: &AppConfig) -> Self {
         Self {
+            auto_switch_enabled: value.features.auto_switch_enabled,
+            fix_two_capitals: value.features.fix_two_capitals,
+            fix_accidental_caps_lock: value.features.fix_accidental_caps_lock,
             layout_switch_combo: value.layout.switch_combo,
             layout_delay_ms: value.layout.delay_ms as u64,
             backspace_ms: value.delays.backspace_ms as u64,
@@ -735,13 +741,7 @@ undo_key = "Pause"
             calls: Arc::new(AtomicUsize::new(0)),
         };
 
-        run_tray_watchdog_iteration(
-            runtime.clone(),
-            &bus,
-            &starter,
-            3,
-            Duration::ZERO,
-        );
+        run_tray_watchdog_iteration(runtime.clone(), &bus, &starter, 3, Duration::ZERO);
 
         assert!(runtime.should_exit());
         assert_eq!(starter.calls.load(Ordering::SeqCst), 3);
@@ -765,10 +765,7 @@ undo_key = "Pause"
     impl TrayServiceStarter for FakeTrayStarter {
         fn start_tray_service(&self) -> Result<(), crate::error::ServiceManagerError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.results
-                .lock()
-                .unwrap()
-                .remove(0)
+            self.results.lock().unwrap().remove(0)
         }
     }
 }
@@ -805,7 +802,9 @@ pub trait TrayServiceStarter {
     fn start_tray_service(&self) -> Result<(), ServiceManagerError>;
 }
 
-impl<R: crate::system::user_services::CommandRunner> TrayServiceStarter for UserServiceController<R> {
+impl<R: crate::system::user_services::CommandRunner> TrayServiceStarter
+    for UserServiceController<R>
+{
     fn start_tray_service(&self) -> Result<(), ServiceManagerError> {
         UserServiceController::start_tray_service(self)
     }
@@ -1071,7 +1070,10 @@ impl RuntimeState {
         );
     }
 
-    pub fn start_tray_watchdog(self: &Arc<Self>, probe: impl TrayPresenceProbe + Send + Sync + 'static) {
+    pub fn start_tray_watchdog(
+        self: &Arc<Self>,
+        probe: impl TrayPresenceProbe + Send + Sync + 'static,
+    ) {
         let runtime = Arc::clone(self);
         let services = UserServiceController::from_system();
         if let Err(error) = thread::Builder::new()

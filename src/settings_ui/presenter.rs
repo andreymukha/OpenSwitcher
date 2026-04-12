@@ -80,10 +80,9 @@ impl SettingsPresenter {
                         });
                     }
                     Err(error) => {
-                        let _ = presenter
-                            .send_event(PresenterEvent::AutostartFailed(
-                                SettingsClientError::ServiceManager(error),
-                            ));
+                        let _ = presenter.send_event(PresenterEvent::AutostartFailed(
+                            SettingsClientError::ServiceManager(error),
+                        ));
                     }
                 }
                 let _ = presenter.emit_view_state();
@@ -96,15 +95,15 @@ impl SettingsPresenter {
         });
     }
 
-    pub fn update_layout_delay(&self, value: u32) {
-        let changed = self.with_state(|state| state.update_layout_delay(value));
+    pub fn update_undo_key(&self, value: UndoKey) {
+        let changed = self.with_state(|state| state.update_undo_key(value));
         if changed {
             let _ = self.emit_view_state();
         }
     }
 
-    pub fn update_undo_key(&self, value: UndoKey) {
-        let changed = self.with_state(|state| state.update_undo_key(value));
+    pub fn update_layout_delay(&self, value: u32) {
+        let changed = self.with_state(|state| state.update_layout_delay(value));
         if changed {
             let _ = self.emit_view_state();
         }
@@ -117,6 +116,27 @@ impl SettingsPresenter {
         }
     }
 
+    pub fn update_auto_switch_enabled(&self, value: bool) {
+        let changed = self.with_state(|state| state.update_auto_switch_enabled(value));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn update_fix_two_capitals(&self, value: bool) {
+        let changed = self.with_state(|state| state.update_fix_two_capitals(value));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
+    pub fn update_fix_accidental_caps_lock(&self, value: bool) {
+        let changed = self.with_state(|state| state.update_fix_accidental_caps_lock(value));
+        if changed {
+            let _ = self.emit_view_state();
+        }
+    }
+
     pub fn set_autostart_enabled(&self, enabled: bool) {
         let changed = self.with_state(|state| state.set_autostart_enabled(enabled));
         if !changed {
@@ -124,6 +144,25 @@ impl SettingsPresenter {
         }
 
         let _ = self.emit_view_state();
+        let presenter = self.clone();
+        thread::spawn(move || {
+            let result = if enabled {
+                presenter.inner.services.enable_autostart()
+            } else {
+                presenter.inner.services.disable_autostart()
+            };
+
+            match result {
+                Ok(()) => presenter.with_state(|state| state.confirm_autostart_enabled(enabled)),
+                Err(error) => {
+                    presenter.with_state(DomainState::revert_autostart_enabled);
+                    let _ = presenter.emit_view_state();
+                    let _ = presenter.send_event(PresenterEvent::AutostartFailed(
+                        SettingsClientError::ServiceManager(error),
+                    ));
+                }
+            }
+        });
     }
 
     pub fn unlock_layout_switch_override(&self) {
@@ -215,23 +254,6 @@ impl SettingsPresenter {
         thread::spawn(
             move || match presenter.inner.client.save_settings(snapshot.settings) {
                 Ok(result) => {
-                    if let Some(enabled) = snapshot.autostart_change {
-                        let service_result = if enabled {
-                            presenter.inner.services.enable_autostart()
-                        } else {
-                            presenter.inner.services.disable_autostart()
-                        };
-
-                        if let Err(error) = service_result {
-                            presenter.with_state(DomainState::save_failed);
-                            let _ = presenter.emit_view_state();
-                            let _ = presenter.send_event(PresenterEvent::SaveFailed(
-                                SettingsClientError::ServiceManager(error),
-                            ));
-                            return;
-                        }
-                    }
-
                     presenter.with_state(|state| state.save_succeeded(snapshot));
                     let _ = presenter.emit_view_state();
                     let _ = presenter.send_event(PresenterEvent::SaveSucceeded(result));

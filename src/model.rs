@@ -537,6 +537,9 @@ impl LayoutSwitchSetting {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Settings {
+    pub auto_switch_enabled: bool,
+    pub fix_two_capitals: bool,
+    pub fix_accidental_caps_lock: bool,
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
     pub selected_text_hotkey: SelectedTextHotkey,
@@ -546,6 +549,9 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
             layout_delay_ms: 30,
             undo_key: UndoKey::default(),
             selected_text_hotkey: SelectedTextHotkey::default(),
@@ -570,6 +576,9 @@ impl Settings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct SettingsDto {
+    pub auto_switch_enabled: bool,
+    pub fix_two_capitals: bool,
+    pub fix_accidental_caps_lock: bool,
     pub layout_delay_ms: u32,
     pub undo_key: UndoKey,
     pub selected_text_hotkey: SelectedTextHotkey,
@@ -585,6 +594,9 @@ impl Default for SettingsDto {
 impl From<Settings> for SettingsDto {
     fn from(value: Settings) -> Self {
         Self {
+            auto_switch_enabled: value.auto_switch_enabled,
+            fix_two_capitals: value.fix_two_capitals,
+            fix_accidental_caps_lock: value.fix_accidental_caps_lock,
             layout_delay_ms: value.layout_delay_ms,
             undo_key: value.undo_key,
             selected_text_hotkey: value.selected_text_hotkey,
@@ -598,6 +610,9 @@ impl TryFrom<SettingsDto> for Settings {
 
     fn try_from(value: SettingsDto) -> Result<Self, Self::Error> {
         Settings {
+            auto_switch_enabled: value.auto_switch_enabled,
+            fix_two_capitals: value.fix_two_capitals,
+            fix_accidental_caps_lock: value.fix_accidental_caps_lock,
             layout_delay_ms: value.layout_delay_ms,
             undo_key: value.undo_key,
             selected_text_hotkey: value.selected_text_hotkey,
@@ -620,6 +635,9 @@ mod tests {
     #[test]
     fn validates_settings_range() {
         let result = Settings {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
             layout_delay_ms: 700,
             undo_key: UndoKey::Pause,
             selected_text_hotkey: SelectedTextHotkey::default(),
@@ -640,6 +658,9 @@ mod tests {
     #[test]
     fn converts_dto_into_domain_settings() {
         let dto = SettingsDto {
+            auto_switch_enabled: false,
+            fix_two_capitals: true,
+            fix_accidental_caps_lock: true,
             layout_delay_ms: 30,
             undo_key: UndoKey::F12,
             selected_text_hotkey: SelectedTextHotkey::AltPause,
@@ -651,6 +672,9 @@ mod tests {
         };
 
         let settings = Settings::try_from(dto).unwrap();
+        assert!(!settings.auto_switch_enabled);
+        assert!(settings.fix_two_capitals);
+        assert!(settings.fix_accidental_caps_lock);
         assert_eq!(settings.undo_key, UndoKey::F12);
         assert_eq!(settings.selected_text_hotkey, SelectedTextHotkey::AltPause);
         assert_eq!(settings.layout_switch.combo, LayoutSwitchCombo::alt_shift());

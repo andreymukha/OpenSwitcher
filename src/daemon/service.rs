@@ -4,7 +4,10 @@ use crate::daemon::keyboard::{
 };
 use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
-use crate::daemon::switch_logic::{manual_correction_plan, should_switch, Keystroke};
+use crate::daemon::switch_logic::{
+    apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
+    should_switch, CorrectionPlan, Keystroke,
+};
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
@@ -22,6 +25,18 @@ struct WordContext {
     valid: bool,
     word_before_cursor: Vec<Keystroke>,
     followed_by_separator: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingWordCommitAction {
+    LayoutCorrection,
+    SameLayoutCaseCorrection { corrected_buffer: Vec<Keystroke> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingWordCommit {
+    separator_key: evdev::Key,
+    action: PendingWordCommitAction,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,7 +117,7 @@ pub struct DaemonService {
     suppressed_undo_key: Option<evdev::Key>,
     suppressed_separator_key: Option<evdev::Key>,
     layout_shortcut_latched: bool,
-    pending_auto_correction_separator: Option<evdev::Key>,
+    pending_word_commit: Option<PendingWordCommit>,
     pending_selected_text_switch: bool,
     startup_layout_resync: StartupLayoutResyncState,
 }
@@ -127,7 +142,7 @@ impl DaemonService {
             suppressed_undo_key: None,
             suppressed_separator_key: None,
             layout_shortcut_latched: false,
-            pending_auto_correction_separator: None,
+            pending_word_commit: None,
             pending_selected_text_switch: false,
             startup_layout_resync: StartupLayoutResyncState::pending(),
         })
@@ -225,9 +240,16 @@ impl DaemonService {
 
         if self.suppressed_separator_key == Some(key) {
             if value == 0 {
-                if self.pending_auto_correction_separator == Some(key) {
-                    self.pending_auto_correction_separator = None;
-                    self.finish_pending_auto_correction(key, &self.runtime.config_snapshot()?)?;
+                if self
+                    .pending_word_commit
+                    .as_ref()
+                    .is_some_and(|pending| pending.separator_key == key)
+                {
+                    let pending = self.pending_word_commit.take().unwrap();
+                    self.finish_pending_word_commit(
+                        pending,
+                        &self.runtime.config_snapshot()?,
+                    )?;
                 }
                 self.suppressed_separator_key = None;
             }
@@ -264,14 +286,15 @@ impl DaemonService {
             );
         }
 
-        if value == 1 && self.pending_auto_correction_separator.is_some() && !is_modifier(key) {
-            let separator_key = self.pending_auto_correction_separator.take().unwrap();
+        if value == 1 && self.pending_word_commit.is_some() && !is_modifier(key) {
+            let pending = self.pending_word_commit.take().unwrap();
+            let separator_key = pending.separator_key;
             // Keep swallowing the physical separator release even if we had to
             // finish the correction early because the next key arrived first.
             // Otherwise a late real key-up can leak back into the normal path
             // after we already replayed the separator virtually.
             self.suppressed_separator_key = Some(separator_key);
-            self.finish_pending_auto_correction(separator_key, &config)?;
+            self.finish_pending_word_commit(pending, &config)?;
             if key == undo_key_to_evdev_key(config.undo_key) {
                 return Ok(());
             }
@@ -360,10 +383,14 @@ impl DaemonService {
                 Vec::new()
             };
             let used_current_buffer = !self.buffer.is_empty();
-            if self.apply_manual_correction(&config, &word_before_cursor)? && used_current_buffer {
-                self.word_context.valid = true;
-                self.word_context.word_before_cursor.clear();
-                self.word_context.followed_by_separator = false;
+            if let Some(corrected_buffer) =
+                self.apply_manual_correction(&config, &word_before_cursor)?
+            {
+                if used_current_buffer {
+                    self.word_context.valid = true;
+                    self.word_context.word_before_cursor = corrected_buffer;
+                    self.word_context.followed_by_separator = false;
+                }
             }
             return Ok(());
         }
@@ -381,7 +408,25 @@ impl DaemonService {
 
                 if corrected {
                     self.suppressed_separator_key = Some(key);
-                    self.pending_auto_correction_separator = Some(key);
+                    self.pending_word_commit = Some(PendingWordCommit {
+                        separator_key: key,
+                        action: PendingWordCommitAction::LayoutCorrection,
+                    });
+                    return Ok(());
+                }
+
+                if let Some(plan) = same_layout_case_correction_plan(
+                    &self.buffer,
+                    config.fix_two_capitals,
+                    config.fix_accidental_caps_lock,
+                ) {
+                    self.suppressed_separator_key = Some(key);
+                    self.pending_word_commit = Some(PendingWordCommit {
+                        separator_key: key,
+                        action: PendingWordCommitAction::SameLayoutCaseCorrection {
+                            corrected_buffer: plan.buffer,
+                        },
+                    });
                     return Ok(());
                 }
 
@@ -392,6 +437,20 @@ impl DaemonService {
                 self.keyboard.forward_event(key, value)
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
+                if let Some(plan) = same_layout_case_correction_plan(
+                    &self.buffer,
+                    config.fix_two_capitals,
+                    config.fix_accidental_caps_lock,
+                ) {
+                    self.suppressed_separator_key = Some(key);
+                    self.pending_word_commit = Some(PendingWordCommit {
+                        separator_key: key,
+                        action: PendingWordCommitAction::SameLayoutCaseCorrection {
+                            corrected_buffer: plan.buffer,
+                        },
+                    });
+                    return Ok(());
+                }
                 self.invalidate_word_context();
                 self.keyboard.forward_event(key, value)
             }
@@ -457,11 +516,58 @@ impl DaemonService {
         separator_key: evdev::Key,
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
     ) -> Result<(), SwitcherError> {
-        self.apply_manual_correction(config, &[])?;
-        self.word_context.valid = !self.buffer.is_empty();
-        self.word_context.word_before_cursor = self.buffer.clone();
-        self.word_context.followed_by_separator = true;
-        self.buffer.clear();
+        let corrected_buffer = self
+            .apply_manual_correction(config, &[])?
+            .unwrap_or_else(|| self.buffer.clone());
+        self.commit_corrected_word(separator_key, corrected_buffer)
+    }
+
+    fn finish_pending_same_layout_case_correction(
+        &mut self,
+        separator_key: evdev::Key,
+        corrected_buffer: Vec<Keystroke>,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+    ) -> Result<(), SwitcherError> {
+        let plan = CorrectionPlan {
+            buffer: corrected_buffer.clone(),
+            extra_backspaces: 0,
+        };
+        self.keyboard
+            .apply_same_layout_correction(&plan, config, self.modifiers)?;
+        self.commit_corrected_word(separator_key, corrected_buffer)
+    }
+
+    fn finish_pending_word_commit(
+        &mut self,
+        pending: PendingWordCommit,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+    ) -> Result<(), SwitcherError> {
+        match pending.action {
+            PendingWordCommitAction::LayoutCorrection => {
+                self.finish_pending_auto_correction(pending.separator_key, config)
+            }
+            PendingWordCommitAction::SameLayoutCaseCorrection { corrected_buffer } => self
+                .finish_pending_same_layout_case_correction(
+                    pending.separator_key,
+                    corrected_buffer,
+                    config,
+                ),
+        }
+    }
+
+    fn commit_corrected_word(
+        &mut self,
+        separator_key: evdev::Key,
+        corrected_buffer: Vec<Keystroke>,
+    ) -> Result<(), SwitcherError> {
+        if separator_key == evdev::Key::KEY_SPACE {
+            self.word_context.valid = !corrected_buffer.is_empty();
+            self.word_context.word_before_cursor = corrected_buffer;
+            self.word_context.followed_by_separator = true;
+            self.buffer.clear();
+        } else {
+            self.invalidate_word_context();
+        }
         self.keyboard.type_separator(separator_key)
     }
 
@@ -486,10 +592,10 @@ impl DaemonService {
         &mut self,
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
         fallback_buffer: &[Keystroke],
-    ) -> Result<bool, SwitcherError> {
+    ) -> Result<Option<Vec<Keystroke>>, SwitcherError> {
         let features = self.runtime.feature_availability();
         if !features.manual_word_fix {
-            return Ok(false);
+            return Ok(None);
         }
 
         let pre_correction_sync = self.runtime.sync_with_backend();
@@ -498,25 +604,28 @@ impl DaemonService {
                 "manual-correction-sync",
                 "source=backend skipped=true phase=before-correction",
             );
-            return Ok(false);
+            return Ok(None);
         }
 
         if !matches!(
             self.current_layout_kind(),
             AppLayoutKind::English | AppLayoutKind::Russian
         ) {
-            return Ok(false);
+            return Ok(None);
         }
 
-        let Some(plan) = manual_correction_plan(
+        let Some(mut plan) = manual_correction_plan(
             &self.buffer,
             fallback_buffer,
             self.word_context.followed_by_separator,
+        ) else {
+            return Ok(None);
+        };
+        plan.buffer = apply_case_fixes_to_strokes(
+            &plan.buffer,
             config.fix_two_capitals,
             config.fix_accidental_caps_lock,
-        ) else {
-            return Ok(false);
-        };
+        );
         self.keyboard
             .apply_correction(&plan, config, self.modifiers)?;
         match self.runtime.sync_with_backend() {
@@ -543,7 +652,7 @@ impl DaemonService {
                 );
             }
         }
-        Ok(true)
+        Ok(Some(plan.buffer))
     }
 
     fn publish_status_changed(&self) -> Result<(), SwitcherError> {

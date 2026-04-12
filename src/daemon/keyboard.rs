@@ -72,6 +72,11 @@ enum WriterTransactionKind {
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
     },
+    ApplySameLayoutCorrection {
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    },
     CopyShortcut {
         modifiers: ModifierState,
     },
@@ -338,6 +343,17 @@ impl KeyboardController {
         self.virtual_device
             .handle()
             .apply_correction(plan.clone(), config.clone(), modifiers)
+    }
+
+    pub fn apply_same_layout_correction(
+        &mut self,
+        plan: &CorrectionPlan,
+        config: &RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    ) -> Result<(), SwitcherError> {
+        self.virtual_device
+            .handle()
+            .apply_same_layout_correction(plan.clone(), config.clone(), modifiers)
     }
 
     pub fn selection_transport(
@@ -702,6 +718,19 @@ impl VirtualKeyboardHandle {
         modifiers: ModifierState,
     ) -> Result<(), SwitcherError> {
         self.run_transaction(WriterTransactionKind::ApplyCorrection {
+            plan,
+            config,
+            modifiers,
+        })
+    }
+
+    fn apply_same_layout_correction(
+        &self,
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    ) -> Result<(), SwitcherError> {
+        self.run_transaction(WriterTransactionKind::ApplySameLayoutCorrection {
             plan,
             config,
             modifiers,
@@ -1228,6 +1257,7 @@ fn run_correction(
     config: &RuntimeConfigSnapshot,
     modifiers: ModifierState,
     x11_switcher: &mut Option<X11LayoutSwitcher>,
+    switch_layout: bool,
 ) -> Result<(), SwitcherError> {
     release_modifiers(device, modifiers)?;
     for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
@@ -1239,17 +1269,19 @@ fn run_correction(
         thread::sleep(Duration::from_millis(config.backspace_ms));
     }
 
-    if let Some(switcher) = x11_switcher {
-        if let Err(e) = switcher.switch_layout(config.layout_switch_combo) {
-            log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
+    if switch_layout {
+        if let Some(switcher) = x11_switcher {
+            if let Err(e) = switcher.switch_layout(config.layout_switch_combo) {
+                log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
+                let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
+                uinput_switcher.switch_layout(config.layout_switch_combo)?;
+            }
+        } else {
             let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
             uinput_switcher.switch_layout(config.layout_switch_combo)?;
         }
-    } else {
-        let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
-        uinput_switcher.switch_layout(config.layout_switch_combo)?;
+        thread::sleep(Duration::from_millis(config.layout_delay_ms));
     }
-    thread::sleep(Duration::from_millis(config.layout_delay_ms));
 
     for stroke in &plan.buffer {
         if stroke.shift {
@@ -1323,6 +1355,19 @@ fn run_virtual_keyboard_writer_loop(
                             &config,
                             modifiers,
                             &mut x11_switcher,
+                            true,
+                        ),
+                        WriterTransactionKind::ApplySameLayoutCorrection {
+                            plan,
+                            config,
+                            modifiers,
+                        } => run_correction(
+                            &mut device,
+                            &plan,
+                            &config,
+                            modifiers,
+                            &mut x11_switcher,
+                            false,
                         ),
                         WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
                             &mut device,

@@ -27,32 +27,34 @@ pub fn manual_correction_plan(
     current_buffer: &[Keystroke],
     last_word_buffer: &[Keystroke],
     last_word_followed_by_separator: bool,
-    fix_two_capitals: bool,
-    fix_accidental_caps_lock: bool,
 ) -> Option<CorrectionPlan> {
     if !current_buffer.is_empty() {
         return Some(CorrectionPlan {
-            buffer: apply_case_fixes_to_strokes(
-                current_buffer,
-                fix_two_capitals,
-                fix_accidental_caps_lock,
-            ),
+            buffer: current_buffer.to_vec(),
             extra_backspaces: 0,
         });
     }
 
     if !last_word_buffer.is_empty() {
         return Some(CorrectionPlan {
-            buffer: apply_case_fixes_to_strokes(
-                last_word_buffer,
-                fix_two_capitals,
-                fix_accidental_caps_lock,
-            ),
+            buffer: last_word_buffer.to_vec(),
             extra_backspaces: usize::from(last_word_followed_by_separator),
         });
     }
 
     None
+}
+
+pub fn same_layout_case_correction_plan(
+    buffer: &[Keystroke],
+    fix_two_capitals: bool,
+    fix_accidental_caps_lock: bool,
+) -> Option<CorrectionPlan> {
+    let corrected = apply_case_fixes_to_strokes(buffer, fix_two_capitals, fix_accidental_caps_lock);
+    (corrected != buffer).then_some(CorrectionPlan {
+        buffer: corrected,
+        extra_backspaces: 0,
+    })
 }
 
 pub fn should_switch(buffer: &[Keystroke]) -> bool {
@@ -226,7 +228,7 @@ fn is_likely_english(word: &str) -> bool {
             .any(|bigram| clean_word.contains(bigram))
 }
 
-fn apply_case_fixes_to_strokes(
+pub fn apply_case_fixes_to_strokes(
     buffer: &[Keystroke],
     fix_two_capitals: bool,
     fix_accidental_caps_lock: bool,
@@ -396,7 +398,7 @@ mod tests {
         let current = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
         let last = vec![stroke(Key::KEY_A)];
 
-        let plan = manual_correction_plan(&current, &last, true, false, false).unwrap();
+        let plan = manual_correction_plan(&current, &last, true).unwrap();
         assert_eq!(plan.buffer, current);
         assert_eq!(plan.extra_backspaces, 0);
     }
@@ -406,7 +408,7 @@ mod tests {
         let current = vec![];
         let last = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
 
-        let plan = manual_correction_plan(&current, &last, false, false, false).unwrap();
+        let plan = manual_correction_plan(&current, &last, false).unwrap();
         assert_eq!(plan.buffer, last);
         assert_eq!(plan.extra_backspaces, 0);
     }
@@ -416,7 +418,7 @@ mod tests {
         let current = vec![];
         let last = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
 
-        let plan = manual_correction_plan(&current, &last, true, false, false).unwrap();
+        let plan = manual_correction_plan(&current, &last, true).unwrap();
         assert_eq!(plan.buffer, last);
         assert_eq!(plan.extra_backspaces, 1);
     }
@@ -442,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_plan_applies_case_fix_to_keystrokes() {
+    fn same_layout_case_fix_plan_applies_case_fix_to_keystrokes() {
         let current = vec![
             Keystroke {
                 key: Key::KEY_G,
@@ -470,8 +472,44 @@ mod tests {
             },
         ];
 
-        let plan = manual_correction_plan(&current, &[], false, true, false).unwrap();
+        let plan = same_layout_case_correction_plan(&current, true, false).unwrap();
         assert_eq!(keys_to_string(&plan.buffer), "Ghbdtn");
+    }
+
+    #[test]
+    fn layout_correction_plan_preserves_original_case_before_case_fix() {
+        let current = vec![
+            Keystroke {
+                key: Key::KEY_G,
+                shift: true,
+            },
+            Keystroke {
+                key: Key::KEY_H,
+                shift: true,
+            },
+            Keystroke {
+                key: Key::KEY_B,
+                shift: false,
+            },
+            Keystroke {
+                key: Key::KEY_D,
+                shift: false,
+            },
+            Keystroke {
+                key: Key::KEY_T,
+                shift: false,
+            },
+            Keystroke {
+                key: Key::KEY_N,
+                shift: false,
+            },
+        ];
+
+        let plan = manual_correction_plan(&current, &[], false).unwrap();
+        assert_eq!(keys_to_string(&plan.buffer), "GHbdtn");
+
+        let corrected = apply_case_fixes_to_strokes(&plan.buffer, true, false);
+        assert_eq!(keys_to_string(&corrected), "Ghbdtn");
     }
 
     #[test]

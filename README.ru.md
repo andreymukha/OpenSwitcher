@@ -28,6 +28,8 @@ OpenSwitcher находится в активной разработке.
 
 ```bash
 ./manage.sh dev build
+./manage.sh doctor
+./manage.sh bootstrap linux-input
 ./manage.sh dev start
 ./manage.sh dev settings
 ```
@@ -87,6 +89,30 @@ OpenSwitcher состоит из трёх бинарников:
 - сессионный D-Bus
 - `systemd --user` для официальной модели запуска и автозапуска
 - настольное окружение с совместимым хостом StatusNotifier/AppIndicator для tray
+
+## Linux input setup
+
+OpenSwitcher читает реальные input-устройства из `/dev/input/event*` и пишет виртуальные нажатия через `/dev/uinput`.
+
+Проверить, готова ли текущая сессия:
+
+```bash
+./manage.sh doctor
+```
+
+Если doctor сообщает об отказе в доступе, запусти официальный setup-шаг:
+
+```bash
+./manage.sh bootstrap linux-input
+```
+
+Что делает bootstrap:
+- устанавливает udev rule проекта из `dist/udev/80-openswitcher-input.rules`
+- перезагружает udev rules, если доступен `udevadm`
+- применяет same-session ACL bridge для текущего пользователя, если доступен `setfacl`
+- повторно запускает `./manage.sh doctor` и подтверждает результат
+
+Этот setup-слой сделан явным специально, чтобы позже его можно было напрямую использовать в packaging без переизобретения Linux input-модели.
 
 ### Зависимости для сборки
 

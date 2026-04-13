@@ -28,6 +28,8 @@ The current public scope is a Linux desktop application for EN/RU typing workflo
 
 ```bash
 ./manage.sh dev build
+./manage.sh doctor
+./manage.sh bootstrap linux-input
 ./manage.sh dev start
 ./manage.sh dev settings
 ```
@@ -87,6 +89,30 @@ Current runtime model:
 - session D-Bus
 - `systemd --user` for the official autostart/runtime model
 - a desktop environment with a compatible StatusNotifier/AppIndicator tray host
+
+## Linux Input Setup
+
+OpenSwitcher reads real input devices from `/dev/input/event*` and writes virtual key events through `/dev/uinput`.
+
+Check whether the current session is ready:
+
+```bash
+./manage.sh doctor
+```
+
+If the doctor reports denied access, run the official setup step:
+
+```bash
+./manage.sh bootstrap linux-input
+```
+
+What the bootstrap does:
+- installs the project udev rule from `dist/udev/80-openswitcher-input.rules`
+- reloads udev rules when `udevadm` is available
+- applies a same-session ACL bridge for the current user when `setfacl` is available
+- reruns `./manage.sh doctor` to confirm the result
+
+This setup layer is explicit on purpose so it can later be reused by packaging without redesigning the Linux input model.
 
 ### Build dependencies
 

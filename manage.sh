@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$SCRIPT_DIR/.run"
 LOG_DIR="$RUN_DIR/logs"
 PID_DIR="$RUN_DIR/pids"
+LINUX_INPUT_HELPER="$SCRIPT_DIR/scripts/linux_input_setup.sh"
 
 PROFILE="${OPEN_SWITCHER_PROFILE:-debug}"
 TARGET_DIR="$SCRIPT_DIR/target/$PROFILE"
@@ -35,6 +36,9 @@ INSTALLED_TRAY_BIN="$SYSTEMD_BIN_DIR/open-switcher-tray"
 INSTALLED_SETTINGS_BIN="$SYSTEMD_BIN_DIR/open-switcher-settings"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
+
+# shellcheck source=/dev/null
+source "$LINUX_INPUT_HELPER"
 
 ensure_dbus_address() {
     if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "/run/user/$(id -u)/bus" ]]; then
@@ -175,8 +179,95 @@ start_component() {
         if [[ -s "$logfile" ]]; then
             tail -n 20 "$logfile" >&2
         fi
+        if [[ "$component" == "daemon" ]] && [[ -f "$logfile" ]]; then
+            if grep -Eq "KeyboardAccessDenied|UinputAccessDenied|Linux input setup is not ready" "$logfile"; then
+                echo >&2
+                echo "Похоже, не выполнен Linux input setup." >&2
+                echo "Проверь:" >&2
+                echo "  ./manage.sh doctor" >&2
+                echo "Исправь:" >&2
+                echo "  ./manage.sh bootstrap linux-input" >&2
+            fi
+        fi
         exit 1
     fi
+}
+
+run_doctor_command() {
+    local target="${1:-linux-input}"
+
+    case "$target" in
+    linux-input|"")
+        openswitcher_linux_input_doctor
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Неизвестная doctor-команда: $target" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+}
+
+bootstrap_linux_input() {
+    local target_user
+    target_user="$(id -un)"
+
+    if [[ "$EUID" -eq 0 ]]; then
+        openswitcher_linux_input_bootstrap_root "$SCRIPT_DIR" "${SUDO_USER:-$target_user}"
+    else
+        if ! command -v sudo >/dev/null 2>&1; then
+            echo "sudo не найден. Для Linux input bootstrap нужен root-level setup." >&2
+            echo 'После установки sudo запусти: ./manage.sh bootstrap linux-input' >&2
+            exit 1
+        fi
+
+        sudo env \
+            OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="${OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT:-}" \
+            OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES="${OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES:-}" \
+            OPEN_SWITCHER_LINUX_INPUT_RULES_DIR="${OPEN_SWITCHER_LINUX_INPUT_RULES_DIR:-}" \
+            bash -lc '
+                source "$0"
+                openswitcher_linux_input_bootstrap_root "$1" "$2"
+            ' "$LINUX_INPUT_HELPER" "$SCRIPT_DIR" "$target_user"
+    fi
+
+    echo
+    echo "Повторная проверка Linux input setup..."
+    if openswitcher_linux_input_doctor; then
+        return 0
+    fi
+
+    echo >&2
+    echo "Bootstrap завершён, но доступ в текущей сессии всё ещё не подтверждён." >&2
+    if ! command -v setfacl >/dev/null 2>&1; then
+        echo "Причина: отсутствует `setfacl`, поэтому same-session ACL bridge не был применён." >&2
+    fi
+    if ! command -v udevadm >/dev/null 2>&1; then
+        echo "Причина: отсутствует `udevadm`, поэтому live reload udev rules не был выполнен." >&2
+    fi
+    echo "Если устройства не переподхватились автоматически, перелогинься и повтори `./manage.sh doctor`." >&2
+    exit 1
+}
+
+run_bootstrap_command() {
+    local target="${1:-}"
+
+    case "$target" in
+    linux-input)
+        bootstrap_linux_input
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Неизвестная bootstrap-команда: ${target:-<empty>}" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
 }
 
 stop_component() {
@@ -418,6 +509,8 @@ usage() {
 Использование:
   ./manage.sh dev <команда>
   ./manage.sh systemd <команда>
+  ./manage.sh doctor [linux-input]
+  ./manage.sh bootstrap linux-input
   ./manage.sh <команда>            # алиасы на dev-режим
 
 dev-команды:
@@ -438,6 +531,12 @@ systemd-команды:
   systemd logs [name]   Показать journalctl-логи: daemon | tray | all
   systemd enable        Включить автозапуск user units
   systemd disable       Выключить автозапуск user units
+
+doctor-команды:
+  doctor                Проверить Linux input setup для `/dev/input/*` и `/dev/uinput`
+
+bootstrap-команды:
+  bootstrap linux-input Установить udev rules и same-session ACL bridge для Linux input setup
 
 Переменные окружения:
   OPEN_SWITCHER_PROFILE=debug|release   По умолчанию: debug
@@ -542,6 +641,12 @@ case "$namespace" in
         ;;
     systemd)
         run_systemd_command "${2:-}" "${3:-}"
+        ;;
+    doctor)
+        run_doctor_command "${2:-linux-input}"
+        ;;
+    bootstrap)
+        run_bootstrap_command "${2:-}"
         ;;
     build|start|stop|restart|status|logs|settings|"")
         run_dev_command "${1:-}" "${2:-}"

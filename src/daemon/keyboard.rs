@@ -5,10 +5,10 @@ use crate::model::{LayoutSwitchCombo, UndoKey};
 use evdev::{enumerate, Device, InputEvent, Key, LedType};
 use std::collections::HashSet;
 use std::env;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
@@ -19,6 +19,9 @@ const INPUT_EVENT_KEYBOARD: i32 = 0x01;
 const MODIFIER_SYNC_DELAY_MS: u64 = 20;
 const LAYOUT_SWITCH_DELAY_MS: u64 = 20;
 const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
+const KEYBOARD_SYMLINK_SUFFIX: &str = "-event-kbd";
+const KEYBOARD_SYMLINK_DIRS: [&str; 2] = ["/dev/input/by-path", "/dev/input/by-id"];
+const UINPUT_PATHS: [&str; 2] = ["/dev/uinput", "/dev/input/uinput"];
 const INPUT_DEBUG_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG";
 const INPUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG_FILE";
 pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
@@ -93,6 +96,7 @@ enum WriterTransaction {
 }
 
 struct GrabbedKeyboardDevice {
+    path: PathBuf,
     device: Device,
     grabbed: bool,
 }
@@ -276,9 +280,7 @@ impl ModifierState {
 
 impl KeyboardController {
     pub fn open() -> Result<Self, SwitcherError> {
-        let keyboard_path = configured_keyboard_path()
-            .or_else(find_keyboard)
-            .ok_or(SwitcherError::KeyboardNotFound)?;
+        let keyboard_path = resolve_keyboard_path()?;
         let pointer_paths = find_pointer_devices(&keyboard_path);
         let mut real_device = GrabbedKeyboardDevice::open(keyboard_path)?;
         println!(
@@ -362,9 +364,11 @@ impl KeyboardController {
         config: &RuntimeConfigSnapshot,
         modifiers: ModifierState,
     ) -> Result<(), SwitcherError> {
-        self.virtual_device
-            .handle()
-            .apply_same_layout_correction(plan.clone(), config.clone(), modifiers)
+        self.virtual_device.handle().apply_same_layout_correction(
+            plan.clone(),
+            config.clone(),
+            modifiers,
+        )
     }
 
     pub fn selection_transport(
@@ -388,8 +392,10 @@ impl KeyboardController {
 
 impl GrabbedKeyboardDevice {
     fn open(path: PathBuf) -> Result<Self, SwitcherError> {
+        let device = Device::open(&path).map_err(|error| map_keyboard_open_error(&path, error))?;
         Ok(Self {
-            device: Device::open(path)?,
+            path,
+            device,
             grabbed: false,
         })
     }
@@ -403,7 +409,9 @@ impl GrabbedKeyboardDevice {
             return Ok(());
         }
 
-        self.device.grab()?;
+        self.device
+            .grab()
+            .map_err(|error| map_keyboard_open_error(&self.path, error))?;
         self.grabbed = true;
         Ok(())
     }
@@ -413,13 +421,18 @@ impl GrabbedKeyboardDevice {
             return Ok(());
         }
 
-        self.device.ungrab()?;
+        self.device
+            .ungrab()
+            .map_err(|error| map_keyboard_open_error(&self.path, error))?;
         self.grabbed = false;
         Ok(())
     }
 
     fn fetch_events(&mut self) -> Result<Vec<InputEvent>, SwitcherError> {
-        Ok(self.device.fetch_events()?.collect())
+        self.device
+            .fetch_events()
+            .map(|events| events.collect())
+            .map_err(|error| map_keyboard_open_error(&self.path, error))
     }
 
     fn fetch_events_timeout(
@@ -434,7 +447,10 @@ impl GrabbedKeyboardDevice {
     }
 
     fn caps_lock_active(&self) -> Result<bool, SwitcherError> {
-        Ok(self.device.get_led_state()?.contains(LedType::LED_CAPSL))
+        self.device
+            .get_led_state()
+            .map(|state| state.contains(LedType::LED_CAPSL))
+            .map_err(|error| map_keyboard_open_error(&self.path, error))
     }
 }
 
@@ -931,6 +947,112 @@ fn configured_keyboard_path() -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
+fn resolve_keyboard_path() -> Result<PathBuf, SwitcherError> {
+    if let Some(path) = configured_keyboard_path() {
+        log_input_debug(
+            "keyboard-detect",
+            &format!("source=env path={}", path.display()),
+        );
+        return Ok(path);
+    }
+
+    if let Some(path) = find_keyboard_via_symlinks()? {
+        return Ok(path);
+    }
+
+    match find_keyboard() {
+        Some(path) => {
+            log_input_debug(
+                "keyboard-detect",
+                &format!("source=enumerate path={}", path.display()),
+            );
+            Ok(path)
+        }
+        None => {
+            log_input_debug("keyboard-detect", "source=enumerate result=not-found");
+            Err(SwitcherError::KeyboardNotFound)
+        }
+    }
+}
+
+fn find_keyboard_via_symlinks() -> Result<Option<PathBuf>, SwitcherError> {
+    let search_roots: Vec<&Path> = KEYBOARD_SYMLINK_DIRS.iter().map(Path::new).collect();
+    let candidates = collect_keyboard_symlink_candidates_from_dirs(&search_roots);
+    log_input_debug(
+        "keyboard-detect-symlinks",
+        &format!("candidates={}", candidates.len()),
+    );
+
+    let mut first_access_denied: Option<(PathBuf, io::Error)> = None;
+
+    for path in candidates {
+        match Device::open(&path) {
+            Ok(_) => {
+                log_input_debug(
+                    "keyboard-detect-symlinks",
+                    &format!("result=selected path={}", path.display()),
+                );
+                return Ok(Some(path));
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                log_input_debug(
+                    "keyboard-detect-symlinks",
+                    &format!("result=access-denied path={} error={error}", path.display()),
+                );
+                if first_access_denied.is_none() {
+                    first_access_denied = Some((path, error));
+                }
+            }
+            Err(error) => {
+                log_input_debug(
+                    "keyboard-detect-symlinks",
+                    &format!("result=skip path={} error={error}", path.display()),
+                );
+            }
+        }
+    }
+
+    if let Some((path, error)) = first_access_denied {
+        return Err(map_keyboard_open_error(&path, error));
+    }
+
+    Ok(None)
+}
+
+fn collect_keyboard_symlink_candidates_from_dirs(dirs: &[&Path]) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+
+        let mut dir_candidates: Vec<PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map_or(false, |name| name.ends_with(KEYBOARD_SYMLINK_SUFFIX))
+            })
+            .collect();
+        dir_candidates.sort();
+        candidates.extend(dir_candidates);
+    }
+
+    candidates
+}
+
+fn map_keyboard_open_error(path: &Path, error: io::Error) -> SwitcherError {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        SwitcherError::KeyboardAccessDenied {
+            path: path.to_path_buf(),
+            source: error,
+        }
+    } else {
+        SwitcherError::Io(error)
+    }
+}
+
 fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<PointerDeviceState> {
     let mut devices = Vec::new();
 
@@ -950,6 +1072,8 @@ fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<PointerDeviceState> {
 }
 
 fn create_virtual_keyboard(name: &str) -> Result<uinput::Device, SwitcherError> {
+    ensure_uinput_writable()?;
+
     let virtual_device = uinput::default()?
         .name(name)?
         .event(uinput::event::Keyboard::All)?
@@ -957,6 +1081,46 @@ fn create_virtual_keyboard(name: &str) -> Result<uinput::Device, SwitcherError> 
 
     thread::sleep(Duration::from_millis(500));
     Ok(virtual_device)
+}
+
+fn ensure_uinput_writable() -> Result<PathBuf, SwitcherError> {
+    let mut first_existing_path: Option<PathBuf> = None;
+    let mut last_error: Option<io::Error> = None;
+
+    for raw_path in UINPUT_PATHS {
+        let path = PathBuf::from(raw_path);
+        match OpenOptions::new().write(true).open(&path) {
+            Ok(file) => {
+                drop(file);
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                last_error = Some(error);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Err(SwitcherError::UinputAccessDenied { path, source: error });
+            }
+            Err(error) => {
+                if first_existing_path.is_none() && path.exists() {
+                    first_existing_path = Some(path);
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    if let Some(path) = first_existing_path {
+        if let Some(error) = last_error {
+            return Err(SwitcherError::Io(io::Error::new(
+                error.kind(),
+                format!("failed to open {}: {}", path.display(), error),
+            )));
+        }
+    }
+
+    Err(last_error
+        .map(SwitcherError::Io)
+        .unwrap_or_else(|| SwitcherError::Io(io::Error::new(io::ErrorKind::NotFound, "uinput device not found"))))
 }
 
 fn set_nonblocking(device: &Device) -> io::Result<()> {
@@ -1163,6 +1327,9 @@ impl ModifierState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io;
+    use std::path::Path;
 
     fn pressed(keys: &[(Key, i32)]) -> ModifierState {
         let mut state = ModifierState::default();
@@ -1219,6 +1386,39 @@ mod tests {
         assert!(!replay_shift_for_stroke(&uppercase_target, true));
         assert!(!replay_shift_for_stroke(&lowercase_target, false));
         assert!(replay_shift_for_stroke(&uppercase_target, false));
+    }
+
+    #[test]
+    fn keyboard_symlink_candidates_prioritize_by_path_before_by_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let by_path = temp_dir.path().join("by-path");
+        let by_id = temp_dir.path().join("by-id");
+        fs::create_dir_all(&by_path).unwrap();
+        fs::create_dir_all(&by_id).unwrap();
+
+        let by_path_keyboard = by_path.join("platform-i8042-serio-0-event-kbd");
+        let by_id_keyboard = by_id.join("usb-Logitech_USB_Keyboard-event-kbd");
+        fs::write(&by_path_keyboard, "").unwrap();
+        fs::write(&by_id_keyboard, "").unwrap();
+
+        let candidates =
+            collect_keyboard_symlink_candidates_from_dirs(&[by_path.as_path(), by_id.as_path()]);
+
+        assert_eq!(
+            candidates,
+            vec![by_path_keyboard, by_id_keyboard],
+            "stable symlink search must prefer /dev/input/by-path before /dev/input/by-id",
+        );
+    }
+
+    #[test]
+    fn keyboard_open_permission_denied_maps_to_keyboard_access_denied() {
+        let error = map_keyboard_open_error(
+            Path::new("/dev/input/event4"),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+
+        assert!(matches!(error, SwitcherError::KeyboardAccessDenied { .. }));
     }
 }
 
@@ -1289,7 +1489,10 @@ fn run_shortcut(
 
 use crate::daemon::layout_switcher::{LayoutSwitcher, UinputLayoutSwitcher, X11LayoutSwitcher};
 
-fn replay_shift_for_stroke(stroke: &crate::daemon::switch_logic::Keystroke, caps_lock: bool) -> bool {
+fn replay_shift_for_stroke(
+    stroke: &crate::daemon::switch_logic::Keystroke,
+    caps_lock: bool,
+) -> bool {
     if is_case_sensitive_letter_key(stroke.key) {
         stroke.shift ^ caps_lock
     } else {

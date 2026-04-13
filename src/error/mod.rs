@@ -6,6 +6,7 @@ pub use config_error::ConfigError;
 pub use dbus_error::DbusError;
 pub use ui_error::{SettingsClientError, UiError};
 
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -88,6 +89,18 @@ pub enum SwitcherError {
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]
     KeyboardNotFound,
+    #[error("Keyboard device is present but access was denied: {path}")]
+    KeyboardAccessDenied {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("uinput device is present but access was denied: {path}")]
+    UinputAccessDenied {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("Failed to execute xset command")]
     Xset(#[source] std::io::Error),
     #[error("Failed to detect system context")]
@@ -135,4 +148,55 @@ pub enum ServiceManagerError {
         code: Option<i32>,
         stderr: String,
     },
+}
+
+impl SwitcherError {
+    pub fn linux_input_setup_hint(&self) -> Option<String> {
+        match self {
+            SwitcherError::KeyboardAccessDenied { path, .. } => Some(format!(
+                "Linux input setup is not ready.\nKeyboard access is denied for: {}\nRun `./manage.sh doctor`\nRun `./manage.sh bootstrap linux-input`",
+                path.display()
+            )),
+            SwitcherError::UinputAccessDenied { path, .. } => Some(format!(
+                "Linux input setup is not ready.\nuinput access is denied for: {}\nRun `./manage.sh doctor`\nRun `./manage.sh bootstrap linux-input`",
+                path.display()
+            )),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keyboard_access_denied_has_linux_input_setup_hint() {
+        let error = SwitcherError::KeyboardAccessDenied {
+            path: PathBuf::from("/dev/input/event4"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+
+        let hint = error
+            .linux_input_setup_hint()
+            .expect("setup hint must be present");
+
+        assert!(hint.contains("./manage.sh doctor"));
+        assert!(hint.contains("./manage.sh bootstrap linux-input"));
+    }
+
+    #[test]
+    fn uinput_access_denied_has_linux_input_setup_hint() {
+        let error = SwitcherError::UinputAccessDenied {
+            path: PathBuf::from("/dev/uinput"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+
+        let hint = error
+            .linux_input_setup_hint()
+            .expect("setup hint must be present");
+
+        assert!(hint.contains("./manage.sh doctor"));
+        assert!(hint.contains("./manage.sh bootstrap linux-input"));
+    }
 }

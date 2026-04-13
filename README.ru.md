@@ -232,11 +232,13 @@ OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
 - `dist/systemd/open-switcher-daemon.service`
 - `dist/systemd/open-switcher-tray.service`
 - `dist/open-switcher.desktop`
+- `dist/icons/hicolor/512x512/apps/open-switcher.png`
 
 Команда `./manage.sh systemd install` устанавливает их в:
 
 - `~/.config/systemd/user/`
 - `~/.local/share/applications/`
+- `~/.local/share/icons/hicolor/512x512/apps/`
 - `~/.local/bin/`
 
 Примечания:

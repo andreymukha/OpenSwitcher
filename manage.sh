@@ -21,6 +21,7 @@ SETTINGS_PIDFILE="$PID_DIR/settings.pid"
 
 SYSTEMD_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 APPLICATIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
 SYSTEMD_BIN_DIR="${OPEN_SWITCHER_SYSTEMD_BINDIR:-$HOME/.local/bin}"
 
 DAEMON_UNIT="open-switcher-daemon.service"
@@ -30,10 +31,12 @@ DESKTOP_FILE="open-switcher.desktop"
 DAEMON_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$DAEMON_UNIT"
 TRAY_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$TRAY_UNIT"
 DESKTOP_FILE_SOURCE="$SCRIPT_DIR/dist/$DESKTOP_FILE"
+ICON_SOURCE="$SCRIPT_DIR/dist/icons/hicolor/512x512/apps/open-switcher.png"
 
 INSTALLED_DAEMON_BIN="$SYSTEMD_BIN_DIR/open-switcher-daemon"
 INSTALLED_TRAY_BIN="$SYSTEMD_BIN_DIR/open-switcher-tray"
 INSTALLED_SETTINGS_BIN="$SYSTEMD_BIN_DIR/open-switcher-settings"
+INSTALLED_ICON="$ICON_DIR/open-switcher.png"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -436,11 +439,12 @@ install_systemd_runtime() {
     require_binary daemon
     require_binary tray
 
-    mkdir -p "$SYSTEMD_UNIT_DIR" "$APPLICATIONS_DIR" "$SYSTEMD_BIN_DIR"
+    mkdir -p "$SYSTEMD_UNIT_DIR" "$APPLICATIONS_DIR" "$SYSTEMD_BIN_DIR" "$ICON_DIR"
 
     ensure_dist_file "$DAEMON_UNIT_SOURCE"
     ensure_dist_file "$TRAY_UNIT_SOURCE"
     ensure_dist_file "$DESKTOP_FILE_SOURCE"
+    ensure_dist_file "$ICON_SOURCE"
     ensure_systemd_command
 
     install -m 0755 "$DAEMON_BIN" "$INSTALLED_DAEMON_BIN"
@@ -448,6 +452,7 @@ install_systemd_runtime() {
     if [[ -x "$SETTINGS_BIN" ]]; then
         install -m 0755 "$SETTINGS_BIN" "$INSTALLED_SETTINGS_BIN"
     fi
+    install -m 0644 "$ICON_SOURCE" "$INSTALLED_ICON"
 
     install_rewritten_file \
         "$DAEMON_UNIT_SOURCE" \
@@ -464,12 +469,19 @@ install_systemd_runtime() {
         "$APPLICATIONS_DIR/$DESKTOP_FILE" \
         '^Exec=systemctl --user start open-switcher-tray\.service$' \
         "Exec=$(command -v systemctl) --user start $TRAY_UNIT"
+    install_rewritten_file \
+        "$APPLICATIONS_DIR/$DESKTOP_FILE" \
+        "$APPLICATIONS_DIR/$DESKTOP_FILE.tmp" \
+        '^Icon=open-switcher$' \
+        "Icon=$INSTALLED_ICON"
+    mv "$APPLICATIONS_DIR/$DESKTOP_FILE.tmp" "$APPLICATIONS_DIR/$DESKTOP_FILE"
 
     run_systemctl_user daemon-reload
 
     echo "systemd user-файлы установлены:"
     echo "  units: $SYSTEMD_UNIT_DIR"
     echo "  desktop: $APPLICATIONS_DIR/$DESKTOP_FILE"
+    echo "  icon: $INSTALLED_ICON"
     echo "  binaries: $SYSTEMD_BIN_DIR"
 }
 

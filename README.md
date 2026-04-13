@@ -123,6 +123,7 @@ sudo apt-get update
 sudo apt-get install -y \
   build-essential \
   pkg-config \
+  libdbus-1-dev \
   libgtk-4-dev \
   libadwaita-1-dev
 ```
@@ -232,11 +233,13 @@ Distribution assets in the repository:
 - `dist/systemd/open-switcher-daemon.service`
 - `dist/systemd/open-switcher-tray.service`
 - `dist/open-switcher.desktop`
+- `dist/icons/hicolor/512x512/apps/open-switcher.png`
 
 Installed by `./manage.sh systemd install` into:
 
 - `~/.config/systemd/user/`
 - `~/.local/share/applications/`
+- `~/.local/share/icons/hicolor/512x512/apps/`
 - `~/.local/bin/`
 
 Notes:

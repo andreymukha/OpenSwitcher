@@ -124,6 +124,7 @@ sudo apt-get install -y \
   build-essential \
   pkg-config \
   libdbus-1-dev \
+  libudev-dev \
   libgtk-4-dev \
   libadwaita-1-dev
 ```

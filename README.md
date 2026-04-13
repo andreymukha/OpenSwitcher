@@ -1,6 +1,8 @@
+Language: **English** | [Русский](README.ru.md)
+
 # OpenSwitcher
 
-OpenSwitcher is a Linux desktop keyboard layout switcher written in Rust.
+OpenSwitcher is an EN/RU-focused Linux desktop typing utility written in Rust.
 
 The project focuses on day-to-day EN/RU typing workflows:
 - automatic correction of the last word when it was typed in the wrong layout
@@ -8,18 +10,38 @@ The project focuses on day-to-day EN/RU typing workflows:
 - selected-text layout conversion
 - lightweight tray control and a separate settings window
 
-This repository contains the full local development history of the project.
+> **Development note**
+>
+> OpenSwitcher is developed through AI-assisted engineering. The Rust implementation in this repository is produced by AI tools under human direction, review, and acceptance.
+>
+> The project owner is not a Rust developer and focuses on product requirements, architecture decisions, testing, UX, and final validation rather than manual Rust implementation.
 
-## What The App Consists Of
+This repository contains the full development history of the project.
+
+## Project Status
+
+OpenSwitcher is in active development.
+
+The current public scope is a Linux desktop application for EN/RU typing workflows, built around a `daemon + tray` runtime model.
+
+## Quick Start
+
+```bash
+./manage.sh dev build
+./manage.sh dev start
+./manage.sh dev settings
+```
+
+## Components
 
 OpenSwitcher is split into three binaries:
 
 - `open-switcher`  
-  The daemon. It owns configuration, input handling, layout correction, and the D-Bus API.
+  The daemon binary. It owns configuration, input handling, correction logic, and the D-Bus API.
 - `open-switcher-tray`  
-  The main user-facing entrypoint. It provides the tray icon, status menu, and talks to the daemon over D-Bus.
+  The tray binary and the main user-facing entrypoint. It provides the tray icon, status menu, and talks to the daemon over D-Bus.
 - `open-switcher-settings`  
-  A GTK4 + libadwaita settings window. It is a service tool, not part of the mandatory runtime pair.
+  A GTK4 + libadwaita settings tool. It is separate from the mandatory `daemon + tray` pair.
 
 ## Runtime Model
 
@@ -28,12 +50,12 @@ For users, OpenSwitcher is one application built from two cooperating processes:
 - `daemon`
 - `tray`
 
-Those two are expected to run together.
+Those two are expected to run together as one user-facing application.
 
 Current runtime model:
 - the official user-facing startup path is the tray
 - the official autostart path is `systemd --user`
-- `tray + daemon` are treated as one application lifecycle
+- `daemon + tray` are treated as one application lifecycle
 - the settings window is optional and can be started separately
 
 ## Current Features
@@ -45,7 +67,7 @@ Current runtime model:
   - fix two uppercase letters at the beginning of a word
   - fix accidental Caps Lock pattern
 - Settings UI for system, correction, and hotkey options
-- User-level `systemd` integration for daemon + tray
+- User-level `systemd` integration for the `daemon + tray` application pair
 - Tray menu with status and control actions
 
 ## Current Scope And Limitations
@@ -64,7 +86,7 @@ Current runtime model:
 - Linux desktop session
 - session D-Bus
 - `systemd --user` for the official autostart/runtime model
-- a tray host compatible with the tray implementation used by the project
+- a desktop environment with a compatible StatusNotifier/AppIndicator tray host
 
 ### Build dependencies
 
@@ -119,7 +141,7 @@ Build:
 ./manage.sh dev build
 ```
 
-Start daemon + tray from the local build:
+Start the local `daemon + tray` pair from the build tree:
 
 ```bash
 ./manage.sh dev start
@@ -143,7 +165,7 @@ OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
 
 ## `systemd --user` Runtime
 
-This is the official runtime model for the published app.
+This is the official runtime model for the published application.
 
 Install user units, desktop entry, and locally installed binaries:
 
@@ -151,7 +173,7 @@ Install user units, desktop entry, and locally installed binaries:
 ./manage.sh systemd install
 ```
 
-Start the app through user services:
+Start the `daemon + tray` application through user services:
 
 ```bash
 ./manage.sh systemd start
@@ -197,6 +219,8 @@ Notes:
 - `~/.config/autostart` is not used
 
 ## Direct Binary Runs
+
+This section is mainly for development and manual local debugging.
 
 If you want to run the binaries manually from the build tree:
 

@@ -33,6 +33,21 @@ enum PendingWordCommitAction {
     SameLayoutCaseCorrection { corrected_buffer: Vec<Keystroke> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorrectionPath {
+    AutoWordCommit,
+    ManualHotkey,
+}
+
+impl CorrectionPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AutoWordCommit => "auto-word-commit",
+            Self::ManualHotkey => "manual-hotkey",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingWordCommit {
     separator_key: evdev::Key,
@@ -102,6 +117,14 @@ fn next_layout_for_user_shortcut(
 
 fn should_publish_pending_status_change(has_pending_status_change: bool) -> bool {
     has_pending_status_change
+}
+
+fn format_legacy_layout(is_english: bool) -> &'static str {
+    if is_english {
+        "EN"
+    } else {
+        "RU"
+    }
 }
 
 fn is_visible_word_commit_separator(stroke: &Keystroke, layout_kind: AppLayoutKind) -> bool {
@@ -286,10 +309,7 @@ impl DaemonService {
                     .is_some_and(|pending| pending.separator_key == key)
                 {
                     let pending = self.pending_word_commit.take().unwrap();
-                    self.finish_pending_word_commit(
-                        pending,
-                        &self.runtime.config_snapshot()?,
-                    )?;
+                    self.finish_pending_word_commit(pending, &self.runtime.config_snapshot()?)?;
                 }
                 self.suppressed_separator_key = None;
             }
@@ -423,9 +443,11 @@ impl DaemonService {
                 Vec::new()
             };
             let used_current_buffer = !self.buffer.is_empty();
-            if let Some(corrected_buffer) =
-                self.apply_manual_correction(&config, &word_before_cursor)?
-            {
+            if let Some(corrected_buffer) = self.apply_manual_correction(
+                &config,
+                &word_before_cursor,
+                CorrectionPath::ManualHotkey,
+            )? {
                 if used_current_buffer {
                     self.word_context.valid = true;
                     self.word_context.word_before_cursor = corrected_buffer;
@@ -439,12 +461,58 @@ impl DaemonService {
             evdev::Key::KEY_SPACE => {
                 let startup_sync_ready = self.refresh_startup_layout_before_autocorrect()?;
                 let features = self.runtime.feature_availability();
+                let cached_layout_state = self.runtime.current_layout_state();
+                let current_layout_kind = self.current_layout_kind();
+                let effective_layout_kind = self.runtime.auto_correction_layout_kind();
+                if effective_layout_kind != current_layout_kind {
+                    let cached_layout_trustworthy = matches!(
+                        cached_layout_state,
+                        CurrentLayoutState::Known {
+                            trustworthy: true,
+                            ..
+                        }
+                    );
+                    log_layout_debug(
+                        "space-layout-cache",
+                        &format!(
+                            "cached_layout_kind={current_layout_kind:?} effective_layout_kind={effective_layout_kind:?} trustworthy={cached_layout_trustworthy} source=runtime-cache",
+                        ),
+                    );
+                }
+                let should_switch_word = should_switch(&self.buffer);
+                let same_layout_plan = same_layout_case_correction_plan(
+                    &self.buffer,
+                    config.fix_two_capitals,
+                    config.fix_accidental_caps_lock,
+                );
                 let corrected = self.runtime.is_enabled()
                     && config.auto_switch_enabled
                     && features.auto_switch
                     && startup_sync_ready
-                    && matches!(self.current_layout_kind(), AppLayoutKind::English)
-                    && should_switch(&self.buffer);
+                    && matches!(effective_layout_kind, AppLayoutKind::English)
+                    && should_switch_word;
+
+                let selected_path = if corrected {
+                    "layout-correction"
+                } else if same_layout_plan.is_some() {
+                    "same-layout-correction"
+                } else {
+                    "no-correction"
+                };
+                log_layout_debug(
+                    "space-correction-decision",
+                    &format!(
+                        "enabled={} auto_switch_enabled={} feature_auto_switch={} startup_sync_ready={} current_layout_kind={current_layout_kind:?} effective_layout_kind={effective_layout_kind:?} should_switch={} same_layout_case_fix={} selected_path={} buffer_len={}",
+                        self.runtime.is_enabled(),
+                        config.auto_switch_enabled,
+                        features.auto_switch,
+                        startup_sync_ready,
+                        should_switch_word,
+                        same_layout_plan.is_some(),
+                        selected_path,
+                        self.buffer.len(),
+                    ),
+                );
 
                 if corrected {
                     self.suppressed_separator_key = Some(key);
@@ -455,11 +523,7 @@ impl DaemonService {
                     return Ok(());
                 }
 
-                if let Some(plan) = same_layout_case_correction_plan(
-                    &self.buffer,
-                    config.fix_two_capitals,
-                    config.fix_accidental_caps_lock,
-                ) {
+                if let Some(plan) = same_layout_plan {
                     self.suppressed_separator_key = Some(key);
                     self.pending_word_commit = Some(PendingWordCommit {
                         separator_key: key,
@@ -580,7 +644,7 @@ impl DaemonService {
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
     ) -> Result<(), SwitcherError> {
         let corrected_buffer = self
-            .apply_manual_correction(config, &[])?
+            .apply_manual_correction(config, &[], CorrectionPath::AutoWordCommit)?
             .unwrap_or_else(|| self.buffer.clone());
         self.commit_corrected_word(separator_key, corrected_buffer)
     }
@@ -655,23 +719,43 @@ impl DaemonService {
         &mut self,
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
         fallback_buffer: &[Keystroke],
+        correction_path: CorrectionPath,
     ) -> Result<Option<Vec<Keystroke>>, SwitcherError> {
         let features = self.runtime.feature_availability();
         if !features.manual_word_fix {
             return Ok(None);
         }
 
+        let cached_layout_before = self.runtime.current_layout_state();
+        let legacy_layout_before = self.runtime.current_layout();
+        let current_layout_kind_before = self.current_layout_kind();
         let pre_correction_sync = self.runtime.sync_with_backend();
+        log_layout_debug(
+            "correction-start",
+            &format!(
+                "path={} combo={:?} pre_sync={pre_correction_sync:?} cached_layout_before={cached_layout_before:?} legacy_layout_before={} current_layout_kind_before={current_layout_kind_before:?} buffer_len={} fallback_buffer_len={} followed_by_separator={}",
+                correction_path.as_str(),
+                config.layout_switch_combo,
+                format_legacy_layout(legacy_layout_before),
+                self.buffer.len(),
+                fallback_buffer.len(),
+                self.word_context.followed_by_separator,
+            ),
+        );
         if !automatic_layout_actions_allowed(&pre_correction_sync) {
             log_layout_debug(
                 "manual-correction-sync",
-                "source=backend skipped=true phase=before-correction",
+                &format!(
+                    "path={} combo={:?} source=backend skipped=true phase=before-correction",
+                    correction_path.as_str(),
+                    config.layout_switch_combo,
+                ),
             );
             return Ok(None);
         }
 
         if !matches!(
-            self.current_layout_kind(),
+            current_layout_kind_before,
             AppLayoutKind::English | AppLayoutKind::Russian
         ) {
             return Ok(None);
@@ -689,13 +773,41 @@ impl DaemonService {
             config.fix_two_capitals,
             config.fix_accidental_caps_lock,
         );
+        log_layout_debug(
+            "correction-plan",
+            &format!(
+                "path={} combo={:?} buffer_len={} extra_backspaces={}",
+                correction_path.as_str(),
+                config.layout_switch_combo,
+                plan.buffer.len(),
+                plan.extra_backspaces,
+            ),
+        );
         self.keyboard
             .apply_correction(&plan, config, self.modifiers)?;
-        match self.runtime.sync_with_backend() {
+        let post_correction_sync = self.runtime.sync_with_backend();
+        let cached_layout_after = self.runtime.current_layout_state();
+        let legacy_layout_after = self.runtime.current_layout();
+        let current_layout_kind_after = self.current_layout_kind();
+        log_layout_debug(
+            "correction-finish",
+            &format!(
+                "path={} combo={:?} post_sync={post_correction_sync:?} cached_layout_after={cached_layout_after:?} legacy_layout_after={} current_layout_kind_after={current_layout_kind_after:?} cached_layout_changed={}",
+                correction_path.as_str(),
+                config.layout_switch_combo,
+                format_legacy_layout(legacy_layout_after),
+                cached_layout_before != cached_layout_after,
+            ),
+        );
+        match post_correction_sync {
             BackendSyncResult::Updated { current, .. } => {
                 log_layout_debug(
                     "manual-correction-sync",
-                    &format!("source=backend updated=true current={current:?}"),
+                    &format!(
+                        "path={} combo={:?} source=backend updated=true current={current:?}",
+                        correction_path.as_str(),
+                        config.layout_switch_combo,
+                    ),
                 );
                 self.startup_layout_resync.complete();
                 self.publish_status_changed()?;
@@ -703,7 +815,11 @@ impl DaemonService {
             BackendSyncResult::Unchanged => {
                 log_layout_debug(
                     "manual-correction-sync",
-                    "source=backend updated=false current=unchanged",
+                    &format!(
+                        "path={} combo={:?} source=backend updated=false current=unchanged",
+                        correction_path.as_str(),
+                        config.layout_switch_combo,
+                    ),
                 );
                 self.startup_layout_resync.complete();
                 self.publish_status_changed()?;
@@ -711,7 +827,11 @@ impl DaemonService {
             BackendSyncResult::Skipped => {
                 log_layout_debug(
                     "manual-correction-sync",
-                    "source=backend skipped=true phase=after-correction fallback=disabled",
+                    &format!(
+                        "path={} combo={:?} source=backend skipped=true phase=after-correction fallback=disabled",
+                        correction_path.as_str(),
+                        config.layout_switch_combo,
+                    ),
                 );
             }
         }
@@ -799,7 +919,6 @@ impl DaemonService {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
     fn startup_layout_resync_starts_pending() {
         let state = StartupLayoutResyncState::pending();

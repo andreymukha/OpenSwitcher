@@ -1,10 +1,26 @@
 use crate::error::SwitcherError;
-use crate::model::LayoutSwitchCombo;
+use crate::model::{LayoutSwitchCombo, SessionType};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutSwitchStrategy {
     X11,
     UinputFallback,
+}
+
+impl LayoutSwitchStrategy {
+    pub fn for_session_type(session_type: SessionType) -> Self {
+        match session_type {
+            SessionType::X11 => Self::X11,
+            SessionType::Wayland | SessionType::Unknown => Self::UinputFallback,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::X11 => "x11",
+            Self::UinputFallback => "uinput",
+        }
+    }
 }
 
 pub trait LayoutSwitcher {
@@ -160,5 +176,32 @@ impl LayoutSwitcher for X11LayoutSwitcher {
         })?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_x11_strategy_only_for_x11_sessions() {
+        assert_eq!(
+            LayoutSwitchStrategy::for_session_type(SessionType::X11),
+            LayoutSwitchStrategy::X11
+        );
+        assert_eq!(
+            LayoutSwitchStrategy::for_session_type(SessionType::Wayland),
+            LayoutSwitchStrategy::UinputFallback
+        );
+        assert_eq!(
+            LayoutSwitchStrategy::for_session_type(SessionType::Unknown),
+            LayoutSwitchStrategy::UinputFallback
+        );
+    }
+
+    #[test]
+    fn formats_strategy_for_logs() {
+        assert_eq!(LayoutSwitchStrategy::X11.as_str(), "x11");
+        assert_eq!(LayoutSwitchStrategy::UinputFallback.as_str(), "uinput");
     }
 }

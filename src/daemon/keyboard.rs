@@ -1,7 +1,8 @@
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
-use crate::model::{LayoutSwitchCombo, UndoKey};
+use crate::model::{LayoutSwitchCombo, SessionType, UndoKey};
+use crate::system::SystemContextDetector;
 use evdev::{enumerate, Device, InputEvent, Key, LedType};
 use std::collections::HashSet;
 use std::env;
@@ -578,6 +579,22 @@ impl InputTargetWatcher {
         let changed_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
 
+        let session_type = detect_current_session_type();
+        if !should_enable_x11_input_target_watcher(session_type) {
+            log_input_debug(
+                "input-target-watcher-disabled",
+                &format!(
+                    "reason=non-x11-session session_type={}",
+                    format_session_type(session_type)
+                ),
+            );
+            return Self {
+                changed_flag,
+                stop_flag,
+                handle: None,
+            };
+        }
+
         let Ok(mut monitor) = ActiveWindowMonitor::connect() else {
             log_input_debug(
                 "input-target-watcher-disabled",
@@ -653,6 +670,68 @@ impl InputTargetWatcher {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
+        }
+    }
+}
+
+fn detect_current_session_type() -> SessionType {
+    SystemContextDetector::detect_current()
+        .map(|context| context.session_type)
+        .unwrap_or(SessionType::Unknown)
+}
+
+fn should_enable_x11_input_target_watcher(session_type: SessionType) -> bool {
+    session_type == SessionType::X11
+}
+
+fn format_session_type(session_type: SessionType) -> &'static str {
+    match session_type {
+        SessionType::X11 => "x11",
+        SessionType::Wayland => "wayland",
+        SessionType::Unknown => "unknown",
+    }
+}
+
+fn initialize_x11_switcher_for_session<T, F>(session_type: SessionType, init_x11: F) -> Option<T>
+where
+    F: FnOnce() -> Result<T, SwitcherError>,
+{
+    let strategy = LayoutSwitchStrategy::for_session_type(session_type);
+
+    match strategy {
+        LayoutSwitchStrategy::X11 => match init_x11() {
+            Ok(switcher) => {
+                log_input_debug(
+                    "layout-switch-strategy",
+                    &format!(
+                        "session_type={} strategy={}",
+                        format_session_type(session_type),
+                        strategy.as_str()
+                    ),
+                );
+                Some(switcher)
+            }
+            Err(error) => {
+                log_input_debug(
+                    "layout-switch-strategy",
+                    &format!(
+                        "session_type={} strategy=uinput reason=x11-init-failed error={error}",
+                        format_session_type(session_type)
+                    ),
+                );
+                None
+            }
+        },
+        LayoutSwitchStrategy::UinputFallback => {
+            log_input_debug(
+                "layout-switch-strategy",
+                &format!(
+                    "session_type={} strategy={}",
+                    format_session_type(session_type),
+                    strategy.as_str()
+                ),
+            );
+            None
         }
     }
 }
@@ -1098,7 +1177,10 @@ fn ensure_uinput_writable() -> Result<PathBuf, SwitcherError> {
                 last_error = Some(error);
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                return Err(SwitcherError::UinputAccessDenied { path, source: error });
+                return Err(SwitcherError::UinputAccessDenied {
+                    path,
+                    source: error,
+                });
             }
             Err(error) => {
                 if first_existing_path.is_none() && path.exists() {
@@ -1118,9 +1200,12 @@ fn ensure_uinput_writable() -> Result<PathBuf, SwitcherError> {
         }
     }
 
-    Err(last_error
-        .map(SwitcherError::Io)
-        .unwrap_or_else(|| SwitcherError::Io(io::Error::new(io::ErrorKind::NotFound, "uinput device not found"))))
+    Err(last_error.map(SwitcherError::Io).unwrap_or_else(|| {
+        SwitcherError::Io(io::Error::new(
+            io::ErrorKind::NotFound,
+            "uinput device not found",
+        ))
+    }))
 }
 
 fn set_nonblocking(device: &Device) -> io::Result<()> {
@@ -1327,6 +1412,7 @@ impl ModifierState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::fs;
     use std::io;
     use std::path::Path;
@@ -1420,6 +1506,65 @@ mod tests {
 
         assert!(matches!(error, SwitcherError::KeyboardAccessDenied { .. }));
     }
+
+    #[test]
+    fn x11_input_target_watcher_is_enabled_only_for_x11_sessions() {
+        assert!(should_enable_x11_input_target_watcher(SessionType::X11));
+        assert!(!should_enable_x11_input_target_watcher(
+            SessionType::Wayland
+        ));
+        assert!(!should_enable_x11_input_target_watcher(
+            SessionType::Unknown
+        ));
+    }
+
+    #[test]
+    fn layout_switcher_initializer_skips_x11_outside_x11_sessions() {
+        let init_called = Cell::new(false);
+
+        let switcher = initialize_x11_switcher_for_session(SessionType::Wayland, || {
+            init_called.set(true);
+            Ok::<_, SwitcherError>("x11")
+        });
+
+        assert_eq!(switcher, None);
+        assert!(
+            !init_called.get(),
+            "Wayland strategy selection must not initialize the X11 switcher"
+        );
+    }
+
+    #[test]
+    fn layout_switcher_initializer_uses_x11_in_x11_sessions() {
+        let init_called = Cell::new(false);
+
+        let switcher = initialize_x11_switcher_for_session(SessionType::X11, || {
+            init_called.set(true);
+            Ok::<_, SwitcherError>("x11")
+        });
+
+        assert_eq!(switcher, Some("x11"));
+        assert!(
+            init_called.get(),
+            "X11 strategy selection must keep using the X11 switcher"
+        );
+    }
+
+    #[test]
+    fn layout_switcher_initializer_falls_back_to_uinput_when_x11_init_fails() {
+        let init_called = Cell::new(false);
+
+        let switcher = initialize_x11_switcher_for_session(SessionType::X11, || {
+            init_called.set(true);
+            Err::<&str, _>(SwitcherError::Io(io::Error::other("x11 unavailable")))
+        });
+
+        assert_eq!(switcher, None);
+        assert!(
+            init_called.get(),
+            "X11 session should attempt X11 init before falling back to uinput"
+        );
+    }
 }
 
 impl SelectionKeyboardTransport {
@@ -1487,7 +1632,9 @@ fn run_shortcut(
     Ok(())
 }
 
-use crate::daemon::layout_switcher::{LayoutSwitcher, UinputLayoutSwitcher, X11LayoutSwitcher};
+use crate::daemon::layout_switcher::{
+    LayoutSwitchStrategy, LayoutSwitcher, UinputLayoutSwitcher, X11LayoutSwitcher,
+};
 
 fn replay_shift_for_stroke(
     stroke: &crate::daemon::switch_logic::Keystroke,
@@ -1547,6 +1694,19 @@ fn run_correction(
     x11_switcher: &mut Option<X11LayoutSwitcher>,
     switch_layout: bool,
 ) -> Result<(), SwitcherError> {
+    log_input_debug(
+        "correction-transaction",
+        &format!(
+            "switch_layout={} combo={:?} buffer_len={} extra_backspaces={} layout_delay_ms={} typing_ms={} backspace_ms={}",
+            switch_layout,
+            config.layout_switch_combo,
+            plan.buffer.len(),
+            plan.extra_backspaces,
+            config.layout_delay_ms,
+            config.typing_ms,
+            config.backspace_ms,
+        ),
+    );
     release_modifiers(device, modifiers)?;
     for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
         device.press(&uinput::event::keyboard::Key::BackSpace)?;
@@ -1559,14 +1719,57 @@ fn run_correction(
 
     if switch_layout {
         if let Some(switcher) = x11_switcher {
+            log_input_debug(
+                "correction-layout-switch",
+                &format!(
+                    "combo={:?} strategy=x11 hold_ms={}",
+                    config.layout_switch_combo, config.layout_delay_ms
+                ),
+            );
             if let Err(e) = switcher.switch_layout(config.layout_switch_combo) {
                 log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=x11 result=error fallback=uinput",
+                        config.layout_switch_combo
+                    ),
+                );
                 let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
                 uinput_switcher.switch_layout(config.layout_switch_combo)?;
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=uinput result=ok hold_ms={}",
+                        config.layout_switch_combo, config.layout_delay_ms
+                    ),
+                );
+            } else {
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=x11 result=ok",
+                        config.layout_switch_combo
+                    ),
+                );
             }
         } else {
+            log_input_debug(
+                "correction-layout-switch",
+                &format!(
+                    "combo={:?} strategy=uinput hold_ms={}",
+                    config.layout_switch_combo, config.layout_delay_ms
+                ),
+            );
             let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
             uinput_switcher.switch_layout(config.layout_switch_combo)?;
+            log_input_debug(
+                "correction-layout-switch",
+                &format!(
+                    "combo={:?} strategy=uinput result=ok",
+                    config.layout_switch_combo
+                ),
+            );
         }
         thread::sleep(Duration::from_millis(config.layout_delay_ms));
     }
@@ -1605,15 +1808,9 @@ fn run_virtual_keyboard_writer_loop(
     mut device: uinput::Device,
     command_rx: mpsc::Receiver<WriterCommand>,
 ) -> Result<(), SwitcherError> {
-    let mut x11_switcher = X11LayoutSwitcher::new().ok();
-    if x11_switcher.is_some() {
-        log_input_debug("x11-layout-switcher", "successfully initialized");
-    } else {
-        log_input_debug(
-            "x11-layout-switcher",
-            "failed to initialize, falling back to uinput",
-        );
-    }
+    let session_type = detect_current_session_type();
+    let mut x11_switcher =
+        initialize_x11_switcher_for_session(session_type, X11LayoutSwitcher::new);
 
     for command in command_rx {
         match command {

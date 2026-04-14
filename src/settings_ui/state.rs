@@ -56,6 +56,7 @@ pub struct LayoutSwitchViewState {
     pub manual_override_active: bool,
     pub show_unlock_hint: bool,
     pub show_fallback_hint: bool,
+    pub fallback_hint_text: String,
     pub capture_active: bool,
     pub capture_hint: &'static str,
     pub actions: LayoutSwitchActionsState,
@@ -287,6 +288,11 @@ impl DomainState {
         let loading = self.request_state == RequestState::Loading;
         let saving = self.request_state == RequestState::Saving;
         let loaded = self.loaded.is_some();
+        let layout_switch_source = if self.layout_switch_manual_override {
+            LayoutSwitchSource::Manual
+        } else {
+            self.draft.layout_switch.source
+        };
         let settings_dirty = self
             .loaded
             .map(|settings| settings != self.draft)
@@ -308,11 +314,7 @@ impl DomainState {
             layout_switch: LayoutSwitchViewState {
                 combo: self.draft.layout_switch.combo,
                 combo_label: self.draft.layout_switch.combo.short_label().to_string(),
-                source: if self.layout_switch_manual_override {
-                    LayoutSwitchSource::Manual
-                } else {
-                    self.draft.layout_switch.source
-                },
+                source: layout_switch_source,
                 editable: loaded
                     && !saving
                     && (!self.draft.layout_switch.is_locked_by_auto_detection()
@@ -322,7 +324,12 @@ impl DomainState {
                     && self.draft.layout_switch.is_locked_by_auto_detection()
                     && !self.layout_switch_manual_override,
                 show_fallback_hint: loaded
-                    && self.draft.layout_switch.source == LayoutSwitchSource::AutoFallback,
+                    && layout_switch_source == LayoutSwitchSource::AutoFallback,
+                fallback_hint_text: if layout_switch_source == LayoutSwitchSource::AutoFallback {
+                    fallback_hint_text(&self.draft.layout_switch)
+                } else {
+                    String::new()
+                },
                 capture_active: self.layout_switch_capture_active,
                 capture_hint: if self.layout_switch_capture_active {
                     "Нажмите желаемую комбинацию. Esc — отмена."
@@ -360,9 +367,30 @@ impl DomainState {
     }
 }
 
+fn fallback_hint_text(layout_switch: &crate::model::LayoutSwitchSetting) -> String {
+    if layout_switch.source != LayoutSwitchSource::AutoFallback {
+        return String::new();
+    }
+
+    let combo_label = layout_switch.combo.short_label();
+    if layout_switch.is_fallback_for_unsupported_context() {
+        return format!(
+            "Автоопределение комбинации переключения раскладки не поддерживается в текущем окружении. Сейчас используется резервная комбинация {combo_label}. При необходимости захватите комбинацию вручную."
+        );
+    }
+
+    format!(
+        "Автоопределение комбинации переключения раскладки не удалось. Сейчас используется резервная комбинация {combo_label}. Захватите комбинацию вручную."
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{
+        DesktopEnvironment, DetectionConfidence, DetectionStrategy, DistroKind, SessionType,
+        SystemContext,
+    };
 
     #[test]
     fn save_enabled_only_for_dirty_idle_state() {
@@ -422,5 +450,89 @@ mod tests {
         assert!(!state.view_state().autostart_enabled);
         assert!(!state.view_state().fix_two_capitals);
         assert!(!state.view_state().dirty);
+    }
+
+    #[test]
+    fn view_state_marks_unsupported_fallback_combo_as_fallback() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::ctrl_shift(),
+                source: LayoutSwitchSource::AutoFallback,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::NoSupportedStrategy,
+                    confidence: DetectionConfidence::Unsupported,
+                    context: SystemContext {
+                        session_type: SessionType::Wayland,
+                        desktop_environment: DesktopEnvironment::Gnome,
+                        distro: DistroKind::Ubuntu,
+                    },
+                },
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+
+        let view = state.view_state();
+        assert!(view.layout_switch.show_fallback_hint);
+        assert_eq!(
+            view.layout_switch.fallback_hint_text,
+            "Автоопределение комбинации переключения раскладки не поддерживается в текущем окружении. Сейчас используется резервная комбинация Ctrl+Shift. При необходимости захватите комбинацию вручную."
+        );
+    }
+
+    #[test]
+    fn view_state_marks_failed_detection_fallback_as_runtime_fallback() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::alt_shift(),
+                source: LayoutSwitchSource::AutoFallback,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                    confidence: DetectionConfidence::Low,
+                    context: SystemContext::default(),
+                },
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+
+        let view = state.view_state();
+        assert!(view.layout_switch.show_fallback_hint);
+        assert_eq!(
+            view.layout_switch.fallback_hint_text,
+            "Автоопределение комбинации переключения раскладки не удалось. Сейчас используется резервная комбинация Alt+Shift. Захватите комбинацию вручную."
+        );
+    }
+
+    #[test]
+    fn manual_override_hides_fallback_hint_even_when_loaded_source_is_auto_fallback() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::ctrl_shift(),
+                source: LayoutSwitchSource::AutoFallback,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::NoSupportedStrategy,
+                    confidence: DetectionConfidence::Unsupported,
+                    context: SystemContext {
+                        session_type: SessionType::Wayland,
+                        desktop_environment: DesktopEnvironment::Gnome,
+                        distro: DistroKind::Ubuntu,
+                    },
+                },
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+
+        assert!(state.start_layout_switch_capture());
+        assert!(state.apply_captured_layout_switch(LayoutSwitchCombo::alt_shift()));
+
+        let view = state.view_state();
+        assert_eq!(view.layout_switch.source, LayoutSwitchSource::Manual);
+        assert!(!view.layout_switch.show_fallback_hint);
+        assert!(view.layout_switch.fallback_hint_text.is_empty());
     }
 }

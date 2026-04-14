@@ -533,6 +533,12 @@ impl LayoutSwitchSetting {
         self.source == LayoutSwitchSource::AutoDetected
             && self.auto_detected.confidence == DetectionConfidence::High
     }
+
+    pub fn is_fallback_for_unsupported_context(self) -> bool {
+        self.source == LayoutSwitchSource::AutoFallback
+            && self.auto_detected.strategy == DetectionStrategy::NoSupportedStrategy
+            && self.auto_detected.confidence == DetectionConfidence::Unsupported
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -793,5 +799,26 @@ mod tests {
                 value: "Space".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn identifies_unsupported_layout_switch_fallback() {
+        let unsupported = LayoutSwitchSetting {
+            combo: LayoutSwitchCombo::ctrl_shift(),
+            source: LayoutSwitchSource::AutoFallback,
+            auto_detected: AutoDetectedLayoutSwitch::default(),
+        };
+        assert!(unsupported.is_fallback_for_unsupported_context());
+
+        let supported_failure = LayoutSwitchSetting {
+            combo: LayoutSwitchCombo::ctrl_shift(),
+            source: LayoutSwitchSource::AutoFallback,
+            auto_detected: AutoDetectedLayoutSwitch {
+                strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                confidence: DetectionConfidence::Low,
+                context: SystemContext::default(),
+            },
+        };
+        assert!(!supported_failure.is_fallback_for_unsupported_context());
     }
 }

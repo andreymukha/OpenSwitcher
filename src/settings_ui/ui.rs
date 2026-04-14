@@ -1491,9 +1491,8 @@ impl SettingsWindow {
                 );
                 form.layout_switch_hint_label.show();
             } else if state.layout_switch.show_fallback_hint {
-                form.layout_switch_hint_label.set_text(
-                    "Автоопределение раскладки не удалось. Захватите комбинацию вручную.",
-                );
+                form.layout_switch_hint_label
+                    .set_text(&state.layout_switch.fallback_hint_text);
                 form.layout_switch_hint_label.show();
             } else {
                 form.layout_switch_hint_label.hide();
@@ -1548,6 +1547,7 @@ fn initial_view_state() -> ViewState {
             manual_override_active: false,
             show_unlock_hint: false,
             show_fallback_hint: false,
+            fallback_hint_text: String::new(),
             capture_active: false,
             capture_hint: "",
             actions: LayoutSwitchActionsState { can_capture: false },

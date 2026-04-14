@@ -5,7 +5,7 @@ use crate::layout_backend::{
     compatibility_from_setup, feature_availability_for, legacy_backend_factory,
     legacy_current_layout_bool, legacy_layout_state_from_bool, AppLayoutKind, BackendCapabilities,
     CurrentLayoutState, FeatureAvailability, LayoutBackend, LayoutBackendRegistry,
-    LayoutBackendRegistryResult, LayoutCompatibility, LayoutSetup,
+    LayoutBackendRegistryResult, LayoutCode, LayoutCompatibility, LayoutSetup, SystemLayout,
 };
 use crate::layout_switch::{
     failed_detection_fallback, CommandDesktopSettingsReader, DesktopSettingsReader,
@@ -370,7 +370,7 @@ mod tests {
                 reason: Some("test".to_string()),
             }),
             system_context,
-            auto_correction_layout_hint: RwLock::new(None),
+            current_layout_observation: RwLock::new(None),
             config_service,
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
@@ -795,12 +795,12 @@ undo_key = "Pause"
         }
     }
 
-    struct LayoutHintReaderStub {
+    struct LayoutObservationReaderStub {
         calls: Arc<AtomicUsize>,
         values: Option<Vec<String>>,
     }
 
-    impl DesktopSettingsReader for LayoutHintReaderStub {
+    impl DesktopSettingsReader for LayoutObservationReaderStub {
         fn gsettings_string_list(
             &self,
             _schema: &str,
@@ -836,7 +836,7 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn auto_correction_layout_kind_prefers_cached_wayland_hint_for_untrustworthy_state() {
+    fn current_layout_state_prefers_gnome_wayland_observation() {
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
                 layout: russian_layout(),
@@ -848,8 +848,16 @@ undo_key = "Pause"
             gnome_wayland_context(),
         );
 
-        *runtime.auto_correction_layout_hint.write().unwrap() = Some(AppLayoutKind::English);
+        runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+        });
 
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
+        );
+        assert!(runtime.current_layout());
         assert_eq!(
             runtime.auto_correction_layout_kind(),
             AppLayoutKind::English
@@ -857,30 +865,39 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn auto_correction_layout_kind_keeps_trustworthy_cached_state_over_hint() {
+    fn sync_with_backend_keeps_gnome_wayland_observation_as_source_of_truth() {
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
-                layout: russian_layout(),
-                trustworthy: true,
+                layout: english_layout(),
+                trustworthy: false,
             },
             Box::new(SnapshotBackend {
-                snapshot: SnapshotOutcome::State(known_layout_state(russian_layout())),
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: russian_layout(),
+                    trustworthy: false,
+                }),
             }),
             gnome_wayland_context(),
         );
 
-        *runtime.auto_correction_layout_hint.write().unwrap() = Some(AppLayoutKind::English);
+        runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+        });
+        runtime.clear_pending_status_change();
 
+        assert_eq!(runtime.sync_with_backend(), BackendSyncResult::Unchanged);
         assert_eq!(
-            runtime.auto_correction_layout_kind(),
-            AppLayoutKind::Russian
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
         );
+        assert!(!runtime.take_pending_status_change());
     }
 
     #[test]
-    fn refresh_auto_correction_layout_hint_reads_gsettings_only_for_gnome_wayland() {
+    fn refresh_current_layout_observation_reads_gsettings_only_for_gnome_wayland() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let reader = LayoutHintReaderStub {
+        let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&calls),
             values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
         };
@@ -895,16 +912,22 @@ undo_key = "Pause"
             cinnamon_x11_context(),
         );
 
-        runtime.refresh_auto_correction_layout_hint_with_reader(&reader);
+        runtime.refresh_current_layout_observation_with_reader(&reader);
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(*runtime.auto_correction_layout_hint.read().unwrap(), None);
+        assert_eq!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Known {
+                layout: russian_layout(),
+                trustworthy: false,
+            }
+        );
     }
 
     #[test]
-    fn refresh_auto_correction_layout_hint_updates_cached_wayland_hint() {
+    fn refresh_current_layout_observation_updates_runtime_cache_and_pending_status() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let reader = LayoutHintReaderStub {
+        let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&calls),
             values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
         };
@@ -919,13 +942,45 @@ undo_key = "Pause"
             gnome_wayland_context(),
         );
 
-        runtime.refresh_auto_correction_layout_hint_with_reader(&reader);
+        runtime.refresh_current_layout_observation_with_reader(&reader);
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            *runtime.auto_correction_layout_hint.read().unwrap(),
-            Some(AppLayoutKind::English)
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
         );
+        assert!(runtime.take_pending_status_change());
+    }
+
+    #[test]
+    fn set_layout_updates_gnome_wayland_observation_cache() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: russian_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            gnome_wayland_context(),
+        );
+
+        runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+        });
+        runtime.clear_pending_status_change();
+
+        runtime.set_layout_with_reason(false, "test-switch");
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(russian_layout())
+        );
+        assert!(!runtime.current_layout());
     }
 }
 
@@ -938,7 +993,7 @@ pub struct RuntimeState {
     layout_compatibility: RwLock<LayoutCompatibility>,
     feature_availability: RwLock<FeatureAvailability>,
     system_context: SystemContext,
-    auto_correction_layout_hint: RwLock<Option<AppLayoutKind>>,
+    current_layout_observation: RwLock<Option<CurrentLayoutState>>,
     config_service: ConfigService,
     capture_session: Mutex<LayoutSwitchCaptureSession>,
     background_sync_started: AtomicBool,
@@ -1039,13 +1094,13 @@ impl RuntimeState {
             layout_compatibility: RwLock::new(layout_compatibility),
             feature_availability: RwLock::new(feature_availability),
             system_context: SystemContextDetector::detect_current().unwrap_or_default(),
-            auto_correction_layout_hint: RwLock::new(None),
+            current_layout_observation: RwLock::new(None),
             config_service,
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
         };
-        runtime.refresh_auto_correction_layout_hint();
+        runtime.refresh_current_layout_observation();
         runtime
     }
 
@@ -1076,11 +1131,108 @@ impl RuntimeState {
     }
 
     pub fn current_layout(&self) -> bool {
-        let state = self
-            .layout_state
+        let state = self.current_layout_state();
+        let state = &state;
+        legacy_current_layout_bool(state)
+    }
+
+    fn raw_layout_state(&self) -> CurrentLayoutState {
+        self.layout_state
             .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn observed_layout_state(&self) -> Option<CurrentLayoutState> {
+        self.current_layout_observation
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn effective_layout_state(&self, raw_state: &CurrentLayoutState) -> CurrentLayoutState {
+        effective_current_layout_state(
+            raw_state,
+            self.observed_layout_state().as_ref(),
+            self.system_context,
+        )
+    }
+
+    fn update_current_layout_observation(
+        &self,
+        next_observation: Option<CurrentLayoutState>,
+        reason: &str,
+    ) {
+        let raw_state = self.raw_layout_state();
+        let mut observation = self
+            .current_layout_observation
+            .write()
             .unwrap_or_else(|error| error.into_inner());
-        legacy_current_layout_bool(&state)
+        let previous_effective =
+            effective_current_layout_state(&raw_state, observation.as_ref(), self.system_context);
+
+        if *observation == next_observation {
+            return;
+        }
+
+        let next_effective = effective_current_layout_state(
+            &raw_state,
+            next_observation.as_ref(),
+            self.system_context,
+        );
+        log_layout_debug(
+            "current-layout-observation",
+            &format!(
+                "reason={reason} previous_observation={:?} next_observation={next_observation:?}",
+                *observation
+            ),
+        );
+        *observation = next_observation;
+
+        if previous_effective != next_effective {
+            self.pending_status_change.store(true, Ordering::SeqCst);
+            log_layout_debug(
+                "current-layout-effective-state",
+                &format!("reason={reason} previous={previous_effective:?} next={next_effective:?}"),
+            );
+        }
+    }
+
+    fn update_current_layout_cache(
+        &self,
+        next_raw_state: CurrentLayoutState,
+        reason: &str,
+    ) -> BackendSyncResult {
+        let observation = self.observed_layout_state();
+        let mut state = self
+            .layout_state
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_effective =
+            effective_current_layout_state(&state, observation.as_ref(), self.system_context);
+        let next_effective = effective_current_layout_state(
+            &next_raw_state,
+            observation.as_ref(),
+            self.system_context,
+        );
+
+        if *state != next_raw_state {
+            *state = next_raw_state;
+        }
+
+        if previous_effective == next_effective {
+            return BackendSyncResult::Unchanged;
+        }
+
+        self.pending_status_change.store(true, Ordering::SeqCst);
+        log_layout_debug(
+            reason,
+            &format!("previous={previous_effective:?} next={next_effective:?}"),
+        );
+        BackendSyncResult::Updated {
+            previous: previous_effective,
+            current: next_effective,
+        }
     }
 
     pub fn set_layout(&self, layout_is_english: bool) {
@@ -1088,14 +1240,14 @@ impl RuntimeState {
     }
 
     pub fn set_layout_with_reason(&self, layout_is_english: bool, reason: &str) {
-        let mut state = self
-            .layout_state
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        let previous = legacy_current_layout_bool(&state);
+        let previous = self.current_layout();
         let next_state = legacy_layout_state_from_bool(layout_is_english);
-        if *state != next_state {
-            *state = next_state;
+        let _ = self.update_current_layout_cache(next_state, "set-layout-cache");
+        if is_gnome_wayland_context(self.system_context) {
+            self.update_current_layout_observation(
+                Some(gnome_wayland_layout_state_from_bool(layout_is_english)),
+                reason,
+            );
         }
         log_layout_debug(
             "set-layout",
@@ -1108,26 +1260,12 @@ impl RuntimeState {
     }
 
     pub fn current_layout_state(&self) -> CurrentLayoutState {
-        self.layout_state
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
+        let raw_state = self.raw_layout_state();
+        self.effective_layout_state(&raw_state)
     }
 
     pub fn auto_correction_layout_kind(&self) -> AppLayoutKind {
-        let cached_state = self.current_layout_state();
-        let cached_layout_kind = current_layout_kind_from_state(&cached_state);
-
-        if current_layout_state_is_trustworthy(&cached_state)
-            || !is_gnome_wayland_context(self.system_context)
-        {
-            return cached_layout_kind;
-        }
-
-        self.auto_correction_layout_hint
-            .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .unwrap_or(cached_layout_kind)
+        current_layout_kind_from_state(&self.current_layout_state())
     }
 
     pub fn layout_setup(&self) -> LayoutSetup {
@@ -1170,32 +1308,12 @@ impl RuntimeState {
             }
         };
 
-        let mut state = self
-            .layout_state
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-
-        if *state == snapshot {
-            return BackendSyncResult::Unchanged;
-        }
-
-        let previous = state.clone();
-        *state = snapshot.clone();
-        self.pending_status_change.store(true, Ordering::SeqCst);
-        log_layout_debug(
-            "backend-sync-update",
-            &format!("previous={previous:?} next={snapshot:?}"),
-        );
-        BackendSyncResult::Updated {
-            previous,
-            current: snapshot,
-        }
+        self.update_current_layout_cache(snapshot, "backend-sync-update")
     }
 
     pub fn periodic_sync_tick(&self) -> BackendSyncResult {
-        let outcome = self.sync_with_backend();
-        self.refresh_auto_correction_layout_hint();
-        outcome
+        self.refresh_current_layout_observation();
+        self.sync_with_backend()
     }
 
     pub fn take_pending_status_change(&self) -> bool {
@@ -1222,7 +1340,7 @@ impl RuntimeState {
             return;
         }
 
-        self.refresh_auto_correction_layout_hint();
+        self.refresh_current_layout_observation();
 
         if self
             .background_sync_started
@@ -1421,55 +1539,24 @@ impl RuntimeState {
         }
     }
 
-    fn refresh_auto_correction_layout_hint(&self) {
-        self.refresh_auto_correction_layout_hint_with_reader(&CommandDesktopSettingsReader);
+    fn refresh_current_layout_observation(&self) {
+        self.refresh_current_layout_observation_with_reader(&CommandDesktopSettingsReader);
     }
 
-    fn refresh_auto_correction_layout_hint_with_reader<R: DesktopSettingsReader>(
-        &self,
-        reader: &R,
-    ) {
+    fn refresh_current_layout_observation_with_reader<R: DesktopSettingsReader>(&self, reader: &R) {
         if !is_gnome_wayland_context(self.system_context) {
-            self.clear_auto_correction_layout_hint();
+            self.clear_current_layout_observation();
             return;
         }
 
-        let cached_state = self.current_layout_state();
-        if current_layout_state_is_trustworthy(&cached_state) {
-            self.clear_auto_correction_layout_hint();
-            return;
-        }
-
-        let Some(next_hint) = gnome_wayland_current_layout_kind(reader) else {
+        let Some(next_observation) = gnome_wayland_current_layout_state(reader) else {
             return;
         };
-
-        let mut hint = self
-            .auto_correction_layout_hint
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        if *hint == Some(next_hint) {
-            return;
-        }
-
-        log_layout_debug(
-            "auto-correction-layout-hint",
-            &format!(
-                "cached_layout_kind={:?} next_hint={next_hint:?}",
-                current_layout_kind_from_state(&cached_state)
-            ),
-        );
-        *hint = Some(next_hint);
+        self.update_current_layout_observation(Some(next_observation), "runtime-sync");
     }
 
-    fn clear_auto_correction_layout_hint(&self) {
-        let mut hint = self
-            .auto_correction_layout_hint
-            .write()
-            .unwrap_or_else(|error| error.into_inner());
-        if hint.take().is_some() {
-            log_layout_debug("auto-correction-layout-hint", "cleared=true");
-        }
+    fn clear_current_layout_observation(&self) {
+        self.update_current_layout_observation(None, "clear-observation");
     }
 }
 
@@ -1484,21 +1571,69 @@ fn current_layout_kind_from_state(state: &CurrentLayoutState) -> AppLayoutKind {
     }
 }
 
-fn current_layout_state_is_trustworthy(state: &CurrentLayoutState) -> bool {
-    match state {
-        CurrentLayoutState::Known { trustworthy, .. } => *trustworthy,
-        CurrentLayoutState::Unknown { .. } => false,
-    }
-}
-
 fn is_gnome_wayland_context(context: SystemContext) -> bool {
     context.session_type == SessionType::Wayland
         && context.desktop_environment == DesktopEnvironment::Gnome
 }
 
-fn gnome_wayland_current_layout_kind<R: DesktopSettingsReader>(
+fn effective_current_layout_state(
+    raw_state: &CurrentLayoutState,
+    observed_state: Option<&CurrentLayoutState>,
+    context: SystemContext,
+) -> CurrentLayoutState {
+    if is_gnome_wayland_context(context) {
+        if let Some(observed_state) = observed_state {
+            return observed_state.clone();
+        }
+    }
+
+    raw_state.clone()
+}
+
+fn gnome_wayland_layout_state_from_bool(layout_is_english: bool) -> CurrentLayoutState {
+    gnome_wayland_current_layout_state_from_code(if layout_is_english { "us" } else { "ru" })
+}
+
+fn gnome_wayland_current_layout_state_from_code(layout_code: &str) -> CurrentLayoutState {
+    let (backend_key, normalized_code, display_name, kind, index) = match layout_code {
+        "us" => (
+            "us".to_string(),
+            LayoutCode::Us,
+            "English".to_string(),
+            AppLayoutKind::English,
+            Some(0),
+        ),
+        "ru" => (
+            "ru".to_string(),
+            LayoutCode::Ru,
+            "Russian".to_string(),
+            AppLayoutKind::Russian,
+            Some(1),
+        ),
+        other => (
+            format!("xkb:{other}"),
+            LayoutCode::from_normalized(other).unwrap_or(LayoutCode::Unknown),
+            other.to_string(),
+            AppLayoutKind::Other,
+            None,
+        ),
+    };
+
+    CurrentLayoutState::Known {
+        layout: SystemLayout {
+            backend_key,
+            normalized_code,
+            display_name,
+            kind,
+            index,
+        },
+        trustworthy: true,
+    }
+}
+
+fn gnome_wayland_current_layout_state<R: DesktopSettingsReader>(
     reader: &R,
-) -> Option<AppLayoutKind> {
+) -> Option<CurrentLayoutState> {
     let values = reader
         .gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_MRU_SOURCES_KEY)
         .ok()?;
@@ -1511,11 +1646,7 @@ fn gnome_wayland_current_layout_kind<R: DesktopSettingsReader>(
         return None;
     }
 
-    Some(match layout_code {
-        "us" => AppLayoutKind::English,
-        "ru" => AppLayoutKind::Russian,
-        _ => AppLayoutKind::Other,
-    })
+    Some(gnome_wayland_current_layout_state_from_code(layout_code))
 }
 
 pub(crate) fn log_layout_debug(stage: &str, details: &str) {

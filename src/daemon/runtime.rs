@@ -195,10 +195,19 @@ mod tests {
     impl DesktopSettingsReader for CountingReader {
         fn gsettings_string_list(
             &self,
-            _schema: &str,
-            _key: &str,
+            schema: &str,
+            key: &str,
         ) -> Result<Vec<String>, LayoutAutoDetectError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if schema == "org.gnome.desktop.wm.keybindings" && key == "switch-input-source" {
+                return Ok(vec![gnome_binding_for_combo(self.combo).to_string()]);
+            }
+
+            if schema == "org.gnome.desktop.wm.keybindings" && key == "switch-input-source-backward"
+            {
+                return Ok(Vec::new());
+            }
+
             Ok(vec![self.combo.xkb_option().to_string()])
         }
 
@@ -241,6 +250,20 @@ mod tests {
             session_type: SessionType::Wayland,
             desktop_environment: DesktopEnvironment::Gnome,
             distro: DistroKind::Ubuntu,
+        }
+    }
+
+    fn gnome_binding_for_combo(combo: LayoutSwitchCombo) -> &'static str {
+        match combo {
+            LayoutSwitchCombo::CtrlShift => "<Primary>Shift_L",
+            LayoutSwitchCombo::AltShift => "<Shift>Alt_L",
+            LayoutSwitchCombo::CapsLock => "Caps_Lock",
+            LayoutSwitchCombo::CtrlSpace => "<Primary>space",
+            LayoutSwitchCombo::SuperSpace => "<Super>space",
+            LayoutSwitchCombo::LeftCtrlLeftShift => "<Control_L>Shift_L",
+            LayoutSwitchCombo::RightCtrlRightShift => "<Control_R>Shift_R",
+            LayoutSwitchCombo::LeftAltLeftShift => "<Alt_L>Shift_L",
+            LayoutSwitchCombo::RightAltRightShift => "<Alt_R>Shift_R",
         }
     }
 
@@ -395,7 +418,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             service.get_settings().unwrap().layout_switch.combo,
             LayoutSwitchCombo::alt_shift()
@@ -457,17 +480,17 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         let persisted = AppConfig::load_or_create(&path).unwrap();
         assert_eq!(
             persisted.layout.switch_source,
-            LayoutSwitchSource::AutoFallback
+            LayoutSwitchSource::AutoDetected
         );
         assert_eq!(
             persisted.layout.auto_detected,
             AutoDetectedLayoutSwitch {
-                strategy: DetectionStrategy::NoSupportedStrategy,
-                confidence: DetectionConfidence::Unsupported,
+                strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                confidence: DetectionConfidence::High,
                 context: gnome_wayland_context(),
             }
         );

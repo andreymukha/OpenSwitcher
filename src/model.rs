@@ -395,6 +395,8 @@ pub enum DetectionStrategy {
     XfceX11SetXkbmapQuery,
     #[serde(rename = "CinnamonX11GSettingsXkbOptions")]
     CinnamonX11GSettingsXkbOptions,
+    #[serde(rename = "GnomeWaylandGSettingsWmKeybindings")]
+    GnomeWaylandGSettingsWmKeybindings,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]

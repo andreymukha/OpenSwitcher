@@ -507,6 +507,33 @@ mod tests {
     }
 
     #[test]
+    fn auto_detected_gnome_wayland_combo_hides_fallback_hint() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                    confidence: DetectionConfidence::High,
+                    context: SystemContext {
+                        session_type: SessionType::Wayland,
+                        desktop_environment: DesktopEnvironment::Gnome,
+                        distro: DistroKind::Ubuntu,
+                    },
+                },
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+
+        let view = state.view_state();
+        assert_eq!(view.layout_switch.source, LayoutSwitchSource::AutoDetected);
+        assert!(!view.layout_switch.show_fallback_hint);
+        assert!(view.layout_switch.fallback_hint_text.is_empty());
+    }
+
+    #[test]
     fn manual_override_hides_fallback_hint_even_when_loaded_source_is_auto_fallback() {
         let mut state = DomainState::new();
         state.apply_loaded(Settings {

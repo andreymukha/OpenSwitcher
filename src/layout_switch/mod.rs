@@ -6,6 +6,9 @@ use crate::model::{
 use std::process::Command;
 
 const CINNAMON_INPUT_SOURCES_SCHEMA: &str = "org.cinnamon.desktop.input-sources";
+const GNOME_WM_KEYBINDINGS_SCHEMA: &str = "org.gnome.desktop.wm.keybindings";
+const GNOME_SWITCH_INPUT_SOURCE_KEY: &str = "switch-input-source";
+const GNOME_SWITCH_INPUT_SOURCE_BACKWARD_KEY: &str = "switch-input-source-backward";
 const XKB_OPTIONS_KEY: &str = "xkb-options";
 const XFCE_KEYBOARD_LAYOUT_CHANNEL: &str = "keyboard-layout";
 const XFCE_XKB_DISABLE_PROPERTY: &str = "/Default/XkbDisable";
@@ -121,6 +124,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
         match select_strategy(context) {
             Strategy::XfceX11 => Ok(self.detect_xfce_x11(context)),
             Strategy::CinnamonX11 => Ok(self.detect_cinnamon_x11(context)),
+            Strategy::GnomeWayland => Ok(self.detect_gnome_wayland(context)),
             Strategy::Unsupported => Ok(unsupported_context_fallback(context)),
         }
     }
@@ -248,12 +252,59 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
             }
         }
     }
+
+    fn detect_gnome_wayland(&self, context: SystemContext) -> LayoutSwitchSetting {
+        if let Some(combo) =
+            self.detect_gnome_wayland_binding(GNOME_SWITCH_INPUT_SOURCE_KEY, "primary")
+        {
+            return detected_setting(
+                combo,
+                DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                context,
+            );
+        }
+
+        if let Some(combo) =
+            self.detect_gnome_wayland_binding(GNOME_SWITCH_INPUT_SOURCE_BACKWARD_KEY, "backward")
+        {
+            return detected_setting(
+                combo,
+                DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                context,
+            );
+        }
+
+        fallback_setting(
+            LayoutSwitchCombo::default(),
+            DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+            DetectionConfidence::Low,
+            context,
+        )
+    }
+
+    fn detect_gnome_wayland_binding(&self, key: &str, source: &str) -> Option<LayoutSwitchCombo> {
+        match self
+            .reader
+            .gsettings_string_list(GNOME_WM_KEYBINDINGS_SCHEMA, key)
+        {
+            Ok(bindings) => bindings
+                .iter()
+                .find_map(|binding| combo_from_gnome_binding(binding)),
+            Err(error) => {
+                eprintln!(
+                    "[layout-switch] Failed to read GNOME {source} input source binding, using fallback: {error}"
+                );
+                None
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Strategy {
     XfceX11,
     CinnamonX11,
+    GnomeWayland,
     Unsupported,
 }
 
@@ -261,6 +312,7 @@ fn select_strategy(context: SystemContext) -> Strategy {
     match (context.desktop_environment, context.session_type) {
         (DesktopEnvironment::Xfce, SessionType::X11) => Strategy::XfceX11,
         (DesktopEnvironment::Cinnamon, SessionType::X11) => Strategy::CinnamonX11,
+        (DesktopEnvironment::Gnome, SessionType::Wayland) => Strategy::GnomeWayland,
         _ => Strategy::Unsupported,
     }
 }
@@ -311,6 +363,7 @@ pub fn failed_detection_fallback(context: SystemContext) -> LayoutSwitchSetting 
     let strategy = match select_strategy(context) {
         Strategy::XfceX11 => DetectionStrategy::XfceX11XfconfKeyboardLayout,
         Strategy::CinnamonX11 => DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+        Strategy::GnomeWayland => DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
         Strategy::Unsupported => DetectionStrategy::NoSupportedStrategy,
     };
 
@@ -341,6 +394,274 @@ fn combo_from_xkb_option(option: &str) -> Option<LayoutSwitchCombo> {
         "grp:ralt_rshift_toggle" => Some(LayoutSwitchCombo::right_alt_right_shift()),
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GnomeAcceleratorToken {
+    Shift(GnomeAcceleratorSide),
+    Ctrl(GnomeAcceleratorSide),
+    Alt(GnomeAcceleratorSide),
+    Super(GnomeAcceleratorSide),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GnomeAcceleratorSide {
+    Generic,
+    Left,
+    Right,
+}
+
+fn combo_from_gnome_binding(binding: &str) -> Option<LayoutSwitchCombo> {
+    let (modifiers, key) = parse_gnome_binding(binding)?;
+    if modifiers.is_empty() {
+        return matches!(key.as_str(), "caps_lock").then_some(LayoutSwitchCombo::caps_lock());
+    }
+
+    if modifiers.len() != 1 {
+        return None;
+    }
+
+    match (modifiers[0], key.as_str()) {
+        (GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Generic), "space")
+        | (GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Left), "space") => {
+            Some(LayoutSwitchCombo::super_space())
+        }
+        (GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic), "space")
+        | (GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Left), "space") => {
+            Some(LayoutSwitchCombo::ctrl_space())
+        }
+        _ => combo_from_gnome_shift_pair(modifiers[0], key.as_str()),
+    }
+}
+
+fn combo_from_gnome_shift_pair(
+    modifier: GnomeAcceleratorToken,
+    key: &str,
+) -> Option<LayoutSwitchCombo> {
+    if let Some(combo) = gnome_shift_combo(
+        modifier,
+        key,
+        GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Generic),
+        GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Generic),
+    ) {
+        return Some(combo);
+    }
+
+    gnome_shift_combo(
+        modifier,
+        key,
+        GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic),
+        GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Generic),
+    )
+}
+
+fn gnome_shift_combo(
+    modifier: GnomeAcceleratorToken,
+    key: &str,
+    primary_generic: GnomeAcceleratorToken,
+    secondary_generic: GnomeAcceleratorToken,
+) -> Option<LayoutSwitchCombo> {
+    let primary = primary_token_side(modifier, key, primary_generic, secondary_generic)?;
+    let secondary = secondary_token_side(modifier, key, primary_generic, secondary_generic)?;
+
+    match (primary_generic, primary, secondary) {
+        (
+            GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Generic),
+            GnomeAcceleratorSide::Left,
+            GnomeAcceleratorSide::Left,
+        ) => Some(LayoutSwitchCombo::left_alt_left_shift()),
+        (
+            GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Generic),
+            GnomeAcceleratorSide::Right,
+            GnomeAcceleratorSide::Right,
+        ) => Some(LayoutSwitchCombo::right_alt_right_shift()),
+        (
+            GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Generic),
+            primary_side,
+            secondary_side,
+        ) if side_pair_matches_generic_left(primary_side, secondary_side) => {
+            Some(LayoutSwitchCombo::alt_shift())
+        }
+        (
+            GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic),
+            GnomeAcceleratorSide::Left,
+            GnomeAcceleratorSide::Left,
+        ) => Some(LayoutSwitchCombo::left_ctrl_left_shift()),
+        (
+            GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic),
+            GnomeAcceleratorSide::Right,
+            GnomeAcceleratorSide::Right,
+        ) => Some(LayoutSwitchCombo::right_ctrl_right_shift()),
+        (
+            GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic),
+            primary_side,
+            secondary_side,
+        ) if side_pair_matches_generic_left(primary_side, secondary_side) => {
+            Some(LayoutSwitchCombo::ctrl_shift())
+        }
+        _ => None,
+    }
+}
+
+fn primary_token_side(
+    modifier: GnomeAcceleratorToken,
+    key: &str,
+    primary_generic: GnomeAcceleratorToken,
+    secondary_generic: GnomeAcceleratorToken,
+) -> Option<GnomeAcceleratorSide> {
+    match modifier {
+        GnomeAcceleratorToken::Alt(side)
+            if matches!(primary_generic, GnomeAcceleratorToken::Alt(_))
+                && matches!(
+                    normalize_gnome_key_token(key),
+                    Some(GnomeAcceleratorToken::Shift(_))
+                ) =>
+        {
+            Some(side)
+        }
+        GnomeAcceleratorToken::Ctrl(side)
+            if matches!(primary_generic, GnomeAcceleratorToken::Ctrl(_))
+                && matches!(
+                    normalize_gnome_key_token(key),
+                    Some(GnomeAcceleratorToken::Shift(_))
+                ) =>
+        {
+            Some(side)
+        }
+        GnomeAcceleratorToken::Shift(_)
+            if matches!(
+                normalize_gnome_key_token(key),
+                Some(GnomeAcceleratorToken::Alt(_))
+            ) && matches!(primary_generic, GnomeAcceleratorToken::Alt(_)) =>
+        {
+            match normalize_gnome_key_token(key)? {
+                GnomeAcceleratorToken::Alt(side) => Some(side),
+                _ => None,
+            }
+        }
+        GnomeAcceleratorToken::Shift(_)
+            if matches!(
+                normalize_gnome_key_token(key),
+                Some(GnomeAcceleratorToken::Ctrl(_))
+            ) && matches!(primary_generic, GnomeAcceleratorToken::Ctrl(_)) =>
+        {
+            match normalize_gnome_key_token(key)? {
+                GnomeAcceleratorToken::Ctrl(side) => Some(side),
+                _ => None,
+            }
+        }
+        _ if matches!(
+            secondary_generic,
+            GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Generic)
+        ) =>
+        {
+            None
+        }
+        _ => None,
+    }
+}
+
+fn secondary_token_side(
+    modifier: GnomeAcceleratorToken,
+    key: &str,
+    _primary_generic: GnomeAcceleratorToken,
+    secondary_generic: GnomeAcceleratorToken,
+) -> Option<GnomeAcceleratorSide> {
+    if !matches!(
+        secondary_generic,
+        GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Generic)
+    ) {
+        return None;
+    }
+
+    match modifier {
+        GnomeAcceleratorToken::Shift(side)
+            if matches!(
+                normalize_gnome_key_token(key),
+                Some(GnomeAcceleratorToken::Alt(_)) | Some(GnomeAcceleratorToken::Ctrl(_))
+            ) =>
+        {
+            Some(side)
+        }
+        GnomeAcceleratorToken::Alt(_) | GnomeAcceleratorToken::Ctrl(_) => {
+            match normalize_gnome_key_token(key)? {
+                GnomeAcceleratorToken::Shift(side) => Some(side),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn side_pair_matches_generic_left(
+    primary: GnomeAcceleratorSide,
+    secondary: GnomeAcceleratorSide,
+) -> bool {
+    matches!(
+        primary,
+        GnomeAcceleratorSide::Generic | GnomeAcceleratorSide::Left
+    ) && matches!(
+        secondary,
+        GnomeAcceleratorSide::Generic | GnomeAcceleratorSide::Left
+    )
+}
+
+fn parse_gnome_binding(binding: &str) -> Option<(Vec<GnomeAcceleratorToken>, String)> {
+    let mut modifiers = Vec::new();
+    let mut rest = binding.trim();
+
+    while let Some(stripped) = rest.strip_prefix('<') {
+        let end = stripped.find('>')?;
+        let token = &stripped[..end];
+        modifiers.push(normalize_gnome_modifier_token(token)?);
+        rest = &stripped[end + 1..];
+    }
+
+    let key = normalize_gnome_key_name(rest)?;
+    Some((modifiers, key))
+}
+
+fn normalize_gnome_modifier_token(token: &str) -> Option<GnomeAcceleratorToken> {
+    normalize_gnome_key_token(token)
+}
+
+fn normalize_gnome_key_token(token: &str) -> Option<GnomeAcceleratorToken> {
+    match token.trim().to_ascii_lowercase().as_str() {
+        "shift" => Some(GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Generic)),
+        "shift_l" => Some(GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Left)),
+        "shift_r" => Some(GnomeAcceleratorToken::Shift(GnomeAcceleratorSide::Right)),
+        "control" | "ctrl" | "primary" => {
+            Some(GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic))
+        }
+        "control_l" | "ctrl_l" | "primary_l" => {
+            Some(GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Left))
+        }
+        "control_r" | "ctrl_r" | "primary_r" => {
+            Some(GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Right))
+        }
+        "alt" => Some(GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Generic)),
+        "alt_l" => Some(GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Left)),
+        "alt_r" => Some(GnomeAcceleratorToken::Alt(GnomeAcceleratorSide::Right)),
+        "super" | "meta" | "win" => {
+            Some(GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Generic))
+        }
+        "super_l" | "meta_l" | "win_l" => {
+            Some(GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Left))
+        }
+        "super_r" | "meta_r" | "win_r" => {
+            Some(GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Right))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_gnome_key_name(key: &str) -> Option<String> {
+    let normalized = key.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    Some(normalized)
 }
 
 fn parse_setxkbmap_options_line(line: &str) -> Option<String> {
@@ -382,7 +703,9 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct StubReader {
-        gsettings_values: Vec<String>,
+        cinnamon_gsettings_values: Vec<String>,
+        gnome_primary_gsettings_values: Vec<String>,
+        gnome_backward_gsettings_values: Vec<String>,
         xfconf_group: String,
         xfconf_disabled: bool,
         setxkbmap_query_output: String,
@@ -391,10 +714,21 @@ mod tests {
     impl DesktopSettingsReader for StubReader {
         fn gsettings_string_list(
             &self,
-            _schema: &str,
-            _key: &str,
+            schema: &str,
+            key: &str,
         ) -> Result<Vec<String>, LayoutAutoDetectError> {
-            Ok(self.gsettings_values.clone())
+            if schema == CINNAMON_INPUT_SOURCES_SCHEMA && key == XKB_OPTIONS_KEY {
+                Ok(self.cinnamon_gsettings_values.clone())
+            } else if schema == GNOME_WM_KEYBINDINGS_SCHEMA && key == GNOME_SWITCH_INPUT_SOURCE_KEY
+            {
+                Ok(self.gnome_primary_gsettings_values.clone())
+            } else if schema == GNOME_WM_KEYBINDINGS_SCHEMA
+                && key == GNOME_SWITCH_INPUT_SOURCE_BACKWARD_KEY
+            {
+                Ok(self.gnome_backward_gsettings_values.clone())
+            } else {
+                Ok(Vec::new())
+            }
         }
 
         fn xfconf_string(
@@ -445,6 +779,14 @@ mod tests {
         }
     }
 
+    fn gnome_wayland_context() -> SystemContext {
+        SystemContext {
+            session_type: SessionType::Wayland,
+            desktop_environment: DesktopEnvironment::Gnome,
+            distro: DistroKind::Ubuntu,
+        }
+    }
+
     #[test]
     fn parses_gsettings_string_list() {
         let parsed = parse_gsettings_string_list("['grp:ctrl_shift_toggle', 'foo']");
@@ -459,6 +801,48 @@ mod tests {
             parsed.as_deref(),
             Some("grp:ctrl_shift_toggle,grp_led:scroll")
         );
+    }
+
+    #[test]
+    fn selects_gnome_wayland_strategy() {
+        assert_eq!(
+            select_strategy(gnome_wayland_context()),
+            Strategy::GnomeWayland
+        );
+    }
+
+    #[test]
+    fn maps_supported_gnome_bindings_to_layout_switch_combos() {
+        let cases = [
+            ("<Super>space", LayoutSwitchCombo::super_space()),
+            ("<Super_L>space", LayoutSwitchCombo::super_space()),
+            ("<Primary>space", LayoutSwitchCombo::ctrl_space()),
+            ("<Control>space", LayoutSwitchCombo::ctrl_space()),
+            ("<Control_L>space", LayoutSwitchCombo::ctrl_space()),
+            ("Caps_Lock", LayoutSwitchCombo::caps_lock()),
+            ("<Shift>Alt_L", LayoutSwitchCombo::alt_shift()),
+            ("<Alt>Shift_L", LayoutSwitchCombo::alt_shift()),
+            ("<Alt_L>Shift_L", LayoutSwitchCombo::left_alt_left_shift()),
+            ("<Alt_R>Shift_R", LayoutSwitchCombo::right_alt_right_shift()),
+            ("<Shift>Control_L", LayoutSwitchCombo::ctrl_shift()),
+            ("<Primary>Shift_L", LayoutSwitchCombo::ctrl_shift()),
+            (
+                "<Control_L>Shift_L",
+                LayoutSwitchCombo::left_ctrl_left_shift(),
+            ),
+            (
+                "<Control_R>Shift_R",
+                LayoutSwitchCombo::right_ctrl_right_shift(),
+            ),
+        ];
+
+        for (binding, expected) in cases {
+            assert_eq!(
+                combo_from_gnome_binding(binding),
+                Some(expected),
+                "{binding}"
+            );
+        }
     }
 
     #[test]
@@ -544,7 +928,7 @@ mod tests {
     #[test]
     fn detects_supported_cinnamon_x11_combo() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
-            gsettings_values: vec!["grp:alt_shift_toggle".to_string()],
+            cinnamon_gsettings_values: vec!["grp:alt_shift_toggle".to_string()],
             ..StubReader::default()
         });
 
@@ -556,7 +940,7 @@ mod tests {
     #[test]
     fn detects_side_specific_cinnamon_x11_combo() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
-            gsettings_values: vec!["grp:lalt_lshift_toggle".to_string()],
+            cinnamon_gsettings_values: vec!["grp:lalt_lshift_toggle".to_string()],
             ..StubReader::default()
         });
 
@@ -586,7 +970,7 @@ mod tests {
     #[test]
     fn falls_back_when_cinnamon_x11_option_is_not_supported() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
-            gsettings_values: vec!["grp:toggle".to_string()],
+            cinnamon_gsettings_values: vec!["grp:toggle".to_string()],
             ..StubReader::default()
         });
 
@@ -599,12 +983,71 @@ mod tests {
     #[test]
     fn detects_right_alt_shift_option() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
-            gsettings_values: vec!["grp:ralt_rshift_toggle".to_string()],
+            cinnamon_gsettings_values: vec!["grp:ralt_rshift_toggle".to_string()],
             ..StubReader::default()
         });
 
         let setting = detector.detect(cinnamon_x11_context()).unwrap();
         assert_eq!(setting.combo, LayoutSwitchCombo::right_alt_right_shift());
         assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+    }
+
+    #[test]
+    fn detects_supported_gnome_wayland_combo_from_primary_keybindings() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            gnome_primary_gsettings_values: vec![
+                "<Super>space".to_string(),
+                "XF86Keyboard".to_string(),
+            ],
+            gnome_backward_gsettings_values: vec![
+                "<Shift><Super>space".to_string(),
+                "<Shift>XF86Keyboard".to_string(),
+            ],
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(gnome_wayland_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::super_space());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::GnomeWaylandGSettingsWmKeybindings
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::High);
+    }
+
+    #[test]
+    fn uses_backward_gnome_wayland_binding_when_primary_is_not_recognized() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            gnome_primary_gsettings_values: vec!["XF86Keyboard".to_string()],
+            gnome_backward_gsettings_values: vec!["<Primary>space".to_string()],
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(gnome_wayland_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::ctrl_space());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::GnomeWaylandGSettingsWmKeybindings
+        );
+    }
+
+    #[test]
+    fn gnome_wayland_falls_back_with_supported_strategy_when_binding_is_not_recognized() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            gnome_primary_gsettings_values: vec!["XF86Keyboard".to_string()],
+            gnome_backward_gsettings_values: vec!["<Shift><Super>space".to_string()],
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(gnome_wayland_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::default());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoFallback);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::GnomeWaylandGSettingsWmKeybindings
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::Low);
     }
 }

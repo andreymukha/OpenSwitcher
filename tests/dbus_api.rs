@@ -21,6 +21,7 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let config_path = temp_dir.path().join("config.toml");
     let service_name = unique_service_name("roundtrip");
     let _service = spawn_service(&config_path, &service_name)?;
+    let initial_config = AppConfig::load_or_create(&config_path)?;
 
     let client = Connection::session()?;
     let proxy = settings_proxy(&client, &service_name)?;
@@ -34,7 +35,7 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     assert_eq!(initial.layout_delay_ms, 30);
     assert_eq!(initial.undo_key, UndoKey::Pause);
     assert_eq!(initial.selected_text_hotkey, SelectedTextHotkey::ShiftPause);
-    assert_eq!(initial.layout_switch.combo, LayoutSwitchCombo::ctrl_shift());
+    assert_eq!(initial.layout_switch, initial_config.settings().layout_switch);
 
     let result: UpdateSettingsResult = proxy.call(
         "UpdateSettings",

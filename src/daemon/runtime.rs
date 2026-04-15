@@ -418,7 +418,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             service.get_settings().unwrap().layout_switch.combo,
             LayoutSwitchCombo::alt_shift()

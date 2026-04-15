@@ -1111,7 +1111,7 @@ fn collect_keyboard_symlink_candidates_from_dirs(dirs: &[&Path]) -> Vec<PathBuf>
             .filter(|path| {
                 path.file_name()
                     .and_then(|name| name.to_str())
-                    .map_or(false, |name| name.ends_with(KEYBOARD_SYMLINK_SUFFIX))
+                    .is_some_and(|name| name.ends_with(KEYBOARD_SYMLINK_SUFFIX))
             })
             .collect();
         dir_candidates.sort();
@@ -1406,164 +1406,6 @@ impl ModifierState {
         }
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::cell::Cell;
-    use std::fs;
-    use std::io;
-    use std::path::Path;
-
-    fn pressed(keys: &[(Key, i32)]) -> ModifierState {
-        let mut state = ModifierState::default();
-        for (key, value) in keys {
-            state.update(*key, *value);
-        }
-        state
-    }
-
-    #[test]
-    fn matches_alt_shift_combo_with_right_alt() {
-        let state = pressed(&[(Key::KEY_RIGHTALT, 1), (Key::KEY_LEFTSHIFT, 1)]);
-        assert!(state.matches_layout_switch_combo(
-            LayoutSwitchCombo::AltShift,
-            Key::KEY_LEFTSHIFT,
-            1
-        ));
-    }
-
-    #[test]
-    fn matches_right_ctrl_right_shift_combo() {
-        let state = pressed(&[(Key::KEY_RIGHTCTRL, 1), (Key::KEY_RIGHTSHIFT, 1)]);
-        assert!(state.matches_layout_switch_combo(
-            LayoutSwitchCombo::RightCtrlRightShift,
-            Key::KEY_RIGHTSHIFT,
-            1
-        ));
-    }
-
-    #[test]
-    fn matches_super_space_combo() {
-        let state = pressed(&[(Key::KEY_LEFTMETA, 1)]);
-        assert!(state.matches_layout_switch_combo(
-            LayoutSwitchCombo::SuperSpace,
-            Key::KEY_SPACE,
-            1
-        ));
-    }
-
-    #[test]
-    fn replay_shift_uses_caps_lock_to_preserve_visible_case() {
-        let lowercase_target = crate::daemon::switch_logic::Keystroke {
-            key: Key::KEY_H,
-            shift: false,
-            caps_lock: false,
-        };
-        let uppercase_target = crate::daemon::switch_logic::Keystroke {
-            key: Key::KEY_H,
-            shift: true,
-            caps_lock: false,
-        };
-
-        assert!(replay_shift_for_stroke(&lowercase_target, true));
-        assert!(!replay_shift_for_stroke(&uppercase_target, true));
-        assert!(!replay_shift_for_stroke(&lowercase_target, false));
-        assert!(replay_shift_for_stroke(&uppercase_target, false));
-    }
-
-    #[test]
-    fn keyboard_symlink_candidates_prioritize_by_path_before_by_id() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let by_path = temp_dir.path().join("by-path");
-        let by_id = temp_dir.path().join("by-id");
-        fs::create_dir_all(&by_path).unwrap();
-        fs::create_dir_all(&by_id).unwrap();
-
-        let by_path_keyboard = by_path.join("platform-i8042-serio-0-event-kbd");
-        let by_id_keyboard = by_id.join("usb-Logitech_USB_Keyboard-event-kbd");
-        fs::write(&by_path_keyboard, "").unwrap();
-        fs::write(&by_id_keyboard, "").unwrap();
-
-        let candidates =
-            collect_keyboard_symlink_candidates_from_dirs(&[by_path.as_path(), by_id.as_path()]);
-
-        assert_eq!(
-            candidates,
-            vec![by_path_keyboard, by_id_keyboard],
-            "stable symlink search must prefer /dev/input/by-path before /dev/input/by-id",
-        );
-    }
-
-    #[test]
-    fn keyboard_open_permission_denied_maps_to_keyboard_access_denied() {
-        let error = map_keyboard_open_error(
-            Path::new("/dev/input/event4"),
-            io::Error::from(io::ErrorKind::PermissionDenied),
-        );
-
-        assert!(matches!(error, SwitcherError::KeyboardAccessDenied { .. }));
-    }
-
-    #[test]
-    fn x11_input_target_watcher_is_enabled_only_for_x11_sessions() {
-        assert!(should_enable_x11_input_target_watcher(SessionType::X11));
-        assert!(!should_enable_x11_input_target_watcher(
-            SessionType::Wayland
-        ));
-        assert!(!should_enable_x11_input_target_watcher(
-            SessionType::Unknown
-        ));
-    }
-
-    #[test]
-    fn layout_switcher_initializer_skips_x11_outside_x11_sessions() {
-        let init_called = Cell::new(false);
-
-        let switcher = initialize_x11_switcher_for_session(SessionType::Wayland, || {
-            init_called.set(true);
-            Ok::<_, SwitcherError>("x11")
-        });
-
-        assert_eq!(switcher, None);
-        assert!(
-            !init_called.get(),
-            "Wayland strategy selection must not initialize the X11 switcher"
-        );
-    }
-
-    #[test]
-    fn layout_switcher_initializer_uses_x11_in_x11_sessions() {
-        let init_called = Cell::new(false);
-
-        let switcher = initialize_x11_switcher_for_session(SessionType::X11, || {
-            init_called.set(true);
-            Ok::<_, SwitcherError>("x11")
-        });
-
-        assert_eq!(switcher, Some("x11"));
-        assert!(
-            init_called.get(),
-            "X11 strategy selection must keep using the X11 switcher"
-        );
-    }
-
-    #[test]
-    fn layout_switcher_initializer_falls_back_to_uinput_when_x11_init_fails() {
-        let init_called = Cell::new(false);
-
-        let switcher = initialize_x11_switcher_for_session(SessionType::X11, || {
-            init_called.set(true);
-            Err::<&str, _>(SwitcherError::Io(io::Error::other("x11 unavailable")))
-        });
-
-        assert_eq!(switcher, None);
-        assert!(
-            init_called.get(),
-            "X11 session should attempt X11 init before falling back to uinput"
-        );
     }
 }
 
@@ -1907,5 +1749,163 @@ impl SharedModifierState {
 
     pub fn snapshot(&self) -> ModifierState {
         ModifierState::from_bits(self.bits.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    fn pressed(keys: &[(Key, i32)]) -> ModifierState {
+        let mut state = ModifierState::default();
+        for (key, value) in keys {
+            state.update(*key, *value);
+        }
+        state
+    }
+
+    #[test]
+    fn matches_alt_shift_combo_with_right_alt() {
+        let state = pressed(&[(Key::KEY_RIGHTALT, 1), (Key::KEY_LEFTSHIFT, 1)]);
+        assert!(state.matches_layout_switch_combo(
+            LayoutSwitchCombo::AltShift,
+            Key::KEY_LEFTSHIFT,
+            1
+        ));
+    }
+
+    #[test]
+    fn matches_right_ctrl_right_shift_combo() {
+        let state = pressed(&[(Key::KEY_RIGHTCTRL, 1), (Key::KEY_RIGHTSHIFT, 1)]);
+        assert!(state.matches_layout_switch_combo(
+            LayoutSwitchCombo::RightCtrlRightShift,
+            Key::KEY_RIGHTSHIFT,
+            1
+        ));
+    }
+
+    #[test]
+    fn matches_super_space_combo() {
+        let state = pressed(&[(Key::KEY_LEFTMETA, 1)]);
+        assert!(state.matches_layout_switch_combo(
+            LayoutSwitchCombo::SuperSpace,
+            Key::KEY_SPACE,
+            1
+        ));
+    }
+
+    #[test]
+    fn replay_shift_uses_caps_lock_to_preserve_visible_case() {
+        let lowercase_target = crate::daemon::switch_logic::Keystroke {
+            key: Key::KEY_H,
+            shift: false,
+            caps_lock: false,
+        };
+        let uppercase_target = crate::daemon::switch_logic::Keystroke {
+            key: Key::KEY_H,
+            shift: true,
+            caps_lock: false,
+        };
+
+        assert!(replay_shift_for_stroke(&lowercase_target, true));
+        assert!(!replay_shift_for_stroke(&uppercase_target, true));
+        assert!(!replay_shift_for_stroke(&lowercase_target, false));
+        assert!(replay_shift_for_stroke(&uppercase_target, false));
+    }
+
+    #[test]
+    fn keyboard_symlink_candidates_prioritize_by_path_before_by_id() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let by_path = temp_dir.path().join("by-path");
+        let by_id = temp_dir.path().join("by-id");
+        fs::create_dir_all(&by_path).unwrap();
+        fs::create_dir_all(&by_id).unwrap();
+
+        let by_path_keyboard = by_path.join("platform-i8042-serio-0-event-kbd");
+        let by_id_keyboard = by_id.join("usb-Logitech_USB_Keyboard-event-kbd");
+        fs::write(&by_path_keyboard, "").unwrap();
+        fs::write(&by_id_keyboard, "").unwrap();
+
+        let candidates =
+            collect_keyboard_symlink_candidates_from_dirs(&[by_path.as_path(), by_id.as_path()]);
+
+        assert_eq!(
+            candidates,
+            vec![by_path_keyboard, by_id_keyboard],
+            "stable symlink search must prefer /dev/input/by-path before /dev/input/by-id",
+        );
+    }
+
+    #[test]
+    fn keyboard_open_permission_denied_maps_to_keyboard_access_denied() {
+        let error = map_keyboard_open_error(
+            Path::new("/dev/input/event4"),
+            io::Error::from(io::ErrorKind::PermissionDenied),
+        );
+
+        assert!(matches!(error, SwitcherError::KeyboardAccessDenied { .. }));
+    }
+
+    #[test]
+    fn x11_input_target_watcher_is_enabled_only_for_x11_sessions() {
+        assert!(should_enable_x11_input_target_watcher(SessionType::X11));
+        assert!(!should_enable_x11_input_target_watcher(
+            SessionType::Wayland
+        ));
+        assert!(!should_enable_x11_input_target_watcher(
+            SessionType::Unknown
+        ));
+    }
+
+    #[test]
+    fn layout_switcher_initializer_skips_x11_outside_x11_sessions() {
+        let init_called = Cell::new(false);
+
+        let switcher = initialize_x11_switcher_for_session(SessionType::Wayland, || {
+            init_called.set(true);
+            Ok::<_, SwitcherError>("x11")
+        });
+
+        assert_eq!(switcher, None);
+        assert!(
+            !init_called.get(),
+            "Wayland strategy selection must not initialize the X11 switcher"
+        );
+    }
+
+    #[test]
+    fn layout_switcher_initializer_uses_x11_in_x11_sessions() {
+        let init_called = Cell::new(false);
+
+        let switcher = initialize_x11_switcher_for_session(SessionType::X11, || {
+            init_called.set(true);
+            Ok::<_, SwitcherError>("x11")
+        });
+
+        assert_eq!(switcher, Some("x11"));
+        assert!(
+            init_called.get(),
+            "X11 strategy selection must keep using the X11 switcher"
+        );
+    }
+
+    #[test]
+    fn layout_switcher_initializer_falls_back_to_uinput_when_x11_init_fails() {
+        let init_called = Cell::new(false);
+
+        let switcher = initialize_x11_switcher_for_session(SessionType::X11, || {
+            init_called.set(true);
+            Err::<&str, _>(SwitcherError::Io(io::Error::other("x11 unavailable")))
+        });
+
+        assert_eq!(switcher, None);
+        assert!(
+            init_called.get(),
+            "X11 session should attempt X11 init before falling back to uinput"
+        );
     }
 }

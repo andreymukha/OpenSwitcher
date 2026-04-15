@@ -88,17 +88,6 @@ pub fn run() -> Result<(), SwitcherError> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::TRAY_APPLICATION_ID;
-    use crate::tray::single_instance::TRAY_SERVICE_NAME;
-
-    #[test]
-    fn tray_application_id_does_not_reuse_single_instance_dbus_name() {
-        assert_ne!(TRAY_APPLICATION_ID, TRAY_SERVICE_NAME);
-    }
-}
-
 fn spawn_tray_backend(
     client: DbusListener,
     initial_state: TrayState,
@@ -119,4 +108,15 @@ fn spawn_tray_backend(
             });
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TRAY_APPLICATION_ID;
+    use crate::tray::single_instance::TRAY_SERVICE_NAME;
+
+    #[test]
+    fn tray_application_id_does_not_reuse_single_instance_dbus_name() {
+        assert_ne!(TRAY_APPLICATION_ID, TRAY_SERVICE_NAME);
+    }
 }

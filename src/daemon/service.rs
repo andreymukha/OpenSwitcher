@@ -916,9 +916,27 @@ impl DaemonService {
     }
 }
 
+fn selected_text_hotkey_matches(
+    hotkey: crate::model::SelectedTextHotkey,
+    modifiers: ModifierState,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    if value != 1 || key != undo_key_to_evdev_key(hotkey.trigger_key()) {
+        return false;
+    }
+
+    let shift = modifiers.is_shift_pressed();
+    let ctrl = modifiers.is_ctrl_pressed();
+    let alt = modifiers.is_alt_pressed();
+
+    shift == hotkey.uses_shift() && ctrl == hotkey.uses_ctrl() && alt == hotkey.uses_alt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn startup_layout_resync_starts_pending() {
         let state = StartupLayoutResyncState::pending();
@@ -1069,21 +1087,4 @@ mod tests {
             AppLayoutKind::Russian
         ));
     }
-}
-
-fn selected_text_hotkey_matches(
-    hotkey: crate::model::SelectedTextHotkey,
-    modifiers: ModifierState,
-    key: evdev::Key,
-    value: i32,
-) -> bool {
-    if value != 1 || key != undo_key_to_evdev_key(hotkey.trigger_key()) {
-        return false;
-    }
-
-    let shift = modifiers.is_shift_pressed();
-    let ctrl = modifiers.is_ctrl_pressed();
-    let alt = modifiers.is_alt_pressed();
-
-    shift == hotkey.uses_shift() && ctrl == hotkey.uses_ctrl() && alt == hotkey.uses_alt()
 }

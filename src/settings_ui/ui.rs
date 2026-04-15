@@ -1478,12 +1478,9 @@ impl SettingsWindow {
                 .set_sensitive(state.form_enabled);
             form.layout_switch_value_icon.set_visible(row_is_actionable);
 
-            form.dialog_capture_hint
-                .set_text(if state.layout_switch.capture_active {
-                    "Поддерживаемые варианты: Ctrl+Shift, Alt+Shift, Right Alt+Right Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift."
-                } else {
-                    "Поддерживаемые варианты: Ctrl+Shift, Alt+Shift, Right Alt+Right Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift."
-                });
+            form.dialog_capture_hint.set_text(
+                "Поддерживаемые варианты: Ctrl+Shift, Alt+Shift, Right Alt+Right Shift, CapsLock, Ctrl+Space, Super+Space, Left Ctrl+Left Shift, Right Ctrl+Right Shift и Left Alt+Left Shift.",
+            );
 
             if state.layout_switch.show_unlock_hint {
                 form.layout_switch_hint_label.set_markup(

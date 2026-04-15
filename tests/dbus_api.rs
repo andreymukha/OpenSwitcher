@@ -9,7 +9,7 @@ use open_switcher::model::{
     UndoKey, UpdateSettingsResult,
 };
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
@@ -135,7 +135,7 @@ fn dbus_update_settings_changes_daemon_visible_is_enabled() -> Result<(), Box<dy
     let client = Connection::session()?;
     let proxy = settings_proxy(&client, &service_name)?;
 
-    assert_eq!(proxy.get_property::<bool>("IsEnabled")?, true);
+    assert!(proxy.get_property::<bool>("IsEnabled")?);
 
     let updated: UpdateSettingsResult = proxy.call(
         "UpdateSettings",
@@ -157,7 +157,7 @@ fn dbus_update_settings_changes_daemon_visible_is_enabled() -> Result<(), Box<dy
     assert!(!updated.restart_required);
     let reloaded_client = Connection::session()?;
     let reloaded_proxy = settings_proxy(&reloaded_client, &service_name)?;
-    assert_eq!(reloaded_proxy.get_property::<bool>("IsEnabled")?, false);
+    assert!(!reloaded_proxy.get_property::<bool>("IsEnabled")?);
 
     Ok(())
 }
@@ -256,8 +256,8 @@ fn dbus_exposes_layout_switch_capture_session_controls() -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn spawn_service(config_path: &PathBuf, service_name: &str) -> Result<Connection, Box<dyn Error>> {
-    let runtime = Arc::new(RuntimeState::new(ConfigService::load(config_path.clone())?));
+fn spawn_service(config_path: &Path, service_name: &str) -> Result<Connection, Box<dyn Error>> {
+    let runtime = Arc::new(RuntimeState::new(ConfigService::load(config_path.to_path_buf())?));
     let connection = ConnectionBuilder::session()?
         .name(service_name)?
         .serve_at(OBJECT_PATH, OpenSwitcherDbusApi::new(runtime))?

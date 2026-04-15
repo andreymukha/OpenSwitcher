@@ -6,7 +6,7 @@ use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
 use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
-    should_switch, visible_char_for_keystroke, CorrectionPlan, Keystroke,
+    should_switch, CorrectionPlan, Keystroke,
 };
 use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
 use crate::error::SwitcherError;
@@ -124,44 +124,6 @@ fn format_legacy_layout(is_english: bool) -> &'static str {
         "EN"
     } else {
         "RU"
-    }
-}
-
-fn is_visible_word_commit_separator(stroke: &Keystroke, layout_kind: AppLayoutKind) -> bool {
-    let Some(english_visible_char) = visible_char_for_keystroke(stroke) else {
-        return false;
-    };
-
-    let visible_char = match layout_kind {
-        AppLayoutKind::English => english_visible_char,
-        AppLayoutKind::Russian => russian_visible_char_for_keyboard_position(english_visible_char),
-        AppLayoutKind::Other | AppLayoutKind::Unknown => return false,
-    };
-
-    matches!(visible_char, ',' | '.' | ';' | ':' | '!' | '?')
-}
-
-fn russian_visible_char_for_keyboard_position(ch: char) -> char {
-    match ch {
-        '`' => 'ё',
-        '~' => 'Ё',
-        '[' => 'х',
-        '{' => 'Х',
-        ']' => 'ъ',
-        '}' => 'Ъ',
-        ';' => 'ж',
-        ':' => 'Ж',
-        '\'' => 'э',
-        '"' => 'Э',
-        ',' => 'б',
-        '<' => 'Б',
-        '.' => 'ю',
-        '>' => 'Ю',
-        '/' => '.',
-        '?' => ',',
-        '\\' => '\\',
-        '|' => '/',
-        _ => ch,
     }
 }
 
@@ -479,9 +441,10 @@ impl DaemonService {
                         ),
                     );
                 }
-                let should_switch_word = should_switch(&self.buffer);
+                let should_switch_word = should_switch(&self.buffer, effective_layout_kind);
                 let same_layout_plan = same_layout_case_correction_plan(
                     &self.buffer,
+                    effective_layout_kind,
                     config.fix_two_capitals,
                     config.fix_accidental_caps_lock,
                 );
@@ -543,6 +506,7 @@ impl DaemonService {
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
                 if let Some(plan) = same_layout_case_correction_plan(
                     &self.buffer,
+                    self.current_layout_kind(),
                     config.fix_two_capitals,
                     config.fix_accidental_caps_lock,
                 ) {
@@ -573,27 +537,6 @@ impl DaemonService {
                     shift: self.modifiers.is_shift_pressed(),
                     caps_lock: self.modifiers.is_caps_lock_active(),
                 };
-                if !self.buffer.is_empty()
-                    && is_visible_word_commit_separator(&current_stroke, self.current_layout_kind())
-                {
-                    if let Some(plan) = same_layout_case_correction_plan(
-                        &self.buffer,
-                        config.fix_two_capitals,
-                        config.fix_accidental_caps_lock,
-                    ) {
-                        self.suppressed_separator_key = Some(key);
-                        self.pending_word_commit = Some(PendingWordCommit {
-                            separator_key: key,
-                            action: PendingWordCommitAction::SameLayoutCaseCorrection {
-                                corrected_buffer: plan.buffer,
-                            },
-                        });
-                        return Ok(());
-                    }
-
-                    self.invalidate_word_context();
-                    return self.keyboard.forward_event(key, value);
-                }
 
                 let plain_character_input = is_character(key)
                     && !self.modifiers.is_ctrl_pressed()
@@ -765,6 +708,7 @@ impl DaemonService {
             &self.buffer,
             fallback_buffer,
             self.word_context.followed_by_separator,
+            current_layout_kind_before,
         ) else {
             return Ok(None);
         };
@@ -1044,47 +988,5 @@ mod tests {
     fn pending_status_change_requests_publish_from_service() {
         assert!(should_publish_pending_status_change(true));
         assert!(!should_publish_pending_status_change(false));
-    }
-
-    #[test]
-    fn visible_punctuation_commit_detects_english_comma() {
-        let stroke = Keystroke {
-            key: evdev::Key::KEY_COMMA,
-            shift: false,
-            caps_lock: false,
-        };
-
-        assert!(is_visible_word_commit_separator(
-            &stroke,
-            AppLayoutKind::English
-        ));
-    }
-
-    #[test]
-    fn visible_punctuation_commit_does_not_treat_russian_letter_be_as_separator() {
-        let stroke = Keystroke {
-            key: evdev::Key::KEY_COMMA,
-            shift: false,
-            caps_lock: false,
-        };
-
-        assert!(!is_visible_word_commit_separator(
-            &stroke,
-            AppLayoutKind::Russian
-        ));
-    }
-
-    #[test]
-    fn visible_punctuation_commit_detects_russian_comma_on_shifted_slash() {
-        let stroke = Keystroke {
-            key: evdev::Key::KEY_SLASH,
-            shift: true,
-            caps_lock: false,
-        };
-
-        assert!(is_visible_word_commit_separator(
-            &stroke,
-            AppLayoutKind::Russian
-        ));
     }
 }

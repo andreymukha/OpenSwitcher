@@ -1,3 +1,4 @@
+use crate::layout_backend::AppLayoutKind;
 use evdev::Key;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11,6 +12,12 @@ pub struct Keystroke {
 pub struct CorrectionPlan {
     pub buffer: Vec<Keystroke>,
     pub extra_backspaces: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WordCoreAndTrailingTail {
+    core: Vec<Keystroke>,
+    trailing_tail: Vec<Keystroke>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,43 +35,66 @@ pub fn manual_correction_plan(
     current_buffer: &[Keystroke],
     last_word_buffer: &[Keystroke],
     last_word_followed_by_separator: bool,
+    layout_kind: AppLayoutKind,
 ) -> Option<CorrectionPlan> {
-    if !current_buffer.is_empty() {
-        return Some(CorrectionPlan {
-            buffer: normalize_strokes_for_replay(current_buffer),
-            extra_backspaces: 0,
-        });
+    let (buffer, extra_backspaces) = if !current_buffer.is_empty() {
+        (current_buffer, 0)
+    } else if !last_word_buffer.is_empty() {
+        (
+            last_word_buffer,
+            usize::from(last_word_followed_by_separator),
+        )
+    } else {
+        return None;
+    };
+
+    let split = split_word_core_and_trailing_tail(buffer, layout_kind);
+    if split.core.is_empty() {
+        return None;
     }
 
-    if !last_word_buffer.is_empty() {
-        return Some(CorrectionPlan {
-            buffer: normalize_strokes_for_replay(last_word_buffer),
-            extra_backspaces: usize::from(last_word_followed_by_separator),
-        });
-    }
-
-    None
+    let mut normalized = normalized_replay_buffer(&split.core);
+    normalized.extend(normalized_replay_buffer(&split.trailing_tail));
+    Some(CorrectionPlan {
+        buffer: normalized,
+        extra_backspaces,
+    })
 }
 
 pub fn same_layout_case_correction_plan(
     buffer: &[Keystroke],
+    layout_kind: AppLayoutKind,
     fix_two_capitals: bool,
     fix_accidental_caps_lock: bool,
 ) -> Option<CorrectionPlan> {
-    let normalized = normalize_strokes_for_replay(buffer);
-    let corrected = apply_case_fixes_to_strokes(buffer, fix_two_capitals, fix_accidental_caps_lock);
-    (corrected != normalized).then_some(CorrectionPlan {
+    let split = split_word_core_and_trailing_tail(buffer, layout_kind);
+    if split.core.is_empty() {
+        return None;
+    }
+
+    let normalized_core = normalized_replay_buffer(&split.core);
+    let corrected_core =
+        apply_case_fixes_to_strokes(&split.core, fix_two_capitals, fix_accidental_caps_lock);
+    if corrected_core == normalized_core {
+        return None;
+    }
+
+    let mut corrected = corrected_core;
+    corrected.extend(normalized_replay_buffer(&split.trailing_tail));
+    Some(CorrectionPlan {
         buffer: corrected,
         extra_backspaces: 0,
     })
 }
 
-pub fn should_switch(buffer: &[Keystroke]) -> bool {
-    if buffer.len() < 3 {
+pub fn should_switch(buffer: &[Keystroke], layout_kind: AppLayoutKind) -> bool {
+    let split = split_word_core_and_trailing_tail(buffer, layout_kind);
+    let core = &split.core;
+    if core.len() < 3 {
         return false;
     }
 
-    let word = keys_to_string(buffer);
+    let word = keys_to_string(core);
     let normalized_word = normalize_word_for_switch_heuristics(&word);
     if is_likely_english(&normalized_word) {
         return false;
@@ -72,7 +102,7 @@ pub fn should_switch(buffer: &[Keystroke]) -> bool {
 
     let mut score = 0;
 
-    for (index, key) in buffer.iter().enumerate() {
+    for (index, key) in core.iter().enumerate() {
         if matches!(
             key.key,
             Key::KEY_LEFTBRACE
@@ -84,11 +114,11 @@ pub fn should_switch(buffer: &[Keystroke]) -> bool {
             score += 15;
         }
         if matches!(key.key, Key::KEY_COMMA | Key::KEY_DOT) {
-            score += if index < buffer.len() - 1 { 15 } else { 5 };
+            score += if index < core.len() - 1 { 15 } else { 5 };
         }
     }
 
-    let rus_vowels = count_russian_vowels(buffer);
+    let rus_vowels = count_russian_vowels(core);
     let eng_vowels = normalized_word
         .chars()
         .filter(|c| "aeiouy".contains(*c))
@@ -150,16 +180,16 @@ fn key_to_char(key: Key, shift: bool, caps_lock: bool) -> Option<char> {
         Key::KEY_X => Some(letter('x', shift, caps_lock)),
         Key::KEY_Y => Some(letter('y', shift, caps_lock)),
         Key::KEY_Z => Some(letter('z', shift, caps_lock)),
-        Key::KEY_0 => Some('0'),
-        Key::KEY_1 => Some('1'),
-        Key::KEY_2 => Some('2'),
-        Key::KEY_3 => Some('3'),
-        Key::KEY_4 => Some('4'),
-        Key::KEY_5 => Some('5'),
-        Key::KEY_6 => Some('6'),
-        Key::KEY_7 => Some('7'),
-        Key::KEY_8 => Some('8'),
-        Key::KEY_9 => Some('9'),
+        Key::KEY_0 => Some(if shift { ')' } else { '0' }),
+        Key::KEY_1 => Some(if shift { '!' } else { '1' }),
+        Key::KEY_2 => Some(if shift { '@' } else { '2' }),
+        Key::KEY_3 => Some(if shift { '#' } else { '3' }),
+        Key::KEY_4 => Some(if shift { '$' } else { '4' }),
+        Key::KEY_5 => Some(if shift { '%' } else { '5' }),
+        Key::KEY_6 => Some(if shift { '^' } else { '6' }),
+        Key::KEY_7 => Some(if shift { '&' } else { '7' }),
+        Key::KEY_8 => Some(if shift { '*' } else { '8' }),
+        Key::KEY_9 => Some(if shift { '(' } else { '9' }),
         Key::KEY_SPACE => Some(' '),
         Key::KEY_DOT => Some(if shift { '>' } else { '.' }),
         Key::KEY_COMMA => Some(if shift { '<' } else { ',' }),
@@ -204,6 +234,67 @@ fn normalize_strokes_for_replay(buffer: &[Keystroke]) -> Vec<Keystroke> {
             },
         })
         .collect()
+}
+
+fn normalized_replay_buffer(buffer: &[Keystroke]) -> Vec<Keystroke> {
+    normalize_strokes_for_replay(buffer)
+}
+
+fn split_word_core_and_trailing_tail(
+    buffer: &[Keystroke],
+    layout_kind: AppLayoutKind,
+) -> WordCoreAndTrailingTail {
+    let tail_start = buffer
+        .iter()
+        .rposition(|stroke| !is_trailing_tail_punctuation(stroke, layout_kind))
+        .map_or(0, |index| index + 1);
+
+    WordCoreAndTrailingTail {
+        core: buffer[..tail_start].to_vec(),
+        trailing_tail: buffer[tail_start..].to_vec(),
+    }
+}
+
+fn is_trailing_tail_punctuation(stroke: &Keystroke, layout_kind: AppLayoutKind) -> bool {
+    visible_char_for_layout(stroke, layout_kind).is_some_and(is_trailing_tail_punctuation_char)
+}
+
+fn is_trailing_tail_punctuation_char(ch: char) -> bool {
+    matches!(ch, ',' | '.' | ';' | ':' | '!' | '?')
+}
+
+fn visible_char_for_layout(stroke: &Keystroke, layout_kind: AppLayoutKind) -> Option<char> {
+    let english_visible_char = visible_char_for_keystroke(stroke)?;
+    Some(match layout_kind {
+        AppLayoutKind::English | AppLayoutKind::Other | AppLayoutKind::Unknown => {
+            english_visible_char
+        }
+        AppLayoutKind::Russian => russian_visible_char_for_keyboard_position(english_visible_char),
+    })
+}
+
+fn russian_visible_char_for_keyboard_position(ch: char) -> char {
+    match ch {
+        '`' => 'ё',
+        '~' => 'Ё',
+        '[' => 'х',
+        '{' => 'Х',
+        ']' => 'ъ',
+        '}' => 'Ъ',
+        ';' => 'ж',
+        ':' => 'Ж',
+        '\'' => 'э',
+        '"' => 'Э',
+        ',' => 'б',
+        '<' => 'Б',
+        '.' => 'ю',
+        '>' => 'Ю',
+        '/' => '.',
+        '?' => ',',
+        '\\' => '\\',
+        '|' => '/',
+        _ => ch,
+    }
 }
 
 fn count_russian_vowels(keys: &[Keystroke]) -> usize {
@@ -419,6 +510,7 @@ fn is_case_fix_letter_key(key: Key) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout_backend::AppLayoutKind;
 
     fn stroke(key: Key) -> Keystroke {
         Keystroke {
@@ -428,12 +520,99 @@ mod tests {
         }
     }
 
+    fn shifted_stroke(key: Key) -> Keystroke {
+        Keystroke {
+            key,
+            shift: true,
+            caps_lock: false,
+        }
+    }
+
+    #[test]
+    fn split_trailing_tail_extracts_english_comma_suffix() {
+        let buffer = vec![
+            stroke(Key::KEY_G),
+            stroke(Key::KEY_H),
+            stroke(Key::KEY_B),
+            stroke(Key::KEY_D),
+            stroke(Key::KEY_T),
+            stroke(Key::KEY_N),
+            stroke(Key::KEY_COMMA),
+        ];
+
+        let split = split_word_core_and_trailing_tail(&buffer, AppLayoutKind::English);
+        assert_eq!(keys_to_string(&split.core), "ghbdtn");
+        assert_eq!(keys_to_string(&split.trailing_tail), ",");
+    }
+
+    #[test]
+    fn split_trailing_tail_keeps_internal_punctuation_in_core() {
+        let buffer = vec![
+            stroke(Key::KEY_N),
+            stroke(Key::KEY_T),
+            stroke(Key::KEY_COMMA),
+            stroke(Key::KEY_Z),
+        ];
+
+        let split = split_word_core_and_trailing_tail(&buffer, AppLayoutKind::English);
+        assert_eq!(keys_to_string(&split.core), "nt,z");
+        assert!(split.trailing_tail.is_empty());
+    }
+
+    #[test]
+    fn split_trailing_tail_extracts_repeated_suffix() {
+        let buffer = vec![
+            stroke(Key::KEY_H),
+            stroke(Key::KEY_E),
+            stroke(Key::KEY_L),
+            stroke(Key::KEY_L),
+            stroke(Key::KEY_O),
+            stroke(Key::KEY_DOT),
+            stroke(Key::KEY_DOT),
+            stroke(Key::KEY_DOT),
+        ];
+
+        let split = split_word_core_and_trailing_tail(&buffer, AppLayoutKind::English);
+        assert_eq!(keys_to_string(&split.core), "hello");
+        assert_eq!(keys_to_string(&split.trailing_tail), "...");
+    }
+
+    #[test]
+    fn split_trailing_tail_extracts_russian_period_from_slash_key() {
+        let buffer = vec![
+            stroke(Key::KEY_G),
+            stroke(Key::KEY_H),
+            stroke(Key::KEY_B),
+            stroke(Key::KEY_D),
+            stroke(Key::KEY_T),
+            stroke(Key::KEY_N),
+            stroke(Key::KEY_SLASH),
+        ];
+
+        let split = split_word_core_and_trailing_tail(&buffer, AppLayoutKind::Russian);
+        assert_eq!(keys_to_string(&split.core), "ghbdtn");
+        assert_eq!(split.trailing_tail, vec![stroke(Key::KEY_SLASH)]);
+    }
+
+    #[test]
+    fn split_trailing_tail_does_not_move_apostrophe_into_tail() {
+        let buffer = vec![
+            stroke(Key::KEY_H),
+            stroke(Key::KEY_E),
+            stroke(Key::KEY_APOSTROPHE),
+        ];
+
+        let split = split_word_core_and_trailing_tail(&buffer, AppLayoutKind::English);
+        assert_eq!(keys_to_string(&split.core), "he'");
+        assert!(split.trailing_tail.is_empty());
+    }
+
     #[test]
     fn manual_plan_prefers_current_buffer() {
         let current = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
         let last = vec![stroke(Key::KEY_A)];
 
-        let plan = manual_correction_plan(&current, &last, true).unwrap();
+        let plan = manual_correction_plan(&current, &last, true, AppLayoutKind::English).unwrap();
         assert_eq!(plan.buffer, current);
         assert_eq!(plan.extra_backspaces, 0);
     }
@@ -443,7 +622,7 @@ mod tests {
         let current = vec![];
         let last = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
 
-        let plan = manual_correction_plan(&current, &last, false).unwrap();
+        let plan = manual_correction_plan(&current, &last, false, AppLayoutKind::English).unwrap();
         assert_eq!(plan.buffer, last);
         assert_eq!(plan.extra_backspaces, 0);
     }
@@ -453,9 +632,31 @@ mod tests {
         let current = vec![];
         let last = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
 
-        let plan = manual_correction_plan(&current, &last, true).unwrap();
+        let plan = manual_correction_plan(&current, &last, true, AppLayoutKind::English).unwrap();
         assert_eq!(plan.buffer, last);
         assert_eq!(plan.extra_backspaces, 1);
+    }
+
+    #[test]
+    fn manual_plan_preserves_trailing_tail_for_previous_word() {
+        let current = vec![];
+        let last = vec![
+            stroke(Key::KEY_F),
+            stroke(Key::KEY_D),
+            stroke(Key::KEY_L),
+            stroke(Key::KEY_COMMA),
+        ];
+
+        let plan = manual_correction_plan(&current, &last, true, AppLayoutKind::English).unwrap();
+        assert_eq!(keys_to_string(&plan.buffer), "fdl,");
+        assert_eq!(plan.extra_backspaces, 1);
+    }
+
+    #[test]
+    fn manual_plan_returns_none_for_punctuation_only_buffer() {
+        let current = vec![stroke(Key::KEY_DOT), stroke(Key::KEY_DOT)];
+
+        assert!(manual_correction_plan(&current, &[], false, AppLayoutKind::English).is_none());
     }
 
     #[test]
@@ -513,8 +714,81 @@ mod tests {
             },
         ];
 
-        let plan = same_layout_case_correction_plan(&current, true, false).unwrap();
+        let plan = same_layout_case_correction_plan(&current, AppLayoutKind::English, true, false)
+            .unwrap();
         assert_eq!(keys_to_string(&plan.buffer), "Ghbdtn");
+    }
+
+    #[test]
+    fn same_layout_case_fix_plan_preserves_question_tail() {
+        let buffer = vec![
+            Keystroke {
+                key: Key::KEY_H,
+                shift: false,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_E,
+                shift: true,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_L,
+                shift: true,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_L,
+                shift: true,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_O,
+                shift: true,
+                caps_lock: false,
+            },
+            shifted_stroke(Key::KEY_SLASH),
+        ];
+
+        let plan =
+            same_layout_case_correction_plan(&buffer, AppLayoutKind::English, false, true).unwrap();
+        assert_eq!(keys_to_string(&plan.buffer), "Hello?");
+    }
+
+    #[test]
+    fn same_layout_case_fix_plan_preserves_exclamation_tail() {
+        let buffer = vec![
+            Keystroke {
+                key: Key::KEY_H,
+                shift: false,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_E,
+                shift: true,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_L,
+                shift: true,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_L,
+                shift: true,
+                caps_lock: false,
+            },
+            Keystroke {
+                key: Key::KEY_O,
+                shift: true,
+                caps_lock: false,
+            },
+            shifted_stroke(Key::KEY_1),
+        ];
+
+        let plan =
+            same_layout_case_correction_plan(&buffer, AppLayoutKind::English, false, true).unwrap();
+        assert_eq!(plan.buffer.last(), Some(&shifted_stroke(Key::KEY_1)));
     }
 
     #[test]
@@ -552,7 +826,7 @@ mod tests {
             },
         ];
 
-        let plan = manual_correction_plan(&current, &[], false).unwrap();
+        let plan = manual_correction_plan(&current, &[], false, AppLayoutKind::English).unwrap();
         assert_eq!(keys_to_string(&plan.buffer), "GHbdtn");
 
         let corrected = apply_case_fixes_to_strokes(&plan.buffer, true, false);
@@ -562,7 +836,18 @@ mod tests {
     #[test]
     fn russian_like_word_triggers_switch() {
         let buffer = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
-        assert!(should_switch(&buffer));
+        assert!(should_switch(&buffer, AppLayoutKind::English));
+    }
+
+    #[test]
+    fn russian_like_word_with_trailing_punctuation_triggers_switch() {
+        let buffer = vec![
+            stroke(Key::KEY_F),
+            stroke(Key::KEY_D),
+            stroke(Key::KEY_L),
+            stroke(Key::KEY_COMMA),
+        ];
+        assert!(should_switch(&buffer, AppLayoutKind::English));
     }
 
     #[test]
@@ -597,14 +882,15 @@ mod tests {
 
         assert_eq!(keys_to_string(&buffer), "hELLO");
 
-        let plan = same_layout_case_correction_plan(&buffer, false, true).unwrap();
+        let plan =
+            same_layout_case_correction_plan(&buffer, AppLayoutKind::English, false, true).unwrap();
         assert_eq!(keys_to_string(&plan.buffer), "Hello");
     }
 
     #[test]
     fn common_english_word_does_not_trigger_switch() {
         let buffer = vec![stroke(Key::KEY_C), stroke(Key::KEY_A), stroke(Key::KEY_R)];
-        assert!(!should_switch(&buffer));
+        assert!(!should_switch(&buffer, AppLayoutKind::English));
     }
 
     #[test]
@@ -619,7 +905,7 @@ mod tests {
             stroke(Key::KEY_E),
             stroke(Key::KEY_D),
         ];
-        assert!(!should_switch(&buffer));
+        assert!(!should_switch(&buffer, AppLayoutKind::English));
     }
 
     #[test]
@@ -630,7 +916,7 @@ mod tests {
             stroke(Key::KEY_X),
             stroke(Key::KEY_T),
         ];
-        assert!(!should_switch(&buffer));
+        assert!(!should_switch(&buffer, AppLayoutKind::English));
     }
 
     #[test]
@@ -658,7 +944,7 @@ mod tests {
             },
         ];
 
-        assert!(!should_switch(&buffer));
+        assert!(!should_switch(&buffer, AppLayoutKind::English));
     }
 
     #[test]
@@ -687,7 +973,7 @@ mod tests {
             stroke(Key::KEY_DOT),
         ];
 
-        assert!(!should_switch(&buffer));
+        assert!(!should_switch(&buffer, AppLayoutKind::English));
     }
 
     #[test]

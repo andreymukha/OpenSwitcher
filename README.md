@@ -114,6 +114,10 @@ What the bootstrap does:
 
 This setup layer is explicit on purpose so it can later be reused by packaging without redesigning the Linux input model.
 
+Notes:
+- `./manage.sh bootstrap linux-input` works without `setfacl`, but the same-session ACL bridge is only applied when `setfacl` is available. On Debian/Ubuntu-like systems that command is typically provided by the `acl` package.
+- runtime layout auto-detect may use desktop-specific tools such as `gsettings`, `xfconf-query`, or `setxkbmap` depending on the current environment.
+
 ### Build dependencies
 
 For Linux Mint / Ubuntu-like systems:
@@ -128,6 +132,10 @@ sudo apt-get install -y \
   libgtk-4-dev \
   libadwaita-1-dev
 ```
+
+Optional helper packages on Debian/Ubuntu-like systems:
+- `acl` for `setfacl` during `./manage.sh bootstrap linux-input`
+- `libglib2.0-bin` for `gdbus` in the D-Bus examples below
 
 ## Building
 
@@ -298,6 +306,8 @@ gdbus call \
   --object-path /org/oswitch/core \
   --method org.oswitch.core.GetSettings
 ```
+
+On Debian/Ubuntu-like systems, `gdbus` is typically provided by `libglib2.0-bin`.
 
 Watch status and settings-related signals:
 

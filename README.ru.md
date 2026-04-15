@@ -114,6 +114,10 @@ OpenSwitcher читает реальные input-устройства из `/dev
 
 Этот setup-слой сделан явным специально, чтобы позже его можно было напрямую использовать в packaging без переизобретения Linux input-модели.
 
+Примечания:
+- `./manage.sh bootstrap linux-input` работает и без `setfacl`, но same-session ACL bridge применяется только если `setfacl` доступен. В Debian/Ubuntu-подобных системах эта команда обычно приходит из пакета `acl`.
+- runtime auto-detect раскладки может использовать environment-specific инструменты, например `gsettings`, `xfconf-query` или `setxkbmap`, в зависимости от текущего окружения.
+
 ### Зависимости для сборки
 
 Для Linux Mint / Ubuntu-подобных систем:
@@ -128,6 +132,10 @@ sudo apt-get install -y \
   libgtk-4-dev \
   libadwaita-1-dev
 ```
+
+Дополнительные полезные пакеты для Debian/Ubuntu-подобных систем:
+- `acl` для `setfacl` во время `./manage.sh bootstrap linux-input`
+- `libglib2.0-bin` для `gdbus` в примерах D-Bus ниже
 
 ## Сборка
 
@@ -298,6 +306,8 @@ gdbus call \
   --object-path /org/oswitch/core \
   --method org.oswitch.core.GetSettings
 ```
+
+В Debian/Ubuntu-подобных системах `gdbus` обычно входит в пакет `libglib2.0-bin`.
 
 Просмотр сигналов статуса и изменений настроек:
 

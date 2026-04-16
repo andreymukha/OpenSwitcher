@@ -1,6 +1,8 @@
 use crate::config::AppConfig;
 use crate::daemon::capture::LayoutSwitchCaptureSession;
-use crate::error::{CaptureError, ConfigError, ServiceManagerError, SettingsError};
+use crate::error::{
+    CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
+};
 use crate::layout_backend::{
     compatibility_from_setup, feature_availability_for, legacy_backend_factory,
     legacy_current_layout_bool, legacy_layout_state_from_bool, AppLayoutKind, BackendCapabilities,
@@ -12,8 +14,8 @@ use crate::layout_switch::{
     LayoutSwitchAutoDetector,
 };
 use crate::model::{
-    DesktopEnvironment, LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey,
-    SessionType, Settings, SystemContext, UndoKey, UpdateSettingsResult,
+    DesktopEnvironment, DistroKind, LayoutSwitchCaptureState, LayoutSwitchCombo,
+    SelectedTextHotkey, SessionType, Settings, SystemContext, UndoKey, UpdateSettingsResult,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::env;
@@ -359,11 +361,7 @@ mod tests {
         initial_layout_state: CurrentLayoutState,
         backend: Box<dyn LayoutBackend>,
     ) -> RuntimeState {
-        test_runtime_with_backend_and_context(
-            initial_layout_state,
-            backend,
-            SystemContext::default(),
-        )
+        test_runtime_with_backend_and_context(initial_layout_state, backend, cinnamon_x11_context())
     }
 
     fn test_runtime_with_backend_and_context(
@@ -392,7 +390,7 @@ mod tests {
                 selected_text_switch: true,
                 reason: Some("test".to_string()),
             }),
-            system_context,
+            system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
@@ -858,6 +856,18 @@ undo_key = "Pause"
         }
     }
 
+    struct SystemContextDetectorStub {
+        calls: Arc<AtomicUsize>,
+        context: SystemContext,
+    }
+
+    impl SystemContextSource for SystemContextDetectorStub {
+        fn detect_current(&self) -> Result<SystemContext, SystemContextError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.context)
+        }
+    }
+
     #[test]
     fn current_layout_state_prefers_gnome_wayland_observation() {
         let runtime = test_runtime_with_backend_and_context(
@@ -976,6 +986,111 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn periodic_sync_tick_late_upgrades_unknown_context_and_uses_gnome_wayland_observation() {
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::clone(&reader_calls),
+            values: Some(vec!["xkb".into(), "ru".into(), "xkb".into(), "us".into()]),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::clone(&detector_calls),
+            context: gnome_wayland_context(),
+        };
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: english_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            SystemContext::default(),
+        );
+
+        runtime.clear_pending_status_change();
+
+        assert_eq!(
+            runtime.periodic_sync_tick_with(&reader, &detector),
+            BackendSyncResult::Unchanged
+        );
+        assert_eq!(runtime.system_context(), gnome_wayland_context());
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(russian_layout())
+        );
+        assert!(runtime.take_pending_status_change());
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn periodic_sync_tick_skips_context_refresh_when_candidate_is_not_a_late_upgrade() {
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::clone(&reader_calls),
+            values: Some(vec!["xkb".into(), "ru".into(), "xkb".into(), "us".into()]),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::clone(&detector_calls),
+            context: SystemContext::default(),
+        };
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: english_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            SystemContext::default(),
+        );
+
+        runtime.clear_pending_status_change();
+
+        assert_eq!(
+            runtime.periodic_sync_tick_with(&reader, &detector),
+            BackendSyncResult::Unchanged
+        );
+        assert_eq!(runtime.system_context(), SystemContext::default());
+        assert_eq!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            }
+        );
+        assert!(!runtime.take_pending_status_change());
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn late_context_upgrade_accepts_partial_context_that_becomes_more_complete() {
+        let partial = SystemContext {
+            session_type: SessionType::Unknown,
+            desktop_environment: DesktopEnvironment::Gnome,
+            distro: DistroKind::Ubuntu,
+        };
+
+        assert!(is_late_system_context_upgrade(
+            partial,
+            gnome_wayland_context()
+        ));
+        assert!(!is_late_system_context_upgrade(
+            gnome_wayland_context(),
+            partial
+        ));
+    }
+
+    #[test]
     fn set_layout_updates_gnome_wayland_observation_cache() {
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -1015,7 +1130,7 @@ pub struct RuntimeState {
     layout_setup: RwLock<LayoutSetup>,
     layout_compatibility: RwLock<LayoutCompatibility>,
     feature_availability: RwLock<FeatureAvailability>,
-    system_context: SystemContext,
+    system_context: RwLock<SystemContext>,
     current_layout_observation: RwLock<Option<CurrentLayoutState>>,
     config_service: ConfigService,
     capture_session: Mutex<LayoutSwitchCaptureSession>,
@@ -1035,6 +1150,16 @@ pub enum BackendSyncResult {
 
 pub trait TrayPresenceProbe {
     fn tray_is_present(&self) -> Result<bool, std::io::Error>;
+}
+
+trait SystemContextSource {
+    fn detect_current(&self) -> Result<SystemContext, SystemContextError>;
+}
+
+impl SystemContextSource for SystemContextDetector {
+    fn detect_current(&self) -> Result<SystemContext, SystemContextError> {
+        Self::detect_current()
+    }
 }
 
 pub trait TrayServiceStarter {
@@ -1116,7 +1241,9 @@ impl RuntimeState {
             layout_setup: RwLock::new(layout_setup),
             layout_compatibility: RwLock::new(layout_compatibility),
             feature_availability: RwLock::new(feature_availability),
-            system_context: SystemContextDetector::detect_current().unwrap_or_default(),
+            system_context: RwLock::new(
+                SystemContextDetector::detect_current().unwrap_or_default(),
+            ),
             current_layout_observation: RwLock::new(None),
             config_service,
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
@@ -1177,8 +1304,15 @@ impl RuntimeState {
         effective_current_layout_state(
             raw_state,
             self.observed_layout_state().as_ref(),
-            self.system_context,
+            self.system_context(),
         )
+    }
+
+    fn system_context(&self) -> SystemContext {
+        *self
+            .system_context
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     fn update_current_layout_observation(
@@ -1192,7 +1326,7 @@ impl RuntimeState {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         let previous_effective =
-            effective_current_layout_state(&raw_state, observation.as_ref(), self.system_context);
+            effective_current_layout_state(&raw_state, observation.as_ref(), self.system_context());
 
         if *observation == next_observation {
             return;
@@ -1201,7 +1335,7 @@ impl RuntimeState {
         let next_effective = effective_current_layout_state(
             &raw_state,
             next_observation.as_ref(),
-            self.system_context,
+            self.system_context(),
         );
         log_layout_debug(
             "current-layout-observation",
@@ -1232,11 +1366,11 @@ impl RuntimeState {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         let previous_effective =
-            effective_current_layout_state(&state, observation.as_ref(), self.system_context);
+            effective_current_layout_state(&state, observation.as_ref(), self.system_context());
         let next_effective = effective_current_layout_state(
             &next_raw_state,
             observation.as_ref(),
-            self.system_context,
+            self.system_context(),
         );
 
         if *state != next_raw_state {
@@ -1266,7 +1400,7 @@ impl RuntimeState {
         let previous = self.current_layout();
         let next_state = legacy_layout_state_from_bool(layout_is_english);
         let _ = self.update_current_layout_cache(next_state, "set-layout-cache");
-        if is_gnome_wayland_context(self.system_context) {
+        if is_gnome_wayland_context(self.system_context()) {
             self.update_current_layout_observation(
                 Some(gnome_wayland_layout_state_from_bool(layout_is_english)),
                 reason,
@@ -1335,7 +1469,16 @@ impl RuntimeState {
     }
 
     pub fn periodic_sync_tick(&self) -> BackendSyncResult {
-        self.refresh_current_layout_observation();
+        self.periodic_sync_tick_with(&CommandDesktopSettingsReader, &SystemContextDetector)
+    }
+
+    fn periodic_sync_tick_with<R: DesktopSettingsReader, D: SystemContextSource>(
+        &self,
+        reader: &R,
+        detector: &D,
+    ) -> BackendSyncResult {
+        self.refresh_system_context_with_detector(detector);
+        self.refresh_current_layout_observation_with_reader(reader);
         self.sync_with_backend()
     }
 
@@ -1567,7 +1710,7 @@ impl RuntimeState {
     }
 
     fn refresh_current_layout_observation_with_reader<R: DesktopSettingsReader>(&self, reader: &R) {
-        if !is_gnome_wayland_context(self.system_context) {
+        if !is_gnome_wayland_context(self.system_context()) {
             self.clear_current_layout_observation();
             return;
         }
@@ -1580,6 +1723,42 @@ impl RuntimeState {
 
     fn clear_current_layout_observation(&self) {
         self.update_current_layout_observation(None, "clear-observation");
+    }
+
+    fn refresh_system_context_with_detector<D: SystemContextSource>(&self, detector: &D) {
+        let previous = self.system_context();
+        let next = match detector.detect_current() {
+            Ok(next) => next,
+            Err(error) => {
+                log_layout_debug(
+                    "system-context-redetect",
+                    &format!(
+                        "previous={previous:?} next=unavailable result=skipped reason=detect-error error={error}"
+                    ),
+                );
+                return;
+            }
+        };
+
+        if !is_late_system_context_upgrade(previous, next) {
+            log_layout_debug(
+                "system-context-redetect",
+                &format!(
+                    "previous={previous:?} next={next:?} result=skipped reason=not-late-upgrade"
+                ),
+            );
+            return;
+        }
+
+        let mut context = self
+            .system_context
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        *context = next;
+        log_layout_debug(
+            "system-context-redetect",
+            &format!("previous={previous:?} next={next:?} result=applied"),
+        );
     }
 }
 
@@ -1597,6 +1776,34 @@ fn current_layout_kind_from_state(state: &CurrentLayoutState) -> AppLayoutKind {
 fn is_gnome_wayland_context(context: SystemContext) -> bool {
     context.session_type == SessionType::Wayland
         && context.desktop_environment == DesktopEnvironment::Gnome
+}
+
+fn is_late_system_context_upgrade(current: SystemContext, candidate: SystemContext) -> bool {
+    candidate != current
+        && context_preserves_known_fields(current, candidate)
+        && context_known_score(candidate) > context_known_score(current)
+}
+
+fn context_preserves_known_fields(current: SystemContext, candidate: SystemContext) -> bool {
+    field_preserves_known(
+        current.session_type,
+        candidate.session_type,
+        SessionType::Unknown,
+    ) && field_preserves_known(
+        current.desktop_environment,
+        candidate.desktop_environment,
+        DesktopEnvironment::Unknown,
+    ) && field_preserves_known(current.distro, candidate.distro, DistroKind::Unknown)
+}
+
+fn field_preserves_known<T: Copy + Eq>(current: T, candidate: T, unknown: T) -> bool {
+    current == unknown || current == candidate
+}
+
+fn context_known_score(context: SystemContext) -> usize {
+    usize::from(context.session_type != SessionType::Unknown)
+        + usize::from(context.desktop_environment != DesktopEnvironment::Unknown)
+        + usize::from(context.distro != DistroKind::Unknown)
 }
 
 fn effective_current_layout_state(

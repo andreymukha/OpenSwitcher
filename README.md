@@ -38,11 +38,11 @@ The current public scope is a Linux desktop application for EN/RU typing workflo
 
 OpenSwitcher is split into three binaries:
 
-- `open-switcher`  
+- `open-switcher`
   The daemon binary. It owns configuration, input handling, correction logic, and the D-Bus API.
-- `open-switcher-tray`  
+- `open-switcher-tray`
   The tray binary and the main user-facing entrypoint. It provides the tray icon, status menu, and talks to the daemon over D-Bus.
-- `open-switcher-settings`  
+- `open-switcher-settings`
   A GTK4 + libadwaita settings tool. It is separate from the mandatory `daemon + tray` pair.
 
 ## Runtime Model
@@ -162,9 +162,9 @@ cargo test --test dbus_api
 
 The repository ships with `manage.sh`, which supports two explicit modes:
 
-- `dev`  
+- `dev`
   Direct local binaries from `target/`
-- `systemd`  
+- `systemd`
   Real user-service runtime through `systemctl --user`
 
 Old top-level commands are kept as aliases for `dev`, but the preferred form is the explicit namespace.

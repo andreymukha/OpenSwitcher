@@ -362,6 +362,7 @@ impl KeyboardController {
     }
 
     pub fn type_separator(&mut self, key: Key) -> Result<(), SwitcherError> {
+        log_input_debug("type-separator-send", &format!("key={key:?}"));
         self.virtual_device.handle().type_separator(key)
     }
 
@@ -865,6 +866,7 @@ impl VirtualKeyboardHandle {
 
     fn type_separator(&self, key: Key) -> Result<(), SwitcherError> {
         self.ensure_alive()?;
+        log_input_debug("type-separator-queue", &format!("key={key:?}"));
         self.send_fast_command(WriterFastCommand::TypeSeparator { key })
     }
 
@@ -1677,14 +1679,6 @@ fn run_correction(
         thread::sleep(Duration::from_millis(config.typing_ms));
     }
 
-    if plan.extra_backspaces > 0 {
-        device.press(&uinput::event::keyboard::Key::Space)?;
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(2));
-        device.release(&uinput::event::keyboard::Key::Space)?;
-        device.synchronize()?;
-    }
-
     restore_modifiers(device, modifiers)?;
     Ok(())
 }
@@ -1706,6 +1700,7 @@ fn run_virtual_keyboard_writer_loop(
                     device.synchronize()?;
                 }
                 WriterFastCommand::TypeSeparator { key } => {
+                    log_input_debug("type-separator-execute", &format!("key={key:?}"));
                     device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
                     device.synchronize()?;
                     thread::sleep(Duration::from_millis(2));

@@ -57,6 +57,13 @@ struct PendingWordCommit {
     action: PendingWordCommitAction,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppliedManualCorrection {
+    corrected_buffer: Vec<Keystroke>,
+    used_current_buffer: bool,
+    extra_backspaces: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupLayoutResyncState {
     Pending { attempts_remaining: u8 },
@@ -128,6 +135,81 @@ fn format_legacy_layout(is_english: bool) -> &'static str {
     } else {
         "RU"
     }
+}
+
+fn pending_word_commit_action_label(pending: Option<&PendingWordCommit>) -> &'static str {
+    match pending.map(|pending| &pending.action) {
+        Some(PendingWordCommitAction::LayoutCorrection) => "layout-correction",
+        Some(PendingWordCommitAction::SameLayoutCaseCorrection { .. }) => {
+            "same-layout-correction"
+        }
+        None => "none",
+    }
+}
+
+fn pending_word_commit_separator_key(
+    pending: Option<&PendingWordCommit>,
+) -> Option<evdev::Key> {
+    pending.map(|pending| pending.separator_key)
+}
+
+fn manual_separator_replay_key(
+    used_current_buffer: bool,
+    extra_backspaces: usize,
+) -> Option<evdev::Key> {
+    if !used_current_buffer && extra_backspaces > 0 {
+        Some(evdev::Key::KEY_SPACE)
+    } else {
+        None
+    }
+}
+
+fn should_swallow_suppressed_separator_release(
+    suppressed_separator_key: Option<evdev::Key>,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    suppressed_separator_key == Some(key) && value == 0
+}
+
+fn preserved_separator_after_early_finish(
+    pending_word_commit: Option<&PendingWordCommit>,
+    key: evdev::Key,
+    value: i32,
+) -> Option<evdev::Key> {
+    if value == 1 && !is_modifier(key) {
+        pending_word_commit.map(|pending| pending.separator_key)
+    } else {
+        None
+    }
+}
+
+fn update_word_context_after_manual_correction(
+    word_context: &mut WordContext,
+    corrected_buffer: &[Keystroke],
+    used_current_buffer: bool,
+    extra_backspaces: usize,
+) {
+    word_context.valid = !corrected_buffer.is_empty();
+    word_context.word_before_cursor = corrected_buffer.to_vec();
+    if used_current_buffer {
+        word_context.followed_by_separator = false;
+    } else {
+        word_context.followed_by_separator = extra_backspaces > 0;
+    }
+}
+
+fn finalize_manual_correction(
+    word_context: &mut WordContext,
+    applied: &AppliedManualCorrection,
+) -> Option<evdev::Key> {
+    update_word_context_after_manual_correction(
+        word_context,
+        &applied.corrected_buffer,
+        applied.used_current_buffer,
+        applied.extra_backspaces,
+    );
+    manual_separator_replay_key(applied.used_current_buffer, applied.extra_backspaces)
 }
 
 pub struct DaemonService {
@@ -274,6 +356,24 @@ impl DaemonService {
     }
 
     fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
+        if matches!(
+            key,
+            evdev::Key::KEY_SPACE | evdev::Key::KEY_TAB | evdev::Key::KEY_ENTER
+        ) && (self.pending_word_commit.is_some() || self.suppressed_separator_key.is_some())
+        {
+            log_input_debug(
+                "separator-key-event",
+                &format!(
+                    "key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                    self.suppressed_separator_key,
+                    pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                    pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                    self.buffer.len(),
+                    self.word_context.followed_by_separator,
+                ),
+            );
+        }
+
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
@@ -289,16 +389,49 @@ impl DaemonService {
             return Ok(());
         }
 
-        if self.suppressed_separator_key == Some(key) {
+        if should_swallow_suppressed_separator_release(self.suppressed_separator_key, key, value) {
+            log_input_debug(
+                "separator-release-swallow",
+                &format!(
+                    "key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                    self.suppressed_separator_key,
+                    pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                    pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                    self.buffer.len(),
+                    self.word_context.followed_by_separator,
+                ),
+            );
             if value == 0 {
                 if self
                     .pending_word_commit
                     .as_ref()
                     .is_some_and(|pending| pending.separator_key == key)
                 {
+                    log_input_debug(
+                        "pending-word-commit-take",
+                        &format!(
+                            "reason=separator-release key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            self.suppressed_separator_key,
+                            pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                            pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     let pending = self.pending_word_commit.take().unwrap();
                     self.finish_pending_word_commit(pending, &self.runtime.config_snapshot()?)?;
                 }
+                log_input_debug(
+                    "suppressed-separator-clear",
+                    &format!(
+                        "reason=separator-release key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                        self.suppressed_separator_key,
+                        pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                        pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                        self.buffer.len(),
+                        self.word_context.followed_by_separator,
+                    ),
+                );
                 self.suppressed_separator_key = None;
             }
             return Ok(());
@@ -335,13 +468,35 @@ impl DaemonService {
         }
 
         if value == 1 && self.pending_word_commit.is_some() && !is_modifier(key) {
+            log_input_debug(
+                "pending-word-commit-take",
+                &format!(
+                    "reason=early-finish key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                    self.suppressed_separator_key,
+                    pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                    pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                    self.buffer.len(),
+                    self.word_context.followed_by_separator,
+                ),
+            );
             let pending = self.pending_word_commit.take().unwrap();
-            let separator_key = pending.separator_key;
             // Keep swallowing the physical separator release even if we had to
             // finish the correction early because the next key arrived first.
             // Otherwise a late real key-up can leak back into the normal path
             // after we already replayed the separator virtually.
-            self.suppressed_separator_key = Some(separator_key);
+            let preserved_separator =
+                preserved_separator_after_early_finish(Some(&pending), key, value);
+            log_input_debug(
+                "suppressed-separator-set",
+                &format!(
+                    "reason=early-finish key={key:?} value={value} next_suppressed_separator_key={preserved_separator:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                    pending_word_commit_action_label(Some(&pending)),
+                    Some(pending.separator_key),
+                    self.buffer.len(),
+                    self.word_context.followed_by_separator,
+                ),
+            );
+            self.suppressed_separator_key = preserved_separator;
             self.finish_pending_word_commit(pending, &config)?;
             if key == undo_key_to_evdev_key(config.undo_key) {
                 return Ok(());
@@ -430,16 +585,42 @@ impl DaemonService {
             } else {
                 Vec::new()
             };
-            let used_current_buffer = !self.buffer.is_empty();
-            if let Some(corrected_buffer) = self.apply_manual_correction(
+            if let Some(applied) = self.apply_manual_correction(
                 &config,
                 &word_before_cursor,
                 CorrectionPath::ManualHotkey,
             )? {
-                if used_current_buffer {
-                    self.word_context.valid = true;
-                    self.word_context.word_before_cursor = corrected_buffer;
-                    self.word_context.followed_by_separator = false;
+                let separator_replay_key =
+                    finalize_manual_correction(&mut self.word_context, &applied);
+                log_input_debug(
+                    "manual-separator-replay",
+                    &format!(
+                        "requested={} key={separator_replay_key:?} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={} used_current_buffer={} extra_backspaces={}",
+                        separator_replay_key.is_some(),
+                        self.suppressed_separator_key,
+                        pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                        pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                        self.buffer.len(),
+                        self.word_context.followed_by_separator,
+                        applied.used_current_buffer,
+                        applied.extra_backspaces,
+                    ),
+                );
+                if let Some(separator_key) = separator_replay_key {
+                    self.keyboard_mut()?.type_separator(separator_key)?;
+                    log_input_debug(
+                        "manual-separator-replay",
+                        &format!(
+                            "sent=true key={separator_key:?} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={} used_current_buffer={} extra_backspaces={}",
+                            self.suppressed_separator_key,
+                            pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                            pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                            applied.used_current_buffer,
+                            applied.extra_backspaces,
+                        ),
+                    );
                 }
             }
             return Ok(());
@@ -504,15 +685,46 @@ impl DaemonService {
                 );
 
                 if corrected {
+                    log_input_debug(
+                        "suppressed-separator-set",
+                        &format!(
+                            "reason=space-layout-correction key={key:?} value={value} next_suppressed_separator_key={:?} pending_action=layout-correction pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            Some(key),
+                            Some(key),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     self.suppressed_separator_key = Some(key);
                     self.pending_word_commit = Some(PendingWordCommit {
                         separator_key: key,
                         action: PendingWordCommitAction::LayoutCorrection,
                     });
+                    log_input_debug(
+                        "pending-word-commit-set",
+                        &format!(
+                            "reason=space-layout-correction key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            self.suppressed_separator_key,
+                            pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                            pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     return Ok(());
                 }
 
                 if let Some(plan) = same_layout_plan {
+                    log_input_debug(
+                        "suppressed-separator-set",
+                        &format!(
+                            "reason=space-same-layout-correction key={key:?} value={value} next_suppressed_separator_key={:?} pending_action=same-layout-correction pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            Some(key),
+                            Some(key),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     self.suppressed_separator_key = Some(key);
                     self.pending_word_commit = Some(PendingWordCommit {
                         separator_key: key,
@@ -520,6 +732,17 @@ impl DaemonService {
                             corrected_buffer: plan.buffer,
                         },
                     });
+                    log_input_debug(
+                        "pending-word-commit-set",
+                        &format!(
+                            "reason=space-same-layout-correction key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            self.suppressed_separator_key,
+                            pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                            pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     return Ok(());
                 }
 
@@ -536,6 +759,16 @@ impl DaemonService {
                     config.fix_two_capitals,
                     config.fix_accidental_caps_lock,
                 ) {
+                    log_input_debug(
+                        "suppressed-separator-set",
+                        &format!(
+                            "reason=commit-same-layout-correction key={key:?} value={value} next_suppressed_separator_key={:?} pending_action=same-layout-correction pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            Some(key),
+                            Some(key),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     self.suppressed_separator_key = Some(key);
                     self.pending_word_commit = Some(PendingWordCommit {
                         separator_key: key,
@@ -543,6 +776,17 @@ impl DaemonService {
                             corrected_buffer: plan.buffer,
                         },
                     });
+                    log_input_debug(
+                        "pending-word-commit-set",
+                        &format!(
+                            "reason=commit-same-layout-correction key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                            self.suppressed_separator_key,
+                            pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                            pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                            self.buffer.len(),
+                            self.word_context.followed_by_separator,
+                        ),
+                    );
                     return Ok(());
                 }
                 self.invalidate_word_context();
@@ -619,6 +863,7 @@ impl DaemonService {
     ) -> Result<(), SwitcherError> {
         let corrected_buffer = self
             .apply_manual_correction(config, &[], CorrectionPath::AutoWordCommit)?
+            .map(|applied| applied.corrected_buffer)
             .unwrap_or_else(|| self.buffer.clone());
         self.commit_corrected_word(separator_key, corrected_buffer)
     }
@@ -644,17 +889,42 @@ impl DaemonService {
         pending: PendingWordCommit,
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
     ) -> Result<(), SwitcherError> {
+        let action_label = pending_word_commit_action_label(Some(&pending));
+        let separator_key = pending.separator_key;
+        log_input_debug(
+            "finish-pending-word-commit",
+            &format!(
+                "phase=start separator_key={:?} action={} suppressed_separator_key={:?} buffer_len={} followed_by_separator={}",
+                separator_key,
+                action_label,
+                self.suppressed_separator_key,
+                self.buffer.len(),
+                self.word_context.followed_by_separator,
+            ),
+        );
         match pending.action {
             PendingWordCommitAction::LayoutCorrection => {
-                self.finish_pending_auto_correction(pending.separator_key, config)
+                self.finish_pending_auto_correction(separator_key, config)?
             }
             PendingWordCommitAction::SameLayoutCaseCorrection { corrected_buffer } => self
                 .finish_pending_same_layout_case_correction(
-                    pending.separator_key,
+                    separator_key,
                     corrected_buffer,
                     config,
-                ),
+                )?,
         }
+        log_input_debug(
+            "finish-pending-word-commit",
+            &format!(
+                "phase=finish separator_key={:?} action={} suppressed_separator_key={:?} buffer_len={} followed_by_separator={}",
+                separator_key,
+                action_label,
+                self.suppressed_separator_key,
+                self.buffer.len(),
+                self.word_context.followed_by_separator,
+            ),
+        );
+        Ok(())
     }
 
     fn commit_corrected_word(
@@ -662,6 +932,18 @@ impl DaemonService {
         separator_key: evdev::Key,
         corrected_buffer: Vec<Keystroke>,
     ) -> Result<(), SwitcherError> {
+        log_input_debug(
+            "commit-corrected-word",
+            &format!(
+                "phase=start separator_key={separator_key:?} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} corrected_buffer_len={} followed_by_separator={}",
+                self.suppressed_separator_key,
+                pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                self.buffer.len(),
+                corrected_buffer.len(),
+                self.word_context.followed_by_separator,
+            ),
+        );
         if separator_key == evdev::Key::KEY_SPACE {
             self.word_context.valid = !corrected_buffer.is_empty();
             self.word_context.word_before_cursor = corrected_buffer;
@@ -670,6 +952,17 @@ impl DaemonService {
         } else {
             self.invalidate_word_context();
         }
+        log_input_debug(
+            "commit-corrected-word",
+            &format!(
+                "phase=type-separator separator_key={separator_key:?} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
+                self.suppressed_separator_key,
+                pending_word_commit_action_label(self.pending_word_commit.as_ref()),
+                pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
+                self.buffer.len(),
+                self.word_context.followed_by_separator,
+            ),
+        );
         self.keyboard_mut()?.type_separator(separator_key)
     }
 
@@ -695,7 +988,7 @@ impl DaemonService {
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
         fallback_buffer: &[Keystroke],
         correction_path: CorrectionPath,
-    ) -> Result<Option<Vec<Keystroke>>, SwitcherError> {
+    ) -> Result<Option<AppliedManualCorrection>, SwitcherError> {
         let features = self.runtime.feature_availability();
         if !features.manual_word_fix {
             return Ok(None);
@@ -736,6 +1029,7 @@ impl DaemonService {
             return Ok(None);
         }
 
+        let used_current_buffer = !self.buffer.is_empty();
         let Some(mut plan) = manual_correction_plan(
             &self.buffer,
             fallback_buffer,
@@ -757,6 +1051,20 @@ impl DaemonService {
                 config.layout_switch_combo,
                 plan.buffer.len(),
                 plan.extra_backspaces,
+            ),
+        );
+        log_input_debug(
+            "manual-correction-separator",
+            &format!(
+                "path={} requested={} key={:?} used_current_buffer={} extra_backspaces={} followed_by_separator={} buffer_len={} fallback_buffer_len={}",
+                correction_path.as_str(),
+                manual_separator_replay_key(used_current_buffer, plan.extra_backspaces).is_some(),
+                manual_separator_replay_key(used_current_buffer, plan.extra_backspaces),
+                used_current_buffer,
+                plan.extra_backspaces,
+                self.word_context.followed_by_separator,
+                self.buffer.len(),
+                fallback_buffer.len(),
             ),
         );
         let modifiers = self.modifiers;
@@ -812,7 +1120,11 @@ impl DaemonService {
                 );
             }
         }
-        Ok(Some(plan.buffer))
+        Ok(Some(AppliedManualCorrection {
+            corrected_buffer: plan.buffer,
+            used_current_buffer,
+            extra_backspaces: plan.extra_backspaces,
+        }))
     }
 
     fn publish_status_changed(&self) -> Result<(), SwitcherError> {
@@ -983,6 +1295,15 @@ fn selected_text_hotkey_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use evdev::Key;
+
+    fn stroke(key: Key) -> Keystroke {
+        Keystroke {
+            key,
+            shift: false,
+            caps_lock: false,
+        }
+    }
 
     #[test]
     fn startup_layout_resync_starts_pending() {
@@ -1091,5 +1412,95 @@ mod tests {
     fn pending_status_change_requests_publish_from_service() {
         assert!(should_publish_pending_status_change(true));
         assert!(!should_publish_pending_status_change(false));
+    }
+
+    #[test]
+    fn manual_previous_word_correction_requests_separator_replay() {
+        let applied = AppliedManualCorrection {
+            corrected_buffer: vec![stroke(Key::KEY_G), stroke(Key::KEY_H)],
+            used_current_buffer: false,
+            extra_backspaces: 1,
+        };
+        let mut word_context = WordContext::default();
+
+        let replay = finalize_manual_correction(&mut word_context, &applied);
+
+        assert_eq!(replay, Some(Key::KEY_SPACE));
+        assert!(word_context.valid);
+        assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
+        assert!(word_context.followed_by_separator);
+    }
+
+    #[test]
+    fn manual_current_word_correction_does_not_request_separator_replay() {
+        let applied = AppliedManualCorrection {
+            corrected_buffer: vec![stroke(Key::KEY_G), stroke(Key::KEY_H)],
+            used_current_buffer: true,
+            extra_backspaces: 0,
+        };
+        let mut word_context = WordContext::default();
+
+        let replay = finalize_manual_correction(&mut word_context, &applied);
+
+        assert_eq!(replay, None);
+        assert!(word_context.valid);
+        assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
+        assert!(!word_context.followed_by_separator);
+    }
+
+    #[test]
+    fn manual_previous_word_correction_updates_word_context_with_separator() {
+        let applied = AppliedManualCorrection {
+            corrected_buffer: vec![stroke(Key::KEY_H), stroke(Key::KEY_E), stroke(Key::KEY_Y)],
+            used_current_buffer: false,
+            extra_backspaces: 1,
+        };
+        let mut word_context = WordContext::default();
+
+        finalize_manual_correction(&mut word_context, &applied);
+
+        assert!(word_context.valid);
+        assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
+        assert!(word_context.followed_by_separator);
+    }
+
+    #[test]
+    fn suppressed_separator_logic_swallows_only_matching_release() {
+        assert!(!should_swallow_suppressed_separator_release(
+            Some(Key::KEY_SPACE),
+            Key::KEY_SPACE,
+            1,
+        ));
+        assert!(should_swallow_suppressed_separator_release(
+            Some(Key::KEY_SPACE),
+            Key::KEY_SPACE,
+            0,
+        ));
+        assert!(!should_swallow_suppressed_separator_release(
+            Some(Key::KEY_SPACE),
+            Key::KEY_ENTER,
+            0,
+        ));
+    }
+
+    #[test]
+    fn early_finish_preserves_one_swallowed_release_for_original_separator() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+
+        assert_eq!(
+            preserved_separator_after_early_finish(Some(&pending), Key::KEY_A, 1),
+            Some(Key::KEY_SPACE)
+        );
+        assert_eq!(
+            preserved_separator_after_early_finish(Some(&pending), Key::KEY_A, 0),
+            None
+        );
+        assert_eq!(
+            preserved_separator_after_early_finish(None, Key::KEY_A, 1),
+            None
+        );
     }
 }

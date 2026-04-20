@@ -151,6 +151,19 @@ pub enum ServiceManagerError {
 }
 
 impl SwitcherError {
+    pub fn is_recoverable_input_error(&self) -> bool {
+        match self {
+            SwitcherError::KeyboardNotFound
+            | SwitcherError::KeyboardAccessDenied { .. }
+            | SwitcherError::UinputAccessDenied { .. } => true,
+            SwitcherError::Io(error) => {
+                matches!(error.raw_os_error(), Some(19))
+                    || error.to_string().contains("No such device")
+            }
+            _ => false,
+        }
+    }
+
     pub fn linux_input_setup_hint(&self) -> Option<String> {
         match self {
             SwitcherError::KeyboardAccessDenied { path, .. } => Some(format!(
@@ -169,6 +182,23 @@ impl SwitcherError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyboard_access_denied_is_recoverable_input_error() {
+        let error = SwitcherError::KeyboardAccessDenied {
+            path: PathBuf::from("/dev/input/event3"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+
+        assert!(error.is_recoverable_input_error());
+    }
+
+    #[test]
+    fn plain_io_error_is_not_recoverable_input_error() {
+        let error = SwitcherError::Io(std::io::Error::other("boom"));
+
+        assert!(!error.is_recoverable_input_error());
+    }
 
     #[test]
     fn keyboard_access_denied_has_linux_input_setup_hint() {

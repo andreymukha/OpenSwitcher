@@ -1,3 +1,6 @@
+use crate::daemon::input_backend::{
+    ActiveInputBackend, InputBackendLifecycle, KeyboardInputBackendOpener, OpenedInputBackend,
+};
 use crate::daemon::keyboard::{
     is_character, is_modifier, log_input_debug, undo_key_to_evdev_key, KeyboardController,
     ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
@@ -130,12 +133,13 @@ fn format_legacy_layout(is_english: bool) -> &'static str {
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
     connection: Connection,
-    keyboard: KeyboardController,
+    input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
+    keyboard: Option<KeyboardController>,
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
     buffer: Vec<Keystroke>,
     word_context: WordContext,
-    selected_text_runner: SelectedTextJobRunner,
+    selected_text_runner: Option<SelectedTextJobRunner>,
     suppressed_hotkey_key: Option<evdev::Key>,
     suppressed_undo_key: Option<evdev::Key>,
     suppressed_separator_key: Option<evdev::Key>,
@@ -147,22 +151,17 @@ pub struct DaemonService {
 
 impl DaemonService {
     pub fn new(runtime: Arc<RuntimeState>, connection: Connection) -> Result<Self, SwitcherError> {
-        let keyboard = KeyboardController::open()?;
-        let mut modifiers = ModifierState::default();
-        modifiers.set_caps_lock_active(keyboard.caps_lock_active());
         let shared_modifiers = SharedModifierState::default();
-        let selected_text_runner =
-            SelectedTextJobRunner::new(keyboard.selection_transport(shared_modifiers.clone()))?;
-
-        Ok(Self {
+        let mut service = Self {
             runtime,
             connection,
-            keyboard,
-            modifiers,
+            input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
+            keyboard: None,
+            modifiers: ModifierState::default(),
             shared_modifiers,
             buffer: Vec::new(),
             word_context: WordContext::default(),
-            selected_text_runner,
+            selected_text_runner: None,
             suppressed_hotkey_key: None,
             suppressed_undo_key: None,
             suppressed_separator_key: None,
@@ -170,7 +169,9 @@ impl DaemonService {
             pending_word_commit: None,
             pending_selected_text_switch: false,
             startup_layout_resync: StartupLayoutResyncState::pending(),
-        })
+        };
+        service.try_initialize_input_backend()?;
+        Ok(service)
     }
 
     pub fn run(&mut self) -> Result<(), SwitcherError> {
@@ -178,26 +179,40 @@ impl DaemonService {
         let mut processed_events = 0u64;
         let mut last_heartbeat = Instant::now();
 
-        loop {
+        'event_loop: loop {
             if self.runtime.should_exit() {
                 self.shutdown();
                 return Ok(());
             }
 
-            let events = match self.keyboard.fetch_events_timeout(INPUT_EVENT_WAIT_TIMEOUT) {
-                Ok(events) => events,
-                Err(error) => {
-                    log_input_debug("keyboard-read-error", &format!("error={error}"));
-                    self.shutdown();
-                    return Err(error);
+            self.maybe_retry_input_backend()?;
+
+            let events = if let Some(keyboard) = self.keyboard.as_mut() {
+                match keyboard.fetch_events_timeout(INPUT_EVENT_WAIT_TIMEOUT) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        log_input_debug("keyboard-read-error", &format!("error={error}"));
+                        if self.handle_runtime_input_failure(&error) {
+                            continue;
+                        }
+                        self.shutdown();
+                        return Err(error);
+                    }
                 }
+            } else {
+                std::thread::sleep(INPUT_EVENT_WAIT_TIMEOUT);
+                Vec::new()
             };
 
             if should_publish_pending_status_change(self.runtime.take_pending_status_change()) {
                 self.publish_status_changed()?;
             }
 
-            if self.keyboard.take_input_target_invalidation() {
+            if self
+                .keyboard
+                .as_ref()
+                .is_some_and(KeyboardController::take_input_target_invalidation)
+            {
                 log_input_debug(
                     "input-target-invalidation",
                     "word context invalidated by active input target change",
@@ -205,7 +220,11 @@ impl DaemonService {
                 self.invalidate_word_context();
             }
 
-            if self.keyboard.take_pointer_click_invalidation() {
+            if self
+                .keyboard
+                .as_ref()
+                .is_some_and(KeyboardController::take_pointer_click_invalidation)
+            {
                 log_input_debug(
                     "pointer-invalidation",
                     "word context invalidated by pointer click",
@@ -220,6 +239,9 @@ impl DaemonService {
                             "event-handler-error",
                             &format!("key={key:?} value={} error={error}", event.value()),
                         );
+                        if self.handle_runtime_input_failure(&error) {
+                            continue 'event_loop;
+                        }
                         self.shutdown();
                         return Err(error);
                     }
@@ -231,8 +253,12 @@ impl DaemonService {
                             "event-loop-heartbeat",
                             &format!(
                                 "events_processed={processed_events} selected_text_in_progress={} writer_alive={}",
-                                self.selected_text_runner.is_in_progress(),
-                                self.keyboard.is_writer_alive()
+                                self.selected_text_runner
+                                    .as_ref()
+                                    .is_some_and(SelectedTextJobRunner::is_in_progress),
+                                self.keyboard
+                                    .as_ref()
+                                    .is_some_and(KeyboardController::is_writer_alive)
                             ),
                         );
                         last_heartbeat = Instant::now();
@@ -244,7 +270,7 @@ impl DaemonService {
 
     pub fn shutdown(&mut self) {
         log_input_debug("event-loop-stop", "daemon input loop stopping");
-        self.keyboard.shutdown();
+        self.drop_active_input_backend();
     }
 
     fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
@@ -390,7 +416,7 @@ impl DaemonService {
         }
 
         if value == 0 {
-            let result = self.keyboard.forward_event(key, value);
+            let result = self.keyboard_mut()?.forward_event(key, value);
             if result.is_ok() {
                 self.maybe_run_pending_selected_text_switch()?;
             }
@@ -501,7 +527,7 @@ impl DaemonService {
                 self.word_context.word_before_cursor = self.buffer.clone();
                 self.word_context.followed_by_separator = true;
                 self.buffer.clear();
-                self.keyboard.forward_event(key, value)
+                self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
                 if let Some(plan) = same_layout_case_correction_plan(
@@ -520,7 +546,7 @@ impl DaemonService {
                     return Ok(());
                 }
                 self.invalidate_word_context();
-                self.keyboard.forward_event(key, value)
+                self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_BACKSPACE => {
                 if !self.buffer.is_empty() {
@@ -529,7 +555,7 @@ impl DaemonService {
                     self.buffer = self.word_context.word_before_cursor.clone();
                     self.word_context.followed_by_separator = false;
                 }
-                self.keyboard.forward_event(key, value)
+                self.keyboard_mut()?.forward_event(key, value)
             }
             _ => {
                 let current_stroke = Keystroke {
@@ -553,7 +579,7 @@ impl DaemonService {
                 } else if !is_modifier(key) {
                     self.invalidate_word_context();
                 }
-                let result = self.keyboard.forward_event(key, value);
+                let result = self.keyboard_mut()?.forward_event(key, value);
                 if result.is_ok() {
                     self.maybe_run_pending_selected_text_switch()?;
                 }
@@ -571,7 +597,12 @@ impl DaemonService {
             return Ok(());
         }
 
-        if !self.selected_text_runner.try_start()? {
+        let Some(selected_text_runner) = self.selected_text_runner.as_ref() else {
+            log_selected_text_debug("hotkey-skip", "reason=input-backend-unavailable");
+            return Ok(());
+        };
+
+        if !selected_text_runner.try_start()? {
             log_selected_text_debug("hotkey-skip", "selected-text job already running");
             return Ok(());
         }
@@ -602,8 +633,9 @@ impl DaemonService {
             buffer: corrected_buffer.clone(),
             extra_backspaces: 0,
         };
-        self.keyboard
-            .apply_same_layout_correction(&plan, config, self.modifiers)?;
+        let modifiers = self.modifiers;
+        self.keyboard_mut()?
+            .apply_same_layout_correction(&plan, config, modifiers)?;
         self.commit_corrected_word(separator_key, corrected_buffer)
     }
 
@@ -638,7 +670,7 @@ impl DaemonService {
         } else {
             self.invalidate_word_context();
         }
-        self.keyboard.type_separator(separator_key)
+        self.keyboard_mut()?.type_separator(separator_key)
     }
 
     fn maybe_run_pending_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
@@ -727,8 +759,9 @@ impl DaemonService {
                 plan.extra_backspaces,
             ),
         );
-        self.keyboard
-            .apply_correction(&plan, config, self.modifiers)?;
+        let modifiers = self.modifiers;
+        self.keyboard_mut()?
+            .apply_correction(&plan, config, modifiers)?;
         let post_correction_sync = self.runtime.sync_with_backend();
         let cached_layout_after = self.runtime.current_layout_state();
         let legacy_layout_after = self.runtime.current_layout();
@@ -798,6 +831,76 @@ impl DaemonService {
         emit_status_changed(&self.connection, &self.runtime)?;
         self.runtime.clear_pending_status_change();
         Ok(())
+    }
+
+    fn try_initialize_input_backend(&mut self) -> Result<(), SwitcherError> {
+        if let Some(opened) = self
+            .input_backend
+            .initialize(self.shared_modifiers.clone(), Instant::now())?
+        {
+            self.install_opened_input_backend(opened);
+        }
+        Ok(())
+    }
+
+    fn maybe_retry_input_backend(&mut self) -> Result<(), SwitcherError> {
+        if let Some(opened) = self
+            .input_backend
+            .try_recover(self.shared_modifiers.clone(), Instant::now())?
+        {
+            self.install_opened_input_backend(opened);
+        }
+        Ok(())
+    }
+
+    fn install_opened_input_backend(
+        &mut self,
+        opened: OpenedInputBackend<ActiveInputBackend>,
+    ) {
+        let ActiveInputBackend {
+            keyboard,
+            selected_text_runner,
+        } = opened.backend;
+        let mut modifiers = ModifierState::default();
+        modifiers.set_caps_lock_active(keyboard.caps_lock_active());
+        self.modifiers = modifiers;
+        self.shared_modifiers.store(self.modifiers);
+        self.keyboard = Some(keyboard);
+        self.selected_text_runner = Some(selected_text_runner);
+    }
+
+    fn handle_runtime_input_failure(&mut self, error: &SwitcherError) -> bool {
+        if self.input_backend.record_runtime_failure(error, Instant::now()) {
+            self.reset_transient_input_state("input-backend-unavailable");
+            self.drop_active_input_backend();
+            return true;
+        }
+
+        false
+    }
+
+    fn drop_active_input_backend(&mut self) {
+        if let Some(mut keyboard) = self.keyboard.take() {
+            keyboard.shutdown();
+        }
+        self.selected_text_runner = None;
+    }
+
+    fn reset_transient_input_state(&mut self, reason: &str) {
+        log_input_debug("transient-input-reset", &format!("reason={reason}"));
+        self.invalidate_word_context();
+        self.suppressed_hotkey_key = None;
+        self.suppressed_undo_key = None;
+        self.suppressed_separator_key = None;
+        self.layout_shortcut_latched = false;
+        self.pending_word_commit = None;
+        self.pending_selected_text_switch = false;
+        self.modifiers = ModifierState::default();
+        self.shared_modifiers.store(self.modifiers);
+    }
+
+    fn keyboard_mut(&mut self) -> Result<&mut KeyboardController, SwitcherError> {
+        self.keyboard.as_mut().ok_or(SwitcherError::KeyboardNotFound)
     }
 
     fn invalidate_word_context(&mut self) {

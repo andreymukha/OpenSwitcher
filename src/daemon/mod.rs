@@ -1,4 +1,5 @@
 pub mod capture;
+pub mod input_backend;
 pub mod keyboard;
 pub mod layout_switcher;
 pub mod runtime;

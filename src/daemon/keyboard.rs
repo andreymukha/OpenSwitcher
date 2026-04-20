@@ -35,6 +35,23 @@ const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputBackendReadiness {
+    pub keyboard_open: bool,
+    pub writer_ready: bool,
+    pub watchers_ready: bool,
+    pub event_processing_ready: bool,
+}
+
+impl InputBackendReadiness {
+    pub fn is_ready(self) -> bool {
+        self.keyboard_open
+            && self.writer_ready
+            && self.watchers_ready
+            && self.event_processing_ready
+    }
+}
+
 pub struct KeyboardController {
     real_device: GrabbedKeyboardDevice,
     pointer_watcher: PointerWatcher,
@@ -389,6 +406,20 @@ impl KeyboardController {
     pub fn caps_lock_active(&self) -> bool {
         self.real_device.caps_lock_active().unwrap_or(false)
     }
+
+    pub fn readiness(&self) -> InputBackendReadiness {
+        let keyboard_open = self.real_device.is_ready();
+        let writer_ready = self.virtual_device.handle().is_alive();
+        let watchers_ready =
+            self.pointer_watcher.is_ready() && self.input_target_watcher.is_ready();
+
+        InputBackendReadiness {
+            keyboard_open,
+            writer_ready,
+            watchers_ready,
+            event_processing_ready: keyboard_open && writer_ready && watchers_ready,
+        }
+    }
 }
 
 impl GrabbedKeyboardDevice {
@@ -452,6 +483,10 @@ impl GrabbedKeyboardDevice {
             .get_led_state()
             .map(|state| state.contains(LedType::LED_CAPSL))
             .map_err(|error| map_keyboard_open_error(&self.path, error))
+    }
+
+    fn is_ready(&self) -> bool {
+        self.grabbed
     }
 }
 
@@ -572,6 +607,10 @@ impl PointerWatcher {
             let _ = handle.join();
         }
     }
+
+    fn is_ready(&self) -> bool {
+        !self.stop_flag.load(Ordering::SeqCst)
+    }
 }
 
 impl InputTargetWatcher {
@@ -671,6 +710,10 @@ impl InputTargetWatcher {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    fn is_ready(&self) -> bool {
+        !self.stop_flag.load(Ordering::SeqCst)
     }
 }
 

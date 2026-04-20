@@ -184,6 +184,19 @@ fn preserved_separator_after_early_finish(
     }
 }
 
+fn should_commit_manually_corrected_current_word(
+    current_word_manually_corrected: bool,
+    key: evdev::Key,
+    buffer_len: usize,
+) -> bool {
+    current_word_manually_corrected
+        && buffer_len > 0
+        && matches!(
+            key,
+            evdev::Key::KEY_SPACE | evdev::Key::KEY_TAB | evdev::Key::KEY_ENTER
+        )
+}
+
 fn update_word_context_after_manual_correction(
     word_context: &mut WordContext,
     corrected_buffer: &[Keystroke],
@@ -200,9 +213,15 @@ fn update_word_context_after_manual_correction(
 }
 
 fn finalize_manual_correction(
+    buffer: &mut Vec<Keystroke>,
     word_context: &mut WordContext,
     applied: &AppliedManualCorrection,
 ) -> Option<evdev::Key> {
+    if applied.used_current_buffer {
+        *buffer = applied.corrected_buffer.clone();
+    } else {
+        buffer.clear();
+    }
     update_word_context_after_manual_correction(
         word_context,
         &applied.corrected_buffer,
@@ -220,6 +239,7 @@ pub struct DaemonService {
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
     buffer: Vec<Keystroke>,
+    current_word_manually_corrected: bool,
     word_context: WordContext,
     selected_text_runner: Option<SelectedTextJobRunner>,
     suppressed_hotkey_key: Option<evdev::Key>,
@@ -242,6 +262,7 @@ impl DaemonService {
             modifiers: ModifierState::default(),
             shared_modifiers,
             buffer: Vec::new(),
+            current_word_manually_corrected: false,
             word_context: WordContext::default(),
             selected_text_runner: None,
             suppressed_hotkey_key: None,
@@ -356,24 +377,6 @@ impl DaemonService {
     }
 
     fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
-        if matches!(
-            key,
-            evdev::Key::KEY_SPACE | evdev::Key::KEY_TAB | evdev::Key::KEY_ENTER
-        ) && (self.pending_word_commit.is_some() || self.suppressed_separator_key.is_some())
-        {
-            log_input_debug(
-                "separator-key-event",
-                &format!(
-                    "key={key:?} value={value} suppressed_separator_key={:?} pending_action={} pending_separator_key={:?} buffer_len={} followed_by_separator={}",
-                    self.suppressed_separator_key,
-                    pending_word_commit_action_label(self.pending_word_commit.as_ref()),
-                    pending_word_commit_separator_key(self.pending_word_commit.as_ref()),
-                    self.buffer.len(),
-                    self.word_context.followed_by_separator,
-                ),
-            );
-        }
-
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
@@ -467,6 +470,7 @@ impl DaemonService {
             );
         }
 
+        let undo_key = undo_key_to_evdev_key(config.undo_key);
         if value == 1 && self.pending_word_commit.is_some() && !is_modifier(key) {
             log_input_debug(
                 "pending-word-commit-take",
@@ -498,7 +502,7 @@ impl DaemonService {
             );
             self.suppressed_separator_key = preserved_separator;
             self.finish_pending_word_commit(pending, &config)?;
-            if key == undo_key_to_evdev_key(config.undo_key) {
+            if key == undo_key {
                 return Ok(());
             }
         }
@@ -578,7 +582,7 @@ impl DaemonService {
             return result;
         }
 
-        if value == 1 && key == undo_key_to_evdev_key(config.undo_key) {
+        if value == 1 && key == undo_key {
             self.suppressed_undo_key = Some(key);
             let word_before_cursor = if self.can_correct_word_before_cursor() {
                 self.word_context.word_before_cursor.clone()
@@ -591,7 +595,7 @@ impl DaemonService {
                 CorrectionPath::ManualHotkey,
             )? {
                 let separator_replay_key =
-                    finalize_manual_correction(&mut self.word_context, &applied);
+                    finalize_manual_correction(&mut self.buffer, &mut self.word_context, &applied);
                 log_input_debug(
                     "manual-separator-replay",
                     &format!(
@@ -622,12 +626,25 @@ impl DaemonService {
                         ),
                     );
                 }
+                self.current_word_manually_corrected = applied.used_current_buffer;
             }
             return Ok(());
         }
 
         match key {
             evdev::Key::KEY_SPACE => {
+                if should_commit_manually_corrected_current_word(
+                    self.current_word_manually_corrected,
+                    key,
+                    self.buffer.len(),
+                ) {
+                    self.current_word_manually_corrected = false;
+                    self.word_context.valid = !self.buffer.is_empty();
+                    self.word_context.word_before_cursor = self.buffer.clone();
+                    self.word_context.followed_by_separator = true;
+                    self.buffer.clear();
+                    return self.keyboard_mut()?.forward_event(key, value);
+                }
                 let startup_sync_ready = self.refresh_startup_layout_before_autocorrect()?;
                 let features = self.runtime.feature_availability();
                 let cached_layout_state = self.runtime.current_layout_state();
@@ -753,6 +770,15 @@ impl DaemonService {
                 self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
+                if should_commit_manually_corrected_current_word(
+                    self.current_word_manually_corrected,
+                    key,
+                    self.buffer.len(),
+                ) {
+                    self.current_word_manually_corrected = false;
+                    self.invalidate_word_context();
+                    return self.keyboard_mut()?.forward_event(key, value);
+                }
                 if let Some(plan) = same_layout_case_correction_plan(
                     &self.buffer,
                     self.current_layout_kind(),
@@ -793,6 +819,7 @@ impl DaemonService {
                 self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_BACKSPACE => {
+                self.current_word_manually_corrected = false;
                 if !self.buffer.is_empty() {
                     self.buffer.pop();
                 } else if self.word_context.valid && self.word_context.followed_by_separator {
@@ -814,6 +841,7 @@ impl DaemonService {
                     && !self.modifiers.is_meta_pressed();
 
                 if plain_character_input {
+                    self.current_word_manually_corrected = false;
                     // Once we are typing the current word again, the cursor is no longer
                     // "after a finished word". Keep only the active buffer state.
                     self.word_context.valid = true;
@@ -1217,6 +1245,7 @@ impl DaemonService {
 
     fn invalidate_word_context(&mut self) {
         self.buffer.clear();
+        self.current_word_manually_corrected = false;
         self.word_context.valid = false;
         self.word_context.word_before_cursor.clear();
         self.word_context.followed_by_separator = false;
@@ -1421,11 +1450,13 @@ mod tests {
             used_current_buffer: false,
             extra_backspaces: 1,
         };
+        let mut buffer = vec![stroke(Key::KEY_A)];
         let mut word_context = WordContext::default();
 
-        let replay = finalize_manual_correction(&mut word_context, &applied);
+        let replay = finalize_manual_correction(&mut buffer, &mut word_context, &applied);
 
         assert_eq!(replay, Some(Key::KEY_SPACE));
+        assert!(buffer.is_empty());
         assert!(word_context.valid);
         assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
         assert!(word_context.followed_by_separator);
@@ -1438,11 +1469,13 @@ mod tests {
             used_current_buffer: true,
             extra_backspaces: 0,
         };
+        let mut buffer = vec![stroke(Key::KEY_A), stroke(Key::KEY_B)];
         let mut word_context = WordContext::default();
 
-        let replay = finalize_manual_correction(&mut word_context, &applied);
+        let replay = finalize_manual_correction(&mut buffer, &mut word_context, &applied);
 
         assert_eq!(replay, None);
+        assert_eq!(buffer, applied.corrected_buffer);
         assert!(word_context.valid);
         assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
         assert!(!word_context.followed_by_separator);
@@ -1455,13 +1488,31 @@ mod tests {
             used_current_buffer: false,
             extra_backspaces: 1,
         };
+        let mut buffer = Vec::new();
         let mut word_context = WordContext::default();
 
-        finalize_manual_correction(&mut word_context, &applied);
+        finalize_manual_correction(&mut buffer, &mut word_context, &applied);
 
         assert!(word_context.valid);
         assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
         assert!(word_context.followed_by_separator);
+    }
+
+    #[test]
+    fn manual_current_word_correction_replaces_stale_active_buffer() {
+        let applied = AppliedManualCorrection {
+            corrected_buffer: vec![stroke(Key::KEY_H), stroke(Key::KEY_E), stroke(Key::KEY_L)],
+            used_current_buffer: true,
+            extra_backspaces: 0,
+        };
+        let mut buffer = vec![stroke(Key::KEY_Q), stroke(Key::KEY_W), stroke(Key::KEY_E)];
+        let mut word_context = WordContext::default();
+
+        finalize_manual_correction(&mut buffer, &mut word_context, &applied);
+
+        assert_eq!(buffer, applied.corrected_buffer);
+        assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
+        assert!(!word_context.followed_by_separator);
     }
 
     #[test]
@@ -1502,5 +1553,43 @@ mod tests {
             preserved_separator_after_early_finish(None, Key::KEY_A, 1),
             None
         );
+    }
+
+    #[test]
+    fn manually_corrected_current_word_requires_plain_separator_commit() {
+        assert!(should_commit_manually_corrected_current_word(
+            true,
+            Key::KEY_SPACE,
+            3,
+        ));
+        assert!(should_commit_manually_corrected_current_word(
+            true,
+            Key::KEY_ENTER,
+            3,
+        ));
+        assert!(should_commit_manually_corrected_current_word(
+            true,
+            Key::KEY_TAB,
+            3,
+        ));
+    }
+
+    #[test]
+    fn manually_corrected_current_word_does_not_commit_without_separator_or_buffer() {
+        assert!(!should_commit_manually_corrected_current_word(
+            false,
+            Key::KEY_SPACE,
+            3,
+        ));
+        assert!(!should_commit_manually_corrected_current_word(
+            true,
+            Key::KEY_SPACE,
+            0,
+        ));
+        assert!(!should_commit_manually_corrected_current_word(
+            true,
+            Key::KEY_A,
+            3,
+        ));
     }
 }

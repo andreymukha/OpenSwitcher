@@ -72,12 +72,20 @@ struct VirtualKeyboardHandle {
 struct VirtualKeyboardWriter {
     handle: VirtualKeyboardHandle,
     join_handle: Option<JoinHandle<()>>,
+    completion_rx: mpsc::Receiver<ManualCurrentWordCompletion>,
+    next_request_id: u64,
 }
 
 enum WriterCommand {
     Shutdown,
     Fast(WriterFastCommand),
     Transaction(WriterTransaction),
+    DeferredManualCurrentWordCorrection {
+        request_id: u64,
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    },
 }
 
 #[derive(Clone)]
@@ -112,6 +120,19 @@ enum WriterTransaction {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManualCurrentWordCompletion {
+    pub request_id: u64,
+    pub outcome: ManualCurrentWordOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManualCurrentWordOutcome {
+    Succeeded(CorrectionPlan),
+    FailedBeforeMutation(String),
+    FailedAfterMutation(String),
+}
+
 struct GrabbedKeyboardDevice {
     path: PathBuf,
     device: Device,
@@ -121,12 +142,16 @@ struct GrabbedKeyboardDevice {
 struct PointerWatcher {
     click_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    required: bool,
     handle: Option<JoinHandle<()>>,
 }
 
 struct InputTargetWatcher {
     changed_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    required: bool,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -140,6 +165,23 @@ struct ActiveWindowMonitor {
     root: u32,
     active_window_atom: u32,
     current_window: Option<u32>,
+}
+
+struct WorkerAliveGuard {
+    alive: Arc<AtomicBool>,
+}
+
+impl WorkerAliveGuard {
+    fn new(alive: Arc<AtomicBool>) -> Self {
+        alive.store(true, Ordering::SeqCst);
+        Self { alive }
+    }
+}
+
+impl Drop for WorkerAliveGuard {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone, Default)]
@@ -344,16 +386,24 @@ impl KeyboardController {
         self.input_target_watcher.take_change_invalidation()
     }
 
-    pub fn shutdown(&mut self) {
-        self.virtual_device.stop();
-        self.pointer_watcher.stop();
-        self.input_target_watcher.stop();
+    pub fn release_grab_best_effort(&mut self) {
+        if !self.real_device.is_ready() {
+            return;
+        }
+
         if let Err(error) = self.real_device.release_grab() {
             log_input_debug("grab-release-error", &format!("error={error}"));
             eprintln!("[input] Не удалось освободить grab клавиатуры: {error}");
         } else {
             log_input_debug("grab-released", "keyboard grab released during shutdown");
         }
+    }
+
+    pub fn shutdown(&mut self) {
+        self.release_grab_best_effort();
+        self.virtual_device.stop();
+        self.pointer_watcher.stop();
+        self.input_target_watcher.stop();
     }
 
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
@@ -374,6 +424,25 @@ impl KeyboardController {
         self.virtual_device
             .handle()
             .apply_correction(plan.clone(), config.clone(), modifiers)
+    }
+
+    pub fn begin_manual_current_word_correction(
+        &mut self,
+        plan: &CorrectionPlan,
+        config: &RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    ) -> Result<u64, SwitcherError> {
+        self.virtual_device.begin_manual_current_word_correction(
+            plan.clone(),
+            config.clone(),
+            modifiers,
+        )
+    }
+
+    pub fn poll_manual_current_word_completion(
+        &mut self,
+    ) -> Result<Option<ManualCurrentWordCompletion>, SwitcherError> {
+        self.virtual_device.poll_manual_current_word_completion()
     }
 
     pub fn apply_same_layout_correction(
@@ -514,19 +583,24 @@ impl PointerWatcher {
     fn spawn(paths: Vec<PathBuf>) -> Self {
         let click_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
 
         if paths.is_empty() {
             log_input_debug("pointer-watcher-start", "devices=0 mode=disabled");
             return Self {
                 click_flag,
                 stop_flag,
+                alive,
+                required: false,
                 handle: None,
             };
         }
 
         let worker_click_flag = Arc::clone(&click_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
+        let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
+            let _alive_guard = WorkerAliveGuard::new(worker_alive);
             let mut devices = open_pointer_devices(paths);
             log_input_debug(
                 "pointer-watcher-start",
@@ -593,6 +667,8 @@ impl PointerWatcher {
         Self {
             click_flag,
             stop_flag,
+            alive,
+            required: true,
             handle: Some(handle),
         }
     }
@@ -603,13 +679,14 @@ impl PointerWatcher {
 
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        self.alive.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 
     fn is_ready(&self) -> bool {
-        !self.stop_flag.load(Ordering::SeqCst)
+        !self.required || self.alive.load(Ordering::SeqCst)
     }
 }
 
@@ -617,6 +694,7 @@ impl InputTargetWatcher {
     fn spawn() -> Self {
         let changed_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
 
         let session_type = detect_current_session_type();
         if !should_enable_x11_input_target_watcher(session_type) {
@@ -630,6 +708,8 @@ impl InputTargetWatcher {
             return Self {
                 changed_flag,
                 stop_flag,
+                alive,
+                required: false,
                 handle: None,
             };
         }
@@ -642,13 +722,17 @@ impl InputTargetWatcher {
             return Self {
                 changed_flag,
                 stop_flag,
+                alive,
+                required: true,
                 handle: None,
             };
         };
 
         let worker_changed_flag = Arc::clone(&changed_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
+        let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
+            let _alive_guard = WorkerAliveGuard::new(worker_alive);
             log_input_debug(
                 "input-target-watcher-start",
                 &format!(
@@ -697,6 +781,8 @@ impl InputTargetWatcher {
         Self {
             changed_flag,
             stop_flag,
+            alive,
+            required: true,
             handle: Some(handle),
         }
     }
@@ -707,13 +793,14 @@ impl InputTargetWatcher {
 
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        self.alive.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 
     fn is_ready(&self) -> bool {
-        !self.stop_flag.load(Ordering::SeqCst)
+        !self.required || self.alive.load(Ordering::SeqCst)
     }
 }
 
@@ -783,13 +870,14 @@ impl VirtualKeyboardWriter {
     fn new(name: &str) -> Result<Self, SwitcherError> {
         let device = create_virtual_keyboard(name)?;
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel();
         let alive = Arc::new(AtomicBool::new(true));
         let worker_alive = Arc::clone(&alive);
 
         let join_handle = thread::spawn(move || {
             log_input_debug("writer-start", "virtual keyboard writer thread started");
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_virtual_keyboard_writer_loop(device, command_rx)
+                run_virtual_keyboard_writer_loop(device, command_rx, completion_tx)
             }));
 
             match loop_result {
@@ -821,6 +909,8 @@ impl VirtualKeyboardWriter {
         Ok(Self {
             handle: VirtualKeyboardHandle { command_tx, alive },
             join_handle: Some(join_handle),
+            completion_rx,
+            next_request_id: 1,
         })
     }
 
@@ -829,12 +919,56 @@ impl VirtualKeyboardWriter {
     }
 
     fn stop(&mut self) {
-        if self.handle.alive.load(Ordering::SeqCst) {
+        if self.handle.alive.swap(false, Ordering::SeqCst) {
             let _ = self.handle.command_tx.send(WriterCommand::Shutdown);
         }
 
         if let Some(join_handle) = self.join_handle.take() {
             let _ = join_handle.join();
+        }
+    }
+
+    fn begin_manual_current_word_correction(
+        &mut self,
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+    ) -> Result<u64, SwitcherError> {
+        self.handle.ensure_alive()?;
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        match self
+            .handle
+            .command_tx
+            .try_send(WriterCommand::DeferredManualCurrentWordCorrection {
+                request_id,
+                plan,
+                config,
+                modifiers,
+            })
+        {
+            Ok(()) => Ok(request_id),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+            }
+            Err(mpsc::TrySendError::Full(_)) => Err(SwitcherError::VirtualKeyboardWriterSaturated),
+        }
+    }
+
+    fn poll_manual_current_word_completion(
+        &mut self,
+    ) -> Result<Option<ManualCurrentWordCompletion>, SwitcherError> {
+        match self.completion_rx.try_recv() {
+            Ok(completion) => Ok(Some(completion)),
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                if self.handle.is_alive() {
+                    Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+                } else {
+                    Ok(None)
+                }
+            }
         }
     }
 }
@@ -1685,6 +1819,7 @@ fn run_correction(
 fn run_virtual_keyboard_writer_loop(
     mut device: uinput::Device,
     command_rx: mpsc::Receiver<WriterCommand>,
+    completion_tx: mpsc::Sender<ManualCurrentWordCompletion>,
 ) -> Result<(), SwitcherError> {
     let session_type = detect_current_session_type();
     let mut x11_switcher =
@@ -1707,6 +1842,40 @@ fn run_virtual_keyboard_writer_loop(
                     device.synchronize()?;
                 }
             },
+            WriterCommand::DeferredManualCurrentWordCorrection {
+                request_id,
+                plan,
+                config,
+                modifiers,
+            } => {
+                let started = Instant::now();
+                let result = run_correction(
+                    &mut device,
+                    &plan,
+                    &config,
+                    modifiers,
+                    &mut x11_switcher,
+                    true,
+                );
+                let outcome = match result {
+                    Ok(()) => ManualCurrentWordOutcome::Succeeded(plan),
+                    Err(error) => {
+                        log_input_debug(
+                            "manual-current-word-writer-error",
+                            &format!(
+                                "request_id={} elapsed_ms={} error={error}",
+                                request_id,
+                                started.elapsed().as_millis(),
+                            ),
+                        );
+                        ManualCurrentWordOutcome::FailedAfterMutation(error.to_string())
+                    }
+                };
+                let _ = completion_tx.send(ManualCurrentWordCompletion {
+                    request_id,
+                    outcome,
+                });
+            }
             WriterCommand::Transaction(transaction) => match transaction {
                 WriterTransaction::Execute { kind, reply } => {
                     let result = match kind {
@@ -1796,6 +1965,9 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::thread;
 
     fn pressed(keys: &[(Key, i32)]) -> ModifierState {
         let mut state = ModifierState::default();
@@ -1803,6 +1975,20 @@ mod tests {
             state.update(*key, *value);
         }
         state
+    }
+
+    fn test_runtime_config_snapshot() -> RuntimeConfigSnapshot {
+        RuntimeConfigSnapshot {
+            auto_switch_enabled: true,
+            fix_two_capitals: true,
+            fix_accidental_caps_lock: true,
+            layout_switch_combo: LayoutSwitchCombo::AltShift,
+            layout_delay_ms: 0,
+            backspace_ms: 0,
+            typing_ms: 0,
+            undo_key: UndoKey::Pause,
+            selected_text_hotkey: crate::model::SelectedTextHotkey::default(),
+        }
     }
 
     #[test]
@@ -1944,6 +2130,182 @@ mod tests {
             init_called.get(),
             "X11 session should attempt X11 init before falling back to uinput"
         );
+    }
+
+    #[test]
+    fn writer_stop_marks_alive_false_before_blocking_shutdown_completes() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
+                key: Key::KEY_SPACE,
+            }))
+            .expect("queue should accept initial command");
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: alive.clone(),
+            },
+            join_handle: Some(thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                drop(command_rx);
+            })),
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+        };
+
+        let stopper = thread::spawn(move || {
+            let mut writer = writer;
+            writer.stop();
+        });
+
+        thread::sleep(Duration::from_millis(5));
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "writer must stop advertising itself as alive immediately on teardown"
+        );
+
+        stopper.join().expect("stop thread should finish");
+    }
+
+    #[test]
+    fn pointer_watcher_readiness_is_true_when_disabled_by_policy() {
+        let watcher = PointerWatcher {
+            click_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            required: false,
+            handle: None,
+        };
+
+        assert!(watcher.is_ready());
+    }
+
+    #[test]
+    fn pointer_watcher_readiness_is_false_when_required_thread_is_dead() {
+        let watcher = PointerWatcher {
+            click_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            required: true,
+            handle: None,
+        };
+
+        assert!(!watcher.is_ready());
+    }
+
+    #[test]
+    fn input_target_watcher_readiness_is_true_when_disabled_by_policy() {
+        let watcher = InputTargetWatcher {
+            changed_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            required: false,
+            handle: None,
+        };
+
+        assert!(watcher.is_ready());
+    }
+
+    #[test]
+    fn input_target_watcher_readiness_is_false_when_required_thread_is_dead() {
+        let watcher = InputTargetWatcher {
+            changed_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            required: true,
+            handle: None,
+        };
+
+        assert!(!watcher.is_ready());
+    }
+
+    #[test]
+    fn begin_manual_current_word_correction_returns_request_id_immediately() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _ = command_rx.recv();
+            })),
+            completion_rx,
+            next_request_id: 1,
+        };
+
+        let request_id = writer
+            .begin_manual_current_word_correction(
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .expect("begin should return immediately");
+
+        assert_eq!(request_id, 1);
+    }
+
+    #[test]
+    fn poll_manual_current_word_completion_returns_none_before_worker_finishes() {
+        let (_command_tx, _command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx: _command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+        };
+
+        let completion = writer
+            .poll_manual_current_word_completion()
+            .expect("poll should not fail");
+
+        assert!(completion.is_none());
+    }
+
+    #[test]
+    fn poll_manual_current_word_completion_returns_success_for_matching_request() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 2,
+        };
+
+        completion_tx
+            .send(ManualCurrentWordCompletion {
+                request_id: 7,
+                outcome: ManualCurrentWordOutcome::Succeeded(CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                }),
+            })
+            .expect("completion send should succeed");
+
+        let completion = writer
+            .poll_manual_current_word_completion()
+            .expect("poll should succeed")
+            .expect("completion should be ready");
+
+        assert_eq!(completion.request_id, 7);
+        assert!(matches!(
+            completion.outcome,
+            ManualCurrentWordOutcome::Succeeded(_)
+        ));
     }
 
 }

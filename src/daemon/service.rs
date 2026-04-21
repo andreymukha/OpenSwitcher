@@ -3,7 +3,8 @@ use crate::daemon::input_backend::{
 };
 use crate::daemon::keyboard::{
     is_character, is_modifier, log_input_debug, undo_key_to_evdev_key, KeyboardController,
-    ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
+    ManualCurrentWordCompletion, ManualCurrentWordOutcome, ModifierState, SharedModifierState,
+    INPUT_EVENT_WAIT_TIMEOUT,
 };
 use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
@@ -15,15 +16,18 @@ use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed}
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
 use evdev::InputEventKind;
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use zbus::blocking::Connection;
 
 const EVENT_LOOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_LOOP_HEARTBEAT_EVENTS: u64 = 500;
 const STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS: u8 = 3;
+const MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_DEFERRED_MANUAL_INPUT_EVENTS: usize = 256;
 
-#[derive(Default)]
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct WordContext {
     valid: bool,
     word_before_cursor: Vec<Keystroke>,
@@ -62,6 +66,64 @@ struct AppliedManualCorrection {
     corrected_buffer: Vec<Keystroke>,
     used_current_buffer: bool,
     extra_backspaces: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedManualCorrection {
+    plan: CorrectionPlan,
+    used_current_buffer: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputOrigin {
+    Physical,
+    DeferredReplay,
+    DeferredRetry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeferredInputEvent {
+    key: evdev::Key,
+    value: i32,
+    timestamp: SystemTime,
+}
+
+#[derive(Clone, Debug)]
+struct DeferredManualCurrentWordSession {
+    request_id: u64,
+    undo_key: evdev::Key,
+    snapshot_buffer: Vec<Keystroke>,
+    snapshot_word_context: WordContext,
+    snapshot_current_word_correction_state: CurrentWordCorrectionState,
+    snapshot_manual_hotkey_latch: Option<ManualHotkeyLatch>,
+    _frozen_modifiers: ModifierState,
+    deferred_input: VecDeque<DeferredInputEvent>,
+    seen_real_next_step: bool,
+    retry_after_drain_requested: bool,
+    started_at: Instant,
+    drained_events: usize,
+}
+
+#[derive(Clone, Debug)]
+enum ManualCurrentWordFlow {
+    Idle,
+    InFlight { session: DeferredManualCurrentWordSession },
+    DrainingDeferredInput { session: DeferredManualCurrentWordSession },
+}
+
+fn deferred_manual_current_word_flow_label(flow: &ManualCurrentWordFlow) -> &'static str {
+    match flow {
+        ManualCurrentWordFlow::Idle => "idle",
+        ManualCurrentWordFlow::InFlight { .. } => "in-flight",
+        ManualCurrentWordFlow::DrainingDeferredInput { .. } => "draining",
+    }
+}
+
+fn should_restart_manual_current_word_after_drain(
+    deferred_len: usize,
+    retry_after_drain_requested: bool,
+) -> bool {
+    deferred_len == 0 && retry_after_drain_requested
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,10 +268,95 @@ enum CurrentWordCorrectionState {
     ManuallyCorrected,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ManualHotkeyLatch {
+    key: evdev::Key,
+    armed_at: SystemTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManualCurrentWordPhysicalEventAction {
+    ProcessImmediately,
+    Swallow,
+    RequestRetryAfterDrain,
+    Enqueue { marks_real_next_step: bool },
+}
+
 fn next_current_word_state_after_plain_character_input(
     current_word_correction_state: CurrentWordCorrectionState,
 ) -> CurrentWordCorrectionState {
     current_word_correction_state
+}
+
+fn should_swallow_manual_hotkey_latched_event(
+    manual_hotkey_latch: Option<ManualHotkeyLatch>,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    manual_hotkey_latch.is_some_and(|latch| latch.key == key) && matches!(value, 0..=2)
+}
+
+fn should_swallow_suppressed_undo_release(
+    suppressed_undo_key: Option<evdev::Key>,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    suppressed_undo_key == Some(key) && value == 0
+}
+
+fn manual_current_word_physical_event_action(
+    flow_active: bool,
+    undo_key: evdev::Key,
+    seen_real_next_step: bool,
+    key: evdev::Key,
+    value: i32,
+    origin: InputOrigin,
+) -> ManualCurrentWordPhysicalEventAction {
+    if !flow_active || !matches!(origin, InputOrigin::Physical) {
+        return ManualCurrentWordPhysicalEventAction::ProcessImmediately;
+    }
+
+    if key == undo_key && matches!(value, 0..=2) {
+        if value == 1 && seen_real_next_step {
+            return ManualCurrentWordPhysicalEventAction::RequestRetryAfterDrain;
+        }
+        return ManualCurrentWordPhysicalEventAction::Swallow;
+    }
+
+    ManualCurrentWordPhysicalEventAction::Enqueue {
+        marks_real_next_step: value == 1 && key != undo_key && !is_modifier(key),
+    }
+}
+
+fn should_clear_manual_hotkey_latch_on_key_press(
+    manual_hotkey_latch: Option<ManualHotkeyLatch>,
+    undo_key: evdev::Key,
+    key: evdev::Key,
+    value: i32,
+    event_timestamp: SystemTime,
+) -> bool {
+    manual_hotkey_latch.is_some_and(|latch| {
+        value == 1
+            && key != undo_key
+            && !is_modifier(key)
+            && event_timestamp > latch.armed_at
+    })
+}
+
+fn next_manual_hotkey_latch_after_manual_correction(
+    undo_key: evdev::Key,
+    correction_path: CorrectionPath,
+    used_current_buffer: bool,
+    armed_at: SystemTime,
+) -> Option<ManualHotkeyLatch> {
+    if matches!(correction_path, CorrectionPath::ManualHotkey) && used_current_buffer {
+        Some(ManualHotkeyLatch {
+            key: undo_key,
+            armed_at,
+        })
+    } else {
+        None
+    }
 }
 
 fn update_word_context_after_manual_correction(
@@ -246,6 +393,39 @@ fn finalize_manual_correction(
     manual_separator_replay_key(applied.used_current_buffer, applied.extra_backspaces)
 }
 
+fn should_abort_manual_current_word_flow_on_queue_overflow(
+    deferred_len: usize,
+    limit: usize,
+) -> bool {
+    deferred_len >= limit
+}
+
+fn take_deferred_input_for_new_manual_current_word_session(
+    flow: &mut ManualCurrentWordFlow,
+    origin: InputOrigin,
+) -> VecDeque<DeferredInputEvent> {
+    match (flow, origin) {
+        (
+            ManualCurrentWordFlow::DrainingDeferredInput { session },
+            InputOrigin::DeferredReplay,
+        ) => std::mem::take(&mut session.deferred_input),
+        _ => VecDeque::new(),
+    }
+}
+
+fn restore_manual_current_word_snapshot_state(
+    buffer: &mut Vec<Keystroke>,
+    word_context: &mut WordContext,
+    current_word_correction_state: &mut CurrentWordCorrectionState,
+    manual_hotkey_latch: &mut Option<ManualHotkeyLatch>,
+    session: &DeferredManualCurrentWordSession,
+) {
+    *buffer = session.snapshot_buffer.clone();
+    *word_context = session.snapshot_word_context.clone();
+    *current_word_correction_state = session.snapshot_current_word_correction_state;
+    *manual_hotkey_latch = session.snapshot_manual_hotkey_latch;
+}
+
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
     connection: Connection,
@@ -259,6 +439,8 @@ pub struct DaemonService {
     selected_text_runner: Option<SelectedTextJobRunner>,
     suppressed_hotkey_key: Option<evdev::Key>,
     suppressed_undo_key: Option<evdev::Key>,
+    manual_hotkey_latch: Option<ManualHotkeyLatch>,
+    manual_current_word_flow: ManualCurrentWordFlow,
     suppressed_separator_key: Option<evdev::Key>,
     layout_shortcut_latched: bool,
     pending_word_commit: Option<PendingWordCommit>,
@@ -282,6 +464,8 @@ impl DaemonService {
             selected_text_runner: None,
             suppressed_hotkey_key: None,
             suppressed_undo_key: None,
+            manual_hotkey_latch: None,
+            manual_current_word_flow: ManualCurrentWordFlow::Idle,
             suppressed_separator_key: None,
             layout_shortcut_latched: false,
             pending_word_commit: None,
@@ -304,9 +488,11 @@ impl DaemonService {
             }
 
             self.maybe_retry_input_backend()?;
+            self.poll_manual_current_word_completion()?;
 
+            let fetch_timeout = self.event_fetch_timeout();
             let events = if let Some(keyboard) = self.keyboard.as_mut() {
-                match keyboard.fetch_events_timeout(INPUT_EVENT_WAIT_TIMEOUT) {
+                match keyboard.fetch_events_timeout(fetch_timeout) {
                     Ok(events) => events,
                     Err(error) => {
                         log_input_debug("keyboard-read-error", &format!("error={error}"));
@@ -331,11 +517,10 @@ impl DaemonService {
                 .as_ref()
                 .is_some_and(KeyboardController::take_input_target_invalidation)
             {
-                log_input_debug(
+                self.handle_non_key_invalidation(
                     "input-target-invalidation",
                     "word context invalidated by active input target change",
                 );
-                self.invalidate_word_context();
             }
 
             if self
@@ -343,16 +528,17 @@ impl DaemonService {
                 .as_ref()
                 .is_some_and(KeyboardController::take_pointer_click_invalidation)
             {
-                log_input_debug(
+                self.handle_non_key_invalidation(
                     "pointer-invalidation",
                     "word context invalidated by pointer click",
                 );
-                self.invalidate_word_context();
             }
 
             for event in events {
                 if let InputEventKind::Key(key) = event.kind() {
-                    if let Err(error) = self.handle_key_event(key, event.value()) {
+                    if let Err(error) =
+                        self.handle_key_event(key, event.value(), event.timestamp(), InputOrigin::Physical)
+                    {
                         log_input_debug(
                             "event-handler-error",
                             &format!("key={key:?} value={} error={error}", event.value()),
@@ -383,6 +569,8 @@ impl DaemonService {
                     }
                 }
             }
+
+            self.drain_one_deferred_input_event()?;
         }
     }
 
@@ -391,7 +579,249 @@ impl DaemonService {
         self.drop_active_input_backend();
     }
 
-    fn handle_key_event(&mut self, key: evdev::Key, value: i32) -> Result<(), SwitcherError> {
+    fn event_fetch_timeout(&self) -> Duration {
+        match self.manual_current_word_flow {
+            ManualCurrentWordFlow::Idle => INPUT_EVENT_WAIT_TIMEOUT,
+            ManualCurrentWordFlow::InFlight { .. } => MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT,
+            ManualCurrentWordFlow::DrainingDeferredInput { .. } => Duration::ZERO,
+        }
+    }
+
+    fn handle_non_key_invalidation(&mut self, stage: &str, message: &str) {
+        log_input_debug(stage, message);
+        if self.has_active_manual_current_word_flow() {
+            self.abort_manual_current_word_flow(stage);
+        } else {
+            self.invalidate_word_context();
+        }
+    }
+
+    fn has_active_manual_current_word_flow(&self) -> bool {
+        !matches!(self.manual_current_word_flow, ManualCurrentWordFlow::Idle)
+    }
+
+    fn poll_manual_current_word_completion(&mut self) -> Result<(), SwitcherError> {
+        let Some(keyboard) = self.keyboard.as_mut() else {
+            return Ok(());
+        };
+
+        let Some(completion) = keyboard.poll_manual_current_word_completion()? else {
+            return Ok(());
+        };
+
+        self.handle_manual_current_word_completion(completion)
+    }
+
+    fn handle_manual_current_word_completion(
+        &mut self,
+        completion: ManualCurrentWordCompletion,
+    ) -> Result<(), SwitcherError> {
+        let session = match std::mem::replace(
+            &mut self.manual_current_word_flow,
+            ManualCurrentWordFlow::Idle,
+        ) {
+            ManualCurrentWordFlow::InFlight { session } if session.request_id == completion.request_id => session,
+            other => {
+                self.manual_current_word_flow = other;
+                return Ok(());
+            }
+        };
+
+        match completion.outcome {
+            ManualCurrentWordOutcome::Succeeded(plan) => {
+                log_input_debug(
+                    "manual-current-word-completion",
+                    &format!(
+                        "request_id={} outcome=success elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} buffer_len={} extra_backspaces={}",
+                        completion.request_id,
+                        session.started_at.elapsed().as_millis(),
+                        session.deferred_input.len(),
+                        session.seen_real_next_step,
+                        session.retry_after_drain_requested,
+                        plan.buffer.len(),
+                        plan.extra_backspaces,
+                    ),
+                );
+                let applied = AppliedManualCorrection {
+                    corrected_buffer: plan.buffer,
+                    used_current_buffer: true,
+                    extra_backspaces: plan.extra_backspaces,
+                };
+                let _ = finalize_manual_correction(&mut self.buffer, &mut self.word_context, &applied);
+                self.current_word_correction_state = CurrentWordCorrectionState::ManuallyCorrected;
+                self.manual_hotkey_latch = None;
+                self.manual_current_word_flow =
+                    ManualCurrentWordFlow::DrainingDeferredInput { session };
+                Ok(())
+            }
+            ManualCurrentWordOutcome::FailedBeforeMutation(error) => {
+                log_input_debug(
+                    "manual-current-word-completion",
+                    &format!(
+                        "request_id={} outcome=failed-before-mutation elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} error={error}",
+                        completion.request_id,
+                        session.started_at.elapsed().as_millis(),
+                        session.deferred_input.len(),
+                        session.seen_real_next_step,
+                        session.retry_after_drain_requested,
+                    ),
+                );
+                self.restore_manual_current_word_snapshot(&session);
+                self.manual_current_word_flow =
+                    ManualCurrentWordFlow::DrainingDeferredInput { session };
+                Ok(())
+            }
+            ManualCurrentWordOutcome::FailedAfterMutation(error) => {
+                log_input_debug(
+                    "manual-current-word-completion",
+                    &format!(
+                        "request_id={} outcome=failed-after-mutation elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} error={error}",
+                        completion.request_id,
+                        session.started_at.elapsed().as_millis(),
+                        session.deferred_input.len(),
+                        session.seen_real_next_step,
+                        session.retry_after_drain_requested,
+                    ),
+                );
+                self.abort_manual_current_word_flow("manual-current-word-failed-after-mutation");
+                Ok(())
+            }
+        }
+    }
+
+    fn restore_manual_current_word_snapshot(
+        &mut self,
+        session: &DeferredManualCurrentWordSession,
+    ) {
+        restore_manual_current_word_snapshot_state(
+            &mut self.buffer,
+            &mut self.word_context,
+            &mut self.current_word_correction_state,
+            &mut self.manual_hotkey_latch,
+            session,
+        );
+    }
+
+    fn abort_manual_current_word_flow(&mut self, reason: &str) {
+        let flow = std::mem::replace(&mut self.manual_current_word_flow, ManualCurrentWordFlow::Idle);
+        let details = match &flow {
+            ManualCurrentWordFlow::InFlight { session }
+            | ManualCurrentWordFlow::DrainingDeferredInput { session } => format!(
+                "reason={reason} state={} request_id={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} drained_events={} elapsed_ms={}",
+                deferred_manual_current_word_flow_label(&flow),
+                session.request_id,
+                session.deferred_input.len(),
+                session.seen_real_next_step,
+                session.retry_after_drain_requested,
+                session.drained_events,
+                session.started_at.elapsed().as_millis(),
+            ),
+            ManualCurrentWordFlow::Idle => format!("reason={reason} state=idle"),
+        };
+        log_input_debug("manual-current-word-abort", &details);
+        self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
+        self.reset_transient_input_state(reason);
+    }
+
+    fn drain_one_deferred_input_event(&mut self) -> Result<(), SwitcherError> {
+        let event = match &mut self.manual_current_word_flow {
+            ManualCurrentWordFlow::DrainingDeferredInput { session } => {
+                let event = session.deferred_input.pop_front();
+                if event.is_some() {
+                    session.drained_events += 1;
+                }
+                event
+            }
+            _ => None,
+        };
+
+        let Some(event) = event else {
+            if let ManualCurrentWordFlow::DrainingDeferredInput { session } = &self.manual_current_word_flow {
+                if should_restart_manual_current_word_after_drain(
+                    session.deferred_input.len(),
+                    session.retry_after_drain_requested,
+                ) {
+                    let undo_key = session.undo_key;
+                    self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
+                    let config = self.runtime.config_snapshot()?;
+                    if self.begin_deferred_manual_current_word_correction(
+                        undo_key,
+                        &config,
+                        InputOrigin::DeferredRetry,
+                    )? {
+                        return Ok(());
+                    }
+                }
+                self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
+            }
+            return Ok(());
+        };
+
+        self.handle_key_event(event.key, event.value, event.timestamp, InputOrigin::DeferredReplay)
+    }
+
+    fn manual_current_word_flow_seen_real_next_step(&self) -> bool {
+        match &self.manual_current_word_flow {
+            ManualCurrentWordFlow::InFlight { session }
+            | ManualCurrentWordFlow::DrainingDeferredInput { session } => session.seen_real_next_step,
+            ManualCurrentWordFlow::Idle => false,
+        }
+    }
+
+    fn enqueue_deferred_physical_input_event(
+        &mut self,
+        key: evdev::Key,
+        value: i32,
+        event_timestamp: SystemTime,
+        marks_real_next_step: bool,
+    ) -> Result<(), SwitcherError> {
+        let session = match &mut self.manual_current_word_flow {
+            ManualCurrentWordFlow::InFlight { session } => session,
+            ManualCurrentWordFlow::DrainingDeferredInput { session } => session,
+            ManualCurrentWordFlow::Idle => return Ok(()),
+        };
+
+        if marks_real_next_step {
+            session.seen_real_next_step = true;
+        }
+
+        if should_abort_manual_current_word_flow_on_queue_overflow(
+            session.deferred_input.len(),
+            MAX_DEFERRED_MANUAL_INPUT_EVENTS,
+        ) {
+            self.abort_manual_current_word_flow("manual-current-word-deferred-overflow");
+            return Ok(());
+        }
+
+        session.deferred_input.push_back(DeferredInputEvent {
+            key,
+            value,
+            timestamp: event_timestamp,
+        });
+        Ok(())
+    }
+
+    fn request_manual_current_word_retry_after_drain(&mut self, _key: evdev::Key) {
+        let session = match &mut self.manual_current_word_flow {
+            ManualCurrentWordFlow::InFlight { session } => session,
+            ManualCurrentWordFlow::DrainingDeferredInput { session } => session,
+            ManualCurrentWordFlow::Idle => return,
+        };
+
+        if session.retry_after_drain_requested {
+            return;
+        }
+
+        session.retry_after_drain_requested = true;
+    }
+
+    fn handle_key_event(
+        &mut self,
+        key: evdev::Key,
+        value: i32,
+        event_timestamp: SystemTime,
+        origin: InputOrigin,
+    ) -> Result<(), SwitcherError> {
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
@@ -400,11 +830,43 @@ impl DaemonService {
             return Ok(());
         }
 
+        if should_swallow_suppressed_undo_release(self.suppressed_undo_key, key, value) {
+            self.suppressed_undo_key = None;
+            return Ok(());
+        }
+
         if self.suppressed_undo_key == Some(key) {
             if value == 0 {
                 self.suppressed_undo_key = None;
             }
             return Ok(());
+        }
+
+        match manual_current_word_physical_event_action(
+            self.has_active_manual_current_word_flow(),
+            undo_key_to_evdev_key(self.runtime.config_snapshot()?.undo_key),
+            self.manual_current_word_flow_seen_real_next_step(),
+            key,
+            value,
+            origin,
+        ) {
+            ManualCurrentWordPhysicalEventAction::ProcessImmediately => {}
+            ManualCurrentWordPhysicalEventAction::Swallow => return Ok(()),
+            ManualCurrentWordPhysicalEventAction::RequestRetryAfterDrain => {
+                self.request_manual_current_word_retry_after_drain(key);
+                return Ok(());
+            }
+            ManualCurrentWordPhysicalEventAction::Enqueue {
+                marks_real_next_step,
+            } => {
+                self.enqueue_deferred_physical_input_event(
+                    key,
+                    value,
+                    event_timestamp,
+                    marks_real_next_step,
+                )?;
+                return Ok(());
+            }
         }
 
         if should_swallow_suppressed_separator_release(self.suppressed_separator_key, key, value) {
@@ -486,6 +948,20 @@ impl DaemonService {
         }
 
         let undo_key = undo_key_to_evdev_key(config.undo_key);
+        if should_clear_manual_hotkey_latch_on_key_press(
+            self.manual_hotkey_latch,
+            undo_key,
+            key,
+            value,
+            event_timestamp,
+        ) {
+            self.manual_hotkey_latch = None;
+        }
+
+        if should_swallow_manual_hotkey_latched_event(self.manual_hotkey_latch, key, value) {
+            return Ok(());
+        }
+
         if value == 1 && self.pending_word_commit.is_some() && !is_modifier(key) {
             log_input_debug(
                 "pending-word-commit-take",
@@ -599,6 +1075,9 @@ impl DaemonService {
 
         if value == 1 && key == undo_key {
             self.suppressed_undo_key = Some(key);
+            if self.begin_deferred_manual_current_word_correction(undo_key, &config, origin)? {
+                return Ok(());
+            }
             let word_before_cursor = if self.can_correct_word_before_cursor() {
                 self.word_context.word_before_cursor.clone()
             } else {
@@ -646,6 +1125,12 @@ impl DaemonService {
                 } else {
                     CurrentWordCorrectionState::Raw
                 };
+                self.manual_hotkey_latch = next_manual_hotkey_latch_after_manual_correction(
+                    undo_key,
+                    CorrectionPath::ManualHotkey,
+                    applied.used_current_buffer,
+                    SystemTime::now(),
+                );
             }
             return Ok(());
         }
@@ -1038,6 +1523,28 @@ impl DaemonService {
         fallback_buffer: &[Keystroke],
         correction_path: CorrectionPath,
     ) -> Result<Option<AppliedManualCorrection>, SwitcherError> {
+        let Some(prepared) =
+            self.prepare_manual_correction(config, fallback_buffer, correction_path)?
+        else {
+            return Ok(None);
+        };
+        let modifiers = self.modifiers;
+        self.keyboard_mut()?
+            .apply_correction(&prepared.plan, config, modifiers)?;
+        self.finish_manual_correction_sync(config, correction_path)?;
+        Ok(Some(AppliedManualCorrection {
+            corrected_buffer: prepared.plan.buffer,
+            used_current_buffer: prepared.used_current_buffer,
+            extra_backspaces: prepared.plan.extra_backspaces,
+        }))
+    }
+
+    fn prepare_manual_correction(
+        &mut self,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+        fallback_buffer: &[Keystroke],
+        correction_path: CorrectionPath,
+    ) -> Result<Option<PreparedManualCorrection>, SwitcherError> {
         let features = self.runtime.feature_availability();
         if !features.manual_word_fix {
             return Ok(None);
@@ -1116,9 +1623,18 @@ impl DaemonService {
                 fallback_buffer.len(),
             ),
         );
-        let modifiers = self.modifiers;
-        self.keyboard_mut()?
-            .apply_correction(&plan, config, modifiers)?;
+        Ok(Some(PreparedManualCorrection {
+            plan,
+            used_current_buffer,
+        }))
+    }
+
+    fn finish_manual_correction_sync(
+        &mut self,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+        correction_path: CorrectionPath,
+    ) -> Result<(), SwitcherError> {
+        let cached_layout_before = self.runtime.current_layout_state();
         let post_correction_sync = self.runtime.sync_with_backend();
         let cached_layout_after = self.runtime.current_layout_state();
         let legacy_layout_after = self.runtime.current_layout();
@@ -1169,11 +1685,69 @@ impl DaemonService {
                 );
             }
         }
-        Ok(Some(AppliedManualCorrection {
-            corrected_buffer: plan.buffer,
-            used_current_buffer,
-            extra_backspaces: plan.extra_backspaces,
-        }))
+        Ok(())
+    }
+
+    fn begin_deferred_manual_current_word_correction(
+        &mut self,
+        undo_key: evdev::Key,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+        origin: InputOrigin,
+    ) -> Result<bool, SwitcherError> {
+        let Some(prepared) =
+            self.prepare_manual_correction(config, &[], CorrectionPath::ManualHotkey)?
+        else {
+            return Ok(false);
+        };
+
+        if !prepared.used_current_buffer {
+            return Ok(false);
+        }
+
+        let frozen_modifiers = self.modifiers;
+        let request_id = self.keyboard_mut()?.begin_manual_current_word_correction(
+            &prepared.plan,
+            config,
+            frozen_modifiers,
+        )?;
+        let deferred_input =
+            take_deferred_input_for_new_manual_current_word_session(
+                &mut self.manual_current_word_flow,
+                origin,
+            );
+        let carried_deferred_len = deferred_input.len();
+        log_input_debug(
+            "manual-current-word-inflight-start",
+            &format!(
+                "request_id={} origin={} undo_key={undo_key:?} buffer_len={} extra_backspaces={} carried_deferred_len={} modifiers={frozen_modifiers:?}",
+                request_id,
+                match origin {
+                    InputOrigin::Physical => "physical",
+                    InputOrigin::DeferredReplay => "deferred-replay",
+                    InputOrigin::DeferredRetry => "deferred-retry",
+                },
+                prepared.plan.buffer.len(),
+                prepared.plan.extra_backspaces,
+                carried_deferred_len,
+            ),
+        );
+        self.manual_current_word_flow = ManualCurrentWordFlow::InFlight {
+            session: DeferredManualCurrentWordSession {
+                request_id,
+                undo_key,
+                snapshot_buffer: self.buffer.clone(),
+                snapshot_word_context: self.word_context.clone(),
+                snapshot_current_word_correction_state: self.current_word_correction_state,
+                snapshot_manual_hotkey_latch: self.manual_hotkey_latch,
+                _frozen_modifiers: frozen_modifiers,
+                deferred_input,
+                seen_real_next_step: false,
+                retry_after_drain_requested: false,
+                started_at: Instant::now(),
+                drained_events: 0,
+            },
+        };
+        Ok(true)
     }
 
     fn publish_status_changed(&self) -> Result<(), SwitcherError> {
@@ -1242,8 +1816,12 @@ impl DaemonService {
 
     fn drop_active_input_backend(&mut self) {
         if let Some(mut keyboard) = self.keyboard.take() {
+            keyboard.release_grab_best_effort();
             keyboard.shutdown();
         }
+        // Selected-text jobs do not own the physical keyboard grab, so for this
+        // critical input-lock fix it is sufficient to drop the runner after
+        // keyboard control has already been returned to the user.
         self.selected_text_runner = None;
     }
 
@@ -1252,6 +1830,8 @@ impl DaemonService {
         self.invalidate_word_context();
         self.suppressed_hotkey_key = None;
         self.suppressed_undo_key = None;
+        self.manual_hotkey_latch = None;
+        self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
         self.suppressed_separator_key = None;
         self.layout_shortcut_latched = false;
         self.pending_word_commit = None;
@@ -1267,6 +1847,8 @@ impl DaemonService {
     fn invalidate_word_context(&mut self) {
         self.buffer.clear();
         self.current_word_correction_state = CurrentWordCorrectionState::Raw;
+        self.manual_hotkey_latch = None;
+        self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
         self.word_context.valid = false;
         self.word_context.word_before_cursor.clear();
         self.word_context.followed_by_separator = false;
@@ -1639,6 +2221,405 @@ mod tests {
             Key::KEY_SPACE,
             4,
         ));
+    }
+
+    #[test]
+    fn queued_pause_events_are_swallowed_while_manual_hotkey_is_latched() {
+        let latched_key = Some(ManualHotkeyLatch {
+            key: Key::KEY_PAUSE,
+            armed_at: SystemTime::UNIX_EPOCH,
+        });
+
+        assert!(should_swallow_manual_hotkey_latched_event(
+            latched_key,
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(should_swallow_manual_hotkey_latched_event(
+            latched_key,
+            Key::KEY_PAUSE,
+            0,
+        ));
+        assert!(should_swallow_manual_hotkey_latched_event(
+            latched_key,
+            Key::KEY_PAUSE,
+            2,
+        ));
+        assert!(!should_swallow_manual_hotkey_latched_event(
+            latched_key,
+            Key::KEY_A,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pause_then_letter_then_pause_clears_latch_and_allows_new_correction() {
+        let latched_key = Some(ManualHotkeyLatch {
+            key: Key::KEY_PAUSE,
+            armed_at: SystemTime::UNIX_EPOCH,
+        });
+
+        assert!(should_clear_manual_hotkey_latch_on_key_press(
+            latched_key,
+            Key::KEY_PAUSE,
+            Key::KEY_A,
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        ));
+
+        let latched_key = None::<ManualHotkeyLatch>;
+        assert!(!should_swallow_manual_hotkey_latched_event(
+            latched_key,
+            Key::KEY_PAUSE,
+            1,
+        ));
+    }
+
+    #[test]
+    fn pause_then_space_clears_latch_without_repeating_correction() {
+        assert!(should_clear_manual_hotkey_latch_on_key_press(
+            Some(ManualHotkeyLatch {
+                key: Key::KEY_PAUSE,
+                armed_at: SystemTime::UNIX_EPOCH,
+            }),
+            Key::KEY_PAUSE,
+            Key::KEY_SPACE,
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn previous_word_manual_correction_does_not_latch_hotkey() {
+        assert_eq!(
+            next_manual_hotkey_latch_after_manual_correction(
+                Key::KEY_PAUSE,
+                CorrectionPath::ManualHotkey,
+                false,
+                SystemTime::UNIX_EPOCH,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn pause_then_backspace_then_pause_clears_latch() {
+        assert!(should_clear_manual_hotkey_latch_on_key_press(
+            Some(ManualHotkeyLatch {
+                key: Key::KEY_PAUSE,
+                armed_at: SystemTime::UNIX_EPOCH,
+            }),
+            Key::KEY_PAUSE,
+            Key::KEY_BACKSPACE,
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn modifier_press_does_not_clear_manual_hotkey_latch() {
+        assert!(!should_clear_manual_hotkey_latch_on_key_press(
+            Some(ManualHotkeyLatch {
+                key: Key::KEY_PAUSE,
+                armed_at: SystemTime::UNIX_EPOCH,
+            }),
+            Key::KEY_PAUSE,
+            Key::KEY_LEFTSHIFT,
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn current_word_manual_correction_sets_hotkey_latch() {
+        assert_eq!(
+            next_manual_hotkey_latch_after_manual_correction(
+                Key::KEY_PAUSE,
+                CorrectionPath::ManualHotkey,
+                true,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+            ),
+            Some(ManualHotkeyLatch {
+                key: Key::KEY_PAUSE,
+                armed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(3),
+            }),
+        );
+    }
+
+    #[test]
+    fn queued_letter_from_during_correction_does_not_clear_latch() {
+        assert!(!should_clear_manual_hotkey_latch_on_key_press(
+            Some(ManualHotkeyLatch {
+                key: Key::KEY_PAUSE,
+                armed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+            }),
+            Key::KEY_PAUSE,
+            Key::KEY_A,
+            1,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(4),
+        ));
+    }
+
+    #[test]
+    fn initiating_pause_release_is_swallowed_by_suppressed_undo_key() {
+        assert!(should_swallow_suppressed_undo_release(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_PAUSE,
+            0,
+        ));
+        assert!(!should_swallow_suppressed_undo_release(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(!should_swallow_suppressed_undo_release(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_A,
+            0,
+        ));
+    }
+
+    #[test]
+    fn modifier_press_is_enqueued_without_marking_real_next_step_during_in_flight() {
+        assert_eq!(
+            manual_current_word_physical_event_action(
+                true,
+                Key::KEY_PAUSE,
+                false,
+                Key::KEY_LEFTSHIFT,
+                1,
+                InputOrigin::Physical,
+            ),
+            ManualCurrentWordPhysicalEventAction::Enqueue {
+                marks_real_next_step: false,
+            },
+        );
+    }
+
+    #[test]
+    fn ordinary_press_marks_real_next_step_when_enqueued_during_in_flight() {
+        assert_eq!(
+            manual_current_word_physical_event_action(
+                true,
+                Key::KEY_PAUSE,
+                false,
+                Key::KEY_A,
+                1,
+                InputOrigin::Physical,
+            ),
+            ManualCurrentWordPhysicalEventAction::Enqueue {
+                marks_real_next_step: true,
+            },
+        );
+    }
+
+    #[test]
+    fn pause_press_after_real_next_step_requests_retry_after_drain() {
+        assert_eq!(
+            manual_current_word_physical_event_action(
+                true,
+                Key::KEY_PAUSE,
+                true,
+                Key::KEY_PAUSE,
+                1,
+                InputOrigin::Physical,
+            ),
+            ManualCurrentWordPhysicalEventAction::RequestRetryAfterDrain,
+        );
+    }
+
+    #[test]
+    fn pause_release_after_real_next_step_is_still_swallowed() {
+        assert_eq!(
+            manual_current_word_physical_event_action(
+                true,
+                Key::KEY_PAUSE,
+                true,
+                Key::KEY_PAUSE,
+                0,
+                InputOrigin::Physical,
+            ),
+            ManualCurrentWordPhysicalEventAction::Swallow,
+        );
+    }
+
+    #[test]
+    fn deferred_replay_modifier_is_processed_immediately() {
+        assert_eq!(
+            manual_current_word_physical_event_action(
+                true,
+                Key::KEY_PAUSE,
+                false,
+                Key::KEY_LEFTSHIFT,
+                1,
+                InputOrigin::DeferredReplay,
+            ),
+            ManualCurrentWordPhysicalEventAction::ProcessImmediately,
+        );
+    }
+
+    #[test]
+    fn deferred_retry_origin_is_processed_immediately() {
+        assert_eq!(
+            manual_current_word_physical_event_action(
+                true,
+                Key::KEY_PAUSE,
+                true,
+                Key::KEY_PAUSE,
+                1,
+                InputOrigin::DeferredRetry,
+            ),
+            ManualCurrentWordPhysicalEventAction::ProcessImmediately,
+        );
+    }
+
+    #[test]
+    fn queue_overflow_policy_aborts_when_limit_is_reached() {
+        assert!(should_abort_manual_current_word_flow_on_queue_overflow(
+            MAX_DEFERRED_MANUAL_INPUT_EVENTS,
+            MAX_DEFERRED_MANUAL_INPUT_EVENTS,
+        ));
+        assert!(!should_abort_manual_current_word_flow_on_queue_overflow(
+            MAX_DEFERRED_MANUAL_INPUT_EVENTS - 1,
+            MAX_DEFERRED_MANUAL_INPUT_EVENTS,
+        ));
+    }
+
+    #[test]
+    fn drain_restart_requires_retry_request_and_empty_queue() {
+        assert!(should_restart_manual_current_word_after_drain(0, true));
+        assert!(!should_restart_manual_current_word_after_drain(1, true));
+        assert!(!should_restart_manual_current_word_after_drain(0, false));
+    }
+
+    #[test]
+    fn deferred_reentry_takes_remaining_tail_only_from_drain_replay() {
+        let mut flow = ManualCurrentWordFlow::DrainingDeferredInput {
+            session: DeferredManualCurrentWordSession {
+                request_id: 1,
+                undo_key: Key::KEY_PAUSE,
+                snapshot_buffer: vec![stroke(Key::KEY_A)],
+                snapshot_word_context: WordContext::default(),
+                snapshot_current_word_correction_state: CurrentWordCorrectionState::Raw,
+                snapshot_manual_hotkey_latch: None,
+                _frozen_modifiers: ModifierState::default(),
+                deferred_input: VecDeque::from([
+                    DeferredInputEvent {
+                        key: Key::KEY_SPACE,
+                        value: 1,
+                        timestamp: SystemTime::UNIX_EPOCH,
+                    },
+                    DeferredInputEvent {
+                        key: Key::KEY_B,
+                        value: 1,
+                        timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+                    },
+                ]),
+                seen_real_next_step: true,
+                retry_after_drain_requested: false,
+                started_at: Instant::now(),
+                drained_events: 0,
+            },
+        };
+
+        let tail =
+            take_deferred_input_for_new_manual_current_word_session(&mut flow, InputOrigin::DeferredReplay);
+
+        assert_eq!(tail.len(), 2);
+        match flow {
+            ManualCurrentWordFlow::DrainingDeferredInput { session } => {
+                assert!(session.deferred_input.is_empty());
+            }
+            _ => panic!("flow must stay in draining state while tail is extracted"),
+        }
+    }
+
+    #[test]
+    fn physical_origin_does_not_take_deferred_tail_for_reentry() {
+        let mut flow = ManualCurrentWordFlow::DrainingDeferredInput {
+            session: DeferredManualCurrentWordSession {
+                request_id: 1,
+                undo_key: Key::KEY_PAUSE,
+                snapshot_buffer: vec![stroke(Key::KEY_A)],
+                snapshot_word_context: WordContext::default(),
+                snapshot_current_word_correction_state: CurrentWordCorrectionState::Raw,
+                snapshot_manual_hotkey_latch: None,
+                _frozen_modifiers: ModifierState::default(),
+                deferred_input: VecDeque::from([DeferredInputEvent {
+                    key: Key::KEY_SPACE,
+                    value: 1,
+                    timestamp: SystemTime::UNIX_EPOCH,
+                }]),
+                seen_real_next_step: true,
+                retry_after_drain_requested: false,
+                started_at: Instant::now(),
+                drained_events: 0,
+            },
+        };
+
+        let tail =
+            take_deferred_input_for_new_manual_current_word_session(&mut flow, InputOrigin::Physical);
+
+        assert!(tail.is_empty());
+        match flow {
+            ManualCurrentWordFlow::DrainingDeferredInput { session } => {
+                assert_eq!(session.deferred_input.len(), 1);
+            }
+            _ => panic!("flow must stay in draining state"),
+        }
+    }
+
+    #[test]
+    fn failed_before_mutation_restores_full_snapshot_state() {
+        let mut buffer = vec![stroke(Key::KEY_Z)];
+        let mut word_context = WordContext {
+            valid: true,
+            word_before_cursor: vec![stroke(Key::KEY_Z)],
+            followed_by_separator: false,
+        };
+        let mut correction_state = CurrentWordCorrectionState::ManuallyCorrected;
+        let mut latch = Some(ManualHotkeyLatch {
+            key: Key::KEY_PAUSE,
+            armed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
+        });
+
+        let session = DeferredManualCurrentWordSession {
+            request_id: 7,
+            undo_key: Key::KEY_PAUSE,
+            snapshot_buffer: vec![stroke(Key::KEY_A), stroke(Key::KEY_B)],
+            snapshot_word_context: WordContext {
+                valid: true,
+                word_before_cursor: vec![stroke(Key::KEY_A)],
+                followed_by_separator: true,
+            },
+            snapshot_current_word_correction_state: CurrentWordCorrectionState::Raw,
+            snapshot_manual_hotkey_latch: Some(ManualHotkeyLatch {
+                key: Key::KEY_PAUSE,
+                armed_at: SystemTime::UNIX_EPOCH,
+            }),
+            _frozen_modifiers: ModifierState::default(),
+            deferred_input: VecDeque::new(),
+            seen_real_next_step: false,
+            retry_after_drain_requested: false,
+            started_at: Instant::now(),
+            drained_events: 0,
+        };
+
+        restore_manual_current_word_snapshot_state(
+            &mut buffer,
+            &mut word_context,
+            &mut correction_state,
+            &mut latch,
+            &session,
+        );
+
+        assert_eq!(buffer, session.snapshot_buffer);
+        assert_eq!(word_context, session.snapshot_word_context);
+        assert_eq!(
+            correction_state,
+            session.snapshot_current_word_correction_state
+        );
+        assert_eq!(latch, session.snapshot_manual_hotkey_latch);
     }
 
 }

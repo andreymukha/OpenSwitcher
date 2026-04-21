@@ -34,7 +34,6 @@ const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // are rare and correctness matters more than shaving a few microseconds there.
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputBackendReadiness {
     pub keyboard_open: bool,
@@ -1946,4 +1945,5 @@ mod tests {
             "X11 session should attempt X11 init before falling back to uinput"
         );
     }
+
 }

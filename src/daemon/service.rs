@@ -185,16 +185,31 @@ fn preserved_separator_after_early_finish(
 }
 
 fn should_commit_manually_corrected_current_word(
-    current_word_manually_corrected: bool,
+    current_word_correction_state: CurrentWordCorrectionState,
     key: evdev::Key,
     buffer_len: usize,
 ) -> bool {
-    current_word_manually_corrected
+    matches!(
+        current_word_correction_state,
+        CurrentWordCorrectionState::ManuallyCorrected
+    )
         && buffer_len > 0
         && matches!(
             key,
             evdev::Key::KEY_SPACE | evdev::Key::KEY_TAB | evdev::Key::KEY_ENTER
         )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CurrentWordCorrectionState {
+    Raw,
+    ManuallyCorrected,
+}
+
+fn next_current_word_state_after_plain_character_input(
+    current_word_correction_state: CurrentWordCorrectionState,
+) -> CurrentWordCorrectionState {
+    current_word_correction_state
 }
 
 fn update_word_context_after_manual_correction(
@@ -239,7 +254,7 @@ pub struct DaemonService {
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
     buffer: Vec<Keystroke>,
-    current_word_manually_corrected: bool,
+    current_word_correction_state: CurrentWordCorrectionState,
     word_context: WordContext,
     selected_text_runner: Option<SelectedTextJobRunner>,
     suppressed_hotkey_key: Option<evdev::Key>,
@@ -262,7 +277,7 @@ impl DaemonService {
             modifiers: ModifierState::default(),
             shared_modifiers,
             buffer: Vec::new(),
-            current_word_manually_corrected: false,
+            current_word_correction_state: CurrentWordCorrectionState::Raw,
             word_context: WordContext::default(),
             selected_text_runner: None,
             suppressed_hotkey_key: None,
@@ -626,7 +641,11 @@ impl DaemonService {
                         ),
                     );
                 }
-                self.current_word_manually_corrected = applied.used_current_buffer;
+                self.current_word_correction_state = if applied.used_current_buffer {
+                    CurrentWordCorrectionState::ManuallyCorrected
+                } else {
+                    CurrentWordCorrectionState::Raw
+                };
             }
             return Ok(());
         }
@@ -634,11 +653,11 @@ impl DaemonService {
         match key {
             evdev::Key::KEY_SPACE => {
                 if should_commit_manually_corrected_current_word(
-                    self.current_word_manually_corrected,
+                    self.current_word_correction_state,
                     key,
                     self.buffer.len(),
                 ) {
-                    self.current_word_manually_corrected = false;
+                    self.current_word_correction_state = CurrentWordCorrectionState::Raw;
                     self.word_context.valid = !self.buffer.is_empty();
                     self.word_context.word_before_cursor = self.buffer.clone();
                     self.word_context.followed_by_separator = true;
@@ -771,11 +790,11 @@ impl DaemonService {
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
                 if should_commit_manually_corrected_current_word(
-                    self.current_word_manually_corrected,
+                    self.current_word_correction_state,
                     key,
                     self.buffer.len(),
                 ) {
-                    self.current_word_manually_corrected = false;
+                    self.current_word_correction_state = CurrentWordCorrectionState::Raw;
                     self.invalidate_word_context();
                     return self.keyboard_mut()?.forward_event(key, value);
                 }
@@ -819,7 +838,7 @@ impl DaemonService {
                 self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_BACKSPACE => {
-                self.current_word_manually_corrected = false;
+                self.current_word_correction_state = CurrentWordCorrectionState::Raw;
                 if !self.buffer.is_empty() {
                     self.buffer.pop();
                 } else if self.word_context.valid && self.word_context.followed_by_separator {
@@ -841,7 +860,9 @@ impl DaemonService {
                     && !self.modifiers.is_meta_pressed();
 
                 if plain_character_input {
-                    self.current_word_manually_corrected = false;
+                    self.current_word_correction_state = next_current_word_state_after_plain_character_input(
+                        self.current_word_correction_state,
+                    );
                     // Once we are typing the current word again, the cursor is no longer
                     // "after a finished word". Keep only the active buffer state.
                     self.word_context.valid = true;
@@ -1245,7 +1266,7 @@ impl DaemonService {
 
     fn invalidate_word_context(&mut self) {
         self.buffer.clear();
-        self.current_word_manually_corrected = false;
+        self.current_word_correction_state = CurrentWordCorrectionState::Raw;
         self.word_context.valid = false;
         self.word_context.word_before_cursor.clear();
         self.word_context.followed_by_separator = false;
@@ -1558,17 +1579,17 @@ mod tests {
     #[test]
     fn manually_corrected_current_word_requires_plain_separator_commit() {
         assert!(should_commit_manually_corrected_current_word(
-            true,
+            CurrentWordCorrectionState::ManuallyCorrected,
             Key::KEY_SPACE,
             3,
         ));
         assert!(should_commit_manually_corrected_current_word(
-            true,
+            CurrentWordCorrectionState::ManuallyCorrected,
             Key::KEY_ENTER,
             3,
         ));
         assert!(should_commit_manually_corrected_current_word(
-            true,
+            CurrentWordCorrectionState::ManuallyCorrected,
             Key::KEY_TAB,
             3,
         ));
@@ -1577,19 +1598,47 @@ mod tests {
     #[test]
     fn manually_corrected_current_word_does_not_commit_without_separator_or_buffer() {
         assert!(!should_commit_manually_corrected_current_word(
-            false,
+            CurrentWordCorrectionState::Raw,
             Key::KEY_SPACE,
             3,
         ));
         assert!(!should_commit_manually_corrected_current_word(
-            true,
+            CurrentWordCorrectionState::ManuallyCorrected,
             Key::KEY_SPACE,
             0,
         ));
         assert!(!should_commit_manually_corrected_current_word(
-            true,
+            CurrentWordCorrectionState::ManuallyCorrected,
             Key::KEY_A,
             3,
         ));
     }
+
+    #[test]
+    fn manually_corrected_current_word_state_survives_plain_character_input() {
+        let state = next_current_word_state_after_plain_character_input(
+            CurrentWordCorrectionState::ManuallyCorrected,
+        );
+
+        assert_eq!(state, CurrentWordCorrectionState::ManuallyCorrected);
+        assert!(should_commit_manually_corrected_current_word(
+            state,
+            Key::KEY_SPACE,
+            4,
+        ));
+    }
+
+    #[test]
+    fn raw_current_word_state_stays_raw_after_plain_character_input() {
+        let state =
+            next_current_word_state_after_plain_character_input(CurrentWordCorrectionState::Raw);
+
+        assert_eq!(state, CurrentWordCorrectionState::Raw);
+        assert!(!should_commit_manually_corrected_current_word(
+            state,
+            Key::KEY_SPACE,
+            4,
+        ));
+    }
+
 }

@@ -178,7 +178,6 @@ struct WorkerAliveGuard {
 
 impl WorkerAliveGuard {
     fn new(alive: Arc<AtomicBool>) -> Self {
-        alive.store(true, Ordering::SeqCst);
         Self { alive }
     }
 }
@@ -668,6 +667,7 @@ impl PointerWatcher {
 
             log_input_debug("pointer-watcher-stop", "reason=shutdown");
         });
+        alive.store(true, Ordering::SeqCst);
 
         Self {
             click_flag,
@@ -782,6 +782,7 @@ impl InputTargetWatcher {
 
             log_input_debug("input-target-watcher-stop", "reason=shutdown");
         });
+        alive.store(true, Ordering::SeqCst);
 
         Self {
             changed_flag,
@@ -2205,6 +2206,19 @@ mod tests {
     }
 
     #[test]
+    fn pointer_watcher_readiness_is_true_immediately_after_successful_spawn() {
+        let watcher = PointerWatcher {
+            click_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(true)),
+            required: true,
+            handle: None,
+        };
+
+        assert!(watcher.is_ready());
+    }
+
+    #[test]
     fn input_target_watcher_readiness_is_true_when_disabled_by_policy() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
@@ -2228,6 +2242,19 @@ mod tests {
         };
 
         assert!(!watcher.is_ready());
+    }
+
+    #[test]
+    fn input_target_watcher_readiness_is_true_immediately_after_successful_spawn() {
+        let watcher = InputTargetWatcher {
+            changed_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(true)),
+            required: true,
+            handle: None,
+        };
+
+        assert!(watcher.is_ready());
     }
 
     #[test]

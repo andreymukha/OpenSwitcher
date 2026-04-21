@@ -3,8 +3,8 @@ use crate::daemon::input_backend::{
 };
 use crate::daemon::keyboard::{
     is_character, is_modifier, log_input_debug, undo_key_to_evdev_key, KeyboardController,
-    ManualCurrentWordCompletion, ManualCurrentWordOutcome, ModifierState, SharedModifierState,
-    INPUT_EVENT_WAIT_TIMEOUT,
+    ManualCurrentWordCompletion, ManualCurrentWordOutcome, ManualCurrentWordStartOutcome,
+    ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
 };
 use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
@@ -92,10 +92,6 @@ struct DeferredInputEvent {
 struct DeferredManualCurrentWordSession {
     request_id: u64,
     undo_key: evdev::Key,
-    snapshot_buffer: Vec<Keystroke>,
-    snapshot_word_context: WordContext,
-    snapshot_current_word_correction_state: CurrentWordCorrectionState,
-    snapshot_manual_hotkey_latch: Option<ManualHotkeyLatch>,
     _frozen_modifiers: ModifierState,
     deferred_input: VecDeque<DeferredInputEvent>,
     seen_real_next_step: bool,
@@ -400,30 +396,18 @@ fn should_abort_manual_current_word_flow_on_queue_overflow(
     deferred_len >= limit
 }
 
-fn take_deferred_input_for_new_manual_current_word_session(
-    flow: &mut ManualCurrentWordFlow,
-    origin: InputOrigin,
-) -> VecDeque<DeferredInputEvent> {
-    match (flow, origin) {
-        (
-            ManualCurrentWordFlow::DrainingDeferredInput { session },
-            InputOrigin::DeferredReplay,
-        ) => std::mem::take(&mut session.deferred_input),
-        _ => VecDeque::new(),
-    }
-}
-
-fn restore_manual_current_word_snapshot_state(
+fn clear_word_context_state(
     buffer: &mut Vec<Keystroke>,
     word_context: &mut WordContext,
     current_word_correction_state: &mut CurrentWordCorrectionState,
     manual_hotkey_latch: &mut Option<ManualHotkeyLatch>,
-    session: &DeferredManualCurrentWordSession,
 ) {
-    *buffer = session.snapshot_buffer.clone();
-    *word_context = session.snapshot_word_context.clone();
-    *current_word_correction_state = session.snapshot_current_word_correction_state;
-    *manual_hotkey_latch = session.snapshot_manual_hotkey_latch;
+    buffer.clear();
+    *current_word_correction_state = CurrentWordCorrectionState::Raw;
+    *manual_hotkey_latch = None;
+    word_context.valid = false;
+    word_context.word_before_cursor.clear();
+    word_context.followed_by_separator = false;
 }
 
 pub struct DaemonService {
@@ -654,23 +638,6 @@ impl DaemonService {
                     ManualCurrentWordFlow::DrainingDeferredInput { session };
                 Ok(())
             }
-            ManualCurrentWordOutcome::FailedBeforeMutation(error) => {
-                log_input_debug(
-                    "manual-current-word-completion",
-                    &format!(
-                        "request_id={} outcome=failed-before-mutation elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} error={error}",
-                        completion.request_id,
-                        session.started_at.elapsed().as_millis(),
-                        session.deferred_input.len(),
-                        session.seen_real_next_step,
-                        session.retry_after_drain_requested,
-                    ),
-                );
-                self.restore_manual_current_word_snapshot(&session);
-                self.manual_current_word_flow =
-                    ManualCurrentWordFlow::DrainingDeferredInput { session };
-                Ok(())
-            }
             ManualCurrentWordOutcome::FailedAfterMutation(error) => {
                 log_input_debug(
                     "manual-current-word-completion",
@@ -687,19 +654,6 @@ impl DaemonService {
                 Ok(())
             }
         }
-    }
-
-    fn restore_manual_current_word_snapshot(
-        &mut self,
-        session: &DeferredManualCurrentWordSession,
-    ) {
-        restore_manual_current_word_snapshot_state(
-            &mut self.buffer,
-            &mut self.word_context,
-            &mut self.current_word_correction_state,
-            &mut self.manual_hotkey_latch,
-            session,
-        );
     }
 
     fn abort_manual_current_word_flow(&mut self, reason: &str) {
@@ -1705,16 +1659,31 @@ impl DaemonService {
         }
 
         let frozen_modifiers = self.modifiers;
-        let request_id = self.keyboard_mut()?.begin_manual_current_word_correction(
+        let start_outcome = self.keyboard_mut()?.begin_manual_current_word_correction(
             &prepared.plan,
             config,
             frozen_modifiers,
         )?;
-        let deferred_input =
-            take_deferred_input_for_new_manual_current_word_session(
-                &mut self.manual_current_word_flow,
-                origin,
-            );
+        let request_id = match start_outcome {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            ManualCurrentWordStartOutcome::RejectedBeforeMutation(reason) => {
+                log_input_debug(
+                    "manual-current-word-start-rejected",
+                    &format!(
+                        "reason={reason} origin={} buffer_len={} extra_backspaces={}",
+                        match origin {
+                            InputOrigin::Physical => "physical",
+                            InputOrigin::DeferredReplay => "deferred-replay",
+                            InputOrigin::DeferredRetry => "deferred-retry",
+                        },
+                        prepared.plan.buffer.len(),
+                        prepared.plan.extra_backspaces,
+                    ),
+                );
+                return Ok(true);
+            }
+        };
+        let deferred_input = VecDeque::new();
         let carried_deferred_len = deferred_input.len();
         log_input_debug(
             "manual-current-word-inflight-start",
@@ -1735,10 +1704,6 @@ impl DaemonService {
             session: DeferredManualCurrentWordSession {
                 request_id,
                 undo_key,
-                snapshot_buffer: self.buffer.clone(),
-                snapshot_word_context: self.word_context.clone(),
-                snapshot_current_word_correction_state: self.current_word_correction_state,
-                snapshot_manual_hotkey_latch: self.manual_hotkey_latch,
                 _frozen_modifiers: frozen_modifiers,
                 deferred_input,
                 seen_real_next_step: false,
@@ -1827,7 +1792,12 @@ impl DaemonService {
 
     fn reset_transient_input_state(&mut self, reason: &str) {
         log_input_debug("transient-input-reset", &format!("reason={reason}"));
-        self.invalidate_word_context();
+        clear_word_context_state(
+            &mut self.buffer,
+            &mut self.word_context,
+            &mut self.current_word_correction_state,
+            &mut self.manual_hotkey_latch,
+        );
         self.suppressed_hotkey_key = None;
         self.suppressed_undo_key = None;
         self.manual_hotkey_latch = None;
@@ -1845,13 +1815,12 @@ impl DaemonService {
     }
 
     fn invalidate_word_context(&mut self) {
-        self.buffer.clear();
-        self.current_word_correction_state = CurrentWordCorrectionState::Raw;
-        self.manual_hotkey_latch = None;
-        self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
-        self.word_context.valid = false;
-        self.word_context.word_before_cursor.clear();
-        self.word_context.followed_by_separator = false;
+        clear_word_context_state(
+            &mut self.buffer,
+            &mut self.word_context,
+            &mut self.current_word_correction_state,
+            &mut self.manual_hotkey_latch,
+        );
     }
 
     fn can_correct_word_before_cursor(&self) -> bool {
@@ -2493,89 +2462,12 @@ mod tests {
     }
 
     #[test]
-    fn deferred_reentry_takes_remaining_tail_only_from_drain_replay() {
-        let mut flow = ManualCurrentWordFlow::DrainingDeferredInput {
-            session: DeferredManualCurrentWordSession {
-                request_id: 1,
-                undo_key: Key::KEY_PAUSE,
-                snapshot_buffer: vec![stroke(Key::KEY_A)],
-                snapshot_word_context: WordContext::default(),
-                snapshot_current_word_correction_state: CurrentWordCorrectionState::Raw,
-                snapshot_manual_hotkey_latch: None,
-                _frozen_modifiers: ModifierState::default(),
-                deferred_input: VecDeque::from([
-                    DeferredInputEvent {
-                        key: Key::KEY_SPACE,
-                        value: 1,
-                        timestamp: SystemTime::UNIX_EPOCH,
-                    },
-                    DeferredInputEvent {
-                        key: Key::KEY_B,
-                        value: 1,
-                        timestamp: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-                    },
-                ]),
-                seen_real_next_step: true,
-                retry_after_drain_requested: false,
-                started_at: Instant::now(),
-                drained_events: 0,
-            },
-        };
-
-        let tail =
-            take_deferred_input_for_new_manual_current_word_session(&mut flow, InputOrigin::DeferredReplay);
-
-        assert_eq!(tail.len(), 2);
-        match flow {
-            ManualCurrentWordFlow::DrainingDeferredInput { session } => {
-                assert!(session.deferred_input.is_empty());
-            }
-            _ => panic!("flow must stay in draining state while tail is extracted"),
-        }
-    }
-
-    #[test]
-    fn physical_origin_does_not_take_deferred_tail_for_reentry() {
-        let mut flow = ManualCurrentWordFlow::DrainingDeferredInput {
-            session: DeferredManualCurrentWordSession {
-                request_id: 1,
-                undo_key: Key::KEY_PAUSE,
-                snapshot_buffer: vec![stroke(Key::KEY_A)],
-                snapshot_word_context: WordContext::default(),
-                snapshot_current_word_correction_state: CurrentWordCorrectionState::Raw,
-                snapshot_manual_hotkey_latch: None,
-                _frozen_modifiers: ModifierState::default(),
-                deferred_input: VecDeque::from([DeferredInputEvent {
-                    key: Key::KEY_SPACE,
-                    value: 1,
-                    timestamp: SystemTime::UNIX_EPOCH,
-                }]),
-                seen_real_next_step: true,
-                retry_after_drain_requested: false,
-                started_at: Instant::now(),
-                drained_events: 0,
-            },
-        };
-
-        let tail =
-            take_deferred_input_for_new_manual_current_word_session(&mut flow, InputOrigin::Physical);
-
-        assert!(tail.is_empty());
-        match flow {
-            ManualCurrentWordFlow::DrainingDeferredInput { session } => {
-                assert_eq!(session.deferred_input.len(), 1);
-            }
-            _ => panic!("flow must stay in draining state"),
-        }
-    }
-
-    #[test]
-    fn failed_before_mutation_restores_full_snapshot_state() {
+    fn clear_word_context_state_clears_word_tracking_without_flow_state() {
         let mut buffer = vec![stroke(Key::KEY_Z)];
         let mut word_context = WordContext {
             valid: true,
             word_before_cursor: vec![stroke(Key::KEY_Z)],
-            followed_by_separator: false,
+            followed_by_separator: true,
         };
         let mut correction_state = CurrentWordCorrectionState::ManuallyCorrected;
         let mut latch = Some(ManualHotkeyLatch {
@@ -2583,43 +2475,17 @@ mod tests {
             armed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(5),
         });
 
-        let session = DeferredManualCurrentWordSession {
-            request_id: 7,
-            undo_key: Key::KEY_PAUSE,
-            snapshot_buffer: vec![stroke(Key::KEY_A), stroke(Key::KEY_B)],
-            snapshot_word_context: WordContext {
-                valid: true,
-                word_before_cursor: vec![stroke(Key::KEY_A)],
-                followed_by_separator: true,
-            },
-            snapshot_current_word_correction_state: CurrentWordCorrectionState::Raw,
-            snapshot_manual_hotkey_latch: Some(ManualHotkeyLatch {
-                key: Key::KEY_PAUSE,
-                armed_at: SystemTime::UNIX_EPOCH,
-            }),
-            _frozen_modifiers: ModifierState::default(),
-            deferred_input: VecDeque::new(),
-            seen_real_next_step: false,
-            retry_after_drain_requested: false,
-            started_at: Instant::now(),
-            drained_events: 0,
-        };
-
-        restore_manual_current_word_snapshot_state(
+        clear_word_context_state(
             &mut buffer,
             &mut word_context,
             &mut correction_state,
             &mut latch,
-            &session,
         );
 
-        assert_eq!(buffer, session.snapshot_buffer);
-        assert_eq!(word_context, session.snapshot_word_context);
-        assert_eq!(
-            correction_state,
-            session.snapshot_current_word_correction_state
-        );
-        assert_eq!(latch, session.snapshot_manual_hotkey_latch);
+        assert!(buffer.is_empty());
+        assert_eq!(correction_state, CurrentWordCorrectionState::Raw);
+        assert_eq!(latch, None);
+        assert_eq!(word_context, WordContext::default());
     }
 
 }

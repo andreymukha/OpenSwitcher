@@ -129,8 +129,13 @@ pub struct ManualCurrentWordCompletion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualCurrentWordOutcome {
     Succeeded(CorrectionPlan),
-    FailedBeforeMutation(String),
     FailedAfterMutation(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ManualCurrentWordStartOutcome {
+    Started(u64),
+    RejectedBeforeMutation(String),
 }
 
 struct GrabbedKeyboardDevice {
@@ -431,7 +436,7 @@ impl KeyboardController {
         plan: &CorrectionPlan,
         config: &RuntimeConfigSnapshot,
         modifiers: ModifierState,
-    ) -> Result<u64, SwitcherError> {
+    ) -> Result<ManualCurrentWordStartOutcome, SwitcherError> {
         self.virtual_device.begin_manual_current_word_correction(
             plan.clone(),
             config.clone(),
@@ -933,7 +938,7 @@ impl VirtualKeyboardWriter {
         plan: CorrectionPlan,
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
-    ) -> Result<u64, SwitcherError> {
+    ) -> Result<ManualCurrentWordStartOutcome, SwitcherError> {
         self.handle.ensure_alive()?;
         let request_id = self.next_request_id;
         self.next_request_id += 1;
@@ -948,11 +953,15 @@ impl VirtualKeyboardWriter {
                 modifiers,
             })
         {
-            Ok(()) => Ok(request_id),
+            Ok(()) => Ok(ManualCurrentWordStartOutcome::Started(request_id)),
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 Err(SwitcherError::VirtualKeyboardWriterDisconnected)
             }
-            Err(mpsc::TrySendError::Full(_)) => Err(SwitcherError::VirtualKeyboardWriterSaturated),
+            Err(mpsc::TrySendError::Full(_)) => Ok(
+                ManualCurrentWordStartOutcome::RejectedBeforeMutation(
+                    "virtual-keyboard-writer-saturated".to_string(),
+                ),
+            ),
         }
     }
 
@@ -2237,7 +2246,7 @@ mod tests {
             next_request_id: 1,
         };
 
-        let request_id = writer
+        let outcome = writer
             .begin_manual_current_word_correction(
                 CorrectionPlan {
                     buffer: Vec::new(),
@@ -2248,7 +2257,45 @@ mod tests {
             )
             .expect("begin should return immediately");
 
-        assert_eq!(request_id, 1);
+        assert_eq!(outcome, ManualCurrentWordStartOutcome::Started(1));
+    }
+
+    #[test]
+    fn begin_manual_current_word_correction_rejects_before_mutation_when_queue_is_full() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        command_tx
+            .send(WriterCommand::Shutdown)
+            .expect("pre-fill should succeed");
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _ = command_rx.recv();
+            })),
+            completion_rx,
+            next_request_id: 1,
+        };
+
+        let outcome = writer
+            .begin_manual_current_word_correction(
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .expect("begin should reject, not fail fatally");
+
+        assert_eq!(
+            outcome,
+            ManualCurrentWordStartOutcome::RejectedBeforeMutation(
+                "virtual-keyboard-writer-saturated".to_string()
+            )
+        );
     }
 
     #[test]

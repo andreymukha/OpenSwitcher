@@ -2294,13 +2294,18 @@ mod tests {
         command_tx
             .send(WriterCommand::Shutdown)
             .expect("pre-fill should succeed");
+        let keep_receiver_alive = Arc::new(AtomicBool::new(true));
+        let worker_alive = Arc::clone(&keep_receiver_alive);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
             },
             join_handle: Some(thread::spawn(move || {
-                let _ = command_rx.recv();
+                while worker_alive.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                drop(command_rx);
             })),
             completion_rx,
             next_request_id: 1,
@@ -2323,6 +2328,9 @@ mod tests {
                 "virtual-keyboard-writer-saturated".to_string()
             )
         );
+
+        keep_receiver_alive.store(false, Ordering::SeqCst);
+        writer.stop();
     }
 
     #[test]

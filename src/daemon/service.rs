@@ -187,6 +187,10 @@ fn should_publish_pending_status_change(has_pending_status_change: bool) -> bool
     has_pending_status_change
 }
 
+fn auto_layout_correction_supported_for_layout(layout_kind: AppLayoutKind) -> bool {
+    matches!(layout_kind, AppLayoutKind::English | AppLayoutKind::Russian)
+}
+
 fn format_legacy_layout(is_english: bool) -> &'static str {
     if is_english {
         "EN"
@@ -1134,7 +1138,7 @@ impl DaemonService {
                     && config.auto_switch_enabled
                     && features.auto_switch
                     && startup_sync_ready
-                    && matches!(effective_layout_kind, AppLayoutKind::English)
+                    && auto_layout_correction_supported_for_layout(effective_layout_kind)
                     && should_switch_word;
 
                 let selected_path = if corrected {
@@ -2013,6 +2017,22 @@ mod tests {
     fn pending_status_change_requests_publish_from_service() {
         assert!(should_publish_pending_status_change(true));
         assert!(!should_publish_pending_status_change(false));
+    }
+
+    #[test]
+    fn automatic_layout_correction_can_be_scheduled_for_english_and_russian_layouts() {
+        assert!(auto_layout_correction_supported_for_layout(
+            AppLayoutKind::English
+        ));
+        assert!(auto_layout_correction_supported_for_layout(
+            AppLayoutKind::Russian
+        ));
+        assert!(!auto_layout_correction_supported_for_layout(
+            AppLayoutKind::Other
+        ));
+        assert!(!auto_layout_correction_supported_for_layout(
+            AppLayoutKind::Unknown
+        ));
     }
 
     #[test]

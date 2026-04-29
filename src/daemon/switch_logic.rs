@@ -26,9 +26,106 @@ enum LetterCase {
     Lower,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutCorrectionDirection {
+    EnglishToRussian,
+    RussianToEnglish,
+}
+
 const EXCLUDED_WORDS: &[&str] = &[
     "sudo", "git", "cargo", "rustc", "python", "node", "grep", "echo", "ls", "cd", "rm", "mkdir",
     "apt",
+];
+
+const TECHNICAL_ENGLISH_WORDS: &[&str] = &[
+    "api",
+    "array",
+    "async",
+    "await",
+    "cache",
+    "class",
+    "composer",
+    "config",
+    "css",
+    "daemon",
+    "debug",
+    "dump",
+    "error",
+    "extends",
+    "folder",
+    "function",
+    "html",
+    "http",
+    "https",
+    "implements",
+    "input",
+    "interface",
+    "json",
+    "laravel",
+    "layout",
+    "middleware",
+    "namespace",
+    "output",
+    "php",
+    "private",
+    "project",
+    "protected",
+    "public",
+    "queue",
+    "request",
+    "repository",
+    "response",
+    "return",
+    "screen",
+    "service",
+    "sql",
+    "static",
+    "switch",
+    "thread",
+    "trait",
+    "var",
+    "worker",
+    "xml",
+    "yaml",
+];
+
+const RUSSIAN_PRIORITY_PHYSICAL_WORDS: &[&str] = &[
+    "kexit",        // лучше
+    "ckexbkjcm",    // случилось
+    "ckeifq",       // слушай
+    "gjckeifq",     // послушай
+    "ckexft",       // случае
+    "here",         // руку
+    "nhelyj",       // трудно
+    "ckexfq",       // случай
+    "gjckeifqnt",   // послушайте
+    "ckeifqnt",     // слушайте
+    "ctreyle",      // секунду
+    "ckexbncz",     // случится
+    "xedcndetim",   // чувствуешь
+    "ckexfqyj",     // случайно
+    "ckeifnm",      // слушать
+    "ckturf",       // слегка
+    "ckexbnmcz",    // случиться
+    "ckexftncz",    // случается
+    "uhelm",        // грудь
+    "ytkturj",      // нелегко
+    "gentitcndbt",  // путешествие
+    "ctreyljxre",   // секундочку
+    "inere",        // штуку
+    "gjckeifnm",    // послушать
+    "ckeiftim",     // слушаешь
+    "eckeue",       // услугу
+    "ckeiftn",      // слушает
+    "ckexfz",       // случая
+    "ckeifk",       // слушал
+    "nheljv",       // трудом
+    "uhflecjd",     // градусов
+    "cjnhelybrjd",  // сотрудников
+    "cjnhelybxfnm", // сотрудничать
+    "gjkexftim",    // получаешь
+    "ckexftd",      // случаев
+    "eckeub",       // услуги
 ];
 
 pub fn manual_correction_plan(
@@ -88,7 +185,24 @@ pub fn same_layout_case_correction_plan(
 }
 
 pub fn should_switch(buffer: &[Keystroke], layout_kind: AppLayoutKind) -> bool {
-    let split = split_word_core_and_trailing_tail(buffer, layout_kind);
+    layout_correction_direction(buffer, layout_kind).is_some()
+}
+
+pub fn layout_correction_direction(
+    buffer: &[Keystroke],
+    layout_kind: AppLayoutKind,
+) -> Option<LayoutCorrectionDirection> {
+    match layout_kind {
+        AppLayoutKind::English => should_switch_english_to_russian(buffer)
+            .then_some(LayoutCorrectionDirection::EnglishToRussian),
+        AppLayoutKind::Russian => should_switch_russian_to_english(buffer)
+            .then_some(LayoutCorrectionDirection::RussianToEnglish),
+        AppLayoutKind::Other | AppLayoutKind::Unknown => None,
+    }
+}
+
+fn should_switch_english_to_russian(buffer: &[Keystroke]) -> bool {
+    let split = split_word_core_and_trailing_tail(buffer, AppLayoutKind::English);
     let core = &split.core;
     if core.len() < 3 {
         return false;
@@ -134,6 +248,27 @@ pub fn should_switch(buffer: &[Keystroke], layout_kind: AppLayoutKind) -> bool {
     score >= 10
 }
 
+fn should_switch_russian_to_english(buffer: &[Keystroke]) -> bool {
+    let split = split_physical_english_core_and_trailing_tail(buffer);
+    let core = &split.core;
+    if core.len() < 3 {
+        return false;
+    }
+
+    let physical_word = keys_to_string(core);
+    let normalized_word = normalize_word_for_switch_heuristics(&physical_word);
+    if !normalized_word.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+
+    let visible_word = keys_to_visible_string(core, AppLayoutKind::Russian);
+    if !visible_word.chars().any(is_russian_letter) {
+        return false;
+    }
+
+    is_confident_english_for_russian_layout(&normalized_word)
+}
+
 fn normalize_word_for_switch_heuristics(word: &str) -> String {
     word.chars().flat_map(|ch| ch.to_lowercase()).collect()
 }
@@ -146,6 +281,16 @@ fn keys_to_string(keys: &[Keystroke]) -> String {
     let mut result = String::with_capacity(keys.len());
     for stroke in keys {
         if let Some(ch) = visible_char_for_keystroke(stroke) {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn keys_to_visible_string(keys: &[Keystroke], layout_kind: AppLayoutKind) -> String {
+    let mut result = String::with_capacity(keys.len());
+    for stroke in keys {
+        if let Some(ch) = visible_char_for_layout(stroke, layout_kind) {
             result.push(ch);
         }
     }
@@ -255,6 +400,20 @@ fn split_word_core_and_trailing_tail(
     }
 }
 
+fn split_physical_english_core_and_trailing_tail(buffer: &[Keystroke]) -> WordCoreAndTrailingTail {
+    let tail_start = buffer
+        .iter()
+        .rposition(|stroke| {
+            !visible_char_for_keystroke(stroke).is_some_and(is_trailing_tail_punctuation_char)
+        })
+        .map_or(0, |index| index + 1);
+
+    WordCoreAndTrailingTail {
+        core: buffer[..tail_start].to_vec(),
+        trailing_tail: buffer[tail_start..].to_vec(),
+    }
+}
+
 fn is_trailing_tail_punctuation(stroke: &Keystroke, layout_kind: AppLayoutKind) -> bool {
     visible_char_for_layout(stroke, layout_kind).is_some_and(is_trailing_tail_punctuation_char)
 }
@@ -275,16 +434,68 @@ fn visible_char_for_layout(stroke: &Keystroke, layout_kind: AppLayoutKind) -> Op
 
 fn russian_visible_char_for_keyboard_position(ch: char) -> char {
     match ch {
+        'q' => 'й',
+        'Q' => 'Й',
+        'w' => 'ц',
+        'W' => 'Ц',
+        'e' => 'у',
+        'E' => 'У',
+        'r' => 'к',
+        'R' => 'К',
+        't' => 'е',
+        'T' => 'Е',
+        'y' => 'н',
+        'Y' => 'Н',
+        'u' => 'г',
+        'U' => 'Г',
+        'i' => 'ш',
+        'I' => 'Ш',
+        'o' => 'щ',
+        'O' => 'Щ',
+        'p' => 'з',
+        'P' => 'З',
         '`' => 'ё',
         '~' => 'Ё',
         '[' => 'х',
         '{' => 'Х',
         ']' => 'ъ',
         '}' => 'Ъ',
+        'a' => 'ф',
+        'A' => 'Ф',
+        's' => 'ы',
+        'S' => 'Ы',
+        'd' => 'в',
+        'D' => 'В',
+        'f' => 'а',
+        'F' => 'А',
+        'g' => 'п',
+        'G' => 'П',
+        'h' => 'р',
+        'H' => 'Р',
+        'j' => 'о',
+        'J' => 'О',
+        'k' => 'л',
+        'K' => 'Л',
+        'l' => 'д',
+        'L' => 'Д',
         ';' => 'ж',
         ':' => 'Ж',
         '\'' => 'э',
         '"' => 'Э',
+        'z' => 'я',
+        'Z' => 'Я',
+        'x' => 'ч',
+        'X' => 'Ч',
+        'c' => 'с',
+        'C' => 'С',
+        'v' => 'м',
+        'V' => 'М',
+        'b' => 'и',
+        'B' => 'И',
+        'n' => 'т',
+        'N' => 'Т',
+        'm' => 'ь',
+        'M' => 'Ь',
         ',' => 'б',
         '<' => 'Б',
         '.' => 'ю',
@@ -295,6 +506,89 @@ fn russian_visible_char_for_keyboard_position(ch: char) -> char {
         '|' => '/',
         _ => ch,
     }
+}
+
+fn is_russian_letter(ch: char) -> bool {
+    matches!(ch, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё')
+}
+
+fn contains_latin_vowel(word: &str) -> bool {
+    word.chars().any(|ch| "aeiou".contains(ch))
+}
+
+fn count_latin_vowels_without_y(word: &str) -> usize {
+    word.chars().filter(|ch| "aeiou".contains(*ch)).count()
+}
+
+fn is_confident_english_for_russian_layout(word: &str) -> bool {
+    if RUSSIAN_PRIORITY_PHYSICAL_WORDS.contains(&word) {
+        return false;
+    }
+    if TECHNICAL_ENGLISH_WORDS.contains(&word) {
+        return true;
+    }
+    if !contains_latin_vowel(word) {
+        return false;
+    }
+
+    let pattern_score = english_pattern_score(word);
+    if word.len() <= 5 {
+        return pattern_score >= 3 && !has_short_unlikely_english_cluster(word);
+    }
+
+    if has_strong_english_signal(word) && pattern_score >= 2 {
+        return true;
+    }
+
+    let vowel_count = count_latin_vowels_without_y(word);
+    pattern_score >= 4 || (vowel_count >= 2 && pattern_score >= 3 && is_likely_english(word))
+}
+
+fn has_strong_english_signal(word: &str) -> bool {
+    const STRONG_SUFFIXES: &[&str] = &["ing", "tion", "ment"];
+    const STRONG_TRIGRAMS: &[&str] = &[
+        "str", "ion", "ent", "ter", "est", "sys", "tem", "key", "fun", "nct", "ret", "tur", "urn",
+        "pro", "ect", "swi", "tch",
+    ];
+
+    STRONG_SUFFIXES.iter().any(|suffix| word.ends_with(suffix))
+        || STRONG_TRIGRAMS.iter().any(|trigram| word.contains(trigram))
+}
+
+fn english_pattern_score(word: &str) -> usize {
+    const COMMON_BIGRAMS: &[&str] = &[
+        "al", "ar", "as", "at", "bo", "br", "ch", "ck", "ct", "do", "ec", "ed", "el", "em", "en",
+        "er", "es", "ex", "ey", "fi", "he", "il", "in", "it", "ke", "le", "ll", "lo", "mi", "na",
+        "nd", "oa", "on", "ow", "pr", "re", "ro", "se", "st", "sw", "sy", "te", "th", "ti", "wi",
+        "ws", "xt", "ys",
+    ];
+    const COMMON_TRIGRAMS: &[&str] = &[
+        "ame", "bro", "cap", "cke", "doc", "ect", "ell", "erm", "est", "hel", "ina", "ing", "ion",
+        "ita", "key", "lec", "llo", "min", "nal", "ock", "ows", "pro", "ret", "row", "sel", "ser",
+        "swi", "sys", "tal", "tem", "ter", "tch", "tur", "urn",
+    ];
+
+    let bigram_score = COMMON_BIGRAMS
+        .iter()
+        .filter(|bigram| word.contains(**bigram))
+        .count();
+    let trigram_score = COMMON_TRIGRAMS
+        .iter()
+        .filter(|trigram| word.contains(**trigram))
+        .count()
+        * 2;
+
+    bigram_score + trigram_score
+}
+
+fn has_short_unlikely_english_cluster(word: &str) -> bool {
+    const UNLIKELY_SHORT_CLUSTERS: &[&str] = &["bj", "bn", "bv", "fy", "kf", "lb", "tk", "yu"];
+
+    word.ends_with('f')
+        || word.ends_with('j')
+        || UNLIKELY_SHORT_CLUSTERS
+            .iter()
+            .any(|cluster| word.contains(*cluster))
 }
 
 fn count_russian_vowels(keys: &[Keystroke]) -> usize {
@@ -526,6 +820,70 @@ mod tests {
             shift: true,
             caps_lock: false,
         }
+    }
+
+    fn strokes_for_text(text: &str) -> Vec<Keystroke> {
+        text.chars()
+            .map(|ch| match ch {
+                'a' => stroke(Key::KEY_A),
+                'A' => shifted_stroke(Key::KEY_A),
+                'b' => stroke(Key::KEY_B),
+                'B' => shifted_stroke(Key::KEY_B),
+                'c' => stroke(Key::KEY_C),
+                'C' => shifted_stroke(Key::KEY_C),
+                'd' => stroke(Key::KEY_D),
+                'D' => shifted_stroke(Key::KEY_D),
+                'e' => stroke(Key::KEY_E),
+                'E' => shifted_stroke(Key::KEY_E),
+                'f' => stroke(Key::KEY_F),
+                'F' => shifted_stroke(Key::KEY_F),
+                'g' => stroke(Key::KEY_G),
+                'G' => shifted_stroke(Key::KEY_G),
+                'h' => stroke(Key::KEY_H),
+                'H' => shifted_stroke(Key::KEY_H),
+                'i' => stroke(Key::KEY_I),
+                'I' => shifted_stroke(Key::KEY_I),
+                'j' => stroke(Key::KEY_J),
+                'J' => shifted_stroke(Key::KEY_J),
+                'k' => stroke(Key::KEY_K),
+                'K' => shifted_stroke(Key::KEY_K),
+                'l' => stroke(Key::KEY_L),
+                'L' => shifted_stroke(Key::KEY_L),
+                'm' => stroke(Key::KEY_M),
+                'M' => shifted_stroke(Key::KEY_M),
+                'n' => stroke(Key::KEY_N),
+                'N' => shifted_stroke(Key::KEY_N),
+                'o' => stroke(Key::KEY_O),
+                'O' => shifted_stroke(Key::KEY_O),
+                'p' => stroke(Key::KEY_P),
+                'P' => shifted_stroke(Key::KEY_P),
+                'q' => stroke(Key::KEY_Q),
+                'Q' => shifted_stroke(Key::KEY_Q),
+                'r' => stroke(Key::KEY_R),
+                'R' => shifted_stroke(Key::KEY_R),
+                's' => stroke(Key::KEY_S),
+                'S' => shifted_stroke(Key::KEY_S),
+                't' => stroke(Key::KEY_T),
+                'T' => shifted_stroke(Key::KEY_T),
+                'u' => stroke(Key::KEY_U),
+                'U' => shifted_stroke(Key::KEY_U),
+                'v' => stroke(Key::KEY_V),
+                'V' => shifted_stroke(Key::KEY_V),
+                'w' => stroke(Key::KEY_W),
+                'W' => shifted_stroke(Key::KEY_W),
+                'x' => stroke(Key::KEY_X),
+                'X' => shifted_stroke(Key::KEY_X),
+                'y' => stroke(Key::KEY_Y),
+                'Y' => shifted_stroke(Key::KEY_Y),
+                'z' => stroke(Key::KEY_Z),
+                'Z' => shifted_stroke(Key::KEY_Z),
+                ',' => stroke(Key::KEY_COMMA),
+                '.' => stroke(Key::KEY_DOT),
+                '!' => shifted_stroke(Key::KEY_1),
+                '?' => shifted_stroke(Key::KEY_SLASH),
+                _ => panic!("unsupported test character: {ch}"),
+            })
+            .collect()
     }
 
     #[test]
@@ -848,6 +1206,185 @@ mod tests {
             stroke(Key::KEY_COMMA),
         ];
         assert!(should_switch(&buffer, AppLayoutKind::English));
+    }
+
+    #[test]
+    fn russian_layout_english_word_hello_triggers_switch() {
+        let buffer = strokes_for_text("hello");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_english_word_test_triggers_switch() {
+        let buffer = strokes_for_text("test");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_english_word_selected_triggers_switch() {
+        let buffer = strokes_for_text("selected");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_common_english_words_trigger_switch() {
+        for word in [
+            "text", "browser", "docker", "terminal", "keyboard", "project", "switch", "screen",
+            "folder", "daemon", "layout", "input", "output", "error", "debug", "config", "cache",
+            "queue", "worker", "thread", "async", "await", "name", "capital",
+        ] {
+            let buffer = strokes_for_text(word);
+            assert!(
+                should_switch(&buffer, AppLayoutKind::Russian),
+                "{word} must trigger RU -> EN correction"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_layout_correct_russian_privet_does_not_trigger_switch() {
+        let buffer = strokes_for_text("ghbdtn");
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_correct_russian_mama_does_not_trigger_switch() {
+        let buffer = strokes_for_text("vfvf");
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_correct_russian_kot_does_not_trigger_switch() {
+        let buffer = strokes_for_text("rjn");
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_correct_russian_naprimer_does_not_trigger_switch() {
+        let buffer = strokes_for_text("yfghbvth");
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_correct_russian_common_words_do_not_trigger_switch() {
+        for (physical, russian) in [
+            ("cltkftim", "сделаешь"),
+            ("ltkftim", "делаешь"),
+            ("ctujlyz", "сегодня"),
+            ("gjxtve", "почему"),
+            ("ghjuhfvvf", "программа"),
+            ("rjnjhsq", "который"),
+            ("lfyyst", "данные"),
+            ("cltkfk", "сделал"),
+            ("frekf", "акула"),
+            ("fyutk", "ангел"),
+            ("felbj", "аудио"),
+            ("felbn", "аудит"),
+            ("kexit", "лучше"),
+            ("here", "руку"),
+            ("ckexfq", "случай"),
+            ("ckeifq", "слушай"),
+            ("uhelm", "грудь"),
+            ("eckeub", "услуги"),
+        ] {
+            let buffer = strokes_for_text(physical);
+            assert!(
+                !should_switch(&buffer, AppLayoutKind::Russian),
+                "{russian} ({physical}) must keep Russian priority"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_layout_php_programming_words_trigger_switch() {
+        for word in [
+            "php",
+            "class",
+            "function",
+            "array",
+            "namespace",
+            "composer",
+            "laravel",
+            "public",
+            "private",
+            "protected",
+            "return",
+            "string",
+            "interface",
+            "trait",
+            "extends",
+            "implements",
+            "static",
+            "json",
+            "request",
+            "response",
+            "controller",
+            "service",
+            "repository",
+            "middleware",
+        ] {
+            let buffer = strokes_for_text(word);
+            assert!(
+                should_switch(&buffer, AppLayoutKind::Russian),
+                "{word} must trigger RU -> EN correction"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_layout_short_word_does_not_trigger_switch() {
+        let buffer = strokes_for_text("hi");
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_punctuation_only_does_not_trigger_switch() {
+        let buffer = vec![
+            stroke(Key::KEY_SLASH),
+            shifted_stroke(Key::KEY_SLASH),
+            shifted_stroke(Key::KEY_1),
+        ];
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_numbers_and_symbols_only_do_not_trigger_switch() {
+        let buffer = vec![
+            stroke(Key::KEY_1),
+            stroke(Key::KEY_2),
+            shifted_stroke(Key::KEY_3),
+        ];
+        assert!(!should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_english_word_with_trailing_punctuation_triggers_switch() {
+        let buffer = strokes_for_text("hello.");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_system_with_physical_period_triggers_switch() {
+        let buffer = strokes_for_text("system.");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+    }
+
+    #[test]
+    fn russian_layout_title_case_english_word_keeps_replay_case() {
+        let buffer = strokes_for_text("Hello");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+
+        let plan = manual_correction_plan(&buffer, &[], false, AppLayoutKind::Russian).unwrap();
+        assert_eq!(keys_to_string(&plan.buffer), "Hello");
+    }
+
+    #[test]
+    fn russian_layout_uppercase_english_word_keeps_replay_case() {
+        let buffer = strokes_for_text("HELLO");
+        assert!(should_switch(&buffer, AppLayoutKind::Russian));
+
+        let plan = manual_correction_plan(&buffer, &[], false, AppLayoutKind::Russian).unwrap();
+        assert_eq!(keys_to_string(&plan.buffer), "HELLO");
     }
 
     #[test]

@@ -617,10 +617,7 @@ fn count_russian_vowels(keys: &[Keystroke]) -> usize {
 
 fn is_likely_english(word: &str) -> bool {
     let clean_word = word.trim_end_matches(&['.', ',', ';', '\'', '`', '[', ']'][..]);
-    if clean_word.len() < 3
-        || EXCLUDED_WORDS.contains(&clean_word)
-        || TECHNICAL_ENGLISH_WORDS.contains(&clean_word)
-    {
+    if is_explicit_english_guard_word(clean_word) {
         return true;
     }
 
@@ -629,24 +626,36 @@ fn is_likely_english(word: &str) -> bool {
         return true;
     }
 
-    let common_english_bigrams = [
-        "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "se", "ed", "te", "st", "el",
-        "le", "ti", "io", "ou", "ll", "oo",
-    ];
-    let common_english_suffixes = ["ed", "ing", "tion", "ment", "ly", "er", "est"];
-
-    if common_english_suffixes
-        .iter()
-        .any(|suffix| clean_word.ends_with(suffix))
-        && eng_vowels >= 2
-    {
+    if eng_vowels >= 2 && has_common_english_suffix(clean_word) {
         return true;
     }
 
-    eng_vowels >= 1
-        && common_english_bigrams
-            .iter()
-            .any(|bigram| clean_word.contains(bigram))
+    eng_vowels >= 1 && has_common_english_bigram(clean_word)
+}
+
+fn is_explicit_english_guard_word(clean_word: &str) -> bool {
+    clean_word.len() < 3
+        || EXCLUDED_WORDS.contains(&clean_word)
+        || TECHNICAL_ENGLISH_WORDS.contains(&clean_word)
+}
+
+fn has_common_english_suffix(clean_word: &str) -> bool {
+    const COMMON_ENGLISH_SUFFIXES: &[&str] = &["ed", "ing", "tion", "ment", "ly", "er", "est"];
+
+    COMMON_ENGLISH_SUFFIXES
+        .iter()
+        .any(|suffix| clean_word.ends_with(suffix))
+}
+
+fn has_common_english_bigram(clean_word: &str) -> bool {
+    const COMMON_ENGLISH_BIGRAMS: &[&str] = &[
+        "th", "he", "in", "er", "an", "re", "on", "at", "en", "nd", "se", "ed", "te", "st", "el",
+        "le", "ti", "io", "ou", "ll", "oo",
+    ];
+
+    COMMON_ENGLISH_BIGRAMS
+        .iter()
+        .any(|bigram| clean_word.contains(bigram))
 }
 
 pub fn apply_case_fixes_to_strokes(

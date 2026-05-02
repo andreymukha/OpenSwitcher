@@ -362,6 +362,8 @@ fn letter(base: char, shift: bool, caps_lock: bool) -> char {
     }
 }
 
+// Replay normalization helpers.
+
 fn normalize_strokes_for_replay(buffer: &[Keystroke]) -> Vec<Keystroke> {
     buffer
         .iter()
@@ -659,6 +661,8 @@ fn has_common_english_bigram(clean_word: &str) -> bool {
         .iter()
         .any(|bigram| clean_word.contains(bigram))
 }
+
+// Same-layout case correction helpers.
 
 pub fn apply_case_fixes_to_strokes(
     buffer: &[Keystroke],

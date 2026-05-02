@@ -214,6 +214,10 @@ fn should_switch_english_to_russian(buffer: &[Keystroke]) -> bool {
         return false;
     }
 
+    english_layout_russian_physical_score(core, &normalized_word) >= 10
+}
+
+fn english_layout_russian_physical_score(core: &[Keystroke], normalized_word: &str) -> i32 {
     let mut score = 0;
 
     for (index, key) in core.iter().enumerate() {
@@ -245,7 +249,7 @@ fn should_switch_english_to_russian(buffer: &[Keystroke]) -> bool {
         score += 12;
     }
 
-    score >= 10
+    score
 }
 
 fn should_switch_russian_to_english(buffer: &[Keystroke]) -> bool {

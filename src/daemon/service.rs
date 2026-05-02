@@ -27,6 +27,8 @@ const STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS: u8 = 3;
 const MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_DEFERRED_MANUAL_INPUT_EVENTS: usize = 256;
 
+// Word tracking / correction state
+
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
 struct WordContext {
     valid: bool,
@@ -74,6 +76,8 @@ struct PreparedManualCorrection {
     used_current_buffer: bool,
 }
 
+// Deferred manual current-word flow state
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputOrigin {
     Physical,
@@ -107,6 +111,8 @@ enum ManualCurrentWordFlow {
     DrainingDeferredInput { session: DeferredManualCurrentWordSession },
 }
 
+// Deferred manual current-word helpers
+
 fn deferred_manual_current_word_flow_label(flow: &ManualCurrentWordFlow) -> &'static str {
     match flow {
         ManualCurrentWordFlow::Idle => "idle",
@@ -121,6 +127,8 @@ fn should_restart_manual_current_word_after_drain(
 ) -> bool {
     deferred_len == 0 && retry_after_drain_requested
 }
+
+// Startup layout resync state
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StartupLayoutResyncState {
@@ -159,6 +167,8 @@ impl StartupLayoutResyncState {
     }
 }
 
+// Layout/action decision helpers
+
 fn automatic_layout_actions_allowed(sync_result: &BackendSyncResult) -> bool {
     !matches!(sync_result, BackendSyncResult::Skipped)
 }
@@ -191,6 +201,8 @@ fn auto_layout_correction_supported_for_layout(layout_kind: AppLayoutKind) -> bo
     matches!(layout_kind, AppLayoutKind::English | AppLayoutKind::Russian)
 }
 
+// Logging format helpers
+
 fn format_legacy_layout(is_english: bool) -> &'static str {
     if is_english {
         "EN"
@@ -198,6 +210,8 @@ fn format_legacy_layout(is_english: bool) -> &'static str {
         "RU"
     }
 }
+
+// Pending word commit helpers
 
 fn pending_word_commit_action_label(pending: Option<&PendingWordCommit>) -> &'static str {
     match pending.map(|pending| &pending.action) {
@@ -214,6 +228,8 @@ fn pending_word_commit_separator_key(
 ) -> Option<evdev::Key> {
     pending.map(|pending| pending.separator_key)
 }
+
+// Separator suppression helpers
 
 fn manual_separator_replay_key(
     used_current_buffer: bool,
@@ -245,6 +261,8 @@ fn preserved_separator_after_early_finish(
         None
     }
 }
+
+// Manual correction state helpers
 
 fn should_commit_manually_corrected_current_word(
     current_word_correction_state: CurrentWordCorrectionState,
@@ -399,6 +417,8 @@ fn should_abort_manual_current_word_flow_on_queue_overflow(
 ) -> bool {
     deferred_len >= limit
 }
+
+// Reset / invalidation helpers
 
 fn clear_word_context_state(
     buffer: &mut Vec<Keystroke>,

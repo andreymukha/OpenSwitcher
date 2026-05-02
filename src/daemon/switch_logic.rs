@@ -613,7 +613,10 @@ fn count_russian_vowels(keys: &[Keystroke]) -> usize {
 
 fn is_likely_english(word: &str) -> bool {
     let clean_word = word.trim_end_matches(&['.', ',', ';', '\'', '`', '[', ']'][..]);
-    if clean_word.len() < 3 || EXCLUDED_WORDS.contains(&clean_word) {
+    if clean_word.len() < 3
+        || EXCLUDED_WORDS.contains(&clean_word)
+        || TECHNICAL_ENGLISH_WORDS.contains(&clean_word)
+    {
         return true;
     }
 
@@ -879,6 +882,7 @@ mod tests {
                 'Z' => shifted_stroke(Key::KEY_Z),
                 ',' => stroke(Key::KEY_COMMA),
                 '.' => stroke(Key::KEY_DOT),
+                '_' => shifted_stroke(Key::KEY_MINUS),
                 '!' => shifted_stroke(Key::KEY_1),
                 '?' => shifted_stroke(Key::KEY_SLASH),
                 _ => panic!("unsupported test character: {ch}"),
@@ -1206,6 +1210,60 @@ mod tests {
             stroke(Key::KEY_COMMA),
         ];
         assert!(should_switch(&buffer, AppLayoutKind::English));
+    }
+
+    #[test]
+    fn english_layout_russian_physical_words_trigger_switch() {
+        for word in [
+            "ghbdtn",
+            "gjrf",
+            "vfvf",
+            "rjn",
+            "ltkf",
+            "ghjuhfvvf",
+            "yfcnjqrb",
+            "ctvz",
+            "gjckt",
+            "xnj,s",
+        ] {
+            let buffer = strokes_for_text(word);
+            assert!(
+                should_switch(&buffer, AppLayoutKind::English),
+                "{word} must trigger EN -> RU correction"
+            );
+        }
+    }
+
+    #[test]
+    fn english_layout_common_and_technical_words_do_not_trigger_switch() {
+        for word in [
+            "hello", "selected", "docker", "terminal", "config", "browser", "cargo", "rust",
+            "sudo", "git",
+        ] {
+            let buffer = strokes_for_text(word);
+            assert!(
+                !should_switch(&buffer, AppLayoutKind::English),
+                "{word} must not trigger EN -> RU correction"
+            );
+        }
+    }
+
+    #[test]
+    fn english_layout_code_like_tokens_do_not_trigger_switch() {
+        for token in [
+            "snake_case",
+            "camelCase",
+            "http",
+            "https",
+            "localhost",
+            "config.toml",
+        ] {
+            let buffer = strokes_for_text(token);
+            assert!(
+                !should_switch(&buffer, AppLayoutKind::English),
+                "{token} must not trigger EN -> RU correction"
+            );
+        }
     }
 
     #[test]

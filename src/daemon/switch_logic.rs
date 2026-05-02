@@ -389,6 +389,8 @@ fn normalized_replay_buffer(buffer: &[Keystroke]) -> Vec<Keystroke> {
     normalize_strokes_for_replay(buffer)
 }
 
+// Word splitting / trailing punctuation helpers.
+
 fn split_word_core_and_trailing_tail(
     buffer: &[Keystroke],
     layout_kind: AppLayoutKind,

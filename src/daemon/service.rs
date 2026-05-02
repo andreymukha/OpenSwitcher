@@ -976,56 +976,8 @@ impl DaemonService {
             }
         }
 
-        if self
-            .modifiers
-            .matches_layout_switch_combo(config.layout_switch_combo, key, value)
-        {
-            if self.layout_shortcut_latched {
-                log_layout_debug(
-                    "layout-shortcut-repeat-ignored",
-                    &format!(
-                        "combo={:?} key={key:?} value={value}",
-                        config.layout_switch_combo
-                    ),
-                );
-                return Ok(());
-            }
-
-            self.layout_shortcut_latched = true;
-            let shortcut_sync = self.runtime.sync_with_backend();
-            let current_layout_kind = self.current_layout_kind();
-            let legacy_layout_is_english = self.runtime.current_layout();
-            log_layout_debug(
-                "observed-layout-shortcut",
-                &format!(
-                    "combo={:?} key={key:?} value={value} shift={} ctrl={} alt={} layout_before={}",
-                    config.layout_switch_combo,
-                    self.modifiers.is_shift_pressed(),
-                    self.modifiers.is_ctrl_pressed(),
-                    self.modifiers.is_alt_pressed(),
-                    if self.runtime.current_layout() {
-                        "EN"
-                    } else {
-                        "RU"
-                    }
-                ),
-            );
-            let Some(next_layout_is_english) = next_layout_for_user_shortcut(
-                &shortcut_sync,
-                current_layout_kind,
-                legacy_layout_is_english,
-            ) else {
-                log_layout_debug(
-                    "layout-shortcut-skip",
-                    &format!("sync={shortcut_sync:?} current_layout_kind={current_layout_kind:?}"),
-                );
-                return Ok(());
-            };
-            self.runtime
-                .set_layout_with_reason(next_layout_is_english, "user-layout-shortcut");
-            self.startup_layout_resync.complete();
-            self.publish_status_changed()?;
-            self.invalidate_word_context();
+        if self.handle_layout_shortcut_if_matched(&config, key, value)? {
+            return Ok(());
         }
 
         if selected_text_hotkey_matches(config.selected_text_hotkey, self.modifiers, key, value) {
@@ -1342,6 +1294,70 @@ impl DaemonService {
                 result
             }
         }
+    }
+
+    fn handle_layout_shortcut_if_matched(
+        &mut self,
+        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
+        key: evdev::Key,
+        value: i32,
+    ) -> Result<bool, SwitcherError> {
+        if !self
+            .modifiers
+            .matches_layout_switch_combo(config.layout_switch_combo, key, value)
+        {
+            return Ok(false);
+        }
+
+        if self.layout_shortcut_latched {
+            log_layout_debug(
+                "layout-shortcut-repeat-ignored",
+                &format!(
+                    "combo={:?} key={key:?} value={value}",
+                    config.layout_switch_combo
+                ),
+            );
+            return Ok(true);
+        }
+
+        self.layout_shortcut_latched = true;
+        let shortcut_sync = self.runtime.sync_with_backend();
+        let current_layout_kind = self.current_layout_kind();
+        let legacy_layout_is_english = self.runtime.current_layout();
+        log_layout_debug(
+            "observed-layout-shortcut",
+            &format!(
+                "combo={:?} key={key:?} value={value} shift={} ctrl={} alt={} layout_before={}",
+                config.layout_switch_combo,
+                self.modifiers.is_shift_pressed(),
+                self.modifiers.is_ctrl_pressed(),
+                self.modifiers.is_alt_pressed(),
+                if self.runtime.current_layout() {
+                    "EN"
+                } else {
+                    "RU"
+                }
+            ),
+        );
+        let Some(next_layout_is_english) = next_layout_for_user_shortcut(
+            &shortcut_sync,
+            current_layout_kind,
+            legacy_layout_is_english,
+        ) else {
+            log_layout_debug(
+                "layout-shortcut-skip",
+                &format!("sync={shortcut_sync:?} current_layout_kind={current_layout_kind:?}"),
+            );
+            return Ok(true);
+        };
+        self.runtime
+            .set_layout_with_reason(next_layout_is_english, "user-layout-shortcut");
+        self.startup_layout_resync.complete();
+        self.publish_status_changed()?;
+        self.invalidate_word_context();
+        // Preserve the original branch behavior: a successful shortcut falls
+        // through to the later input handling instead of returning early.
+        Ok(false)
     }
 
     fn apply_selected_text_switch(&mut self) -> Result<(), SwitcherError> {

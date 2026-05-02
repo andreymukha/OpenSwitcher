@@ -434,6 +434,30 @@ fn clear_word_context_state(
     word_context.followed_by_separator = false;
 }
 
+fn apply_corrected_word_commit_state(
+    buffer: &mut Vec<Keystroke>,
+    word_context: &mut WordContext,
+    current_word_correction_state: &mut CurrentWordCorrectionState,
+    manual_hotkey_latch: &mut Option<ManualHotkeyLatch>,
+    separator_key: evdev::Key,
+    corrected_buffer: Vec<Keystroke>,
+) -> evdev::Key {
+    if separator_key == evdev::Key::KEY_SPACE {
+        word_context.valid = !corrected_buffer.is_empty();
+        word_context.word_before_cursor = corrected_buffer;
+        word_context.followed_by_separator = true;
+        buffer.clear();
+    } else {
+        clear_word_context_state(
+            buffer,
+            word_context,
+            current_word_correction_state,
+            manual_hotkey_latch,
+        );
+    }
+    separator_key
+}
+
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
     connection: Connection,
@@ -1472,14 +1496,14 @@ impl DaemonService {
                 self.word_context.followed_by_separator,
             ),
         );
-        if separator_key == evdev::Key::KEY_SPACE {
-            self.word_context.valid = !corrected_buffer.is_empty();
-            self.word_context.word_before_cursor = corrected_buffer;
-            self.word_context.followed_by_separator = true;
-            self.buffer.clear();
-        } else {
-            self.invalidate_word_context();
-        }
+        let replay_separator_key = apply_corrected_word_commit_state(
+            &mut self.buffer,
+            &mut self.word_context,
+            &mut self.current_word_correction_state,
+            &mut self.manual_hotkey_latch,
+            separator_key,
+            corrected_buffer,
+        );
         log_input_debug(
             "commit-corrected-word",
             &format!(
@@ -1491,7 +1515,7 @@ impl DaemonService {
                 self.word_context.followed_by_separator,
             ),
         );
-        self.keyboard_mut()?.type_separator(separator_key)
+        self.keyboard_mut()?.type_separator(replay_separator_key)
     }
 
     fn maybe_run_pending_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
@@ -2260,6 +2284,126 @@ mod tests {
         assert_eq!(buffer, applied.corrected_buffer);
         assert_eq!(word_context.word_before_cursor, applied.corrected_buffer);
         assert!(!word_context.followed_by_separator);
+    }
+
+    #[test]
+    fn corrected_word_commit_state_for_space_updates_context_and_replays_separator() {
+        let corrected_buffer = vec![stroke(Key::KEY_H), stroke(Key::KEY_I)];
+        let mut buffer = vec![stroke(Key::KEY_A), stroke(Key::KEY_B)];
+        let mut word_context = WordContext {
+            valid: true,
+            word_before_cursor: vec![stroke(Key::KEY_Q)],
+            followed_by_separator: false,
+        };
+        let mut correction_state = CurrentWordCorrectionState::ManuallyCorrected;
+        let latch = Some(ManualHotkeyLatch {
+            key: Key::KEY_PAUSE,
+            armed_at: SystemTime::UNIX_EPOCH,
+        });
+        let mut manual_hotkey_latch = latch;
+
+        let replay_key = apply_corrected_word_commit_state(
+            &mut buffer,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            Key::KEY_SPACE,
+            corrected_buffer.clone(),
+        );
+
+        assert_eq!(replay_key, Key::KEY_SPACE);
+        assert!(buffer.is_empty());
+        assert!(word_context.valid);
+        assert_eq!(word_context.word_before_cursor, corrected_buffer);
+        assert!(word_context.followed_by_separator);
+        assert_eq!(correction_state, CurrentWordCorrectionState::ManuallyCorrected);
+        assert_eq!(manual_hotkey_latch, latch);
+    }
+
+    #[test]
+    fn corrected_word_commit_state_for_enter_invalidates_context_and_replays_separator() {
+        let corrected_buffer = vec![stroke(Key::KEY_H), stroke(Key::KEY_I)];
+        let mut buffer = vec![stroke(Key::KEY_A), stroke(Key::KEY_B)];
+        let mut word_context = WordContext {
+            valid: true,
+            word_before_cursor: vec![stroke(Key::KEY_Q)],
+            followed_by_separator: true,
+        };
+        let mut correction_state = CurrentWordCorrectionState::ManuallyCorrected;
+        let mut manual_hotkey_latch = Some(ManualHotkeyLatch {
+            key: Key::KEY_PAUSE,
+            armed_at: SystemTime::UNIX_EPOCH,
+        });
+
+        let replay_key = apply_corrected_word_commit_state(
+            &mut buffer,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            Key::KEY_ENTER,
+            corrected_buffer,
+        );
+
+        assert_eq!(replay_key, Key::KEY_ENTER);
+        assert!(buffer.is_empty());
+        assert_eq!(word_context, WordContext::default());
+        assert_eq!(correction_state, CurrentWordCorrectionState::Raw);
+        assert_eq!(manual_hotkey_latch, None);
+    }
+
+    #[test]
+    fn corrected_word_commit_state_for_tab_invalidates_context_and_replays_separator() {
+        let corrected_buffer = vec![stroke(Key::KEY_H), stroke(Key::KEY_I)];
+        let mut buffer = vec![stroke(Key::KEY_A), stroke(Key::KEY_B)];
+        let mut word_context = WordContext {
+            valid: true,
+            word_before_cursor: vec![stroke(Key::KEY_Q)],
+            followed_by_separator: true,
+        };
+        let mut correction_state = CurrentWordCorrectionState::ManuallyCorrected;
+        let mut manual_hotkey_latch = Some(ManualHotkeyLatch {
+            key: Key::KEY_PAUSE,
+            armed_at: SystemTime::UNIX_EPOCH,
+        });
+
+        let replay_key = apply_corrected_word_commit_state(
+            &mut buffer,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            Key::KEY_TAB,
+            corrected_buffer,
+        );
+
+        assert_eq!(replay_key, Key::KEY_TAB);
+        assert!(buffer.is_empty());
+        assert_eq!(word_context, WordContext::default());
+        assert_eq!(correction_state, CurrentWordCorrectionState::Raw);
+        assert_eq!(manual_hotkey_latch, None);
+    }
+
+    #[test]
+    fn same_layout_pending_commit_state_uses_corrected_buffer() {
+        let corrected_buffer = vec![stroke(Key::KEY_H), stroke(Key::KEY_E), stroke(Key::KEY_Y)];
+        let original_buffer = vec![stroke(Key::KEY_A), stroke(Key::KEY_B)];
+        let mut buffer = original_buffer.clone();
+        let mut word_context = WordContext::default();
+        let mut correction_state = CurrentWordCorrectionState::Raw;
+        let mut manual_hotkey_latch = None;
+
+        let replay_key = apply_corrected_word_commit_state(
+            &mut buffer,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            Key::KEY_SPACE,
+            corrected_buffer.clone(),
+        );
+
+        assert_eq!(replay_key, Key::KEY_SPACE);
+        assert_ne!(word_context.word_before_cursor, original_buffer);
+        assert_eq!(word_context.word_before_cursor, corrected_buffer);
+        assert!(word_context.followed_by_separator);
     }
 
     // Separator suppression / early finish

@@ -250,6 +250,33 @@ fn should_swallow_suppressed_separator_release(
     suppressed_separator_key == Some(key) && value == 0
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SuppressedSeparatorReleaseState {
+    pending_to_finish: Option<PendingWordCommit>,
+}
+
+fn take_suppressed_separator_release_state(
+    suppressed_separator_key: Option<evdev::Key>,
+    pending_word_commit: &mut Option<PendingWordCommit>,
+    key: evdev::Key,
+    value: i32,
+) -> Option<SuppressedSeparatorReleaseState> {
+    if !should_swallow_suppressed_separator_release(suppressed_separator_key, key, value) {
+        return None;
+    }
+
+    let pending_to_finish = if pending_word_commit
+        .as_ref()
+        .is_some_and(|pending| pending.separator_key == key)
+    {
+        pending_word_commit.take()
+    } else {
+        None
+    };
+
+    Some(SuppressedSeparatorReleaseState { pending_to_finish })
+}
+
 fn preserved_separator_after_early_finish(
     pending_word_commit: Option<&PendingWordCommit>,
     key: evdev::Key,
@@ -884,11 +911,11 @@ impl DaemonService {
                 ),
             );
             if value == 0 {
-                if self
+                let should_log_pending_take = self
                     .pending_word_commit
                     .as_ref()
-                    .is_some_and(|pending| pending.separator_key == key)
-                {
+                    .is_some_and(|pending| pending.separator_key == key);
+                if should_log_pending_take {
                     log_input_debug(
                         "pending-word-commit-take",
                         &format!(
@@ -900,7 +927,15 @@ impl DaemonService {
                             self.word_context.followed_by_separator,
                         ),
                     );
-                    let pending = self.pending_word_commit.take().unwrap();
+                }
+                let release_state = take_suppressed_separator_release_state(
+                    self.suppressed_separator_key,
+                    &mut self.pending_word_commit,
+                    key,
+                    value,
+                )
+                .expect("suppressed separator release already matched");
+                if let Some(pending) = release_state.pending_to_finish {
                     self.finish_pending_word_commit(pending, &self.runtime.config_snapshot()?)?;
                 }
                 log_input_debug(
@@ -2425,6 +2460,98 @@ mod tests {
             Key::KEY_ENTER,
             0,
         ));
+    }
+
+    #[test]
+    fn suppressed_separator_release_state_takes_matching_pending_once() {
+        let mut suppressed_separator_key = Some(Key::KEY_SPACE);
+        let mut pending_word_commit = Some(PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        });
+
+        let release_state = take_suppressed_separator_release_state(
+            suppressed_separator_key,
+            &mut pending_word_commit,
+            Key::KEY_SPACE,
+            0,
+        )
+        .unwrap();
+        suppressed_separator_key = None;
+        let repeated_release = take_suppressed_separator_release_state(
+            suppressed_separator_key,
+            &mut pending_word_commit,
+            Key::KEY_SPACE,
+            0,
+        );
+
+        assert_eq!(
+            release_state.pending_to_finish,
+            Some(PendingWordCommit {
+                separator_key: Key::KEY_SPACE,
+                action: PendingWordCommitAction::LayoutCorrection,
+            })
+        );
+        assert_eq!(pending_word_commit, None);
+        assert_eq!(repeated_release, None);
+    }
+
+    #[test]
+    fn suppressed_separator_release_state_ignores_non_matching_key() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+        let mut pending_word_commit = Some(pending.clone());
+
+        let release_state = take_suppressed_separator_release_state(
+            Some(Key::KEY_SPACE),
+            &mut pending_word_commit,
+            Key::KEY_ENTER,
+            0,
+        );
+
+        assert_eq!(release_state, None);
+        assert_eq!(pending_word_commit, Some(pending));
+    }
+
+    #[test]
+    fn suppressed_separator_release_state_ignores_key_press() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+        let mut pending_word_commit = Some(pending.clone());
+
+        let release_state = take_suppressed_separator_release_state(
+            Some(Key::KEY_SPACE),
+            &mut pending_word_commit,
+            Key::KEY_SPACE,
+            1,
+        );
+
+        assert_eq!(release_state, None);
+        assert_eq!(pending_word_commit, Some(pending));
+    }
+
+    #[test]
+    fn suppressed_separator_release_state_preserves_mismatched_pending() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_ENTER,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+        let mut pending_word_commit = Some(pending.clone());
+
+        let release_state = take_suppressed_separator_release_state(
+            Some(Key::KEY_SPACE),
+            &mut pending_word_commit,
+            Key::KEY_SPACE,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(release_state.pending_to_finish, None);
+        assert_eq!(pending_word_commit, Some(pending));
     }
 
     #[test]

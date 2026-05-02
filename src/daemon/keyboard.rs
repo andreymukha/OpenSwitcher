@@ -2076,6 +2076,82 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn modifier_state_roundtrips_pressed_modifiers_through_bits() {
+        let state = pressed(&[
+            (Key::KEY_LEFTCTRL, 1),
+            (Key::KEY_RIGHTCTRL, 1),
+            (Key::KEY_LEFTSHIFT, 1),
+            (Key::KEY_RIGHTSHIFT, 1),
+            (Key::KEY_LEFTALT, 1),
+            (Key::KEY_RIGHTALT, 1),
+            (Key::KEY_LEFTMETA, 1),
+            (Key::KEY_RIGHTMETA, 1),
+        ]);
+
+        let restored = ModifierState::from_bits(state.to_bits());
+
+        assert_eq!(restored.to_bits(), state.to_bits());
+        assert!(restored.is_ctrl_pressed());
+        assert!(restored.is_shift_pressed());
+        assert!(restored.is_alt_pressed());
+        assert!(restored.is_meta_pressed());
+    }
+
+    #[test]
+    fn caps_lock_toggles_only_on_key_press() {
+        let mut state = ModifierState::default();
+
+        state.update(Key::KEY_CAPSLOCK, 1);
+        assert!(state.is_caps_lock_active());
+
+        state.update(Key::KEY_CAPSLOCK, 0);
+        assert!(state.is_caps_lock_active());
+
+        state.update(Key::KEY_CAPSLOCK, 2);
+        assert!(state.is_caps_lock_active());
+
+        state.update(Key::KEY_CAPSLOCK, 1);
+        assert!(!state.is_caps_lock_active());
+    }
+
+    #[test]
+    fn shared_modifier_state_stores_and_loads_snapshot() {
+        let shared = SharedModifierState::default();
+        let state = pressed(&[
+            (Key::KEY_RIGHTCTRL, 1),
+            (Key::KEY_LEFTSHIFT, 1),
+            (Key::KEY_RIGHTALT, 1),
+            (Key::KEY_LEFTMETA, 1),
+        ]);
+
+        shared.store(state);
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.to_bits(), state.to_bits());
+        assert!(snapshot.is_ctrl_pressed());
+        assert!(snapshot.is_shift_pressed());
+        assert!(snapshot.is_alt_pressed());
+        assert!(snapshot.is_meta_pressed());
+    }
+
+    #[test]
+    fn modifier_state_aggregate_helpers_track_left_and_right_keys() {
+        assert!(pressed(&[(Key::KEY_LEFTSHIFT, 1)]).is_shift_pressed());
+        assert!(pressed(&[(Key::KEY_RIGHTSHIFT, 1)]).is_shift_pressed());
+        assert!(pressed(&[(Key::KEY_LEFTCTRL, 1)]).is_ctrl_pressed());
+        assert!(pressed(&[(Key::KEY_RIGHTCTRL, 1)]).is_ctrl_pressed());
+        assert!(pressed(&[(Key::KEY_LEFTALT, 1)]).is_alt_pressed());
+        assert!(pressed(&[(Key::KEY_RIGHTALT, 1)]).is_alt_pressed());
+        assert!(pressed(&[(Key::KEY_LEFTMETA, 1)]).is_meta_pressed());
+        assert!(pressed(&[(Key::KEY_RIGHTMETA, 1)]).is_meta_pressed());
+
+        assert!(!pressed(&[(Key::KEY_LEFTSHIFT, 0)]).is_shift_pressed());
+        assert!(!pressed(&[(Key::KEY_LEFTCTRL, 0)]).is_ctrl_pressed());
+        assert!(!pressed(&[(Key::KEY_LEFTALT, 0)]).is_alt_pressed());
+        assert!(!pressed(&[(Key::KEY_LEFTMETA, 0)]).is_meta_pressed());
+    }
+
     // Correction replay helpers
 
     #[test]

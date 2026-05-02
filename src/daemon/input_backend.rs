@@ -282,6 +282,8 @@ mod tests {
         outcome: FakeOutcome,
     }
 
+    // Test helpers
+
     impl InputBackendOpener for FakeOpener {
         type Backend = FakeBackend;
 
@@ -315,6 +317,23 @@ mod tests {
             event_processing_ready: true,
         }
     }
+
+    // Retry scheduling helpers
+
+    #[test]
+    fn retry_delay_uses_initial_backoff_sequence() {
+        assert_eq!(retry_delay_for_attempt(0), Duration::from_millis(500));
+        assert_eq!(retry_delay_for_attempt(1), Duration::from_secs(1));
+        assert_eq!(retry_delay_for_attempt(2), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn retry_delay_uses_steady_delay_after_initial_sequence() {
+        assert_eq!(retry_delay_for_attempt(3), STEADY_RETRY_DELAY);
+        assert_eq!(retry_delay_for_attempt(20), STEADY_RETRY_DELAY);
+    }
+
+    // Lifecycle transitions
 
     #[test]
     fn startup_access_denied_enters_waiting_for_input_access() {

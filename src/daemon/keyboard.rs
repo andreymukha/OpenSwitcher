@@ -1979,6 +1979,8 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
+    // Test helpers
+
     fn pressed(keys: &[(Key, i32)]) -> ModifierState {
         let mut state = ModifierState::default();
         for (key, value) in keys {
@@ -2000,6 +2002,8 @@ mod tests {
             selected_text_hotkey: crate::model::SelectedTextHotkey::default(),
         }
     }
+
+    // Modifier state / layout shortcuts
 
     #[test]
     fn matches_alt_shift_combo_with_right_alt() {
@@ -2031,6 +2035,8 @@ mod tests {
         ));
     }
 
+    // Correction replay helpers
+
     #[test]
     fn replay_shift_uses_caps_lock_to_preserve_visible_case() {
         let lowercase_target = crate::daemon::switch_logic::Keystroke {
@@ -2049,6 +2055,8 @@ mod tests {
         assert!(!replay_shift_for_stroke(&lowercase_target, false));
         assert!(replay_shift_for_stroke(&uppercase_target, false));
     }
+
+    // Device discovery
 
     #[test]
     fn keyboard_symlink_candidates_prioritize_by_path_before_by_id() {
@@ -2082,6 +2090,8 @@ mod tests {
 
         assert!(matches!(error, SwitcherError::KeyboardAccessDenied { .. }));
     }
+
+    // X11/session policy
 
     #[test]
     fn x11_input_target_watcher_is_enabled_only_for_x11_sessions() {
@@ -2142,6 +2152,8 @@ mod tests {
         );
     }
 
+    // Writer lifecycle / queue behavior
+
     #[test]
     fn writer_stop_marks_alive_false_before_blocking_shutdown_completes() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
@@ -2178,6 +2190,8 @@ mod tests {
 
         stopper.join().expect("stop thread should finish");
     }
+
+    // Watcher readiness
 
     #[test]
     fn pointer_watcher_readiness_is_true_when_disabled_by_policy() {
@@ -2256,6 +2270,8 @@ mod tests {
 
         assert!(watcher.is_ready());
     }
+
+    // Deferred manual current-word writer
 
     #[test]
     fn begin_manual_current_word_correction_returns_request_id_immediately() {

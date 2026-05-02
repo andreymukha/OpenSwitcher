@@ -1900,6 +1900,7 @@ fn selected_text_hotkey_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::SelectedTextHotkey;
     use evdev::Key;
 
     fn stroke(key: Key) -> Keystroke {
@@ -1908,6 +1909,14 @@ mod tests {
             shift: false,
             caps_lock: false,
         }
+    }
+
+    fn modifiers_with(pressed_keys: &[Key]) -> ModifierState {
+        let mut modifiers = ModifierState::default();
+        for key in pressed_keys {
+            modifiers.update(*key, 1);
+        }
+        modifiers
     }
 
     #[test]
@@ -2020,6 +2029,74 @@ mod tests {
     }
 
     #[test]
+    fn selected_text_hotkey_matches_shift_pause_press_only_with_exact_modifiers() {
+        assert!(selected_text_hotkey_matches(
+            SelectedTextHotkey::ShiftPause,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            SelectedTextHotkey::ShiftPause,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_PAUSE,
+            0,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            SelectedTextHotkey::ShiftPause,
+            ModifierState::default(),
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            SelectedTextHotkey::ShiftPause,
+            modifiers_with(&[Key::KEY_LEFTCTRL]),
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            SelectedTextHotkey::ShiftPause,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_F12,
+            1,
+        ));
+    }
+
+    #[test]
+    fn selected_text_hotkey_matches_configured_f12_and_scroll_lock_variants() {
+        assert!(selected_text_hotkey_matches(
+            SelectedTextHotkey::ShiftF12,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(selected_text_hotkey_matches(
+            SelectedTextHotkey::CtrlF12,
+            modifiers_with(&[Key::KEY_LEFTCTRL]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(selected_text_hotkey_matches(
+            SelectedTextHotkey::AltScrollLock,
+            modifiers_with(&[Key::KEY_LEFTALT]),
+            Key::KEY_SCROLLLOCK,
+            1,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            SelectedTextHotkey::CtrlF12,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            SelectedTextHotkey::AltScrollLock,
+            modifiers_with(&[Key::KEY_LEFTALT]),
+            Key::KEY_SCROLLLOCK,
+            0,
+        ));
+    }
+
+    #[test]
     fn automatic_layout_correction_can_be_scheduled_for_english_and_russian_layouts() {
         assert!(auto_layout_correction_supported_for_layout(
             AppLayoutKind::English
@@ -2033,6 +2110,30 @@ mod tests {
         assert!(!auto_layout_correction_supported_for_layout(
             AppLayoutKind::Unknown
         ));
+    }
+
+    #[test]
+    fn manual_previous_word_correction_with_punctuation_tail_replays_separator() {
+        let corrected_previous_word = vec![
+            stroke(Key::KEY_G),
+            stroke(Key::KEY_H),
+            stroke(Key::KEY_COMMA),
+        ];
+        let applied = AppliedManualCorrection {
+            corrected_buffer: corrected_previous_word.clone(),
+            used_current_buffer: false,
+            extra_backspaces: 1,
+        };
+        let mut buffer = vec![stroke(Key::KEY_A), stroke(Key::KEY_B)];
+        let mut word_context = WordContext::default();
+
+        let replay = finalize_manual_correction(&mut buffer, &mut word_context, &applied);
+
+        assert_eq!(replay, Some(Key::KEY_SPACE));
+        assert!(buffer.is_empty());
+        assert!(word_context.valid);
+        assert_eq!(word_context.word_before_cursor, corrected_previous_word);
+        assert!(word_context.followed_by_separator);
     }
 
     #[test]
@@ -2124,6 +2225,27 @@ mod tests {
             Key::KEY_ENTER,
             0,
         ));
+    }
+
+    #[test]
+    fn early_finish_does_not_preserve_separator_when_next_event_is_release_or_modifier() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+
+        assert_eq!(
+            preserved_separator_after_early_finish(Some(&pending), Key::KEY_A, 1),
+            Some(Key::KEY_SPACE)
+        );
+        assert_eq!(
+            preserved_separator_after_early_finish(Some(&pending), Key::KEY_A, 0),
+            None
+        );
+        assert_eq!(
+            preserved_separator_after_early_finish(Some(&pending), Key::KEY_LEFTSHIFT, 1),
+            None
+        );
     }
 
     #[test]

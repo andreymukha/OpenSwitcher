@@ -809,6 +809,8 @@ mod tests {
     use super::*;
     use crate::layout_backend::AppLayoutKind;
 
+    // Test helpers
+
     fn stroke(key: Key) -> Keystroke {
         Keystroke {
             key,
@@ -890,6 +892,8 @@ mod tests {
             .collect()
     }
 
+    // Word splitting / trailing punctuation
+
     #[test]
     fn split_trailing_tail_extracts_english_comma_suffix() {
         let buffer = vec![
@@ -969,6 +973,8 @@ mod tests {
         assert!(split.trailing_tail.is_empty());
     }
 
+    // Manual correction plans
+
     #[test]
     fn manual_plan_prefers_current_buffer() {
         let current = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
@@ -1020,6 +1026,8 @@ mod tests {
 
         assert!(manual_correction_plan(&current, &[], false, AppLayoutKind::English).is_none());
     }
+
+    // Same-layout case correction and case preservation
 
     #[test]
     fn fixes_two_capitals_text_pattern_for_russian_and_english_examples() {
@@ -1195,6 +1203,8 @@ mod tests {
         assert_eq!(keys_to_string(&corrected), "Ghbdtn");
     }
 
+    // EN -> RU auto-switch heuristic
+
     #[test]
     fn russian_like_word_triggers_switch() {
         let buffer = vec![stroke(Key::KEY_F), stroke(Key::KEY_D), stroke(Key::KEY_L)];
@@ -1265,6 +1275,8 @@ mod tests {
             );
         }
     }
+
+    // RU -> EN auto-switch heuristic
 
     #[test]
     fn russian_layout_english_word_hello_triggers_switch() {
@@ -1482,6 +1494,8 @@ mod tests {
         assert_eq!(keys_to_string(&plan.buffer), "Hello");
     }
 
+    // False positives / technical tokens
+
     #[test]
     fn common_english_word_does_not_trigger_switch() {
         let buffer = vec![stroke(Key::KEY_C), stroke(Key::KEY_A), stroke(Key::KEY_R)];
@@ -1570,6 +1584,8 @@ mod tests {
 
         assert!(!should_switch(&buffer, AppLayoutKind::English));
     }
+
+    // Low-level key/string helpers
 
     #[test]
     fn keys_to_string_uses_direct_character_mapping() {

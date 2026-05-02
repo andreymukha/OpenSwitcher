@@ -34,6 +34,9 @@ const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // are rare and correctness matters more than shaving a few microseconds there.
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
+
+// Backend readiness state
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InputBackendReadiness {
     pub keyboard_open: bool,
@@ -51,6 +54,8 @@ impl InputBackendReadiness {
     }
 }
 
+// Keyboard controller
+
 pub struct KeyboardController {
     real_device: GrabbedKeyboardDevice,
     pointer_watcher: PointerWatcher,
@@ -58,10 +63,14 @@ pub struct KeyboardController {
     virtual_device: VirtualKeyboardWriter,
 }
 
+// Selection keyboard transport
+
 pub struct SelectionKeyboardTransport {
     virtual_device: VirtualKeyboardHandle,
     modifiers: SharedModifierState,
 }
+
+// Virtual keyboard writer
 
 #[derive(Clone)]
 struct VirtualKeyboardHandle {
@@ -138,11 +147,15 @@ pub enum ManualCurrentWordStartOutcome {
     RejectedBeforeMutation(String),
 }
 
+// Real keyboard device
+
 struct GrabbedKeyboardDevice {
     path: PathBuf,
     device: Device,
     grabbed: bool,
 }
+
+// Pointer watcher
 
 struct PointerWatcher {
     click_flag: Arc<AtomicBool>,
@@ -151,6 +164,8 @@ struct PointerWatcher {
     required: bool,
     handle: Option<JoinHandle<()>>,
 }
+
+// Input target watcher
 
 struct InputTargetWatcher {
     changed_flag: Arc<AtomicBool>,
@@ -165,12 +180,16 @@ struct PointerDeviceState {
     pressed_buttons: HashSet<Key>,
 }
 
+// X11 active window monitor
+
 struct ActiveWindowMonitor {
     conn: x11rb::rust_connection::RustConnection,
     root: u32,
     active_window_atom: u32,
     current_window: Option<u32>,
 }
+
+// Watcher worker lifecycle
 
 struct WorkerAliveGuard {
     alive: Arc<AtomicBool>,
@@ -187,6 +206,8 @@ impl Drop for WorkerAliveGuard {
         self.alive.store(false, Ordering::SeqCst);
     }
 }
+
+// Modifier state
 
 #[derive(Clone, Default)]
 pub struct SharedModifierState {
@@ -340,6 +361,8 @@ impl ModifierState {
         }
     }
 }
+
+// Keyboard controller
 
 impl KeyboardController {
     pub fn open() -> Result<Self, SwitcherError> {
@@ -495,6 +518,8 @@ impl KeyboardController {
     }
 }
 
+// Real keyboard device
+
 impl GrabbedKeyboardDevice {
     fn open(path: PathBuf) -> Result<Self, SwitcherError> {
         let device = Device::open(&path).map_err(|error| map_keyboard_open_error(&path, error))?;
@@ -582,6 +607,8 @@ impl Drop for GrabbedKeyboardDevice {
         self.grabbed = false;
     }
 }
+
+// Pointer watcher
 
 impl PointerWatcher {
     fn spawn(paths: Vec<PathBuf>) -> Self {
@@ -694,6 +721,8 @@ impl PointerWatcher {
         !self.required || self.alive.load(Ordering::SeqCst)
     }
 }
+
+// Input target watcher
 
 impl InputTargetWatcher {
     fn spawn() -> Self {
@@ -871,6 +900,8 @@ where
         }
     }
 }
+
+// Virtual keyboard writer
 
 impl VirtualKeyboardWriter {
     fn new(name: &str) -> Result<Self, SwitcherError> {
@@ -1204,6 +1235,8 @@ impl ActiveWindowMonitor {
         Ok(reply.value32().and_then(|mut values| values.next()))
     }
 }
+
+// Device discovery
 
 fn configured_keyboard_path() -> Option<PathBuf> {
     let raw = env::var_os(KEYBOARD_PATH_ENV)?;
@@ -1563,6 +1596,8 @@ fn format_x11_window(window: Option<u32>) -> String {
     }
 }
 
+// Modifier replay helpers
+
 impl ModifierState {
     fn for_each_pressed(
         self,
@@ -1597,6 +1632,8 @@ impl ModifierState {
     }
 }
 
+// Selection keyboard transport
+
 impl SelectionKeyboardTransport {
     pub fn send_copy_shortcut(&mut self) -> Result<(), SwitcherError> {
         // Take a fresh modifier snapshot for each shortcut so copy/paste does not
@@ -1610,6 +1647,8 @@ impl SelectionKeyboardTransport {
             .send_paste_shortcut(self.modifiers.snapshot())
     }
 }
+
+// Correction replay
 
 fn release_modifiers(
     device: &mut uinput::Device,
@@ -1825,6 +1864,8 @@ fn run_correction(
     restore_modifiers(device, modifiers)?;
     Ok(())
 }
+
+// Virtual keyboard writer loop
 
 fn run_virtual_keyboard_writer_loop(
     mut device: uinput::Device,

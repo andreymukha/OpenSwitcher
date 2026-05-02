@@ -32,11 +32,14 @@ pub enum LayoutCorrectionDirection {
     RussianToEnglish,
 }
 
+// Short command/tool names are treated as English in the EN -> RU guard.
 const EXCLUDED_WORDS: &[&str] = &[
     "sudo", "git", "cargo", "rustc", "python", "node", "grep", "echo", "ls", "cd", "rm", "mkdir",
     "apt",
 ];
 
+// Technical English terms are protected from EN -> RU correction and accepted
+// as confident English candidates when typed while the Russian layout is active.
 const TECHNICAL_ENGLISH_WORDS: &[&str] = &[
     "api",
     "array",
@@ -89,6 +92,8 @@ const TECHNICAL_ENGLISH_WORDS: &[&str] = &[
     "yaml",
 ];
 
+// Physical-key strings that spell common Russian words have priority over
+// English-looking patterns in the RU -> EN heuristic.
 const RUSSIAN_PRIORITY_PHYSICAL_WORDS: &[&str] = &[
     "kexit",        // лучше
     "ckexbkjcm",    // случилось

@@ -28,3 +28,6 @@ jobs:
 
       - name: Cargo test
         run: cargo test -q
+
+      - name: Cargo test settings-ui lib
+        run: cargo test -q --features settings-ui --lib

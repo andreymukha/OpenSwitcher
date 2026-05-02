@@ -1757,6 +1757,8 @@ impl DaemonService {
         Ok(())
     }
 
+    // Input backend lifecycle
+
     fn try_initialize_input_backend(&mut self) -> Result<(), SwitcherError> {
         if let Some(opened) = self
             .input_backend
@@ -1813,6 +1815,8 @@ impl DaemonService {
         // keyboard control has already been returned to the user.
         self.selected_text_runner = None;
     }
+
+    // Transient input state reset / invalidation
 
     fn reset_transient_input_state(&mut self, reason: &str) {
         log_input_debug("transient-input-reset", &format!("reason={reason}"));

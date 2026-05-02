@@ -1903,6 +1903,8 @@ mod tests {
     use crate::model::SelectedTextHotkey;
     use evdev::Key;
 
+    // Test helpers
+
     fn stroke(key: Key) -> Keystroke {
         Keystroke {
             key,
@@ -1918,6 +1920,8 @@ mod tests {
         }
         modifiers
     }
+
+    // Startup layout resync
 
     #[test]
     fn startup_layout_resync_starts_pending() {
@@ -1972,6 +1976,8 @@ mod tests {
         assert_eq!(state, StartupLayoutResyncState::Completed);
     }
 
+    // Layout shortcut decisions
+
     #[test]
     fn automatic_layout_actions_are_blocked_when_backend_sync_is_skipped() {
         assert!(!automatic_layout_actions_allowed(
@@ -2022,11 +2028,15 @@ mod tests {
         );
     }
 
+    // Pending status / status publishing helpers
+
     #[test]
     fn pending_status_change_requests_publish_from_service() {
         assert!(should_publish_pending_status_change(true));
         assert!(!should_publish_pending_status_change(false));
     }
+
+    // Selected-text hotkey matching
 
     #[test]
     fn selected_text_hotkey_matches_shift_pause_press_only_with_exact_modifiers() {
@@ -2096,6 +2106,8 @@ mod tests {
         ));
     }
 
+    // Auto-correction scheduling helpers
+
     #[test]
     fn automatic_layout_correction_can_be_scheduled_for_english_and_russian_layouts() {
         assert!(auto_layout_correction_supported_for_layout(
@@ -2111,6 +2123,8 @@ mod tests {
             AppLayoutKind::Unknown
         ));
     }
+
+    // Manual correction finalization
 
     #[test]
     fn manual_previous_word_correction_with_punctuation_tail_replays_separator() {
@@ -2208,6 +2222,8 @@ mod tests {
         assert!(!word_context.followed_by_separator);
     }
 
+    // Separator suppression / early finish
+
     #[test]
     fn suppressed_separator_logic_swallows_only_matching_release() {
         assert!(!should_swallow_suppressed_separator_release(
@@ -2268,6 +2284,8 @@ mod tests {
             None
         );
     }
+
+    // Manual current-word commit state
 
     #[test]
     fn manually_corrected_current_word_requires_plain_separator_commit() {
@@ -2333,6 +2351,8 @@ mod tests {
             4,
         ));
     }
+
+    // Manual hotkey latch / undo suppression
 
     #[test]
     fn queued_pause_events_are_swallowed_while_manual_hotkey_is_latched() {
@@ -2490,6 +2510,8 @@ mod tests {
         ));
     }
 
+    // Deferred manual current-word flow
+
     #[test]
     fn modifier_press_is_enqueued_without_marking_real_next_step_during_in_flight() {
         assert_eq!(
@@ -2602,6 +2624,8 @@ mod tests {
         assert!(!should_restart_manual_current_word_after_drain(1, true));
         assert!(!should_restart_manual_current_word_after_drain(0, false));
     }
+
+    // Reset / invalidation helpers
 
     #[test]
     fn clear_word_context_state_clears_word_tracking_without_flow_state() {

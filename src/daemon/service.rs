@@ -289,6 +289,29 @@ fn preserved_separator_after_early_finish(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingWordCommitEarlyFinishState {
+    pending: PendingWordCommit,
+    preserved_separator_key: Option<evdev::Key>,
+}
+
+fn take_pending_word_commit_for_early_finish(
+    pending_word_commit: &mut Option<PendingWordCommit>,
+    key: evdev::Key,
+    value: i32,
+) -> Option<PendingWordCommitEarlyFinishState> {
+    if value != 1 || is_modifier(key) {
+        return None;
+    }
+
+    let pending = pending_word_commit.take()?;
+    let preserved_separator_key = preserved_separator_after_early_finish(Some(&pending), key, value);
+    Some(PendingWordCommitEarlyFinishState {
+        pending,
+        preserved_separator_key,
+    })
+}
+
 // Manual correction state helpers
 
 fn should_commit_manually_corrected_current_word(
@@ -1011,13 +1034,14 @@ impl DaemonService {
                     self.word_context.followed_by_separator,
                 ),
             );
-            let pending = self.pending_word_commit.take().unwrap();
-            // Keep swallowing the physical separator release even if we had to
-            // finish the correction early because the next key arrived first.
-            // Otherwise a late real key-up can leak back into the normal path
-            // after we already replayed the separator virtually.
-            let preserved_separator =
-                preserved_separator_after_early_finish(Some(&pending), key, value);
+            let early_finish = take_pending_word_commit_for_early_finish(
+                &mut self.pending_word_commit,
+                key,
+                value,
+            )
+            .expect("pending early finish already matched");
+            let pending = early_finish.pending;
+            let preserved_separator = early_finish.preserved_separator_key;
             log_input_debug(
                 "suppressed-separator-set",
                 &format!(
@@ -2594,6 +2618,87 @@ mod tests {
             preserved_separator_after_early_finish(None, Key::KEY_A, 1),
             None
         );
+    }
+
+    #[test]
+    fn early_finish_state_takes_pending_on_non_modifier_press() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+        let mut pending_word_commit = Some(pending.clone());
+
+        let early_finish = take_pending_word_commit_for_early_finish(
+            &mut pending_word_commit,
+            Key::KEY_A,
+            1,
+        )
+        .unwrap();
+        let repeated = take_pending_word_commit_for_early_finish(
+            &mut pending_word_commit,
+            Key::KEY_B,
+            1,
+        );
+
+        assert_eq!(
+            early_finish,
+            PendingWordCommitEarlyFinishState {
+                pending,
+                preserved_separator_key: Some(Key::KEY_SPACE),
+            }
+        );
+        assert_eq!(pending_word_commit, None);
+        assert_eq!(repeated, None);
+    }
+
+    #[test]
+    fn early_finish_state_ignores_key_release_and_preserves_pending() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+        let mut pending_word_commit = Some(pending.clone());
+
+        let early_finish = take_pending_word_commit_for_early_finish(
+            &mut pending_word_commit,
+            Key::KEY_A,
+            0,
+        );
+
+        assert_eq!(early_finish, None);
+        assert_eq!(pending_word_commit, Some(pending));
+    }
+
+    #[test]
+    fn early_finish_state_ignores_modifier_press_and_preserves_pending() {
+        let pending = PendingWordCommit {
+            separator_key: Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+        };
+        let mut pending_word_commit = Some(pending.clone());
+
+        let early_finish = take_pending_word_commit_for_early_finish(
+            &mut pending_word_commit,
+            Key::KEY_LEFTSHIFT,
+            1,
+        );
+
+        assert_eq!(early_finish, None);
+        assert_eq!(pending_word_commit, Some(pending));
+    }
+
+    #[test]
+    fn early_finish_state_ignores_missing_pending_commit() {
+        let mut pending_word_commit = None;
+
+        let early_finish = take_pending_word_commit_for_early_finish(
+            &mut pending_word_commit,
+            Key::KEY_A,
+            1,
+        );
+
+        assert_eq!(early_finish, None);
+        assert_eq!(pending_word_commit, None);
     }
 
     // Manual current-word commit state

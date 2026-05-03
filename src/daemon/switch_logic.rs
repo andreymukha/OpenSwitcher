@@ -136,6 +136,15 @@ const RUSSIAN_PRIORITY_PHYSICAL_WORDS: &[&str] = &[
     "eckeub",       // услуги
 ];
 
+// Common English words are accepted only in the RU -> EN heuristic. Keeping
+// them separate avoids broadening EN -> RU technical-token guards.
+const RU_LAYOUT_COMMON_ENGLISH_WORDS: &[&str] = &[
+    "you", "the", "and", "are", "can", "get", "not", "for", "but", "all", "one", "our", "out",
+    "see", "use", "work", "home", "time", "know", "want", "make", "need", "like", "good",
+    "love", "look", "come", "from", "have", "will", "with", "this", "that", "about", "after",
+    "people", "because", "should", "would", "could", "really", "please", "thanks",
+];
+
 pub fn manual_correction_plan(
     current_buffer: &[Keystroke],
     last_word_buffer: &[Keystroke],
@@ -542,6 +551,9 @@ fn count_latin_vowels_without_y(word: &str) -> usize {
 fn is_confident_english_for_russian_layout(word: &str) -> bool {
     if RUSSIAN_PRIORITY_PHYSICAL_WORDS.contains(&word) {
         return false;
+    }
+    if RU_LAYOUT_COMMON_ENGLISH_WORDS.contains(&word) {
+        return true;
     }
     if TECHNICAL_ENGLISH_WORDS.contains(&word) {
         return true;
@@ -957,6 +969,39 @@ mod tests {
         assert!(
             triggered.is_empty(),
             "tokens must not trigger EN -> RU correction: {triggered:?}"
+        );
+    }
+
+    fn russian_layout_corpus_results<'a>(words: &'a [&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+        let mut passed = Vec::new();
+        let mut failed = Vec::new();
+        for word in words {
+            if should_switch(&strokes_for_text(word), AppLayoutKind::Russian) {
+                passed.push(*word);
+            } else {
+                failed.push(*word);
+            }
+        }
+        (passed, failed)
+    }
+
+    fn assert_russian_layout_words_switch(words: &[&str]) {
+        let (passed, failed) = russian_layout_corpus_results(words);
+        assert!(
+            failed.is_empty(),
+            "RU -> EN corpus failures: passed={passed:?} failed={failed:?}"
+        );
+    }
+
+    fn assert_russian_layout_words_do_not_switch(words: &[&str]) {
+        let switched = words
+            .iter()
+            .copied()
+            .filter(|word| should_switch(&strokes_for_text(word), AppLayoutKind::Russian))
+            .collect::<Vec<_>>();
+        assert!(
+            switched.is_empty(),
+            "Russian/control corpus must not trigger RU -> EN correction: {switched:?}"
         );
     }
 
@@ -1417,6 +1462,30 @@ mod tests {
     }
 
     #[test]
+    fn russian_layout_common_english_three_letter_words_trigger_switch() {
+        assert_russian_layout_words_switch(&[
+            "you", "the", "and", "are", "can", "get", "not", "for", "but", "all", "one", "our",
+            "out", "see", "use",
+        ]);
+    }
+
+    #[test]
+    fn russian_layout_common_english_four_letter_words_trigger_switch() {
+        assert_russian_layout_words_switch(&[
+            "work", "home", "time", "know", "want", "make", "need", "like", "good", "love",
+            "look", "come", "from", "have", "will", "with", "this", "that",
+        ]);
+    }
+
+    #[test]
+    fn russian_layout_common_english_longer_words_trigger_switch() {
+        assert_russian_layout_words_switch(&[
+            "about", "after", "people", "because", "should", "would", "could", "really",
+            "please", "thanks",
+        ]);
+    }
+
+    #[test]
     fn russian_layout_correct_russian_privet_does_not_trigger_switch() {
         let buffer = strokes_for_text("ghbdtn");
         assert!(!should_switch(&buffer, AppLayoutKind::Russian));
@@ -1515,6 +1584,24 @@ mod tests {
                 "{word} is currently accepted as a RU -> EN false negative"
             );
         }
+    }
+
+    #[test]
+    fn russian_layout_developer_technical_corpus_documents_current_behavior() {
+        let should_switch_words = [
+            "json", "yaml", "http", "https", "docker", "config", "terminal", "browser",
+        ];
+        let should_not_switch_words = ["cargo", "rust", "sudo", "git", "npm", "ssh", "jwt"];
+
+        assert_russian_layout_words_switch(&should_switch_words);
+        assert_russian_layout_words_do_not_switch(&should_not_switch_words);
+    }
+
+    #[test]
+    fn russian_layout_negative_russian_priority_corpus_with_punctuation_does_not_switch() {
+        assert_russian_layout_words_do_not_switch(&[
+            "ghbdtn,", "vfvf.", "rjn?", "yfghbvth!", "kexit.", "here,", "ckexfq?",
+        ]);
     }
 
     #[test]

@@ -2044,6 +2044,26 @@ mod tests {
         }
     }
 
+    fn test_writer_handle(
+        capacity: usize,
+        alive: bool,
+    ) -> (VirtualKeyboardHandle, mpsc::Receiver<WriterCommand>) {
+        let (command_tx, command_rx) = mpsc::sync_channel(capacity);
+        (
+            VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(alive)),
+            },
+            command_rx,
+        )
+    }
+
+    fn copy_shortcut_transaction() -> WriterTransactionKind {
+        WriterTransactionKind::CopyShortcut {
+            modifiers: ModifierState::default(),
+        }
+    }
+
     // Modifier state / layout shortcuts
 
     #[test]
@@ -2306,6 +2326,91 @@ mod tests {
         );
 
         stopper.join().expect("stop thread should finish");
+    }
+
+    #[test]
+    fn transaction_returns_disconnected_when_receiver_is_dropped() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        drop(command_rx);
+
+        let error = handle.run_transaction(copy_shortcut_transaction()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+    }
+
+    #[test]
+    fn transaction_returns_disconnected_when_reply_sender_is_dropped() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let worker = thread::spawn(move || {
+            let command = command_rx.recv().expect("transaction command should be sent");
+            match command {
+                WriterCommand::Transaction(WriterTransaction::Execute { reply, .. }) => {
+                    drop(reply);
+                }
+                _ => panic!("expected transaction command"),
+            }
+        });
+
+        let error = handle.run_transaction(copy_shortcut_transaction()).unwrap_err();
+        worker.join().expect("worker should finish");
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+    }
+
+    #[test]
+    fn transaction_returns_worker_reply_result() {
+        fn run_with_reply(reply_result: Result<(), SwitcherError>) -> Result<(), SwitcherError> {
+            let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+            let worker = thread::spawn(move || {
+                let command = command_rx.recv().expect("transaction command should be sent");
+                match command {
+                    WriterCommand::Transaction(WriterTransaction::Execute { reply, .. }) => {
+                        reply.send(reply_result).expect("caller should await reply");
+                    }
+                    _ => panic!("expected transaction command"),
+                }
+            });
+
+            let result = handle.run_transaction(copy_shortcut_transaction());
+            worker.join().expect("worker should finish");
+            result
+        }
+
+        assert!(run_with_reply(Ok(())).is_ok());
+
+        let error =
+            run_with_reply(Err(SwitcherError::VirtualKeyboardWriterSaturated)).unwrap_err();
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterSaturated
+        ));
+    }
+
+    #[test]
+    fn fast_command_returns_saturated_when_queue_stays_full() {
+        let (handle, command_rx) = test_writer_handle(1, true);
+        handle
+            .command_tx
+            .send(WriterCommand::Shutdown)
+            .expect("pre-fill should succeed");
+
+        let error = handle
+            .send_fast_command(WriterFastCommand::TypeSeparator {
+                key: Key::KEY_SPACE,
+            })
+            .unwrap_err();
+        drop(command_rx);
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterSaturated
+        ));
     }
 
     // Watcher readiness

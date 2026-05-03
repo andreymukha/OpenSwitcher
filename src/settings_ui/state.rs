@@ -392,6 +392,8 @@ mod tests {
         SystemContext,
     };
 
+    // Dirty/save state
+
     #[test]
     fn save_enabled_only_for_dirty_idle_state() {
         let mut state = DomainState::new();
@@ -405,6 +407,8 @@ mod tests {
         state.begin_save();
         assert!(!state.view_state().save_enabled);
     }
+
+    // Autostart state
 
     #[test]
     fn autostart_checkbox_is_part_of_dirty_settings_state() {
@@ -438,6 +442,8 @@ mod tests {
         assert!(state.view_state().saving);
     }
 
+    // Discard/reload state
+
     #[test]
     fn discard_changes_restores_persisted_settings_and_autostart_checkbox() {
         let mut state = DomainState::new();
@@ -451,6 +457,8 @@ mod tests {
         assert!(!state.view_state().fix_two_capitals);
         assert!(!state.view_state().dirty);
     }
+
+    // Layout switch fallback hints
 
     #[test]
     fn view_state_marks_unsupported_fallback_combo_as_fallback() {
@@ -532,6 +540,8 @@ mod tests {
         assert!(!view.layout_switch.show_fallback_hint);
         assert!(view.layout_switch.fallback_hint_text.is_empty());
     }
+
+    // Layout switch manual override/capture
 
     #[test]
     fn manual_override_hides_fallback_hint_even_when_loaded_source_is_auto_fallback() {

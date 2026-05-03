@@ -35,6 +35,8 @@ const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
 const TRANSACTION_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
+const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
+const SHUTDOWN_JOIN_RETRY_WINDOW: Duration = Duration::from_millis(50);
 
 // Backend readiness state
 
@@ -958,10 +960,87 @@ impl VirtualKeyboardWriter {
 
     fn stop(&mut self) {
         if self.handle.alive.swap(false, Ordering::SeqCst) {
-            let _ = self.handle.command_tx.send(WriterCommand::Shutdown);
+            self.send_shutdown_command();
         }
 
+        self.join_writer_thread_best_effort();
+    }
+
+    fn send_shutdown_command(&self) {
+        let started = Instant::now();
+        let mut yielded = false;
+        let mut command = WriterCommand::Shutdown;
+
+        loop {
+            match self.handle.command_tx.try_send(command) {
+                Ok(()) => {
+                    if yielded {
+                        log_input_debug(
+                            "writer-shutdown-backpressure-recovered",
+                            &format!("elapsed_us={}", started.elapsed().as_micros()),
+                        );
+                    }
+                    return;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    log_input_debug("writer-shutdown-disconnected", "receiver_closed=true");
+                    return;
+                }
+                Err(mpsc::TrySendError::Full(returned_command)) => {
+                    if started.elapsed() >= SHUTDOWN_SEND_RETRY_WINDOW {
+                        log_input_debug(
+                            "writer-shutdown-backpressure-failed",
+                            &format!(
+                                "elapsed_us={} retry_window_us={}",
+                                started.elapsed().as_micros(),
+                                SHUTDOWN_SEND_RETRY_WINDOW.as_micros()
+                            ),
+                        );
+                        return;
+                    }
+
+                    if !yielded {
+                        log_input_debug(
+                            "writer-shutdown-backpressure",
+                            &format!("retry_window_us={}", SHUTDOWN_SEND_RETRY_WINDOW.as_micros()),
+                        );
+                        yielded = true;
+                    }
+                    command = returned_command;
+                    thread::yield_now();
+                }
+            }
+        }
+    }
+
+    fn join_writer_thread_best_effort(&mut self) {
         if let Some(join_handle) = self.join_handle.take() {
+            let started = Instant::now();
+            let mut yielded = false;
+
+            while !join_handle.is_finished() {
+                if started.elapsed() >= SHUTDOWN_JOIN_RETRY_WINDOW {
+                    log_input_debug(
+                        "writer-shutdown-join-timeout",
+                        &format!(
+                            "elapsed_us={} retry_window_us={}",
+                            started.elapsed().as_micros(),
+                            SHUTDOWN_JOIN_RETRY_WINDOW.as_micros()
+                        ),
+                    );
+                    return;
+                }
+
+                if !yielded {
+                    log_input_debug(
+                        "writer-shutdown-join-wait",
+                        &format!("retry_window_us={}", SHUTDOWN_JOIN_RETRY_WINDOW.as_micros()),
+                    );
+                    yielded = true;
+                }
+                thread::yield_now();
+            }
+
             let _ = join_handle.join();
         }
     }
@@ -2343,7 +2422,7 @@ mod tests {
     // Writer lifecycle / queue behavior
 
     #[test]
-    fn writer_stop_marks_alive_false_before_blocking_shutdown_completes() {
+    fn writer_stop_marks_alive_false_before_shutdown_completes() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         command_tx
             .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
@@ -2377,6 +2456,115 @@ mod tests {
         );
 
         stopper.join().expect("stop thread should finish");
+    }
+
+    #[test]
+    fn writer_stop_returns_when_shutdown_queue_is_full() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
+                key: Key::KEY_SPACE,
+            }))
+            .expect("queue should accept initial command");
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: alive.clone(),
+            },
+            join_handle: Some(thread::spawn(|| {})),
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let stopper = thread::spawn(move || {
+            let mut writer = writer;
+            writer.stop();
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => {}
+            Err(error) => {
+                drop(command_rx);
+                stopper.join().expect("stop thread should finish");
+                panic!("writer stop should return without blocking on a full queue: {error:?}");
+            }
+        }
+
+        drop(command_rx);
+        stopper.join().expect("stop thread should finish");
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "writer must stop advertising itself as alive during teardown"
+        );
+    }
+
+    #[test]
+    fn writer_stop_handles_disconnected_shutdown_receiver() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        drop(command_rx);
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: alive.clone(),
+            },
+            join_handle: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+        };
+
+        writer.stop();
+
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "writer must stop advertising itself as alive even when shutdown cannot be sent"
+        );
+    }
+
+    #[test]
+    fn writer_stop_returns_when_writer_thread_does_not_finish() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let alive = Arc::new(AtomicBool::new(true));
+        let writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: alive.clone(),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_receiver_alive = command_rx;
+                let _ = release_rx.recv();
+            })),
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+
+        let stopper = thread::spawn(move || {
+            let mut writer = writer;
+            writer.stop();
+            let _ = done_tx.send(());
+        });
+
+        match done_rx.recv_timeout(Duration::from_millis(250)) {
+            Ok(()) => {}
+            Err(error) => {
+                drop(release_tx);
+                stopper.join().expect("stop thread should finish");
+                panic!("writer stop should return without blocking forever on join: {error:?}");
+            }
+        }
+
+        drop(release_tx);
+        stopper.join().expect("stop thread should finish");
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "writer must stop advertising itself as alive during teardown"
+        );
     }
 
     #[test]

@@ -231,6 +231,8 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
+    // Initial state retry
+
     #[test]
     fn initial_state_retry_waits_for_daemon_to_appear() {
         let availability = RefCell::new(VecDeque::from([Ok(false), Ok(false), Ok(true)]));

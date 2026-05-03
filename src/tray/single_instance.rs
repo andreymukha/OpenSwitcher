@@ -71,6 +71,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::time::Duration;
 
+    // Single-instance guard
+
     #[test]
     fn second_tray_instance_is_rejected_when_name_is_taken() {
         let bus = FakeNameRequester {
@@ -80,6 +82,8 @@ mod tests {
         let err = acquire_tray_instance(&bus).unwrap_err();
         assert_eq!(err, TrayInstanceError::AlreadyRunning);
     }
+
+    // Daemon availability / startup retry
 
     #[test]
     fn daemon_restart_is_attempted_three_times_before_tray_gives_up() {

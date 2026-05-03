@@ -1,7 +1,7 @@
 use open_switcher::config::AppConfig;
 use open_switcher::daemon::runtime::{ConfigService, RuntimeState};
 use open_switcher::dbus::{
-    OpenSwitcherDbusApi, OpenSwitcherProxyBlocking, INTERFACE_NAME, OBJECT_PATH,
+    OpenSwitcherDbusApi, OpenSwitcherProxyBlocking, INTERFACE_NAME, OBJECT_PATH, SERVICE_NAME,
 };
 use open_switcher::model::{
     AutoDetectedLayoutSwitch, LayoutSwitchCapturePhase, LayoutSwitchCaptureState,
@@ -14,6 +14,17 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use zbus::blocking::{Connection, ConnectionBuilder, Proxy};
+
+// D-Bus contract constants
+
+#[test]
+fn dbus_public_constants_match_contract() {
+    assert_eq!(SERVICE_NAME, "org.oswitch.core");
+    assert_eq!(OBJECT_PATH, "/org/oswitch/core");
+    assert_eq!(INTERFACE_NAME, "org.oswitch.core");
+}
+
+// Settings roundtrip
 
 #[test]
 fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
@@ -82,6 +93,8 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// Validation errors
+
 #[test]
 fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
     let temp_dir = TempDir::new()?;
@@ -124,6 +137,8 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+// Enabled/toggle behavior
 
 #[test]
 fn dbus_update_settings_changes_daemon_visible_is_enabled() -> Result<(), Box<dyn Error>> {
@@ -194,6 +209,8 @@ fn dbus_toggle_updates_persisted_auto_switch_setting() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+// Tray/settings reload consistency
+
 #[test]
 fn tray_and_settings_reload_observe_same_auto_switch_value() -> Result<(), Box<dyn Error>> {
     let temp_dir = TempDir::new()?;
@@ -231,6 +248,8 @@ fn tray_and_settings_reload_observe_same_auto_switch_value() -> Result<(), Box<d
     Ok(())
 }
 
+// Capture controls
+
 #[test]
 fn dbus_exposes_layout_switch_capture_session_controls() -> Result<(), Box<dyn Error>> {
     let temp_dir = TempDir::new()?;
@@ -255,6 +274,8 @@ fn dbus_exposes_layout_switch_capture_session_controls() -> Result<(), Box<dyn E
 
     Ok(())
 }
+
+// Test harness
 
 fn spawn_service(config_path: &Path, service_name: &str) -> Result<Connection, Box<dyn Error>> {
     let runtime = Arc::new(RuntimeState::new(ConfigService::load(config_path.to_path_buf())?));

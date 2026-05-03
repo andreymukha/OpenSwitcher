@@ -30,10 +30,11 @@ const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
 // Transactional commands use the same total-order queue, but are represented as
-// single indivisible commands and are sent with blocking semantics because they
-// are rare and correctness matters more than shaving a few microseconds there.
+// single indivisible commands and get a larger bounded enqueue window because
+// correctness matters more than shaving a few microseconds there.
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
+const TRANSACTION_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 
 // Backend readiness state
 
@@ -1081,15 +1082,65 @@ impl VirtualKeyboardHandle {
     fn run_transaction(&self, kind: WriterTransactionKind) -> Result<(), SwitcherError> {
         self.ensure_alive()?;
         let (reply_tx, reply_rx) = mpsc::channel();
-        self.command_tx
-            .send(WriterCommand::Transaction(WriterTransaction::Execute {
-                kind,
-                reply: reply_tx,
-            }))
-            .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?;
+        self.send_transaction_command(WriterTransaction::Execute {
+            kind,
+            reply: reply_tx,
+        })?;
         reply_rx
             .recv()
             .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?
+    }
+
+    fn send_transaction_command(
+        &self,
+        transaction: WriterTransaction,
+    ) -> Result<(), SwitcherError> {
+        let started = Instant::now();
+        let mut yielded = false;
+        let mut command = WriterCommand::Transaction(transaction);
+
+        loop {
+            match self.command_tx.try_send(command) {
+                Ok(()) => {
+                    if yielded {
+                        log_input_debug(
+                            "writer-transaction-backpressure-recovered",
+                            &format!("elapsed_us={}", started.elapsed().as_micros()),
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+                }
+                Err(mpsc::TrySendError::Full(returned_command)) => {
+                    if started.elapsed() >= TRANSACTION_SEND_RETRY_WINDOW {
+                        log_input_debug(
+                            "writer-transaction-backpressure-failed",
+                            &format!(
+                                "elapsed_us={} retry_window_us={}",
+                                started.elapsed().as_micros(),
+                                TRANSACTION_SEND_RETRY_WINDOW.as_micros()
+                            ),
+                        );
+                        return Err(SwitcherError::VirtualKeyboardWriterSaturated);
+                    }
+
+                    if !yielded {
+                        log_input_debug(
+                            "writer-transaction-backpressure",
+                            &format!(
+                                "retry_window_us={}",
+                                TRANSACTION_SEND_RETRY_WINDOW.as_micros()
+                            ),
+                        );
+                        yielded = true;
+                    }
+                    command = returned_command;
+                    thread::yield_now();
+                }
+            }
+        }
     }
 
     fn send_fast_command(&self, command: WriterFastCommand) -> Result<(), SwitcherError> {
@@ -2386,6 +2437,23 @@ mod tests {
 
         let error =
             run_with_reply(Err(SwitcherError::VirtualKeyboardWriterSaturated)).unwrap_err();
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterSaturated
+        ));
+    }
+
+    #[test]
+    fn transaction_send_times_out_when_queue_stays_full() {
+        let (handle, command_rx) = test_writer_handle(1, true);
+        handle
+            .command_tx
+            .send(WriterCommand::Shutdown)
+            .expect("pre-fill should succeed");
+
+        let error = handle.run_transaction(copy_shortcut_transaction()).unwrap_err();
+        drop(command_rx);
+
         assert!(matches!(
             error,
             SwitcherError::VirtualKeyboardWriterSaturated

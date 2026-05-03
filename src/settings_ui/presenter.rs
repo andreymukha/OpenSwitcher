@@ -374,6 +374,7 @@ mod tests {
     use crate::model::{LayoutSwitchSetting, LayoutSwitchSource, Settings};
     use std::collections::VecDeque;
 
+    // Test helpers
     #[derive(Clone, Default)]
     struct FakeSettingsClient {
         state: Arc<Mutex<FakeSettingsClientState>>,
@@ -479,6 +480,7 @@ mod tests {
         }
     }
 
+    // Save flow
     #[test]
     fn save_keeps_persisted_changes_when_autostart_apply_fails_and_reloads_real_state() {
         let client = FakeSettingsClient::default();

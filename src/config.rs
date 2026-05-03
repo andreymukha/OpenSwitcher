@@ -207,7 +207,61 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::LayoutSwitchSource;
+    use crate::model::{
+        DetectionConfidence, DetectionStrategy, DesktopEnvironment, DistroKind, SessionType,
+        SystemContext,
+    };
+    use tempfile::TempDir;
+
+    // Test helpers
+
+    fn cinnamon_x11_detection() -> AutoDetectedLayoutSwitch {
+        AutoDetectedLayoutSwitch {
+            strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+            confidence: DetectionConfidence::High,
+            context: SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Cinnamon,
+                distro: DistroKind::LinuxMint,
+            },
+        }
+    }
+
+    fn xfce_x11_detection() -> AutoDetectedLayoutSwitch {
+        AutoDetectedLayoutSwitch {
+            strategy: DetectionStrategy::XfceX11XfconfKeyboardLayout,
+            confidence: DetectionConfidence::Low,
+            context: SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Xfce,
+                distro: DistroKind::Debian,
+            },
+        }
+    }
+
+    fn non_default_config(source: LayoutSwitchSource) -> AppConfig {
+        AppConfig {
+            layout: LayoutConfig {
+                switch_combo: LayoutSwitchCombo::right_ctrl_right_shift(),
+                switch_source: source,
+                auto_detected: cinnamon_x11_detection(),
+                delay_ms: 123,
+            },
+            delays: DelaysConfig {
+                backspace_ms: 4,
+                typing_ms: 5,
+            },
+            features: FeaturesConfig {
+                auto_switch_enabled: false,
+                fix_two_capitals: true,
+                fix_accidental_caps_lock: true,
+                undo_key: UndoKey::ScrollLock,
+                selected_text_switch_hotkey: SelectedTextHotkey::CtrlF12,
+            },
+        }
+    }
+
+    // Legacy config rejection
 
     #[test]
     fn rejects_legacy_layout_keys_format() {
@@ -268,6 +322,8 @@ mod tests {
         ));
     }
 
+    // Defaults / missing fields
+
     #[test]
     fn missing_new_feature_flags_in_config_default_to_supported_values() {
         let parsed: AppConfigFile = toml::from_str(
@@ -292,5 +348,111 @@ selected_text_switch_hotkey = "ShiftPause"
         assert!(config.features.auto_switch_enabled);
         assert!(!config.features.fix_two_capitals);
         assert!(!config.features.fix_accidental_caps_lock);
+    }
+
+    // Settings mapping
+
+    #[test]
+    fn app_config_settings_and_apply_settings_map_all_boundary_fields() {
+        let mut config = non_default_config(LayoutSwitchSource::AutoDetected);
+        let settings = config.settings();
+
+        assert!(!settings.auto_switch_enabled);
+        assert!(settings.fix_two_capitals);
+        assert!(settings.fix_accidental_caps_lock);
+        assert_eq!(settings.layout_delay_ms, 123);
+        assert_eq!(settings.undo_key, UndoKey::ScrollLock);
+        assert_eq!(settings.selected_text_hotkey, SelectedTextHotkey::CtrlF12);
+        assert_eq!(
+            settings.layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::right_ctrl_right_shift(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: cinnamon_x11_detection(),
+            }
+        );
+
+        let updated = Settings {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
+            layout_delay_ms: 77,
+            undo_key: UndoKey::F12,
+            selected_text_hotkey: SelectedTextHotkey::AltScrollLock,
+            layout_switch: LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::left_alt_left_shift(),
+                source: LayoutSwitchSource::AutoFallback,
+                auto_detected: xfce_x11_detection(),
+            },
+        };
+
+        config.apply_settings(updated);
+
+        assert!(config.features.auto_switch_enabled);
+        assert!(!config.features.fix_two_capitals);
+        assert!(!config.features.fix_accidental_caps_lock);
+        assert_eq!(config.layout.delay_ms, 77);
+        assert_eq!(config.features.undo_key, UndoKey::F12);
+        assert_eq!(
+            config.features.selected_text_switch_hotkey,
+            SelectedTextHotkey::AltScrollLock
+        );
+        assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::left_alt_left_shift());
+        assert_eq!(config.layout.switch_source, LayoutSwitchSource::AutoFallback);
+        assert_eq!(config.layout.auto_detected, xfce_x11_detection());
+        assert_eq!(config.settings(), updated);
+    }
+
+    // TOML roundtrip / serialization shape
+
+    #[test]
+    fn save_to_path_load_or_create_toml_roundtrip_preserves_boundary_fields() {
+        let config = non_default_config(LayoutSwitchSource::AutoDetected);
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+
+        config.save_to_path(&path).unwrap();
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.settings(), config.settings());
+        assert_eq!(
+            loaded.features.selected_text_switch_hotkey,
+            SelectedTextHotkey::CtrlF12
+        );
+        assert_eq!(loaded.layout.switch_combo, LayoutSwitchCombo::right_ctrl_right_shift());
+        assert_eq!(loaded.layout.switch_source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(loaded.layout.auto_detected, cinnamon_x11_detection());
+        assert_eq!(loaded.layout.delay_ms, 123);
+        assert_eq!(loaded.delays.backspace_ms, 4);
+        assert_eq!(loaded.delays.typing_ms, 5);
+    }
+
+    #[test]
+    fn auto_detected_serialization_depends_on_layout_switch_source() {
+        let manual = non_default_config(LayoutSwitchSource::Manual);
+        let manual_toml = toml::to_string_pretty(&AppConfigFile::from(&manual)).unwrap();
+        assert!(!manual_toml.contains("auto_detected"));
+        let parsed_manual: AppConfigFile = toml::from_str(&manual_toml).unwrap();
+        assert!(parsed_manual.layout.auto_detected.is_none());
+        assert_eq!(
+            AppConfig::try_from(parsed_manual).unwrap().layout.auto_detected,
+            AutoDetectedLayoutSwitch::default()
+        );
+
+        for source in [
+            LayoutSwitchSource::AutoDetected,
+            LayoutSwitchSource::AutoFallback,
+        ] {
+            let config = non_default_config(source);
+            let serialized = toml::to_string_pretty(&AppConfigFile::from(&config)).unwrap();
+            assert!(serialized.contains("auto_detected"));
+            let parsed: AppConfigFile = toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.layout.auto_detected, Some(cinnamon_x11_detection()));
+            assert_eq!(
+                AppConfig::try_from(parsed).unwrap().layout.auto_detected,
+                cinnamon_x11_detection()
+            );
+        }
     }
 }

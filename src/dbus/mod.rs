@@ -55,8 +55,8 @@ impl OpenSwitcherDbusApi {
             .toggle_enabled_result()
             .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
         let layout = self.runtime.current_layout();
-        zbus::block_on(Self::status_changed(&ctxt, enabled, layout))
-            .map_err(|err| fdo::Error::from(DbusError::Signal(err)))
+        emit_status_changed_from_context_best_effort("toggle", &ctxt, enabled, layout);
+        Ok(())
     }
 
     pub fn request_exit(&self) {
@@ -84,12 +84,12 @@ impl OpenSwitcherDbusApi {
             .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
 
         if self.runtime.is_enabled() != enabled_before {
-            zbus::block_on(Self::status_changed(
+            emit_status_changed_from_context_best_effort(
+                "update-settings",
                 &ctxt,
                 self.runtime.is_enabled(),
                 self.runtime.current_layout(),
-            ))
-            .map_err(|err| fdo::Error::from(DbusError::Signal(err)))?;
+            );
         }
 
         Ok(result)
@@ -173,6 +173,19 @@ impl OpenSwitcherDbusApi {
     ) -> zbus::Result<()>;
 }
 
+fn emit_status_changed_from_context_best_effort(
+    context: &str,
+    ctxt: &SignalContext<'_>,
+    enabled: bool,
+    layout: bool,
+) {
+    status_signal_best_effort(
+        context,
+        zbus::block_on(OpenSwitcherDbusApi::status_changed(ctxt, enabled, layout))
+            .map_err(DbusError::Signal),
+    );
+}
+
 pub fn emit_status_changed(
     connection: &Connection,
     runtime: &RuntimeState,
@@ -194,6 +207,28 @@ pub fn emit_status_changed(
     .map_err(DbusError::Signal)
 }
 
+pub fn emit_status_changed_best_effort(
+    connection: &Connection,
+    runtime: &RuntimeState,
+    context: &str,
+) {
+    status_signal_best_effort(context, emit_status_changed(connection, runtime));
+}
+
+fn status_signal_best_effort<E: std::fmt::Display>(context: &str, result: Result<(), E>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            log_layout_debug(
+                "dbus-status-signal-error",
+                &format!("context={context} error={error}"),
+            );
+            eprintln!("[dbus] Failed to emit StatusChanged signal ({context}): {error}");
+            false
+        }
+    }
+}
+
 pub fn emit_layout_switch_capture_state_changed(
     connection: &Connection,
     state: &LayoutSwitchCaptureState,
@@ -204,4 +239,22 @@ pub fn emit_layout_switch_capture_state_changed(
         state.clone(),
     ))
     .map_err(DbusError::Signal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_signal_best_effort_treats_success_as_ok() {
+        assert!(status_signal_best_effort("test-success", Ok::<(), &str>(())));
+    }
+
+    #[test]
+    fn status_signal_best_effort_treats_failure_as_non_fatal() {
+        assert!(!status_signal_best_effort(
+            "test-failure",
+            Err::<(), &str>("signal failed")
+        ));
+    }
 }

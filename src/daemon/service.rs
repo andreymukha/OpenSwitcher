@@ -12,7 +12,7 @@ use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
     should_switch, CorrectionPlan, Keystroke,
 };
-use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed};
+use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed_best_effort};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
 use evdev::InputEventKind;
@@ -591,7 +591,7 @@ impl DaemonService {
             };
 
             if should_publish_pending_status_change(self.runtime.take_pending_status_change()) {
-                self.publish_status_changed()?;
+                self.publish_status_changed();
             }
 
             if self
@@ -1436,7 +1436,7 @@ impl DaemonService {
         self.runtime
             .set_layout_with_reason(next_layout_is_english, "user-layout-shortcut");
         self.startup_layout_resync.complete();
-        self.publish_status_changed()?;
+        self.publish_status_changed();
         self.invalidate_word_context();
         // Preserve the original branch behavior: a successful shortcut falls
         // through to the later input handling instead of returning early.
@@ -1737,7 +1737,7 @@ impl DaemonService {
                     ),
                 );
                 self.startup_layout_resync.complete();
-                self.publish_status_changed()?;
+                self.publish_status_changed();
             }
             BackendSyncResult::Unchanged => {
                 log_layout_debug(
@@ -1749,7 +1749,7 @@ impl DaemonService {
                     ),
                 );
                 self.startup_layout_resync.complete();
-                self.publish_status_changed()?;
+                self.publish_status_changed();
             }
             BackendSyncResult::Skipped => {
                 log_layout_debug(
@@ -1838,7 +1838,7 @@ impl DaemonService {
         Ok(true)
     }
 
-    fn publish_status_changed(&self) -> Result<(), SwitcherError> {
+    fn publish_status_changed(&self) {
         log_layout_debug(
             "status-signal",
             &format!(
@@ -1851,9 +1851,8 @@ impl DaemonService {
                 }
             ),
         );
-        emit_status_changed(&self.connection, &self.runtime)?;
+        emit_status_changed_best_effort(&self.connection, &self.runtime, "daemon-service");
         self.runtime.clear_pending_status_change();
-        Ok(())
     }
 
     // Input backend lifecycle
@@ -1972,7 +1971,7 @@ impl DaemonService {
                     &format!("source=backend updated=true current={current:?}"),
                 );
                 if self.runtime.current_layout() != layout_before {
-                    self.publish_status_changed()?;
+                    self.publish_status_changed();
                 }
                 Ok(true)
             }

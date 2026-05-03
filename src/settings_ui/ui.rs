@@ -75,6 +75,7 @@ enum SelectedTextHotkeyTrigger {
     ScrollLock,
 }
 
+// Window controller
 #[derive(Clone, Default)]
 pub(crate) struct SettingsWindowController {
     mode: SettingsWindowMode,
@@ -122,6 +123,7 @@ impl SettingsWindowController {
     }
 }
 
+// Initialization and event wiring
 pub fn run_standalone() {
     let controller = SettingsWindowController::standalone();
     let app = adw::Application::builder()
@@ -378,6 +380,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     presenter.initialize();
 }
 
+// Form/widget construction
 fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     let autostart_row = adw::ActionRow::builder()
         .title("Автозапуск")
@@ -699,6 +702,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     }
 }
 
+// Page builders
 fn build_general_page(
     autostart_row: &adw::ActionRow,
     auto_switch_row: &adw::ActionRow,
@@ -758,6 +762,7 @@ fn build_hotkeys_page(
     clamp
 }
 
+// Settings window widgets
 struct FormWidgets {
     container: gtk::Box,
     autostart_switch: gtk::Switch,
@@ -792,6 +797,7 @@ struct FormWidgets {
     undo_handler: Option<SignalHandlerId>,
 }
 
+// Settings window
 struct SettingsWindow {
     window: adw::ApplicationWindow,
     toast_overlay: adw::ToastOverlay,
@@ -927,6 +933,7 @@ impl SettingsWindow {
         self.presenter.replace(Some(presenter));
     }
 
+    // Capture dialogs
     fn apply_capture_state(&self, presenter: &SettingsPresenter, state: LayoutSwitchCaptureState) {
         match state.phase {
             LayoutSwitchCapturePhase::Idle => {
@@ -1335,6 +1342,7 @@ impl SettingsWindow {
         }
     }
 
+    // Selected-text hotkey capture
     fn install_selected_text_hotkey_capture(self: &Rc<Self>) {
         let controller = gtk::EventControllerKey::new();
 
@@ -1387,6 +1395,7 @@ impl SettingsWindow {
             .add_controller(controller);
     }
 
+    // View state rendering
     fn apply_view_state(&self, state: &ViewState) {
         *self.current_view_state.borrow_mut() = state.clone();
 
@@ -1502,6 +1511,7 @@ impl SettingsWindow {
         self.status_label.set_text(state.status_text);
     }
 
+    // Error/toast helpers
     fn show_toast(&self, message: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(message));
     }
@@ -1524,6 +1534,7 @@ impl SettingsWindow {
     }
 }
 
+// View state helpers
 fn initial_view_state() -> ViewState {
     ViewState {
         autostart_enabled: false,
@@ -1561,6 +1572,7 @@ fn initial_view_state() -> ViewState {
     }
 }
 
+// Selected-text hotkey helpers
 fn selected_text_hotkey_modifier_from_key(key: gdk::Key) -> Option<SelectedTextHotkeyModifier> {
     match key {
         gdk::Key::Shift_L | gdk::Key::Shift_R => Some(SelectedTextHotkeyModifier::Shift),
@@ -1643,6 +1655,7 @@ fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'stati
     }
 }
 
+// Tests
 #[cfg(test)]
 mod tests {
     use super::*;

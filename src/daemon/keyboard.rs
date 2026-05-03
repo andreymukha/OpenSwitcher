@@ -26,8 +26,8 @@ const UINPUT_PATHS: [&str; 2] = ["/dev/uinput", "/dev/input/uinput"];
 const INPUT_DEBUG_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG";
 const INPUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG_FILE";
 pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
-const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(5);
-const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
 // Transactional commands use the same total-order queue, but are represented as
 // single indivisible commands and get a larger bounded enqueue window because
@@ -2670,6 +2670,14 @@ mod tests {
     }
 
     // Watcher readiness
+
+    #[test]
+    fn watcher_polling_intervals_stay_within_idle_cpu_budget() {
+        assert!(POINTER_POLL_INTERVAL >= Duration::from_millis(10));
+        assert!(POINTER_POLL_INTERVAL <= Duration::from_millis(20));
+        assert!(INPUT_TARGET_POLL_INTERVAL >= Duration::from_millis(10));
+        assert!(INPUT_TARGET_POLL_INTERVAL <= Duration::from_millis(50));
+    }
 
     #[test]
     fn pointer_watcher_readiness_is_true_when_disabled_by_policy() {

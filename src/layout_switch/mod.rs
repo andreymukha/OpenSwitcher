@@ -238,6 +238,39 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                     )
                 })
                 .unwrap_or_else(|| {
+                    self.detect_cinnamon_x11_setxkbmap_fallback(context)
+                }),
+            Err(error) => {
+                eprintln!(
+                    "[layout-switch] Failed to read Cinnamon input source options, using fallback: {error}"
+                );
+                fallback_setting(
+                    LayoutSwitchCombo::default(),
+                    DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                    DetectionConfidence::Low,
+                    context,
+                )
+            }
+        }
+    }
+
+    fn detect_cinnamon_x11_setxkbmap_fallback(
+        &self,
+        context: SystemContext,
+    ) -> LayoutSwitchSetting {
+        match self.reader.setxkbmap_query() {
+            Ok(query) => query
+                .lines()
+                .find_map(parse_setxkbmap_options_line)
+                .and_then(|options| combo_from_option_list(&options))
+                .map(|combo| {
+                    detected_setting(
+                        combo,
+                        DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                        context,
+                    )
+                })
+                .unwrap_or_else(|| {
                     fallback_setting(
                         LayoutSwitchCombo::default(),
                         DetectionStrategy::CinnamonX11GSettingsXkbOptions,
@@ -247,7 +280,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                 }),
             Err(error) => {
                 eprintln!(
-                    "[layout-switch] Failed to read Cinnamon input source options, using fallback: {error}"
+                    "[layout-switch] Failed to read X11 runtime layout options for Cinnamon fallback, using fallback: {error}"
                 );
                 fallback_setting(
                     LayoutSwitchCombo::default(),
@@ -727,6 +760,7 @@ mod tests {
         xfconf_group: String,
         xfconf_disabled: bool,
         setxkbmap_query_output: String,
+        setxkbmap_query_should_fail: bool,
     }
 
     impl DesktopSettingsReader for StubReader {
@@ -777,6 +811,12 @@ mod tests {
         }
 
         fn setxkbmap_query(&self) -> Result<String, LayoutAutoDetectError> {
+            if self.setxkbmap_query_should_fail {
+                return Err(LayoutAutoDetectError::SetXkbMapFailed {
+                    stderr: "unexpected setxkbmap query".to_string(),
+                });
+            }
+
             Ok(self.setxkbmap_query_output.clone())
         }
     }
@@ -803,6 +843,10 @@ mod tests {
             desktop_environment: DesktopEnvironment::Gnome,
             distro: DistroKind::Ubuntu,
         }
+    }
+
+    fn setxkbmap_query_with_options(options: &str) -> String {
+        format!("rules: evdev\noptions:    {options}\n")
     }
 
     // Parser helpers
@@ -966,6 +1010,23 @@ mod tests {
     }
 
     #[test]
+    fn cinnamon_x11_gsettings_combo_wins_over_setxkbmap_fallback() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            cinnamon_gsettings_values: vec!["grp:alt_shift_toggle".to_string()],
+            setxkbmap_query_should_fail: true,
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(cinnamon_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::alt_shift());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::CinnamonX11GSettingsXkbOptions
+        );
+    }
+
+    #[test]
     fn detects_side_specific_cinnamon_x11_combo() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
             cinnamon_gsettings_values: vec!["grp:lalt_lshift_toggle".to_string()],
@@ -975,6 +1036,73 @@ mod tests {
         let setting = detector.detect(cinnamon_x11_context()).unwrap();
         assert_eq!(setting.combo, LayoutSwitchCombo::left_alt_left_shift());
         assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+    }
+
+    #[test]
+    fn cinnamon_x11_uses_setxkbmap_when_gsettings_is_empty() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            setxkbmap_query_output: setxkbmap_query_with_options(
+                "grp:alt_shift_toggle,grp_led:scroll",
+            ),
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(cinnamon_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::alt_shift());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::CinnamonX11GSettingsXkbOptions
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::High);
+    }
+
+    #[test]
+    fn cinnamon_x11_uses_setxkbmap_when_gsettings_has_no_supported_combo() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            cinnamon_gsettings_values: vec!["grp:toggle".to_string()],
+            setxkbmap_query_output: setxkbmap_query_with_options(
+                "grp:rctrl_rshift_toggle,grp_led:scroll",
+            ),
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(cinnamon_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::right_ctrl_right_shift());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::CinnamonX11GSettingsXkbOptions
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::High);
+    }
+
+    #[test]
+    fn cinnamon_x11_falls_back_when_gsettings_and_setxkbmap_are_not_useful() {
+        let cases = [
+            (
+                vec!["grp:toggle".to_string()],
+                setxkbmap_query_with_options("grp:toggle,grp_led:scroll"),
+            ),
+            (Vec::new(), "rules: evdev\nlayout: us,ru\n".to_string()),
+        ];
+
+        for (cinnamon_gsettings_values, setxkbmap_query_output) in cases {
+            let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+                cinnamon_gsettings_values,
+                setxkbmap_query_output,
+                ..StubReader::default()
+            });
+
+            let setting = detector.detect(cinnamon_x11_context()).unwrap();
+            assert_eq!(setting.combo, LayoutSwitchCombo::default());
+            assert_eq!(setting.source, LayoutSwitchSource::AutoFallback);
+            assert_eq!(
+                setting.auto_detected.strategy,
+                DetectionStrategy::CinnamonX11GSettingsXkbOptions
+            );
+            assert_eq!(setting.auto_detected.confidence, DetectionConfidence::Low);
+        }
     }
 
     // Fallback behavior

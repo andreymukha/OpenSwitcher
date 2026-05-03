@@ -178,6 +178,28 @@ fn dbus_update_settings_changes_daemon_visible_is_enabled() -> Result<(), Box<dy
 }
 
 #[test]
+fn dbus_current_layout_property_is_available() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("current_layout_property");
+    let _service = spawn_service(&config_path, &service_name)?;
+
+    let client = Connection::session()?;
+    let generic_proxy = settings_proxy(&client, &service_name)?;
+    let generated_proxy = OpenSwitcherProxyBlocking::builder(&client)
+        .destination(service_name.clone())?
+        .path(OBJECT_PATH)?
+        .build()?;
+
+    let generic_value = generic_proxy.get_property::<bool>("CurrentLayout")?;
+    let generated_value = generated_proxy.current_layout()?;
+
+    assert_eq!(generic_value, generated_value);
+
+    Ok(())
+}
+
+#[test]
 fn dbus_toggle_updates_persisted_auto_switch_setting() -> Result<(), Box<dyn Error>> {
     let temp_dir = TempDir::new()?;
     let config_path = temp_dir.path().join("config.toml");

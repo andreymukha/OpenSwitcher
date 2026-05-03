@@ -1642,3 +1642,68 @@ fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'stati
         SettingsClientError::Validation(error) => ("Некорректные значения", error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_text_hotkey_supported_triggers_are_recognized() {
+        let mut state = SelectedTextHotkeyDialogState::default();
+        state.shift = true;
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::Pause),
+            Ok(SelectedTextHotkey::ShiftPause)
+        );
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::F12),
+            Ok(SelectedTextHotkey::ShiftF12)
+        );
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::ScrollLock),
+            Ok(SelectedTextHotkey::ShiftScrollLock)
+        );
+
+        let mut state = SelectedTextHotkeyDialogState::default();
+        state.ctrl = true;
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::Pause),
+            Ok(SelectedTextHotkey::CtrlPause)
+        );
+
+        let mut state = SelectedTextHotkeyDialogState::default();
+        state.alt = true;
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::F12),
+            Ok(SelectedTextHotkey::AltF12)
+        );
+    }
+
+    #[test]
+    fn selected_text_hotkey_capture_rejects_missing_modifier() {
+        let state = SelectedTextHotkeyDialogState::default();
+
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::Pause),
+            Err("Нужна ровно одна клавиша-модификатор: Shift, Ctrl или Alt.")
+        );
+    }
+
+    #[test]
+    fn selected_text_hotkey_capture_rejects_multiple_modifiers() {
+        let mut state = SelectedTextHotkeyDialogState::default();
+        state.shift = true;
+        state.ctrl = true;
+
+        assert_eq!(
+            selected_text_hotkey_from_capture_state(&state, SelectedTextHotkeyTrigger::F12),
+            Err("Нужна ровно одна клавиша-модификатор: Shift, Ctrl или Alt.")
+        );
+    }
+
+    #[test]
+    fn selected_text_hotkey_key_helpers_reject_unsupported_keys() {
+        assert_eq!(selected_text_hotkey_trigger_from_key(gdk::Key::space), None);
+        assert_eq!(selected_text_hotkey_modifier_from_key(gdk::Key::space), None);
+    }
+}

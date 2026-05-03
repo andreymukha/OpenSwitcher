@@ -545,7 +545,7 @@ systemd-команды:
   systemd disable       Выключить автозапуск user units
 
 doctor-команды:
-  doctor                Проверить Linux input setup для `/dev/input/*` и `/dev/uinput`
+  doctor                Проверить Linux input setup для '/dev/input/*' и '/dev/uinput'
 
 bootstrap-команды:
   bootstrap linux-input Установить udev rules и same-session ACL bridge для Linux input setup

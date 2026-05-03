@@ -194,3 +194,48 @@ fn draw_char(data: &mut [u8], mask: &str, x_offset: usize, y_offset: usize, imag
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Icon rendering
+
+    #[test]
+    fn tray_icon_pixmap_contains_single_stable_bitmap() {
+        for enabled in [true, false] {
+            for layout_is_english in [true, false] {
+                let icons = draw_icon(enabled, layout_is_english);
+                assert_eq!(icons.len(), 1);
+
+                let icon = &icons[0];
+                assert_eq!(icon.width, 22);
+                assert_eq!(icon.height, 22);
+                assert_eq!(icon.data.len(), 22 * 22 * 4);
+                assert!(icon.data.iter().any(|byte| *byte != 0));
+            }
+        }
+    }
+
+    #[test]
+    fn tray_icon_bitmap_draws_letters_over_background() {
+        let icon = draw_bitmap_icon(true, true);
+        let white_pixels = icon
+            .data
+            .chunks_exact(4)
+            .filter(|pixel| {
+                pixel[0] == 255 && pixel[1] == 255 && pixel[2] == 255 && pixel[3] == 255
+            })
+            .count();
+        let background_pixels = icon
+            .data
+            .chunks_exact(4)
+            .filter(|pixel| {
+                pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 80 && pixel[3] == 220
+            })
+            .count();
+
+        assert!(white_pixels > 0);
+        assert!(background_pixels > 0);
+    }
+}

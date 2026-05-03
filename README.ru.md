@@ -22,7 +22,12 @@ OpenSwitcher — это настольная Linux-утилита, ориент�
 
 OpenSwitcher находится в активной разработке.
 
-Текущий публичный фокус проекта — настольное Linux-приложение для EN/RU-сценариев ввода, построенное вокруг модели `daemon + tray`.
+Цель первого релиза — настольное Linux-приложение для EN/RU-сценариев ввода, построенное вокруг модели `daemon + tray`.
+
+Текущая базовая среда релиза:
+- протестировано на Linux Mint Cinnamon X11
+- фокус только на EN/RU-вводе
+- официальная модель запуска и автозапуска — `systemd --user`
 
 ## Быстрый старт
 
@@ -75,10 +80,18 @@ OpenSwitcher состоит из трёх бинарников:
 ## Текущие границы и ограничения
 
 - Только Linux
+- Протестированный baseline: Linux Mint Cinnamon X11
+- Другие настольные окружения Linux считаются best-effort, если явно не указано другое
+- Широкая поддержка Wayland в первом релизе не заявляется
+- KDE не подтверждён как поддерживаемое окружение
+- GNOME Wayland — partial/best-effort, без статуса полной поддержки
 - Основной поддерживаемый сценарий ввода — EN/RU
 - Поддержка раскладок и backend-слоя пока остаётся консервативной и опирается на конкретные backend-реализации
 - Текущий backend-слой спроектирован с расчётом на расширение, но поддержка пока не охватывает широко все настольные окружения
+- Исключения для отдельных приложений не входят в первый релиз
+- GNOME Shell extension не входит в первый релиз
 - Работа tray зависит от настольного окружения с совместимым хостом StatusNotifier/AppIndicator
+- Официальная модель запуска и автозапуска зависит от `systemd --user`
 - Окно настроек собирается под feature-флагом Cargo `settings-ui`
 
 ## Требования
@@ -118,6 +131,31 @@ OpenSwitcher читает реальные input-устройства из `/dev
 - `./manage.sh bootstrap linux-input` работает и без `setfacl`, но same-session ACL bridge применяется только если `setfacl` доступен. В Debian/Ubuntu-подобных системах эта команда обычно приходит из пакета `acl`.
 - runtime auto-detect раскладки может использовать environment-specific инструменты, например `gsettings`, `xfconf-query` или `setxkbmap`, в зависимости от текущего окружения.
 
+## Определение переключателя раскладки
+
+OpenSwitcher пытается определить shortcut переключения раскладки по текущему окружению и типу сессии.
+
+Текущее поведение:
+- Cinnamon X11 сначала читает настройки клавиатуры Cinnamon
+- если Cinnamon settings пустые или не подходят, Cinnamon X11 использует fallback через `setxkbmap -query`
+- Xfce X11 и GNOME Wayland имеют отдельные best-effort пути определения
+- на неподдерживаемых или неизвестных окружениях может понадобиться ручной выбор shortcut в настройках
+
+Найденная настройка сохраняется в конфиге daemon. Ручной выбор, сделанный в окне настроек, сохраняется и не перезаписывается auto-detection.
+
+## Конвертация выделенного текста
+
+Конвертация выделенного текста работает через clipboard:
+- OpenSwitcher отправляет copy shortcut, чтобы получить текущее выделение
+- конвертирует скопированный текст между EN/RU physical layouts
+- временно заменяет clipboard на сконвертированный текст
+- отправляет paste shortcut
+- затем пытается восстановить предыдущее содержимое clipboard
+
+Захват hotkey может зависеть от физической клавиатуры и desktop environment. На некоторых ноутбуках `Pause`, `F12` или `ScrollLock` могут зависеть от Fn-клавиш или глобальных shortcut-ов окружения.
+
+Selected-text debug logging включается только явно. Если он включён, selected-text debug summaries содержат только metadata, например длину и количество строк, без preview текста.
+
 ### Зависимости для сборки
 
 Для Linux Mint / Ubuntu-подобных систем:
@@ -151,12 +189,23 @@ cargo check --features settings-ui --bin open-switcher --bin open-switcher-tray 
 cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
 ```
 
-Запустить тесты:
+Запустить регулярные проверки:
 
 ```bash
 cargo test -q --lib
-cargo test --test dbus_api
+cargo test -q --features settings-ui --lib
+cargo test --test dbus_api -q
+cargo check -q --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
+git diff --check
 ```
+
+Опциональная более широкая проверка:
+
+```bash
+cargo test -q --all-targets --features settings-ui
+```
+
+CI также запускает `settings-ui` feature tests, чтобы feature-gated покрытие не пропускалось случайно.
 
 ## Процесс разработки
 
@@ -317,6 +366,22 @@ gdbus monitor \
   --dest org.oswitch.core \
   --object-path /org/oswitch/core
 ```
+
+## Известные ограничения
+
+- OpenSwitcher сейчас ориентирован только на EN/RU-сценарии ввода.
+- Первый релиз протестирован на Linux Mint Cinnamon X11. Другие настольные окружения Linux считаются best-effort, если явно не указано другое.
+- Широкая поддержка Wayland в этом релизе не заявляется.
+- KDE не подтверждён как поддерживаемое окружение.
+- GNOME Wayland — partial/best-effort, без статуса полной поддержки.
+- Исключения для отдельных приложений не входят в первый релиз.
+- GNOME Shell extension не входит в первый релиз.
+- Видимость tray зависит от совместимого StatusNotifier/AppIndicator host.
+- Официальная модель запуска и автозапуска зависит от `systemd --user`.
+- Конвертация выделенного текста временно использует clipboard и пытается восстановить предыдущее содержимое после конвертации.
+- Захват selected-text hotkey может зависеть от Fn-клавиш ноутбука и глобальных shortcut-ов окружения.
+- Эвристика автокоррекции намеренно консервативна. Некоторые короткие RU -> EN technical false negatives могут оставаться, например `cargo`, `rust`, `sudo`, `git`, `ssh`, `npm`, `jwt`.
+- Текущий rustfmt drift и не полностью hermetic shell/platform tests — известный technical debt для будущей cleanup-итерации.
 
 ## Практическая проверка
 

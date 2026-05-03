@@ -15,7 +15,8 @@ use crate::layout_switch::{
 };
 use crate::model::{
     DesktopEnvironment, DistroKind, LayoutSwitchCaptureState, LayoutSwitchCombo,
-    SelectedTextHotkey, SessionType, Settings, SystemContext, UndoKey, UpdateSettingsResult,
+    LayoutSwitchSetting, SelectedTextHotkey, SessionType, Settings, SystemContext, UndoKey,
+    UpdateSettingsResult,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::env;
@@ -88,25 +89,9 @@ impl ConfigService {
     ) -> Result<Self, ConfigError> {
         let mut config = AppConfig::load_or_create(&config_path)?;
 
-        let should_detect = !matches!(
-            config.layout.switch_source,
-            crate::model::LayoutSwitchSource::Manual
-        );
-
-        if should_detect {
-            let detected = match detector.detect(context) {
-                Ok(detected) => detected,
-                Err(error) => {
-                    eprintln!(
-                        "[config] Failed to auto-detect layout switch combo, using fallback: {error}"
-                    );
-                    failed_detection_fallback(context)
-                }
-            };
-            if config.settings().layout_switch != detected {
-                config.layout.switch_combo = detected.combo;
-                config.layout.switch_source = detected.source;
-                config.layout.auto_detected = detected.auto_detected;
+        if should_detect_layout_switch(&config) {
+            let detected = detect_layout_switch_setting(context, detector);
+            if apply_detected_layout_switch_if_changed(&mut config, detected) {
                 config.save_to_path(&config_path)?;
             }
         }
@@ -171,6 +156,42 @@ impl ConfigService {
             .map(|config| config.features.auto_switch_enabled)
             .map_err(|_| SettingsError::LockPoisoned)
     }
+}
+
+fn should_detect_layout_switch(config: &AppConfig) -> bool {
+    !matches!(
+        config.layout.switch_source,
+        crate::model::LayoutSwitchSource::Manual
+    )
+}
+
+fn detect_layout_switch_setting<R: DesktopSettingsReader>(
+    context: SystemContext,
+    detector: &LayoutSwitchAutoDetector<R>,
+) -> LayoutSwitchSetting {
+    match detector.detect(context) {
+        Ok(detected) => detected,
+        Err(error) => {
+            eprintln!(
+                "[config] Failed to auto-detect layout switch combo, using fallback: {error}"
+            );
+            failed_detection_fallback(context)
+        }
+    }
+}
+
+fn apply_detected_layout_switch_if_changed(
+    config: &mut AppConfig,
+    detected: LayoutSwitchSetting,
+) -> bool {
+    if config.settings().layout_switch == detected {
+        return false;
+    }
+
+    config.layout.switch_combo = detected.combo;
+    config.layout.switch_source = detected.source;
+    config.layout.auto_detected = detected.auto_detected;
+    true
 }
 
 #[cfg(test)]

@@ -640,6 +640,8 @@ pub struct UpdateSettingsResult {
 mod tests {
     use super::*;
 
+    // Settings validation / DTO conversion
+
     #[test]
     fn validates_settings_range() {
         let result = Settings {
@@ -661,6 +663,46 @@ mod tests {
                 found: 700,
             }
         );
+    }
+
+    #[test]
+    fn settings_dto_roundtrip_preserves_all_fields() {
+        let settings = Settings {
+            auto_switch_enabled: false,
+            fix_two_capitals: true,
+            fix_accidental_caps_lock: true,
+            layout_delay_ms: 123,
+            undo_key: UndoKey::ScrollLock,
+            selected_text_hotkey: SelectedTextHotkey::CtrlF12,
+            layout_switch: LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::right_alt_right_shift(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                    confidence: DetectionConfidence::High,
+                    context: SystemContext {
+                        session_type: SessionType::Wayland,
+                        desktop_environment: DesktopEnvironment::Gnome,
+                        distro: DistroKind::Ubuntu,
+                    },
+                },
+            },
+        };
+
+        let dto = SettingsDto::from(settings);
+        assert_eq!(dto.auto_switch_enabled, settings.auto_switch_enabled);
+        assert_eq!(dto.fix_two_capitals, settings.fix_two_capitals);
+        assert_eq!(
+            dto.fix_accidental_caps_lock,
+            settings.fix_accidental_caps_lock
+        );
+        assert_eq!(dto.layout_delay_ms, settings.layout_delay_ms);
+        assert_eq!(dto.undo_key, settings.undo_key);
+        assert_eq!(dto.selected_text_hotkey, settings.selected_text_hotkey);
+        assert_eq!(dto.layout_switch, settings.layout_switch);
+
+        let roundtripped = Settings::try_from(dto).unwrap();
+        assert_eq!(roundtripped, settings);
     }
 
     #[test]
@@ -686,6 +728,29 @@ mod tests {
         assert_eq!(settings.undo_key, UndoKey::F12);
         assert_eq!(settings.selected_text_hotkey, SelectedTextHotkey::AltPause);
         assert_eq!(settings.layout_switch.combo, LayoutSwitchCombo::alt_shift());
+    }
+
+    // Undo/selected-text hotkey parsing
+
+    #[test]
+    fn parses_and_formats_supported_undo_keys() {
+        assert_eq!(UndoKey::default(), UndoKey::Pause);
+        assert_eq!(
+            UndoKey::ALL,
+            [UndoKey::Pause, UndoKey::F12, UndoKey::ScrollLock]
+        );
+
+        let keys = [
+            ("Pause", UndoKey::Pause),
+            ("F12", UndoKey::F12),
+            ("ScrollLock", UndoKey::ScrollLock),
+        ];
+
+        for (raw, expected) in keys {
+            assert_eq!(UndoKey::from_str(raw).unwrap(), expected);
+            assert_eq!(expected.as_str(), raw);
+            assert_eq!(expected.to_string(), raw);
+        }
     }
 
     #[test]
@@ -719,6 +784,8 @@ mod tests {
             assert_eq!(expected.to_string(), raw);
         }
     }
+
+    // Layout switch combo parsing
 
     #[test]
     fn parses_and_formats_supported_layout_switch_combos() {
@@ -803,6 +870,8 @@ mod tests {
         );
     }
 
+    // Detection/layout switch metadata
+
     #[test]
     fn identifies_unsupported_layout_switch_fallback() {
         let unsupported = LayoutSwitchSetting {
@@ -822,5 +891,53 @@ mod tests {
             },
         };
         assert!(!supported_failure.is_fallback_for_unsupported_context());
+    }
+
+    // Capture state
+
+    #[test]
+    fn layout_switch_capture_state_constructors_set_contract_fields() {
+        let idle = LayoutSwitchCaptureState::idle();
+        assert_eq!(idle.phase, LayoutSwitchCapturePhase::Idle);
+        assert_eq!(idle.candidate, LayoutSwitchCombo::default());
+        assert!(!idle.has_candidate);
+        assert!(idle.message.is_empty());
+        assert!(!idle.is_active());
+
+        let waiting = LayoutSwitchCaptureState::waiting();
+        assert_eq!(waiting.phase, LayoutSwitchCapturePhase::Waiting);
+        assert_eq!(waiting.candidate, LayoutSwitchCombo::default());
+        assert!(!waiting.has_candidate);
+        assert!(waiting.message.is_empty());
+        assert!(waiting.is_active());
+
+        let candidate_combo = LayoutSwitchCombo::left_alt_left_shift();
+        let candidate = LayoutSwitchCaptureState::candidate(candidate_combo);
+        assert_eq!(candidate.phase, LayoutSwitchCapturePhase::Candidate);
+        assert_eq!(candidate.candidate, candidate_combo);
+        assert!(candidate.has_candidate);
+        assert!(candidate.message.is_empty());
+        assert!(candidate.is_active());
+
+        let unsupported = LayoutSwitchCaptureState::unsupported("not supported");
+        assert_eq!(unsupported.phase, LayoutSwitchCapturePhase::Unsupported);
+        assert_eq!(unsupported.candidate, LayoutSwitchCombo::default());
+        assert!(!unsupported.has_candidate);
+        assert_eq!(unsupported.message, "not supported");
+        assert!(unsupported.is_active());
+
+        let cancelled = LayoutSwitchCaptureState::cancelled();
+        assert_eq!(cancelled.phase, LayoutSwitchCapturePhase::Cancelled);
+        assert_eq!(cancelled.candidate, LayoutSwitchCombo::default());
+        assert!(!cancelled.has_candidate);
+        assert!(cancelled.message.is_empty());
+        assert!(!cancelled.is_active());
+
+        let finished = LayoutSwitchCaptureState::finished();
+        assert_eq!(finished.phase, LayoutSwitchCapturePhase::Finished);
+        assert_eq!(finished.candidate, LayoutSwitchCombo::default());
+        assert!(!finished.has_candidate);
+        assert!(finished.message.is_empty());
+        assert!(!finished.is_active());
     }
 }

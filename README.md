@@ -22,7 +22,12 @@ This repository contains the full development history of the project.
 
 OpenSwitcher is in active development.
 
-The current public scope is a Linux desktop application for EN/RU typing workflows, built around a `daemon + tray` runtime model.
+The first release target is a Linux desktop application for EN/RU typing workflows, built around a `daemon + tray` runtime model.
+
+Current release baseline:
+- tested on Linux Mint Cinnamon X11
+- focused on EN/RU typing only
+- official runtime and autostart model: `systemd --user`
 
 ## Quick Start
 
@@ -75,10 +80,18 @@ Current runtime model:
 ## Current Scope And Limitations
 
 - Linux only
+- Tested baseline: Linux Mint Cinnamon X11
+- Other Linux desktop environments are best-effort unless explicitly stated
+- Broad Wayland support is not claimed for the first release
+- KDE support is not confirmed
+- GNOME Wayland is partial/best-effort, not fully supported
 - Main supported typing scenario is EN/RU
 - Layout/backend support is still conservative and backend-driven
 - The current backend layer is designed for expansion, but support is not yet broad across all desktop environments
+- Application-specific exclusions are not included in the first release
+- A GNOME Shell extension is not included
 - Tray support depends on the desktop environment providing a compatible StatusNotifier/AppIndicator host
+- The official runtime and autostart model depends on `systemd --user`
 - The settings UI is built behind the `settings-ui` Cargo feature
 
 ## Requirements
@@ -118,6 +131,31 @@ Notes:
 - `./manage.sh bootstrap linux-input` works without `setfacl`, but the same-session ACL bridge is only applied when `setfacl` is available. On Debian/Ubuntu-like systems that command is typically provided by the `acl` package.
 - runtime layout auto-detect may use desktop-specific tools such as `gsettings`, `xfconf-query`, or `setxkbmap` depending on the current environment.
 
+## Layout Switch Detection
+
+OpenSwitcher tries to detect the user's layout-switch shortcut from the current desktop/session context.
+
+Current behavior:
+- Cinnamon X11 reads Cinnamon keyboard settings first
+- if Cinnamon settings are empty or unusable, Cinnamon X11 falls back to `setxkbmap -query`
+- Xfce X11 and GNOME Wayland have separate best-effort detection paths
+- unsupported or unknown desktop environments may require a manual layout-switch override in settings
+
+The detected setting is stored in the daemon config. Manual choices made in settings are preserved and are not overwritten by auto-detection.
+
+## Selected-text Conversion
+
+Selected-text conversion uses a clipboard-based flow:
+- OpenSwitcher sends a copy shortcut to read the current selection
+- converts the copied text between EN/RU physical layouts
+- temporarily replaces the clipboard with the converted text
+- sends a paste shortcut
+- then attempts to restore the previous clipboard contents
+
+Hotkey capture can depend on the physical keyboard and desktop environment. On some laptops, `Pause`, `F12`, or `ScrollLock` may be affected by Fn-key handling or global desktop shortcuts.
+
+Selected-text debug logging is opt-in. When enabled, selected-text debug summaries contain metadata only, such as length and line count, not text previews.
+
 ### Build dependencies
 
 For Linux Mint / Ubuntu-like systems:
@@ -151,12 +189,23 @@ Build everything locally:
 cargo build --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
 ```
 
-Run tests:
+Run regular checks:
 
 ```bash
 cargo test -q --lib
-cargo test --test dbus_api
+cargo test -q --features settings-ui --lib
+cargo test --test dbus_api -q
+cargo check -q --features settings-ui --bin open-switcher --bin open-switcher-tray --bin open-switcher-settings
+git diff --check
 ```
+
+Optional broader check:
+
+```bash
+cargo test -q --all-targets --features settings-ui
+```
+
+CI also runs the `settings-ui` feature tests so feature-gated coverage is not skipped accidentally.
 
 ## Development Workflow
 
@@ -317,6 +366,22 @@ gdbus monitor \
   --dest org.oswitch.core \
   --object-path /org/oswitch/core
 ```
+
+## Known Limitations
+
+- OpenSwitcher is currently focused on EN/RU typing workflows only.
+- The first release is tested on Linux Mint Cinnamon X11. Other Linux desktop environments are best-effort unless explicitly stated.
+- Broad Wayland support is not claimed for this release.
+- KDE support is not confirmed.
+- GNOME Wayland is partial/best-effort, not fully supported.
+- Application-specific exclusions are not included in the first release.
+- A GNOME Shell extension is not included.
+- Tray visibility depends on a compatible StatusNotifier/AppIndicator host.
+- The official runtime and autostart model depends on `systemd --user`.
+- Selected-text conversion temporarily uses the clipboard and attempts to restore previous clipboard contents after conversion.
+- Selected-text hotkey capture may depend on laptop Fn keys and desktop/global shortcut handling.
+- The autocorrection heuristic is intentionally conservative. Some short RU -> EN technical false negatives may remain, for example `cargo`, `rust`, `sudo`, `git`, `ssh`, `npm`, `jwt`.
+- Existing rustfmt drift and non-hermetic shell/platform tests are known technical debt for later cleanup.
 
 ## Practical Smoke Test
 

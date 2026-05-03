@@ -46,6 +46,7 @@ mod tests {
     use crate::layout_backend::{
         BackendCapabilities, CurrentLayoutState, LayoutBackendOperation, LayoutSetup,
     };
+    use std::io;
 
     struct TestBackend;
 
@@ -96,6 +97,14 @@ mod tests {
         Ok(Box::new(TestBackend))
     }
 
+    fn runtime_error_factory() -> Result<Box<dyn LayoutBackend>, LayoutBackendError> {
+        Err(LayoutBackendError::runtime(
+            "broken",
+            LayoutBackendOperation::DetectSetup,
+            io::Error::other("boom"),
+        ))
+    }
+
     #[test]
     fn registry_skips_unsupported_factories_and_picks_first_working_backend() {
         let mut registry = LayoutBackendRegistry::new();
@@ -108,6 +117,25 @@ mod tests {
             LayoutBackendRegistryResult::Backend(backend) => assert_eq!(backend.id(), "test"),
             LayoutBackendRegistryResult::Unsupported { reason } => {
                 panic!("expected backend, got unsupported: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn registry_stops_on_runtime_error_and_reports_reason() {
+        let mut registry = LayoutBackendRegistry::new();
+        registry.register_factory(runtime_error_factory);
+        registry.register_factory(working_factory);
+
+        let result = registry.pick_backend();
+
+        match result {
+            LayoutBackendRegistryResult::Unsupported { reason } => {
+                assert!(reason.contains("broken"));
+                assert!(reason.contains("DetectSetup"));
+            }
+            LayoutBackendRegistryResult::Backend(backend) => {
+                panic!("expected runtime error, got backend: {}", backend.id())
             }
         }
     }

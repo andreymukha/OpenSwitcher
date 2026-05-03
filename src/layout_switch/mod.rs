@@ -1022,6 +1022,36 @@ mod tests {
         assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
     }
 
+    #[test]
+    fn failed_detection_fallback_keeps_supported_strategy_context() {
+        let context = cinnamon_x11_context();
+        let setting = failed_detection_fallback(context);
+
+        assert_eq!(setting.combo, LayoutSwitchCombo::default());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoFallback);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::CinnamonX11GSettingsXkbOptions
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::Low);
+        assert_eq!(setting.auto_detected.context, context);
+    }
+
+    #[test]
+    fn failed_detection_fallback_uses_no_strategy_for_unknown_context() {
+        let context = SystemContext::default();
+        let setting = failed_detection_fallback(context);
+
+        assert_eq!(setting.combo, LayoutSwitchCombo::default());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoFallback);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::NoSupportedStrategy
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::Low);
+        assert_eq!(setting.auto_detected.context, context);
+    }
+
     // GNOME Wayland detection
 
     #[test]

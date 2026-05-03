@@ -36,6 +36,8 @@ pub const TRAY_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 pub const TRAY_RECOVERY_DELAY: Duration = Duration::from_millis(500);
 pub const MAX_TRAY_RECOVERY_ATTEMPTS: usize = 3;
 
+// Runtime config snapshot
+
 #[derive(Clone, Debug)]
 pub struct RuntimeConfigSnapshot {
     pub auto_switch_enabled: bool,
@@ -64,6 +66,8 @@ impl From<&AppConfig> for RuntimeConfigSnapshot {
         }
     }
 }
+
+// Config service
 
 pub struct ConfigService {
     config_path: PathBuf,
@@ -1138,6 +1142,8 @@ undo_key = "Pause"
     }
 }
 
+// Runtime state
+
 pub struct RuntimeState {
     enabled: AtomicBool,
     should_exit: AtomicBool,
@@ -1163,6 +1169,8 @@ pub enum BackendSyncResult {
     Unchanged,
     Skipped,
 }
+
+// Tray watchdog
 
 pub trait TrayPresenceProbe {
     fn tray_is_present(&self) -> Result<bool, std::io::Error>;
@@ -1245,6 +1253,8 @@ pub fn run_tray_watchdog_iteration(
 }
 
 impl RuntimeState {
+    // Runtime state initialization and flags
+
     pub fn new(config_service: ConfigService) -> Self {
         let (backend, layout_state, layout_setup, layout_compatibility, feature_availability) =
             Self::initialize_layout_backend();
@@ -1462,6 +1472,8 @@ impl RuntimeState {
             .clone()
     }
 
+    // Layout backend sync
+
     pub fn sync_with_backend(&self) -> BackendSyncResult {
         let snapshot = {
             let mut backend_guard = self
@@ -1505,6 +1517,8 @@ impl RuntimeState {
     pub fn clear_pending_status_change(&self) {
         self.pending_status_change.store(false, Ordering::SeqCst);
     }
+
+    // Background sync and tray watchdog
 
     pub fn start_background_sync_polling(self: &Arc<Self>) {
         let capabilities = {
@@ -1592,6 +1606,8 @@ impl RuntimeState {
         }
     }
 
+    // Config/settings bridge
+
     pub fn get_settings(&self) -> Result<Settings, SettingsError> {
         self.config_service.get_settings()
     }
@@ -1609,6 +1625,8 @@ impl RuntimeState {
     pub fn config_snapshot(&self) -> Result<RuntimeConfigSnapshot, SettingsError> {
         self.config_service.snapshot()
     }
+
+    // Capture delegation
 
     pub fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
         let mut session = self
@@ -1661,6 +1679,8 @@ impl RuntimeState {
             .map_err(|_| CaptureError::LockPoisoned)?;
         Ok(session.handle_key_event(key, value))
     }
+
+    // Layout backend initialization
 
     fn initialize_layout_backend() -> (
         Option<Box<dyn LayoutBackend>>,
@@ -1721,6 +1741,8 @@ impl RuntimeState {
         }
     }
 
+    // GNOME Wayland observation
+
     fn refresh_current_layout_observation(&self) {
         self.refresh_current_layout_observation_with_reader(&CommandDesktopSettingsReader);
     }
@@ -1777,6 +1799,8 @@ impl RuntimeState {
         );
     }
 }
+
+// Layout backend sync
 
 fn background_sync_polling_enabled(capabilities: BackendCapabilities) -> bool {
     capabilities.can_read_current_layout && !capabilities.can_observe_layout_changes
@@ -1836,6 +1860,8 @@ fn effective_current_layout_state(
     raw_state.clone()
 }
 
+// GNOME Wayland observation
+
 fn gnome_wayland_layout_state_from_bool(layout_is_english: bool) -> CurrentLayoutState {
     gnome_wayland_current_layout_state_from_code(if layout_is_english { "us" } else { "ru" })
 }
@@ -1894,6 +1920,8 @@ fn gnome_wayland_current_layout_state<R: DesktopSettingsReader>(
 
     Some(gnome_wayland_current_layout_state_from_code(layout_code))
 }
+
+// Logging helpers
 
 pub(crate) fn log_layout_debug(stage: &str, details: &str) {
     if !layout_debug_enabled() {

@@ -14,6 +14,8 @@ const XFCE_KEYBOARD_LAYOUT_CHANNEL: &str = "keyboard-layout";
 const XFCE_XKB_DISABLE_PROPERTY: &str = "/Default/XkbDisable";
 const XFCE_XKB_GROUP_PROPERTY: &str = "/Default/XkbOptions/Group";
 
+// Desktop settings reader
+
 pub trait DesktopSettingsReader {
     fn gsettings_string_list(
         &self,
@@ -99,6 +101,8 @@ impl DesktopSettingsReader for CommandDesktopSettingsReader {
     }
 }
 
+// Layout switch auto-detector
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LayoutSwitchAutoDetector<R = CommandDesktopSettingsReader> {
     reader: R,
@@ -128,6 +132,8 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
             Strategy::Unsupported => Ok(unsupported_context_fallback(context)),
         }
     }
+
+    // Desktop-specific detection strategies
 
     fn detect_xfce_x11(&self, context: SystemContext) -> LayoutSwitchSetting {
         match self
@@ -300,6 +306,8 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
     }
 }
 
+// Strategy selection
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Strategy {
     XfceX11,
@@ -316,6 +324,8 @@ fn select_strategy(context: SystemContext) -> Strategy {
         _ => Strategy::Unsupported,
     }
 }
+
+// Detection fallback builders
 
 fn detected_setting(
     combo: LayoutSwitchCombo,
@@ -375,6 +385,8 @@ pub fn failed_detection_fallback(context: SystemContext) -> LayoutSwitchSetting 
     )
 }
 
+// XKB option parsing
+
 fn combo_from_option_list(raw: &str) -> Option<LayoutSwitchCombo> {
     raw.split(',')
         .map(str::trim)
@@ -395,6 +407,8 @@ fn combo_from_xkb_option(option: &str) -> Option<LayoutSwitchCombo> {
         _ => None,
     }
 }
+
+// GNOME accelerator parsing
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GnomeAcceleratorToken {
@@ -664,6 +678,8 @@ fn normalize_gnome_key_name(key: &str) -> Option<String> {
     Some(normalized)
 }
 
+// Command output parsing
+
 fn parse_setxkbmap_options_line(line: &str) -> Option<String> {
     let line = line.trim();
     let (_, options) = line.split_once("options:")?;
@@ -700,6 +716,8 @@ fn parse_gsettings_string_list(output: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::model::{DesktopEnvironment, DistroKind, SessionType};
+
+    // Test helpers
 
     #[derive(Clone, Default)]
     struct StubReader {
@@ -787,6 +805,8 @@ mod tests {
         }
     }
 
+    // Parser helpers
+
     #[test]
     fn parses_gsettings_string_list() {
         let parsed = parse_gsettings_string_list("['grp:ctrl_shift_toggle', 'foo']");
@@ -803,6 +823,8 @@ mod tests {
         );
     }
 
+    // Strategy selection
+
     #[test]
     fn selects_gnome_wayland_strategy() {
         assert_eq!(
@@ -810,6 +832,8 @@ mod tests {
             Strategy::GnomeWayland
         );
     }
+
+    // GNOME binding parsing
 
     #[test]
     fn maps_supported_gnome_bindings_to_layout_switch_combos() {
@@ -844,6 +868,8 @@ mod tests {
             );
         }
     }
+
+    // XFCE detection
 
     #[test]
     fn detects_supported_xfce_x11_combo_from_xfconf() {
@@ -925,6 +951,8 @@ mod tests {
         );
     }
 
+    // Cinnamon detection
+
     #[test]
     fn detects_supported_cinnamon_x11_combo() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
@@ -948,6 +976,8 @@ mod tests {
         assert_eq!(setting.combo, LayoutSwitchCombo::left_alt_left_shift());
         assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
     }
+
+    // Fallback behavior
 
     #[test]
     fn falls_back_for_unsupported_context() {
@@ -991,6 +1021,8 @@ mod tests {
         assert_eq!(setting.combo, LayoutSwitchCombo::right_alt_right_shift());
         assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
     }
+
+    // GNOME Wayland detection
 
     #[test]
     fn detects_supported_gnome_wayland_combo_from_primary_keybindings() {

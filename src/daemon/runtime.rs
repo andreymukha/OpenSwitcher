@@ -188,6 +188,8 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    // Test helpers
+
     #[derive(Clone)]
     struct CountingReader {
         calls: Arc<AtomicUsize>,
@@ -399,6 +401,8 @@ mod tests {
         }
     }
 
+    // Config auto-detection
+
     #[test]
     fn detects_combo_on_first_load_and_persists_it() {
         let temp_dir = TempDir::new().unwrap();
@@ -493,6 +497,8 @@ mod tests {
             }
         );
     }
+
+    // Manual config preservation
 
     #[test]
     fn preserves_manual_choice_even_when_context_changes() {
@@ -611,6 +617,8 @@ undo_key = "Pause"
         assert!(persisted.contains("keys = ["));
     }
 
+    // Backend sync
+
     #[test]
     fn sync_with_backend_reports_update_and_replaces_cached_state() {
         let initial = known_layout_state(english_layout());
@@ -689,6 +697,8 @@ undo_key = "Pause"
         assert_eq!(runtime.current_layout_state(), expected);
     }
 
+    // Background sync policy
+
     #[test]
     fn background_sync_polling_is_enabled_only_for_non_observing_backends() {
         assert!(background_sync_polling_enabled(BackendCapabilities {
@@ -744,6 +754,8 @@ undo_key = "Pause"
         assert!(!runtime.take_pending_status_change());
     }
 
+    // Request exit / runtime flags
+
     #[test]
     fn request_exit_sets_exit_flag() {
         let runtime = test_runtime_with_backend(
@@ -757,6 +769,8 @@ undo_key = "Pause"
         runtime.request_exit();
         assert!(runtime.should_exit());
     }
+
+    // Tray watchdog
 
     #[test]
     fn tray_watchdog_attempts_restart_three_times_then_requests_exit() {
@@ -815,6 +829,8 @@ undo_key = "Pause"
             self.results.lock().unwrap().remove(0)
         }
     }
+
+    // GNOME Wayland observation
 
     struct LayoutObservationReaderStub {
         calls: Arc<AtomicUsize>,

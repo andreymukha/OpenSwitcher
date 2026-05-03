@@ -92,6 +92,9 @@ const TECHNICAL_ENGLISH_WORDS: &[&str] = &[
     "yaml",
 ];
 
+const ENGLISH_LAYOUT_NO_VOWEL_TECHNICAL_WORDS: &[&str] =
+    &["ssh", "src", "npm", "pwd", "pdf", "www"];
+
 // Physical-key strings that spell common Russian words have priority over
 // English-looking patterns in the RU -> EN heuristic.
 const RUSSIAN_PRIORITY_PHYSICAL_WORDS: &[&str] = &[
@@ -215,6 +218,9 @@ fn should_switch_english_to_russian(buffer: &[Keystroke]) -> bool {
 
     let word = keys_to_string(core);
     let normalized_word = normalize_word_for_switch_heuristics(&word);
+    if is_english_layout_technical_token(core, &normalized_word) {
+        return false;
+    }
     if is_likely_english(&normalized_word) {
         return false;
     }
@@ -648,6 +654,18 @@ fn is_explicit_english_guard_word(clean_word: &str) -> bool {
         || TECHNICAL_ENGLISH_WORDS.contains(&clean_word)
 }
 
+fn is_english_layout_technical_token(core: &[Keystroke], normalized_word: &str) -> bool {
+    ENGLISH_LAYOUT_NO_VOWEL_TECHNICAL_WORDS.contains(&normalized_word)
+        || core.iter().any(is_structural_code_token_stroke)
+}
+
+fn is_structural_code_token_stroke(stroke: &Keystroke) -> bool {
+    matches!(
+        visible_char_for_keystroke(stroke),
+        Some('0'..='9' | '/' | ':' | '_' | '.' | '-')
+    )
+}
+
 fn has_common_english_suffix(clean_word: &str) -> bool {
     const COMMON_ENGLISH_SUFFIXES: &[&str] = &["ed", "ing", "tion", "ment", "ly", "er", "est"];
 
@@ -906,14 +924,40 @@ mod tests {
                 'Y' => shifted_stroke(Key::KEY_Y),
                 'z' => stroke(Key::KEY_Z),
                 'Z' => shifted_stroke(Key::KEY_Z),
+                '0' => stroke(Key::KEY_0),
+                '1' => stroke(Key::KEY_1),
+                '2' => stroke(Key::KEY_2),
+                '3' => stroke(Key::KEY_3),
+                '4' => stroke(Key::KEY_4),
+                '5' => stroke(Key::KEY_5),
+                '6' => stroke(Key::KEY_6),
+                '7' => stroke(Key::KEY_7),
+                '8' => stroke(Key::KEY_8),
+                '9' => stroke(Key::KEY_9),
                 ',' => stroke(Key::KEY_COMMA),
                 '.' => stroke(Key::KEY_DOT),
+                '/' => stroke(Key::KEY_SLASH),
+                ':' => shifted_stroke(Key::KEY_SEMICOLON),
+                ';' => stroke(Key::KEY_SEMICOLON),
+                '-' => stroke(Key::KEY_MINUS),
                 '_' => shifted_stroke(Key::KEY_MINUS),
                 '!' => shifted_stroke(Key::KEY_1),
                 '?' => shifted_stroke(Key::KEY_SLASH),
                 _ => panic!("unsupported test character: {ch}"),
             })
             .collect()
+    }
+
+    fn assert_english_layout_tokens_do_not_switch(tokens: &[&str]) {
+        let triggered = tokens
+            .iter()
+            .copied()
+            .filter(|token| should_switch(&strokes_for_text(token), AppLayoutKind::English))
+            .collect::<Vec<_>>();
+        assert!(
+            triggered.is_empty(),
+            "tokens must not trigger EN -> RU correction: {triggered:?}"
+        );
     }
 
     // Word splitting / trailing punctuation
@@ -1300,6 +1344,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn english_layout_short_technical_no_vowel_tokens_do_not_trigger_switch() {
+        assert_english_layout_tokens_do_not_switch(&["ssh", "src", "npm", "pwd", "pdf", "www"]);
+    }
+
+    #[test]
+    fn english_layout_code_and_path_like_tokens_do_not_trigger_switch() {
+        assert_english_layout_tokens_do_not_switch(&[
+            "id_rsa",
+            "php8",
+            "src/lib",
+            "http://",
+            "localhost:3000",
+            "config.json",
+            "src/main.rs",
+        ]);
+    }
+
+    #[test]
+    fn english_layout_punctuation_corpus_matches_expected_correction_behavior() {
+        for word in ["ghbdtn;", "ghbdtn:", "ghbdtn?!"] {
+            let buffer = strokes_for_text(word);
+            assert!(
+                should_switch(&buffer, AppLayoutKind::English),
+                "{word} must trigger EN -> RU correction"
+            );
+        }
+
+        for punctuation in ["!!!", "?!"] {
+            let buffer = strokes_for_text(punctuation);
+            assert!(
+                !should_switch(&buffer, AppLayoutKind::English),
+                "{punctuation} must not trigger EN -> RU correction"
+            );
+        }
+    }
+
     // RU -> EN auto-switch heuristic
 
     #[test]
@@ -1421,6 +1502,17 @@ mod tests {
             assert!(
                 should_switch(&buffer, AppLayoutKind::Russian),
                 "{word} must trigger RU -> EN correction"
+            );
+        }
+    }
+
+    #[test]
+    fn russian_layout_short_technical_tokens_document_current_false_negative_behavior() {
+        for word in ["cargo", "rust", "sudo", "git", "ssh", "npm", "jwt"] {
+            let buffer = strokes_for_text(word);
+            assert!(
+                !should_switch(&buffer, AppLayoutKind::Russian),
+                "{word} is currently accepted as a RU -> EN false negative"
             );
         }
     }

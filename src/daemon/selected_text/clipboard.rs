@@ -11,7 +11,6 @@ const COPY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const COPY_TIMEOUT: Duration = Duration::from_millis(900);
 const COPY_CHANGE_STABLE_FOR: Duration = Duration::from_millis(60);
 const COPY_MIN_ACCEPT_DELAY: Duration = Duration::from_millis(120);
-const PASTE_SETTLE_INTERVAL: Duration = Duration::from_millis(5);
 const PASTE_SETTLE_TIMEOUT: Duration = Duration::from_millis(140);
 
 pub(super) trait ClipboardAccess {
@@ -291,10 +290,7 @@ fn wait_for_paste_settle() {
     // The target application does not provide an acknowledgment that paste has landed.
     // On X11 the clipboard owner may be queried a bit later, so we keep a bounded
     // grace window before restoring the previous clipboard contents.
-    let started = Instant::now();
-    while started.elapsed() < PASTE_SETTLE_TIMEOUT {
-        thread::sleep(PASTE_SETTLE_INTERVAL);
-    }
+    thread::sleep(PASTE_SETTLE_TIMEOUT);
 }
 
 fn restore_clipboard(

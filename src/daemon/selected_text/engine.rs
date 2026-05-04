@@ -173,11 +173,16 @@ struct SegmentEvaluation {
 }
 
 fn evaluate_segment_conversion(segment: &str) -> SegmentEvaluation {
-    let latin_letter_count = segment
-        .chars()
-        .filter(|ch| ch.is_ascii_alphabetic())
-        .count();
-    let cyrillic_letter_count = segment.chars().filter(|ch| is_cyrillic_letter(*ch)).count();
+    let mut latin_letter_count = 0;
+    let mut cyrillic_letter_count = 0;
+
+    for ch in segment.chars() {
+        if ch.is_ascii_alphabetic() {
+            latin_letter_count += 1;
+        } else if is_cyrillic_letter(ch) {
+            cyrillic_letter_count += 1;
+        }
+    }
 
     let (direction, reason) = if cyrillic_letter_count > latin_letter_count {
         (ConversionDirection::RuToEn, "majority-cyrillic")

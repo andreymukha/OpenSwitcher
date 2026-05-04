@@ -21,6 +21,7 @@ SETTINGS_PIDFILE="$PID_DIR/settings.pid"
 
 SYSTEMD_UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 APPLICATIONS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+AUTOSTART_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
 ICON_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/512x512/apps"
 SYSTEMD_BIN_DIR="${OPEN_SWITCHER_SYSTEMD_BINDIR:-$HOME/.local/bin}"
 
@@ -37,6 +38,7 @@ INSTALLED_DAEMON_BIN="$SYSTEMD_BIN_DIR/open-switcher-daemon"
 INSTALLED_TRAY_BIN="$SYSTEMD_BIN_DIR/open-switcher-tray"
 INSTALLED_SETTINGS_BIN="$SYSTEMD_BIN_DIR/open-switcher-settings"
 INSTALLED_ICON="$ICON_DIR/open-switcher.png"
+INSTALLED_AUTOSTART_FILE="$AUTOSTART_DIR/$DESKTOP_FILE"
 
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
@@ -435,6 +437,37 @@ install_rewritten_file() {
     sed "s|$search|$escaped_replacement|" "$source" >"$destination"
 }
 
+xdg_autostart_content() {
+    cat <<EOF
+[Desktop Entry]
+Type=Application
+Name=OpenSwitcher
+Comment=Start OpenSwitcher tray service
+Exec=systemctl --user start $TRAY_UNIT
+X-GNOME-Autostart-enabled=true
+EOF
+}
+
+install_xdg_autostart_fallback() {
+    mkdir -p "$AUTOSTART_DIR"
+    xdg_autostart_content >"$INSTALLED_AUTOSTART_FILE"
+}
+
+remove_xdg_autostart_fallback() {
+    rm -f "$INSTALLED_AUTOSTART_FILE"
+}
+
+xdg_autostart_fallback_installed() {
+    [[ -f "$INSTALLED_AUTOSTART_FILE" ]] \
+        && grep -Fxq "Exec=systemctl --user start $TRAY_UNIT" "$INSTALLED_AUTOSTART_FILE" \
+        && grep -Fxq "X-GNOME-Autostart-enabled=true" "$INSTALLED_AUTOSTART_FILE"
+}
+
+systemd_autostart_enabled() {
+    run_systemctl_user is-enabled "$DAEMON_UNIT" >/dev/null 2>&1 \
+        && run_systemctl_user is-enabled "$TRAY_UNIT" >/dev/null 2>&1
+}
+
 install_systemd_runtime() {
     require_binary daemon
     require_binary tray
@@ -477,16 +510,20 @@ install_systemd_runtime() {
     mv "$APPLICATIONS_DIR/$DESKTOP_FILE.tmp" "$APPLICATIONS_DIR/$DESKTOP_FILE"
 
     run_systemctl_user daemon-reload
+    if systemd_autostart_enabled; then
+        install_xdg_autostart_fallback
+    fi
 
     echo "systemd user-файлы установлены:"
     echo "  units: $SYSTEMD_UNIT_DIR"
     echo "  desktop: $APPLICATIONS_DIR/$DESKTOP_FILE"
+    echo "  autostart: $INSTALLED_AUTOSTART_FILE"
     echo "  icon: $INSTALLED_ICON"
     echo "  binaries: $SYSTEMD_BIN_DIR"
 }
 
 show_systemd_status() {
-    local unit active enabled
+    local unit active enabled autostart
     for unit in "$DAEMON_UNIT" "$TRAY_UNIT"; do
         active="$(run_systemctl_user is-active "$unit" 2>/dev/null || true)"
         enabled="$(run_systemctl_user is-enabled "$unit" 2>/dev/null || true)"
@@ -494,6 +531,11 @@ show_systemd_status() {
         [[ -n "$enabled" ]] || enabled="unknown"
         echo "$unit: active=$active enabled=$enabled"
     done
+    autostart="missing"
+    if xdg_autostart_fallback_installed; then
+        autostart="installed"
+    fi
+    echo "xdg-autostart: $autostart path=$INSTALLED_AUTOSTART_FILE"
 }
 
 show_systemd_logs() {
@@ -535,14 +577,14 @@ dev-команды:
   dev settings          Открыть окно настроек из target/
 
 systemd-команды:
-  systemd install       Установить user units, desktop entry и бинарники в ~/.local
+  systemd install       Установить user units, desktop entry, autostart fallback и бинарники в ~/.local
   systemd start         Запустить $DAEMON_UNIT и $TRAY_UNIT
   systemd stop          Остановить $TRAY_UNIT и $DAEMON_UNIT
   systemd restart       Перезапустить $DAEMON_UNIT и $TRAY_UNIT
   systemd status        Показать active/enabled статус user units
   systemd logs [name]   Показать journalctl-логи: daemon | tray | all
-  systemd enable        Включить автозапуск user units
-  systemd disable       Выключить автозапуск user units
+  systemd enable        Включить автозапуск user units и XDG fallback
+  systemd disable       Выключить автозапуск user units и XDG fallback
 
 doctor-команды:
   doctor                Проверить Linux input setup для '/dev/input/*' и '/dev/uinput'
@@ -629,10 +671,12 @@ run_systemd_command() {
     enable)
         run_systemctl_user enable "$DAEMON_UNIT"
         run_systemctl_user enable "$TRAY_UNIT"
+        install_xdg_autostart_fallback
         ;;
     disable)
         run_systemctl_user disable "$TRAY_UNIT"
         run_systemctl_user disable "$DAEMON_UNIT"
+        remove_xdg_autostart_fallback
         ;;
     ""|-h|--help|help)
         usage

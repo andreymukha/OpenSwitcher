@@ -1536,22 +1536,19 @@ impl SettingsWindow {
 
 // View state helpers
 fn initial_view_state() -> ViewState {
+    let default_settings = crate::model::Settings::default();
     ViewState {
         autostart_enabled: false,
-        auto_switch_enabled: crate::model::Settings::default().auto_switch_enabled,
-        fix_two_capitals: crate::model::Settings::default().fix_two_capitals,
-        fix_accidental_caps_lock: crate::model::Settings::default().fix_accidental_caps_lock,
-        layout_delay_ms: crate::model::Settings::default().layout_delay_ms,
-        undo_key: crate::model::Settings::default().undo_key,
-        selected_text_hotkey: crate::model::Settings::default().selected_text_hotkey,
+        auto_switch_enabled: default_settings.auto_switch_enabled,
+        fix_two_capitals: default_settings.fix_two_capitals,
+        fix_accidental_caps_lock: default_settings.fix_accidental_caps_lock,
+        layout_delay_ms: default_settings.layout_delay_ms,
+        undo_key: default_settings.undo_key,
+        selected_text_hotkey: default_settings.selected_text_hotkey,
         layout_switch: LayoutSwitchViewState {
-            combo: crate::model::Settings::default().layout_switch.combo,
-            combo_label: crate::model::Settings::default()
-                .layout_switch
-                .combo
-                .short_label()
-                .to_string(),
-            source: crate::model::Settings::default().layout_switch.source,
+            combo: default_settings.layout_switch.combo,
+            combo_label: default_settings.layout_switch.combo.short_label().to_string(),
+            source: default_settings.layout_switch.source,
             editable: false,
             manual_override_active: false,
             show_unlock_hint: false,

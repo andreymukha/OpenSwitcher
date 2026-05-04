@@ -296,6 +296,7 @@ Distribution assets in the repository:
 Installed by `./manage.sh systemd install` into:
 
 - `~/.config/systemd/user/`
+- `~/.config/autostart/`
 - `~/.local/share/applications/`
 - `~/.local/share/icons/hicolor/512x512/apps/`
 - `~/.local/bin/`
@@ -303,7 +304,7 @@ Installed by `./manage.sh systemd install` into:
 Notes:
 - the desktop entry starts the tray service through `systemctl --user`
 - the tray unit pulls in the daemon unit
-- `~/.config/autostart` is not used
+- the XDG autostart fallback at `~/.config/autostart/open-switcher.desktop` also starts the tray systemd service, not the tray binary directly, for desktop-session login reliability
 
 ## Direct Binary Runs
 

@@ -296,6 +296,7 @@ OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
 Команда `./manage.sh systemd install` устанавливает их в:
 
 - `~/.config/systemd/user/`
+- `~/.config/autostart/`
 - `~/.local/share/applications/`
 - `~/.local/share/icons/hicolor/512x512/apps/`
 - `~/.local/bin/`
@@ -303,7 +304,7 @@ OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
 Примечания:
 - desktop-файл запускает сервис tray через `systemctl --user`
 - tray unit подтягивает daemon unit
-- `~/.config/autostart` не используется
+- XDG autostart fallback в `~/.config/autostart/open-switcher.desktop` тоже запускает tray systemd service, а не tray binary напрямую, чтобы автозапуск был надёжнее после входа в desktop session
 
 ## Прямой запуск бинарников
 

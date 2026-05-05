@@ -259,7 +259,7 @@ fn english_layout_russian_physical_score(core: &[Keystroke], normalized_word: &s
     let rus_vowels = count_russian_vowels(core);
     let eng_vowels = normalized_word
         .chars()
-        .filter(|c| "aeiouy".contains(*c))
+        .filter(|c| matches!(*c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y'))
         .count();
 
     if rus_vowels > eng_vowels {
@@ -294,7 +294,7 @@ fn should_switch_russian_to_english(buffer: &[Keystroke]) -> bool {
 }
 
 fn normalize_word_for_switch_heuristics(word: &str) -> String {
-    word.chars().flat_map(|ch| ch.to_lowercase()).collect()
+    word.to_lowercase()
 }
 
 pub fn visible_char_for_keystroke(stroke: &Keystroke) -> Option<char> {
@@ -545,7 +545,7 @@ fn contains_latin_vowel(word: &str) -> bool {
 }
 
 fn count_latin_vowels_without_y(word: &str) -> usize {
-    word.chars().filter(|ch| "aeiou".contains(*ch)).count()
+    word.chars().filter(|ch| matches!(*ch, 'a' | 'e' | 'i' | 'o' | 'u')).count()
 }
 
 fn is_confident_english_for_russian_layout(word: &str) -> bool {
@@ -643,12 +643,13 @@ fn count_russian_vowels(keys: &[Keystroke]) -> usize {
 }
 
 fn is_likely_english(word: &str) -> bool {
-    let clean_word = word.trim_end_matches(&['.', ',', ';', '\'', '`', '[', ']'][..]);
+    const ENGLISH_PUNCTUATION: &[char] = &['.', ',', ';', '\'', '`', '[', ']'];
+    let clean_word = word.trim_end_matches(ENGLISH_PUNCTUATION);
     if is_explicit_english_guard_word(clean_word) {
         return true;
     }
 
-    let eng_vowels = clean_word.chars().filter(|c| "aeiouy".contains(*c)).count();
+    let eng_vowels = clean_word.chars().filter(|c| matches!(*c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')).count();
     if eng_vowels >= 2 && clean_word.len() <= 5 {
         return true;
     }
@@ -747,13 +748,14 @@ fn apply_case_fixes_to_text(
         return word.to_string();
     };
 
-    word.chars()
-        .zip(corrected_pattern)
-        .flat_map(|(ch, case)| match case {
-            LetterCase::Upper => ch.to_uppercase().collect::<Vec<_>>(),
-            LetterCase::Lower => ch.to_lowercase().collect::<Vec<_>>(),
-        })
-        .collect()
+    let mut result = String::with_capacity(word.len());
+    for (ch, case) in word.chars().zip(corrected_pattern) {
+        match case {
+            LetterCase::Upper => result.extend(ch.to_uppercase()),
+            LetterCase::Lower => result.extend(ch.to_lowercase()),
+        }
+    }
+    result
 }
 
 fn corrected_case_pattern(

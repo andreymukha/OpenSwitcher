@@ -62,35 +62,35 @@ impl CaptureProgress {
             return EvaluatedCapture::waiting("no-keys-pressed");
         }
 
-        if *keys == BTreeSet::from([Key::CapsLock]) {
+        if keys.len() == 1 && caps_lock {
             return EvaluatedCapture::candidate(
                 LayoutSwitchCombo::caps_lock(),
                 "matched-caps-lock",
             );
         }
 
-        if *keys == BTreeSet::from([Key::LeftCtrl, Key::LeftShift]) {
+        if keys.len() == 2 && left_ctrl && left_shift {
             return EvaluatedCapture::candidate(
                 LayoutSwitchCombo::left_ctrl_left_shift(),
                 "matched-left-ctrl-left-shift",
             );
         }
 
-        if *keys == BTreeSet::from([Key::RightCtrl, Key::RightShift]) {
+        if keys.len() == 2 && right_ctrl && right_shift {
             return EvaluatedCapture::candidate(
                 LayoutSwitchCombo::right_ctrl_right_shift(),
                 "matched-right-ctrl-right-shift",
             );
         }
 
-        if *keys == BTreeSet::from([Key::LeftAlt, Key::LeftShift]) {
+        if keys.len() == 2 && left_alt && left_shift {
             return EvaluatedCapture::candidate(
                 LayoutSwitchCombo::left_alt_left_shift(),
                 "matched-left-alt-left-shift",
             );
         }
 
-        if *keys == BTreeSet::from([Key::RightAlt, Key::RightShift]) {
+        if keys.len() == 2 && right_alt && right_shift {
             return EvaluatedCapture::candidate(
                 LayoutSwitchCombo::right_alt_right_shift(),
                 "matched-right-alt-right-shift",
@@ -129,34 +129,16 @@ impl CaptureProgress {
             return EvaluatedCapture::unsupported("trigger-key-with-extra-keys");
         }
 
-        let is_supported_prefix = matches!(
-            keys.iter().copied().collect::<Vec<_>>().as_slice(),
-            [Key::LeftCtrl]
-                | [Key::RightCtrl]
-                | [Key::LeftShift]
-                | [Key::RightShift]
-                | [Key::LeftAlt]
-                | [Key::RightAlt]
-                | [Key::Super]
-        );
-
-        if is_supported_prefix {
-            return EvaluatedCapture::waiting("supported-prefix");
-        }
-
-        if keys.is_subset(&BTreeSet::from([Key::LeftCtrl, Key::LeftShift]))
-            || keys.is_subset(&BTreeSet::from([Key::RightCtrl, Key::RightShift]))
-            || keys.is_subset(&BTreeSet::from([Key::LeftAlt, Key::LeftShift]))
-            || keys.is_subset(&BTreeSet::from([Key::RightAlt, Key::RightShift]))
-            || keys.is_subset(&BTreeSet::from([Key::LeftCtrl, Key::RightShift]))
-            || keys.is_subset(&BTreeSet::from([Key::RightCtrl, Key::LeftShift]))
-            || keys.is_subset(&BTreeSet::from([Key::LeftAlt, Key::RightShift]))
-            || keys.is_subset(&BTreeSet::from([Key::RightAlt, Key::LeftShift]))
-            || keys.is_subset(&BTreeSet::from([Key::LeftCtrl, Key::Space]))
-            || keys.is_subset(&BTreeSet::from([Key::RightCtrl, Key::Space]))
-            || keys.is_subset(&BTreeSet::from([Key::Super, Key::Space]))
+        if keys.len() == 1
+            && (left_ctrl
+                || right_ctrl
+                || left_shift
+                || right_shift
+                || left_alt
+                || right_alt
+                || super_key)
         {
-            return EvaluatedCapture::waiting("supported-partial-combo");
+            return EvaluatedCapture::waiting("supported-prefix");
         }
 
         EvaluatedCapture::unsupported("no-whitelist-match")

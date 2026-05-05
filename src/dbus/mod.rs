@@ -2,13 +2,83 @@ use crate::daemon::runtime::log_layout_debug;
 use crate::daemon::runtime::RuntimeState;
 use crate::error::{DbusError, SettingsError};
 use crate::model::{LayoutSwitchCaptureState, Settings, SettingsDto, UpdateSettingsResult};
-use std::sync::Arc;
+use std::sync::{
+    mpsc::{self, SyncSender},
+    Arc,
+};
+use std::thread;
 use zbus::blocking::Connection;
 use zbus::{dbus_interface, dbus_proxy, fdo, SignalContext};
 
 pub const SERVICE_NAME: &str = "org.oswitch.core";
 pub const OBJECT_PATH: &str = "/org/oswitch/core";
 pub const INTERFACE_NAME: &str = "org.oswitch.core";
+#[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
+pub(crate) const DBUS_SIGNAL_QUEUE_CAPACITY: usize = 16;
+
+#[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DbusSignalEvent {
+    StatusChanged { enabled: bool, layout: bool },
+    LayoutSwitchCaptureStateChanged(LayoutSwitchCaptureState),
+}
+
+#[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
+#[derive(Clone)]
+pub(crate) struct DbusSignalPublisher {
+    sender: SyncSender<DbusSignalEvent>,
+}
+
+impl DbusSignalPublisher {
+    #[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
+    pub(crate) fn spawn(connection: Connection) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(DBUS_SIGNAL_QUEUE_CAPACITY);
+        let _ = thread::spawn(move || {
+            while let Ok(event) = receiver.recv() {
+                match event {
+                    DbusSignalEvent::StatusChanged { enabled, layout } => {
+                        if let Err(error) =
+                            emit_status_changed_payload(&connection, enabled, layout)
+                        {
+                            log_layout_debug(
+                                "dbus-publisher-status-error",
+                                &format!("error={error}"),
+                            );
+                            eprintln!(
+                                "[dbus] Failed to emit queued StatusChanged signal: {error}"
+                            );
+                        }
+                    }
+                    DbusSignalEvent::LayoutSwitchCaptureStateChanged(state) => {
+                        if let Err(error) =
+                            emit_layout_switch_capture_state_changed(&connection, &state)
+                        {
+                            log_layout_debug(
+                                "dbus-publisher-capture-error",
+                                &format!("error={error}"),
+                            );
+                            eprintln!(
+                                "[dbus] Failed to emit queued LayoutSwitchCaptureStateChanged signal: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+
+        Self { sender }
+    }
+
+    #[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
+    pub(crate) fn try_publish(&self, event: DbusSignalEvent) -> bool {
+        self.sender.try_send(event).is_ok()
+    }
+
+    #[cfg(test)]
+    fn from_sender(sender: SyncSender<DbusSignalEvent>) -> Self {
+        Self { sender }
+    }
+}
 
 #[dbus_proxy(
     interface = "org.oswitch.core",
@@ -190,21 +260,27 @@ pub fn emit_status_changed(
     connection: &Connection,
     runtime: &RuntimeState,
 ) -> Result<(), DbusError> {
+    let enabled = runtime.is_enabled();
+    let layout = runtime.current_layout();
     log_layout_debug(
         "dbus-emit-status",
         &format!(
             "enabled={} current_layout={}",
-            runtime.is_enabled(),
-            if runtime.current_layout() { "EN" } else { "RU" }
+            enabled,
+            if layout { "EN" } else { "RU" }
         ),
     );
+    emit_status_changed_payload(connection, enabled, layout)
+}
+
+fn emit_status_changed_payload(
+    connection: &Connection,
+    enabled: bool,
+    layout: bool,
+) -> Result<(), DbusError> {
     let ctxt = SignalContext::new(connection.inner(), OBJECT_PATH).map_err(DbusError::Signal)?;
-    zbus::block_on(OpenSwitcherDbusApi::status_changed(
-        &ctxt,
-        runtime.is_enabled(),
-        runtime.current_layout(),
-    ))
-    .map_err(DbusError::Signal)
+    zbus::block_on(OpenSwitcherDbusApi::status_changed(&ctxt, enabled, layout))
+        .map_err(DbusError::Signal)
 }
 
 pub fn emit_status_changed_best_effort(
@@ -244,6 +320,7 @@ pub fn emit_layout_switch_capture_state_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
     fn status_signal_best_effort_treats_success_as_ok() {
@@ -256,5 +333,57 @@ mod tests {
             "test-failure",
             Err::<(), &str>("signal failed")
         ));
+    }
+
+    #[test]
+    fn publisher_enqueue_success_sends_exact_status_payload() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let publisher = DbusSignalPublisher::from_sender(sender);
+        let event = DbusSignalEvent::StatusChanged {
+            enabled: true,
+            layout: false,
+        };
+
+        assert!(publisher.try_publish(event.clone()));
+        assert_eq!(receiver.try_recv(), Ok(event));
+    }
+
+    #[test]
+    fn publisher_enqueue_success_sends_exact_capture_payload() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let publisher = DbusSignalPublisher::from_sender(sender);
+        let state =
+            LayoutSwitchCaptureState::candidate(crate::model::LayoutSwitchCombo::alt_shift());
+        let event = DbusSignalEvent::LayoutSwitchCaptureStateChanged(state);
+
+        assert!(publisher.try_publish(event.clone()));
+        assert_eq!(receiver.try_recv(), Ok(event));
+    }
+
+    #[test]
+    fn publisher_try_publish_returns_false_when_queue_is_full() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let publisher = DbusSignalPublisher::from_sender(sender);
+
+        assert!(publisher.try_publish(DbusSignalEvent::StatusChanged {
+            enabled: true,
+            layout: true,
+        }));
+        assert!(!publisher.try_publish(DbusSignalEvent::StatusChanged {
+            enabled: false,
+            layout: false,
+        }));
+    }
+
+    #[test]
+    fn publisher_try_publish_returns_false_when_receiver_is_dropped() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let publisher = DbusSignalPublisher::from_sender(sender);
+
+        assert!(!publisher.try_publish(DbusSignalEvent::StatusChanged {
+            enabled: true,
+            layout: true,
+        }));
     }
 }

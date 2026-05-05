@@ -18,7 +18,6 @@ pub(crate) const DBUS_SIGNAL_QUEUE_CAPACITY: usize = 16;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DbusSignalEvent {
     StatusChanged { enabled: bool, layout: bool },
-    #[allow(dead_code)] // Wired into DaemonService capture path in a later publisher batch.
     LayoutSwitchCaptureStateChanged(LayoutSwitchCaptureState),
 }
 

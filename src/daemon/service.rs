@@ -12,7 +12,7 @@ use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
     should_switch, CorrectionPlan, Keystroke,
 };
-use crate::dbus::{emit_layout_switch_capture_state_changed, DbusSignalEvent, DbusSignalPublisher};
+use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
 use evdev::InputEventKind;
@@ -510,7 +510,6 @@ fn apply_corrected_word_commit_state(
 
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
-    connection: Connection,
     signal_publisher: DbusSignalPublisher,
     input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
     keyboard: Option<KeyboardController>,
@@ -534,10 +533,9 @@ pub struct DaemonService {
 impl DaemonService {
     pub fn new(runtime: Arc<RuntimeState>, connection: Connection) -> Result<Self, SwitcherError> {
         let shared_modifiers = SharedModifierState::default();
-        let signal_publisher = DbusSignalPublisher::spawn(connection.clone());
+        let signal_publisher = DbusSignalPublisher::spawn(connection);
         let mut service = Self {
             runtime,
-            connection,
             signal_publisher,
             input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
             keyboard: None,
@@ -984,7 +982,9 @@ impl DaemonService {
             self.modifiers.update(key, value);
 
             if let Some(state) = self.runtime.handle_capture_key_event(key, value)? {
-                emit_layout_switch_capture_state_changed(&self.connection, &state)?;
+                let _ = self
+                    .signal_publisher
+                    .try_publish(DbusSignalEvent::LayoutSwitchCaptureStateChanged(state));
             }
 
             if !self.runtime.is_capture_active()? {

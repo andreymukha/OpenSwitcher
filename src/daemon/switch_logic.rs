@@ -15,9 +15,9 @@ pub struct CorrectionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct WordCoreAndTrailingTail {
-    core: Vec<Keystroke>,
-    trailing_tail: Vec<Keystroke>,
+struct WordCoreAndTrailingTail<'a> {
+    core: &'a [Keystroke],
+    trailing_tail: &'a [Keystroke],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,8 +167,8 @@ pub fn manual_correction_plan(
         return None;
     }
 
-    let mut normalized = normalized_replay_buffer(&split.core);
-    normalized.extend(normalized_replay_buffer(&split.trailing_tail));
+    let mut normalized = normalized_replay_buffer(split.core);
+    normalized.extend(normalized_replay_buffer(split.trailing_tail));
     Some(CorrectionPlan {
         buffer: normalized,
         extra_backspaces,
@@ -186,15 +186,15 @@ pub fn same_layout_case_correction_plan(
         return None;
     }
 
-    let normalized_core = normalized_replay_buffer(&split.core);
+    let normalized_core = normalized_replay_buffer(split.core);
     let corrected_core =
-        apply_case_fixes_to_strokes(&split.core, fix_two_capitals, fix_accidental_caps_lock);
+        apply_case_fixes_to_strokes(split.core, fix_two_capitals, fix_accidental_caps_lock);
     if corrected_core == normalized_core {
         return None;
     }
 
     let mut corrected = corrected_core;
-    corrected.extend(normalized_replay_buffer(&split.trailing_tail));
+    corrected.extend(normalized_replay_buffer(split.trailing_tail));
     Some(CorrectionPlan {
         buffer: corrected,
         extra_backspaces: 0,
@@ -220,7 +220,7 @@ pub fn layout_correction_direction(
 
 fn should_switch_english_to_russian(buffer: &[Keystroke]) -> bool {
     let split = split_word_core_and_trailing_tail(buffer, AppLayoutKind::English);
-    let core = &split.core;
+    let core = split.core;
     if core.len() < 3 {
         return false;
     }
@@ -274,7 +274,7 @@ fn english_layout_russian_physical_score(core: &[Keystroke], normalized_word: &s
 
 fn should_switch_russian_to_english(buffer: &[Keystroke]) -> bool {
     let split = split_physical_english_core_and_trailing_tail(buffer);
-    let core = &split.core;
+    let core = split.core;
     if core.len() < 3 {
         return false;
     }
@@ -416,19 +416,21 @@ fn normalized_replay_buffer(buffer: &[Keystroke]) -> Vec<Keystroke> {
 fn split_word_core_and_trailing_tail(
     buffer: &[Keystroke],
     layout_kind: AppLayoutKind,
-) -> WordCoreAndTrailingTail {
+) -> WordCoreAndTrailingTail<'_> {
     let tail_start = buffer
         .iter()
         .rposition(|stroke| !is_trailing_tail_punctuation(stroke, layout_kind))
         .map_or(0, |index| index + 1);
 
     WordCoreAndTrailingTail {
-        core: buffer[..tail_start].to_vec(),
-        trailing_tail: buffer[tail_start..].to_vec(),
+        core: &buffer[..tail_start],
+        trailing_tail: &buffer[tail_start..],
     }
 }
 
-fn split_physical_english_core_and_trailing_tail(buffer: &[Keystroke]) -> WordCoreAndTrailingTail {
+fn split_physical_english_core_and_trailing_tail(
+    buffer: &[Keystroke],
+) -> WordCoreAndTrailingTail<'_> {
     let tail_start = buffer
         .iter()
         .rposition(|stroke| {
@@ -437,8 +439,8 @@ fn split_physical_english_core_and_trailing_tail(buffer: &[Keystroke]) -> WordCo
         .map_or(0, |index| index + 1);
 
     WordCoreAndTrailingTail {
-        core: buffer[..tail_start].to_vec(),
-        trailing_tail: buffer[tail_start..].to_vec(),
+        core: &buffer[..tail_start],
+        trailing_tail: &buffer[tail_start..],
     }
 }
 

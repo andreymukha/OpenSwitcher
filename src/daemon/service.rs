@@ -111,6 +111,57 @@ enum ManualCurrentWordFlow {
     DrainingDeferredInput { session: DeferredManualCurrentWordSession },
 }
 
+// D-Bus signal publishing diagnostics
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DbusSignalEventKind {
+    StatusChanged,
+    CaptureStateChanged,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DbusSignalDropCounts {
+    status_changed: u64,
+    capture_state_changed: u64,
+}
+
+impl DbusSignalDropCounts {
+    fn heartbeat_fields(self) -> Option<String> {
+        if self == Self::default() {
+            return None;
+        }
+
+        Some(format!(
+            "dbus_signal_drops_status={} dbus_signal_drops_capture={}",
+            self.status_changed, self.capture_state_changed,
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct DbusSignalDropCounters {
+    counts: DbusSignalDropCounts,
+}
+
+impl DbusSignalDropCounters {
+    fn record(&mut self, event: DbusSignalEventKind) {
+        match event {
+            DbusSignalEventKind::StatusChanged => {
+                self.counts.status_changed += 1;
+            }
+            DbusSignalEventKind::CaptureStateChanged => {
+                self.counts.capture_state_changed += 1;
+            }
+        }
+    }
+
+    fn take_counts(&mut self) -> DbusSignalDropCounts {
+        let counts = self.counts;
+        self.counts = DbusSignalDropCounts::default();
+        counts
+    }
+}
+
 // Deferred manual current-word helpers
 
 fn deferred_manual_current_word_flow_label(flow: &ManualCurrentWordFlow) -> &'static str {
@@ -528,6 +579,7 @@ pub struct DaemonService {
     pending_word_commit: Option<PendingWordCommit>,
     pending_selected_text_switch: bool,
     startup_layout_resync: StartupLayoutResyncState,
+    dbus_signal_drop_counters: DbusSignalDropCounters,
 }
 
 impl DaemonService {
@@ -554,6 +606,7 @@ impl DaemonService {
             pending_word_commit: None,
             pending_selected_text_switch: false,
             startup_layout_resync: StartupLayoutResyncState::pending(),
+            dbus_signal_drop_counters: DbusSignalDropCounters::default(),
         };
         service.try_initialize_input_backend()?;
         Ok(service)
@@ -636,16 +689,27 @@ impl DaemonService {
                     if processed_events.is_multiple_of(EVENT_LOOP_HEARTBEAT_EVENTS)
                         || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
                     {
+                        let dbus_signal_drop_fields = self
+                            .dbus_signal_drop_counters
+                            .take_counts()
+                            .heartbeat_fields();
+                        if let Some(fields) = dbus_signal_drop_fields.as_deref() {
+                            log_layout_debug("dbus-signal-drop-summary", fields);
+                        }
+                        let dbus_signal_drop_fields = dbus_signal_drop_fields
+                            .map(|fields| format!(" {fields}"))
+                            .unwrap_or_default();
                         log_input_debug(
                             "event-loop-heartbeat",
                             &format!(
-                                "events_processed={processed_events} selected_text_in_progress={} writer_alive={}",
+                                "events_processed={processed_events} selected_text_in_progress={} writer_alive={}{}",
                                 self.selected_text_runner
                                     .as_ref()
                                     .is_some_and(SelectedTextJobRunner::is_in_progress),
                                 self.keyboard
                                     .as_ref()
-                                    .is_some_and(KeyboardController::is_writer_alive)
+                                    .is_some_and(KeyboardController::is_writer_alive),
+                                dbus_signal_drop_fields,
                             ),
                         );
                         last_heartbeat = Instant::now();
@@ -984,7 +1048,7 @@ impl DaemonService {
             if let Some(state) = self.runtime.handle_capture_key_event(key, value)? {
                 self.try_publish_signal_event(
                     DbusSignalEvent::LayoutSwitchCaptureStateChanged(state),
-                    "capture-state-changed",
+                    DbusSignalEventKind::CaptureStateChanged,
                 );
             }
 
@@ -1842,7 +1906,7 @@ impl DaemonService {
         Ok(true)
     }
 
-    fn publish_status_changed(&self) {
+    fn publish_status_changed(&mut self) {
         let enabled = self.runtime.is_enabled();
         let layout = self.runtime.current_layout();
         log_layout_debug(
@@ -1859,20 +1923,17 @@ impl DaemonService {
         );
         self.try_publish_signal_event(
             DbusSignalEvent::StatusChanged { enabled, layout },
-            "status-changed",
+            DbusSignalEventKind::StatusChanged,
         );
         self.runtime.clear_pending_status_change();
     }
 
-    fn try_publish_signal_event(&self, event: DbusSignalEvent, event_label: &'static str) {
+    fn try_publish_signal_event(&mut self, event: DbusSignalEvent, event_kind: DbusSignalEventKind) {
         if self.signal_publisher.try_publish(event) {
             return;
         }
 
-        log_layout_debug(
-            "dbus-signal-drop",
-            &format!("event={event_label} reason=queue-full-or-disconnected"),
-        );
+        self.dbus_signal_drop_counters.record(event_kind);
     }
 
     // Input backend lifecycle
@@ -2176,6 +2237,42 @@ mod tests {
     fn pending_status_change_requests_publish_from_service() {
         assert!(should_publish_pending_status_change(true));
         assert!(!should_publish_pending_status_change(false));
+    }
+
+    #[test]
+    fn dbus_signal_drop_counters_accumulate_and_reset() {
+        let mut counters = DbusSignalDropCounters::default();
+
+        counters.record(DbusSignalEventKind::StatusChanged);
+        counters.record(DbusSignalEventKind::StatusChanged);
+        counters.record(DbusSignalEventKind::CaptureStateChanged);
+
+        assert_eq!(
+            counters.take_counts(),
+            DbusSignalDropCounts {
+                status_changed: 2,
+                capture_state_changed: 1,
+            }
+        );
+        assert_eq!(counters.take_counts(), DbusSignalDropCounts::default());
+    }
+
+    #[test]
+    fn empty_dbus_signal_drop_counts_have_no_heartbeat_fields() {
+        assert_eq!(DbusSignalDropCounts::default().heartbeat_fields(), None);
+    }
+
+    #[test]
+    fn dbus_signal_drop_counts_format_heartbeat_fields() {
+        let counts = DbusSignalDropCounts {
+            status_changed: 3,
+            capture_state_changed: 4,
+        };
+
+        assert_eq!(
+            counts.heartbeat_fields(),
+            Some("dbus_signal_drops_status=3 dbus_signal_drops_capture=4".to_string())
+        );
     }
 
     // Selected-text hotkey matching

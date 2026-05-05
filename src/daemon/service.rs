@@ -12,7 +12,7 @@ use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
     should_switch, CorrectionPlan, Keystroke,
 };
-use crate::dbus::{emit_layout_switch_capture_state_changed, emit_status_changed_best_effort};
+use crate::dbus::{emit_layout_switch_capture_state_changed, DbusSignalEvent, DbusSignalPublisher};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
 use evdev::InputEventKind;
@@ -511,6 +511,7 @@ fn apply_corrected_word_commit_state(
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
     connection: Connection,
+    signal_publisher: DbusSignalPublisher,
     input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
     keyboard: Option<KeyboardController>,
     modifiers: ModifierState,
@@ -533,9 +534,11 @@ pub struct DaemonService {
 impl DaemonService {
     pub fn new(runtime: Arc<RuntimeState>, connection: Connection) -> Result<Self, SwitcherError> {
         let shared_modifiers = SharedModifierState::default();
+        let signal_publisher = DbusSignalPublisher::spawn(connection.clone());
         let mut service = Self {
             runtime,
             connection,
+            signal_publisher,
             input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
             keyboard: None,
             modifiers: ModifierState::default(),
@@ -1839,19 +1842,23 @@ impl DaemonService {
     }
 
     fn publish_status_changed(&self) {
+        let enabled = self.runtime.is_enabled();
+        let layout = self.runtime.current_layout();
         log_layout_debug(
             "status-signal",
             &format!(
                 "enabled={} current_layout={}",
-                self.runtime.is_enabled(),
-                if self.runtime.current_layout() {
+                enabled,
+                if layout {
                     "EN"
                 } else {
                     "RU"
                 }
             ),
         );
-        emit_status_changed_best_effort(&self.connection, &self.runtime, "daemon-service");
+        let _ = self
+            .signal_publisher
+            .try_publish(DbusSignalEvent::StatusChanged { enabled, layout });
         self.runtime.clear_pending_status_change();
     }
 

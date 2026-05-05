@@ -13,24 +13,21 @@ use zbus::{dbus_interface, dbus_proxy, fdo, SignalContext};
 pub const SERVICE_NAME: &str = "org.oswitch.core";
 pub const OBJECT_PATH: &str = "/org/oswitch/core";
 pub const INTERFACE_NAME: &str = "org.oswitch.core";
-#[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
 pub(crate) const DBUS_SIGNAL_QUEUE_CAPACITY: usize = 16;
 
-#[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DbusSignalEvent {
     StatusChanged { enabled: bool, layout: bool },
+    #[allow(dead_code)] // Wired into DaemonService capture path in a later publisher batch.
     LayoutSwitchCaptureStateChanged(LayoutSwitchCaptureState),
 }
 
-#[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
 #[derive(Clone)]
 pub(crate) struct DbusSignalPublisher {
     sender: SyncSender<DbusSignalEvent>,
 }
 
 impl DbusSignalPublisher {
-    #[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
     pub(crate) fn spawn(connection: Connection) -> Self {
         let (sender, receiver) = mpsc::sync_channel(DBUS_SIGNAL_QUEUE_CAPACITY);
         let _ = thread::spawn(move || {
@@ -69,7 +66,6 @@ impl DbusSignalPublisher {
         Self { sender }
     }
 
-    #[allow(dead_code)] // Wired into DaemonService in the next publisher batch.
     pub(crate) fn try_publish(&self, event: DbusSignalEvent) -> bool {
         self.sender.try_send(event).is_ok()
     }

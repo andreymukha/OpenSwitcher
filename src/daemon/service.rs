@@ -982,9 +982,10 @@ impl DaemonService {
             self.modifiers.update(key, value);
 
             if let Some(state) = self.runtime.handle_capture_key_event(key, value)? {
-                let _ = self
-                    .signal_publisher
-                    .try_publish(DbusSignalEvent::LayoutSwitchCaptureStateChanged(state));
+                self.try_publish_signal_event(
+                    DbusSignalEvent::LayoutSwitchCaptureStateChanged(state),
+                    "capture-state-changed",
+                );
             }
 
             if !self.runtime.is_capture_active()? {
@@ -1856,10 +1857,22 @@ impl DaemonService {
                 }
             ),
         );
-        let _ = self
-            .signal_publisher
-            .try_publish(DbusSignalEvent::StatusChanged { enabled, layout });
+        self.try_publish_signal_event(
+            DbusSignalEvent::StatusChanged { enabled, layout },
+            "status-changed",
+        );
         self.runtime.clear_pending_status_change();
+    }
+
+    fn try_publish_signal_event(&self, event: DbusSignalEvent, event_label: &'static str) {
+        if self.signal_publisher.try_publish(event) {
+            return;
+        }
+
+        log_layout_debug(
+            "dbus-signal-drop",
+            &format!("event={event_label} reason=queue-full-or-disconnected"),
+        );
     }
 
     // Input backend lifecycle

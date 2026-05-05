@@ -21,6 +21,8 @@ pub(crate) enum DbusSignalEvent {
     LayoutSwitchCaptureStateChanged(LayoutSwitchCaptureState),
 }
 
+// Best-effort, non-blocking signal publisher for paths that may run while
+// the real keyboard is grabbed. The worker exits when all senders are dropped.
 #[derive(Clone)]
 pub(crate) struct DbusSignalPublisher {
     sender: SyncSender<DbusSignalEvent>,

@@ -8,6 +8,8 @@ pub const DAEMON_UNIT: &str = "open-switcher-daemon.service";
 pub const TRAY_UNIT: &str = "open-switcher-tray.service";
 
 const XDG_AUTOSTART_FILE: &str = "open-switcher.desktop";
+const XDG_AUTOSTART_EXEC_LINE: &str = "Exec=systemctl --user start open-switcher-tray.service";
+const XDG_AUTOSTART_ENABLED_LINE: &str = "X-GNOME-Autostart-enabled=true";
 const XDG_AUTOSTART_CONTENT: &str = "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=systemctl --user start open-switcher-tray.service\nX-GNOME-Autostart-enabled=true\n";
 
 pub trait CommandRunner: Clone {
@@ -126,10 +128,17 @@ impl<R: CommandRunner> UserServiceController<R> {
 
     fn xdg_autostart_fallback_installed(&self) -> bool {
         match fs::read_to_string(&self.autostart_file) {
-            Ok(content) => content == XDG_AUTOSTART_CONTENT,
+            Ok(content) => xdg_autostart_fallback_content_installed(&content),
             Err(_) => false,
         }
     }
+}
+
+fn xdg_autostart_fallback_content_installed(content: &str) -> bool {
+    let has_tray_service_exec = content.lines().any(|line| line == XDG_AUTOSTART_EXEC_LINE);
+    let has_enabled = content.lines().any(|line| line == XDG_AUTOSTART_ENABLED_LINE);
+
+    has_tray_service_exec && has_enabled
 }
 
 fn default_xdg_autostart_file() -> PathBuf {
@@ -374,6 +383,63 @@ mod tests {
 
             let services = UserServiceController::new(runner);
             assert!(services.is_autostart_enabled().unwrap());
+        });
+    }
+
+    #[test]
+    fn xdg_autostart_fallback_allows_extra_desktop_fields() {
+        with_temp_xdg_config_home(|config_home| {
+            let autostart_file = xdg_autostart_file(config_home);
+            fs::create_dir_all(autostart_file.parent().unwrap()).unwrap();
+            fs::write(
+                &autostart_file,
+                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=systemctl --user start open-switcher-tray.service\nX-GNOME-Autostart-enabled=true\nX-Cinnamon-Autostart-enabled=true\n",
+            )
+            .unwrap();
+
+            let mut runner = FakeCommandRunner::default();
+            runner.push_ok("enabled\n");
+
+            let services = UserServiceController::new(runner);
+            assert!(services.is_autostart_enabled().unwrap());
+        });
+    }
+
+    #[test]
+    fn xdg_autostart_fallback_requires_tray_service_exec_line() {
+        with_temp_xdg_config_home(|config_home| {
+            let autostart_file = xdg_autostart_file(config_home);
+            fs::create_dir_all(autostart_file.parent().unwrap()).unwrap();
+            fs::write(
+                &autostart_file,
+                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nX-GNOME-Autostart-enabled=true\n",
+            )
+            .unwrap();
+
+            let mut runner = FakeCommandRunner::default();
+            runner.push_ok("enabled\n");
+
+            let services = UserServiceController::new(runner);
+            assert!(!services.is_autostart_enabled().unwrap());
+        });
+    }
+
+    #[test]
+    fn xdg_autostart_fallback_requires_enabled_line() {
+        with_temp_xdg_config_home(|config_home| {
+            let autostart_file = xdg_autostart_file(config_home);
+            fs::create_dir_all(autostart_file.parent().unwrap()).unwrap();
+            fs::write(
+                &autostart_file,
+                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nExec=systemctl --user start open-switcher-tray.service\n",
+            )
+            .unwrap();
+
+            let mut runner = FakeCommandRunner::default();
+            runner.push_ok("enabled\n");
+
+            let services = UserServiceController::new(runner);
+            assert!(!services.is_autostart_enabled().unwrap());
         });
     }
 

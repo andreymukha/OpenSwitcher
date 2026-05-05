@@ -463,6 +463,31 @@ mod tests {
     }
 
     #[test]
+    fn builds_super_space_trigger_combo() {
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start();
+
+        assert_eq!(session.handle_key_event(Key::KEY_LEFTMETA, 1), None);
+        assert_eq!(
+            session.handle_key_event(Key::KEY_SPACE, 1),
+            Some(LayoutSwitchCaptureState::candidate(
+                LayoutSwitchCombo::super_space()
+            ))
+        );
+
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start();
+
+        assert_eq!(session.handle_key_event(Key::KEY_RIGHTMETA, 1), None);
+        assert_eq!(
+            session.handle_key_event(Key::KEY_SPACE, 1),
+            Some(LayoutSwitchCaptureState::candidate(
+                LayoutSwitchCombo::super_space()
+            ))
+        );
+    }
+
+    #[test]
     fn rejects_unsupported_combos() {
         let mut session = LayoutSwitchCaptureSession::default();
         session.start();

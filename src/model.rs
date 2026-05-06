@@ -154,7 +154,8 @@ impl HotkeyTrigger {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Type)]
+#[zvariant(signature = "s")]
 pub struct HotkeySpec {
     pub modifiers: HotkeyModifiers,
     pub trigger: HotkeyTrigger,
@@ -204,6 +205,19 @@ pub fn hotkeys_conflict_exact(left: HotkeySpec, right: HotkeySpec) -> bool {
     left.conflicts_exact(right)
 }
 
+pub fn validate_hotkey_conflicts(
+    manual_correction_hotkey: HotkeySpec,
+    selected_text_hotkey: HotkeySpec,
+) -> Result<(), ValidationError> {
+    if hotkeys_conflict_exact(manual_correction_hotkey, selected_text_hotkey) {
+        return Err(ValidationError::DuplicateHotkey {
+            hotkey: manual_correction_hotkey.config_value(),
+        });
+    }
+
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HotkeySpecParseError {
     Empty,
@@ -226,6 +240,25 @@ impl std::fmt::Display for HotkeySpecParseError {
 }
 
 impl std::error::Error for HotkeySpecParseError {}
+
+impl Serialize for HotkeySpec {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.config_value())
+    }
+}
+
+impl<'de> Deserialize<'de> for HotkeySpec {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
 
 impl std::fmt::Display for HotkeySpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1277,6 +1310,44 @@ mod tests {
             HotkeySpec::from_str("shift+ctrl+alt+insert").unwrap(),
             shift_ctrl_alt_insert
         );
+    }
+
+    #[test]
+    fn hotkey_spec_serializes_as_canonical_string() {
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct HotkeyHolder {
+            hotkey: HotkeySpec,
+        }
+
+        let holder = HotkeyHolder {
+            hotkey: HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12),
+        };
+
+        let serialized = toml::to_string(&holder).unwrap();
+        assert_eq!(serialized, "hotkey = \"ctrl+alt+f12\"\n");
+
+        let parsed: HotkeyHolder = toml::from_str("hotkey = \"ShiftF12\"").unwrap();
+        assert_eq!(
+            parsed,
+            HotkeyHolder {
+                hotkey: HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12),
+            }
+        );
+    }
+
+    #[test]
+    fn hotkey_spec_validation_rejects_exact_duplicate() {
+        let manual = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+        let selected = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+        let shifted = HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::F12);
+
+        assert_eq!(
+            validate_hotkey_conflicts(manual, selected).unwrap_err(),
+            ValidationError::DuplicateHotkey {
+                hotkey: "ctrl+alt+f12".to_string(),
+            }
+        );
+        assert!(validate_hotkey_conflicts(manual, shifted).is_ok());
     }
 
     #[test]

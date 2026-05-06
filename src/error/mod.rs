@@ -31,6 +31,8 @@ pub enum LayoutSwitchComboParseError {
 pub enum ValidationError {
     #[error("Задержка переключения должна быть в диапазоне от {min} до {max} мс.")]
     LayoutDelayOutOfRange { min: u32, max: u32, found: u32 },
+    #[error("Горячие клавиши ручного исправления и выделенного текста совпадают: {hotkey}")]
+    DuplicateHotkey { hotkey: String },
 }
 
 #[derive(Debug, Error)]

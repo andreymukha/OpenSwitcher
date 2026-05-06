@@ -1,6 +1,6 @@
 use crate::model::{
-    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSource, SelectedTextHotkey, Settings,
-    UndoKey,
+    hotkeys_conflict_exact, AutoDetectedLayoutSwitch, HotkeySpec, LayoutSwitchCombo,
+    LayoutSwitchSource, Settings,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,8 +34,10 @@ pub struct ViewState {
     pub fix_two_capitals: bool,
     pub fix_accidental_caps_lock: bool,
     pub layout_delay_ms: u32,
-    pub undo_key: UndoKey,
-    pub selected_text_hotkey: SelectedTextHotkey,
+    pub manual_correction_hotkey: HotkeySpec,
+    pub selected_text_hotkey: HotkeySpec,
+    pub hotkey_error_text: String,
+    pub layout_prefix_warning_text: String,
     pub layout_switch: LayoutSwitchViewState,
     pub loading: bool,
     pub saving: bool,
@@ -176,12 +178,12 @@ impl DomainState {
         true
     }
 
-    pub fn update_undo_key(&mut self, value: UndoKey) -> bool {
-        if self.draft.undo_key == value {
+    pub fn update_manual_correction_hotkey(&mut self, value: HotkeySpec) -> bool {
+        if self.draft.manual_correction_hotkey == value {
             return false;
         }
 
-        self.draft.undo_key = value;
+        self.draft.manual_correction_hotkey = value;
         true
     }
 
@@ -194,7 +196,7 @@ impl DomainState {
         true
     }
 
-    pub fn update_selected_text_hotkey(&mut self, value: SelectedTextHotkey) -> bool {
+    pub fn update_selected_text_hotkey(&mut self, value: HotkeySpec) -> bool {
         if self.draft.selected_text_hotkey == value {
             return false;
         }
@@ -302,6 +304,14 @@ impl DomainState {
             .map(|enabled| enabled != self.autostart_enabled)
             .unwrap_or(false);
         let dirty = settings_dirty || autostart_dirty;
+        let hotkey_error_text =
+            hotkey_error_text(self.draft.manual_correction_hotkey, self.draft.selected_text_hotkey);
+        let layout_prefix_warning_text = layout_prefix_warning_text(
+            self.draft.layout_switch.combo,
+            self.draft.manual_correction_hotkey,
+            self.draft.selected_text_hotkey,
+        );
+        let has_hotkey_error = !hotkey_error_text.is_empty();
 
         ViewState {
             autostart_enabled: self.autostart_enabled,
@@ -309,8 +319,10 @@ impl DomainState {
             fix_two_capitals: self.draft.fix_two_capitals,
             fix_accidental_caps_lock: self.draft.fix_accidental_caps_lock,
             layout_delay_ms: self.draft.layout_delay_ms,
-            undo_key: self.draft.undo_key,
+            manual_correction_hotkey: self.draft.manual_correction_hotkey,
             selected_text_hotkey: self.draft.selected_text_hotkey,
+            hotkey_error_text,
+            layout_prefix_warning_text,
             layout_switch: LayoutSwitchViewState {
                 combo: self.draft.layout_switch.combo,
                 combo_label: self.draft.layout_switch.combo.short_label().to_string(),
@@ -345,7 +357,7 @@ impl DomainState {
             loaded,
             dirty,
             form_enabled: loaded && !saving,
-            save_enabled: loaded && !saving && dirty,
+            save_enabled: loaded && !saving && dirty && !has_hotkey_error,
             cancel_enabled: !saving,
             status_text: if loading {
                 "Загрузка настроек из демона OpenSwitcher..."
@@ -365,6 +377,34 @@ impl DomainState {
         }
         settings
     }
+}
+
+fn hotkey_error_text(manual: HotkeySpec, selected_text: HotkeySpec) -> String {
+    if hotkeys_conflict_exact(manual, selected_text) {
+        return format!(
+            "Горячие клавиши ручного исправления и выделенного текста совпадают: {}.",
+            manual.short_label()
+        );
+    }
+
+    String::new()
+}
+
+fn layout_prefix_warning_text(
+    combo: LayoutSwitchCombo,
+    manual: HotkeySpec,
+    selected_text: HotkeySpec,
+) -> String {
+    let manual_conflict = manual.has_layout_switch_prefix_conflict(combo);
+    let selected_conflict = selected_text.has_layout_switch_prefix_conflict(combo);
+    if !(manual_conflict || selected_conflict) {
+        return String::new();
+    }
+
+    format!(
+        "Предупреждение: горячая клавиша содержит префикс переключения раскладки {}. Сохранение разрешено, но сочетание может конфликтовать с DE.",
+        combo.short_label()
+    )
 }
 
 fn fallback_hint_text(layout_switch: &crate::model::LayoutSwitchSetting) -> String {
@@ -440,6 +480,37 @@ mod tests {
         assert!(snapshot.settings.fix_two_capitals);
         assert!(snapshot.settings.fix_accidental_caps_lock);
         assert!(state.view_state().saving);
+    }
+
+    #[test]
+    fn exact_duplicate_hotkeys_disable_save() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+        state.update_manual_correction_hotkey(HotkeySpec::from(crate::model::UndoKey::F12));
+        state.update_selected_text_hotkey(HotkeySpec::from(crate::model::UndoKey::F12));
+
+        let view = state.view_state();
+        assert!(view.dirty);
+        assert!(!view.hotkey_error_text.is_empty());
+        assert!(!view.save_enabled);
+    }
+
+    #[test]
+    fn layout_prefix_hotkey_conflict_is_warning_not_save_blocker() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+        state.update_manual_correction_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::shift_ctrl(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+
+        let view = state.view_state();
+        assert!(view.dirty);
+        assert!(view.hotkey_error_text.is_empty());
+        assert!(!view.layout_prefix_warning_text.is_empty());
+        assert!(view.save_enabled);
     }
 
     // Discard/reload state

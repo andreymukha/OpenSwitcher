@@ -122,6 +122,18 @@ impl HotkeyTrigger {
         }
     }
 
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::F9 => "F9",
+            Self::F10 => "F10",
+            Self::F12 => "F12",
+            Self::Pause => "Pause",
+            Self::ScrollLock => "ScrollLock",
+            Self::Insert => "Insert",
+            Self::Menu => "Menu",
+        }
+    }
+
     fn compact_alias(self) -> &'static str {
         match self {
             Self::F9 => "f9",
@@ -170,6 +182,21 @@ impl HotkeySpec {
         self.to_string()
     }
 
+    pub fn short_label(self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.shift {
+            parts.push("Shift");
+        }
+        if self.modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.modifiers.alt {
+            parts.push("Alt");
+        }
+        parts.push(self.trigger.short_label());
+        parts.join("+")
+    }
+
     pub fn parse(value: &str) -> Result<Self, HotkeySpecParseError> {
         value.parse()
     }
@@ -216,6 +243,14 @@ pub fn validate_hotkey_conflicts(
     }
 
     Ok(())
+}
+
+pub const fn default_manual_correction_hotkey() -> HotkeySpec {
+    HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause)
+}
+
+pub const fn default_selected_text_hotkey() -> HotkeySpec {
+    HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::Pause)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -873,8 +908,8 @@ pub struct Settings {
     pub fix_two_capitals: bool,
     pub fix_accidental_caps_lock: bool,
     pub layout_delay_ms: u32,
-    pub undo_key: UndoKey,
-    pub selected_text_hotkey: SelectedTextHotkey,
+    pub manual_correction_hotkey: HotkeySpec,
+    pub selected_text_hotkey: HotkeySpec,
     pub layout_switch: LayoutSwitchSetting,
 }
 
@@ -885,8 +920,8 @@ impl Default for Settings {
             fix_two_capitals: false,
             fix_accidental_caps_lock: false,
             layout_delay_ms: 30,
-            undo_key: UndoKey::default(),
-            selected_text_hotkey: SelectedTextHotkey::default(),
+            manual_correction_hotkey: default_manual_correction_hotkey(),
+            selected_text_hotkey: default_selected_text_hotkey(),
             layout_switch: LayoutSwitchSetting::default(),
         }
     }
@@ -902,6 +937,8 @@ impl Settings {
             });
         }
 
+        validate_hotkey_conflicts(self.manual_correction_hotkey, self.selected_text_hotkey)?;
+
         Ok(self)
     }
 }
@@ -912,8 +949,8 @@ pub struct SettingsDto {
     pub fix_two_capitals: bool,
     pub fix_accidental_caps_lock: bool,
     pub layout_delay_ms: u32,
-    pub undo_key: UndoKey,
-    pub selected_text_hotkey: SelectedTextHotkey,
+    pub manual_correction_hotkey: HotkeySpec,
+    pub selected_text_hotkey: HotkeySpec,
     pub layout_switch: LayoutSwitchSetting,
 }
 
@@ -930,7 +967,7 @@ impl From<Settings> for SettingsDto {
             fix_two_capitals: value.fix_two_capitals,
             fix_accidental_caps_lock: value.fix_accidental_caps_lock,
             layout_delay_ms: value.layout_delay_ms,
-            undo_key: value.undo_key,
+            manual_correction_hotkey: value.manual_correction_hotkey,
             selected_text_hotkey: value.selected_text_hotkey,
             layout_switch: value.layout_switch,
         }
@@ -946,7 +983,7 @@ impl TryFrom<SettingsDto> for Settings {
             fix_two_capitals: value.fix_two_capitals,
             fix_accidental_caps_lock: value.fix_accidental_caps_lock,
             layout_delay_ms: value.layout_delay_ms,
-            undo_key: value.undo_key,
+            manual_correction_hotkey: value.manual_correction_hotkey,
             selected_text_hotkey: value.selected_text_hotkey,
             layout_switch: value.layout_switch,
         }
@@ -973,8 +1010,8 @@ mod tests {
             fix_two_capitals: false,
             fix_accidental_caps_lock: false,
             layout_delay_ms: 700,
-            undo_key: UndoKey::Pause,
-            selected_text_hotkey: SelectedTextHotkey::default(),
+            manual_correction_hotkey: default_manual_correction_hotkey(),
+            selected_text_hotkey: default_selected_text_hotkey(),
             layout_switch: LayoutSwitchSetting::default(),
         }
         .validate();
@@ -996,8 +1033,8 @@ mod tests {
             fix_two_capitals: true,
             fix_accidental_caps_lock: true,
             layout_delay_ms: 123,
-            undo_key: UndoKey::ScrollLock,
-            selected_text_hotkey: SelectedTextHotkey::CtrlF12,
+            manual_correction_hotkey: HotkeySpec::from(UndoKey::ScrollLock),
+            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::CtrlF12),
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::right_alt_right_shift(),
                 source: LayoutSwitchSource::AutoDetected,
@@ -1021,7 +1058,10 @@ mod tests {
             settings.fix_accidental_caps_lock
         );
         assert_eq!(dto.layout_delay_ms, settings.layout_delay_ms);
-        assert_eq!(dto.undo_key, settings.undo_key);
+        assert_eq!(
+            dto.manual_correction_hotkey,
+            settings.manual_correction_hotkey
+        );
         assert_eq!(dto.selected_text_hotkey, settings.selected_text_hotkey);
         assert_eq!(dto.layout_switch, settings.layout_switch);
 
@@ -1036,8 +1076,8 @@ mod tests {
             fix_two_capitals: true,
             fix_accidental_caps_lock: true,
             layout_delay_ms: 30,
-            undo_key: UndoKey::F12,
-            selected_text_hotkey: SelectedTextHotkey::AltPause,
+            manual_correction_hotkey: HotkeySpec::from(UndoKey::F12),
+            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::AltPause),
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::alt_shift(),
                 source: LayoutSwitchSource::Manual,
@@ -1049,8 +1089,11 @@ mod tests {
         assert!(!settings.auto_switch_enabled);
         assert!(settings.fix_two_capitals);
         assert!(settings.fix_accidental_caps_lock);
-        assert_eq!(settings.undo_key, UndoKey::F12);
-        assert_eq!(settings.selected_text_hotkey, SelectedTextHotkey::AltPause);
+        assert_eq!(settings.manual_correction_hotkey, HotkeySpec::from(UndoKey::F12));
+        assert_eq!(
+            settings.selected_text_hotkey,
+            HotkeySpec::from(SelectedTextHotkey::AltPause)
+        );
         assert_eq!(settings.layout_switch.combo, LayoutSwitchCombo::alt_shift());
     }
 

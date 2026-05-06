@@ -1,4 +1,4 @@
-use crate::error::{LayoutAutoDetectError, SystemContextError};
+use crate::error::{LayoutAutoDetectError, SystemContextError, ValidationError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -13,6 +13,8 @@ pub enum ConfigError {
     SystemContext(#[from] SystemContextError),
     #[error("Failed to auto-detect layout switch combo")]
     LayoutAutoDetect(#[from] LayoutAutoDetectError),
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
     #[error(
         "Unsupported legacy config format detected; rewrite config.toml using the current format"
     )]

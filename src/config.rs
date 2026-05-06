@@ -1,7 +1,7 @@
 use crate::error::ConfigError;
 use crate::model::{
-    AutoDetectedLayoutSwitch, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource,
-    SelectedTextHotkey, Settings, UndoKey,
+    default_manual_correction_hotkey, default_selected_text_hotkey, AutoDetectedLayoutSwitch,
+    HotkeySpec, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, Settings,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -36,9 +36,10 @@ pub struct FeaturesConfig {
     pub fix_two_capitals: bool,
     #[serde(default)]
     pub fix_accidental_caps_lock: bool,
-    pub undo_key: UndoKey,
-    #[serde(default)]
-    pub selected_text_switch_hotkey: SelectedTextHotkey,
+    #[serde(rename = "undo_key", default = "default_manual_correction_hotkey")]
+    pub manual_correction_hotkey: HotkeySpec,
+    #[serde(default = "default_selected_text_hotkey")]
+    pub selected_text_switch_hotkey: HotkeySpec,
 }
 
 fn default_auto_switch_enabled() -> bool {
@@ -62,8 +63,8 @@ impl Default for AppConfig {
                 auto_switch_enabled: true,
                 fix_two_capitals: false,
                 fix_accidental_caps_lock: false,
-                undo_key: UndoKey::Pause,
-                selected_text_switch_hotkey: SelectedTextHotkey::default(),
+                manual_correction_hotkey: default_manual_correction_hotkey(),
+                selected_text_switch_hotkey: default_selected_text_hotkey(),
             },
         }
     }
@@ -83,6 +84,7 @@ impl AppConfig {
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), ConfigError> {
+        self.settings().validate()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -97,7 +99,7 @@ impl AppConfig {
             fix_two_capitals: self.features.fix_two_capitals,
             fix_accidental_caps_lock: self.features.fix_accidental_caps_lock,
             layout_delay_ms: self.layout.delay_ms,
-            undo_key: self.features.undo_key,
+            manual_correction_hotkey: self.features.manual_correction_hotkey,
             selected_text_hotkey: self.features.selected_text_switch_hotkey,
             layout_switch: LayoutSwitchSetting {
                 combo: self.layout.switch_combo,
@@ -115,7 +117,7 @@ impl AppConfig {
         self.layout.switch_combo = settings.layout_switch.combo;
         self.layout.switch_source = settings.layout_switch.source;
         self.layout.auto_detected = settings.layout_switch.auto_detected;
-        self.features.undo_key = settings.undo_key;
+        self.features.manual_correction_hotkey = settings.manual_correction_hotkey;
         self.features.selected_text_switch_hotkey = settings.selected_text_hotkey;
     }
 }
@@ -175,7 +177,7 @@ impl TryFrom<AppConfigFile> for AppConfig {
                 field: "layout.switch_combo",
             })?;
 
-        Ok(Self {
+        let config = Self {
             layout: LayoutConfig {
                 switch_combo,
                 switch_source: value.layout.switch_source,
@@ -184,7 +186,9 @@ impl TryFrom<AppConfigFile> for AppConfig {
             },
             delays: value.delays,
             features: value.features,
-        })
+        };
+        config.settings().validate()?;
+        Ok(config)
     }
 }
 
@@ -207,9 +211,10 @@ pub fn default_config_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ValidationError;
     use crate::model::{
-        DetectionConfidence, DetectionStrategy, DesktopEnvironment, DistroKind, SessionType,
-        SystemContext,
+        DetectionConfidence, DetectionStrategy, DesktopEnvironment, DistroKind, HotkeyModifiers,
+        HotkeySpec, HotkeyTrigger, SelectedTextHotkey, SessionType, SystemContext, UndoKey,
     };
     use tempfile::TempDir;
 
@@ -255,8 +260,8 @@ mod tests {
                 auto_switch_enabled: false,
                 fix_two_capitals: true,
                 fix_accidental_caps_lock: true,
-                undo_key: UndoKey::ScrollLock,
-                selected_text_switch_hotkey: SelectedTextHotkey::CtrlF12,
+                manual_correction_hotkey: HotkeySpec::from(UndoKey::ScrollLock),
+                selected_text_switch_hotkey: HotkeySpec::from(SelectedTextHotkey::CtrlF12),
             },
         }
     }
@@ -281,8 +286,8 @@ mod tests {
                 auto_switch_enabled: true,
                 fix_two_capitals: false,
                 fix_accidental_caps_lock: false,
-                undo_key: UndoKey::Pause,
-                selected_text_switch_hotkey: SelectedTextHotkey::default(),
+                manual_correction_hotkey: default_manual_correction_hotkey(),
+                selected_text_switch_hotkey: default_selected_text_hotkey(),
             },
         };
 
@@ -308,8 +313,8 @@ mod tests {
                 auto_switch_enabled: true,
                 fix_two_capitals: false,
                 fix_accidental_caps_lock: false,
-                undo_key: UndoKey::Pause,
-                selected_text_switch_hotkey: SelectedTextHotkey::default(),
+                manual_correction_hotkey: default_manual_correction_hotkey(),
+                selected_text_switch_hotkey: default_selected_text_hotkey(),
             },
         };
 
@@ -350,6 +355,84 @@ selected_text_switch_hotkey = "ShiftPause"
         assert!(!config.features.fix_accidental_caps_lock);
     }
 
+    #[test]
+    fn old_hotkey_values_load_as_hotkey_specs() {
+        let parsed: AppConfigFile = toml::from_str(
+            r#"
+[layout]
+switch_combo = "CtrlShift"
+switch_source = "Unknown"
+delay_ms = 30
+
+[delays]
+backspace_ms = 0
+typing_ms = 0
+
+[features]
+undo_key = "ScrollLock"
+selected_text_switch_hotkey = "CtrlF12"
+"#,
+        )
+        .unwrap();
+
+        let config = AppConfig::try_from(parsed).unwrap();
+        assert_eq!(
+            config.features.manual_correction_hotkey,
+            HotkeySpec::from(UndoKey::ScrollLock)
+        );
+        assert_eq!(
+            config.features.selected_text_switch_hotkey,
+            HotkeySpec::from(SelectedTextHotkey::CtrlF12)
+        );
+    }
+
+    #[test]
+    fn new_hotkey_values_save_load_roundtrip_as_canonical_strings() {
+        let mut config = non_default_config(LayoutSwitchSource::Manual);
+        config.layout.auto_detected = AutoDetectedLayoutSwitch::default();
+        config.features.manual_correction_hotkey =
+            HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+        config.features.selected_text_switch_hotkey =
+            HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::Insert);
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+
+        config.save_to_path(&path).unwrap();
+        let serialized = std::fs::read_to_string(&path).unwrap();
+        assert!(serialized.contains("undo_key = \"ctrl+alt+f12\""));
+        assert!(serialized.contains("selected_text_switch_hotkey = \"shift+ctrl+alt+insert\""));
+
+        let loaded = AppConfig::load_or_create(&path).unwrap();
+        assert_eq!(loaded, config);
+    }
+
+    #[test]
+    fn duplicate_hotkeys_in_config_are_rejected() {
+        let parsed: AppConfigFile = toml::from_str(
+            r#"
+[layout]
+switch_combo = "CtrlShift"
+switch_source = "Unknown"
+delay_ms = 30
+
+[delays]
+backspace_ms = 0
+typing_ms = 0
+
+[features]
+undo_key = "ctrl+alt+f12"
+selected_text_switch_hotkey = "ctrl+alt+f12"
+"#,
+        )
+        .unwrap();
+
+        let error = AppConfig::try_from(parsed).unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::DuplicateHotkey { .. })
+        ));
+    }
+
     // Settings mapping
 
     #[test]
@@ -361,8 +444,14 @@ selected_text_switch_hotkey = "ShiftPause"
         assert!(settings.fix_two_capitals);
         assert!(settings.fix_accidental_caps_lock);
         assert_eq!(settings.layout_delay_ms, 123);
-        assert_eq!(settings.undo_key, UndoKey::ScrollLock);
-        assert_eq!(settings.selected_text_hotkey, SelectedTextHotkey::CtrlF12);
+        assert_eq!(
+            settings.manual_correction_hotkey,
+            HotkeySpec::from(UndoKey::ScrollLock)
+        );
+        assert_eq!(
+            settings.selected_text_hotkey,
+            HotkeySpec::from(SelectedTextHotkey::CtrlF12)
+        );
         assert_eq!(
             settings.layout_switch,
             LayoutSwitchSetting {
@@ -377,8 +466,8 @@ selected_text_switch_hotkey = "ShiftPause"
             fix_two_capitals: false,
             fix_accidental_caps_lock: false,
             layout_delay_ms: 77,
-            undo_key: UndoKey::F12,
-            selected_text_hotkey: SelectedTextHotkey::AltScrollLock,
+            manual_correction_hotkey: HotkeySpec::from(UndoKey::F12),
+            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::AltScrollLock),
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::left_alt_left_shift(),
                 source: LayoutSwitchSource::AutoFallback,
@@ -392,10 +481,13 @@ selected_text_switch_hotkey = "ShiftPause"
         assert!(!config.features.fix_two_capitals);
         assert!(!config.features.fix_accidental_caps_lock);
         assert_eq!(config.layout.delay_ms, 77);
-        assert_eq!(config.features.undo_key, UndoKey::F12);
+        assert_eq!(
+            config.features.manual_correction_hotkey,
+            HotkeySpec::from(UndoKey::F12)
+        );
         assert_eq!(
             config.features.selected_text_switch_hotkey,
-            SelectedTextHotkey::AltScrollLock
+            HotkeySpec::from(SelectedTextHotkey::AltScrollLock)
         );
         assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::left_alt_left_shift());
         assert_eq!(config.layout.switch_source, LayoutSwitchSource::AutoFallback);
@@ -418,7 +510,7 @@ selected_text_switch_hotkey = "ShiftPause"
         assert_eq!(loaded.settings(), config.settings());
         assert_eq!(
             loaded.features.selected_text_switch_hotkey,
-            SelectedTextHotkey::CtrlF12
+            HotkeySpec::from(SelectedTextHotkey::CtrlF12)
         );
         assert_eq!(loaded.layout.switch_combo, LayoutSwitchCombo::right_ctrl_right_shift());
         assert_eq!(loaded.layout.switch_source, LayoutSwitchSource::AutoDetected);

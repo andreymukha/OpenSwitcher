@@ -1,7 +1,7 @@
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
-use crate::model::{LayoutSwitchCombo, SessionType, UndoKey};
+use crate::model::{HotkeyTrigger, LayoutSwitchCombo, SessionType, UndoKey};
 use crate::system::SystemContextDetector;
 use evdev::{enumerate, Device, InputEvent, Key, LedType};
 use std::collections::HashSet;
@@ -1653,12 +1653,20 @@ pub fn is_character(key: Key) -> bool {
         || (code >= Key::KEY_BACKSLASH.code() && code <= Key::KEY_SLASH.code())
 }
 
-pub fn undo_key_to_evdev_key(key: UndoKey) -> Key {
-    match key {
-        UndoKey::Pause => Key::KEY_PAUSE,
-        UndoKey::F12 => Key::KEY_F12,
-        UndoKey::ScrollLock => Key::KEY_SCROLLLOCK,
+pub fn hotkey_trigger_to_evdev_key(trigger: HotkeyTrigger) -> Key {
+    match trigger {
+        HotkeyTrigger::F9 => Key::KEY_F9,
+        HotkeyTrigger::F10 => Key::KEY_F10,
+        HotkeyTrigger::F12 => Key::KEY_F12,
+        HotkeyTrigger::Pause => Key::KEY_PAUSE,
+        HotkeyTrigger::ScrollLock => Key::KEY_SCROLLLOCK,
+        HotkeyTrigger::Insert => Key::KEY_INSERT,
+        HotkeyTrigger::Menu => Key::KEY_MENU,
     }
+}
+
+pub fn undo_key_to_evdev_key(key: UndoKey) -> Key {
+    hotkey_trigger_to_evdev_key(HotkeyTrigger::from(key))
 }
 
 fn find_keyboard() -> Option<PathBuf> {
@@ -2142,6 +2150,7 @@ impl SharedModifierState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{default_manual_correction_hotkey, default_selected_text_hotkey};
     use std::cell::Cell;
     use std::fs;
     use std::io;
@@ -2169,8 +2178,8 @@ mod tests {
             layout_delay_ms: 0,
             backspace_ms: 0,
             typing_ms: 0,
-            undo_key: UndoKey::Pause,
-            selected_text_hotkey: crate::model::SelectedTextHotkey::default(),
+            manual_correction_hotkey: default_manual_correction_hotkey(),
+            selected_text_hotkey: default_selected_text_hotkey(),
         }
     }
 

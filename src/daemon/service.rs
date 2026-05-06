@@ -2,7 +2,7 @@ use crate::daemon::input_backend::{
     ActiveInputBackend, InputBackendLifecycle, KeyboardInputBackendOpener, OpenedInputBackend,
 };
 use crate::daemon::keyboard::{
-    is_character, is_modifier, log_input_debug, undo_key_to_evdev_key, KeyboardController,
+    hotkey_trigger_to_evdev_key, is_character, is_modifier, log_input_debug, KeyboardController,
     ManualCurrentWordCompletion, ManualCurrentWordOutcome, ManualCurrentWordStartOutcome,
     ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
 };
@@ -15,6 +15,7 @@ use crate::daemon::switch_logic::{
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
+use crate::model::{HotkeyModifiers, HotkeySpec};
 use evdev::InputEventKind;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -961,7 +962,12 @@ impl DaemonService {
 
         match manual_current_word_physical_event_action(
             self.has_active_manual_current_word_flow(),
-            undo_key_to_evdev_key(self.runtime.config_snapshot()?.undo_key),
+            hotkey_trigger_to_evdev_key(
+                self.runtime
+                    .config_snapshot()?
+                    .manual_correction_hotkey
+                    .trigger,
+            ),
             self.manual_current_word_flow_seen_real_next_step(),
             key,
             value,
@@ -1075,10 +1081,11 @@ impl DaemonService {
             );
         }
 
-        let undo_key = undo_key_to_evdev_key(config.undo_key);
+        let manual_correction_key =
+            hotkey_trigger_to_evdev_key(config.manual_correction_hotkey.trigger);
         if should_clear_manual_hotkey_latch_on_key_press(
             self.manual_hotkey_latch,
-            undo_key,
+            manual_correction_key,
             key,
             value,
             event_timestamp,
@@ -1122,7 +1129,12 @@ impl DaemonService {
             );
             self.suppressed_separator_key = preserved_separator;
             self.finish_pending_word_commit(pending, &config)?;
-            if manual_correction_hotkey_matches(undo_key, self.modifiers, key, value) {
+            if manual_correction_hotkey_matches(
+                config.manual_correction_hotkey,
+                self.modifiers,
+                key,
+                value,
+            ) {
                 return Ok(());
             }
         }
@@ -1154,9 +1166,18 @@ impl DaemonService {
             return result;
         }
 
-        if manual_correction_hotkey_matches(undo_key, self.modifiers, key, value) {
+        if manual_correction_hotkey_matches(
+            config.manual_correction_hotkey,
+            self.modifiers,
+            key,
+            value,
+        ) {
             self.suppressed_undo_key = Some(key);
-            if self.begin_deferred_manual_current_word_correction(undo_key, &config, origin)? {
+            if self.begin_deferred_manual_current_word_correction(
+                manual_correction_key,
+                &config,
+                origin,
+            )? {
                 return Ok(());
             }
             let word_before_cursor = if self.can_correct_word_before_cursor() {
@@ -1207,7 +1228,7 @@ impl DaemonService {
                     CurrentWordCorrectionState::Raw
                 };
                 self.manual_hotkey_latch = next_manual_hotkey_latch_after_manual_correction(
-                    undo_key,
+                    manual_correction_key,
                     CorrectionPath::ManualHotkey,
                     applied.used_current_buffer,
                     SystemTime::now(),
@@ -2084,39 +2105,41 @@ impl DaemonService {
 }
 
 fn selected_text_hotkey_matches(
-    hotkey: crate::model::SelectedTextHotkey,
+    hotkey: HotkeySpec,
     modifiers: ModifierState,
     key: evdev::Key,
     value: i32,
 ) -> bool {
-    if value != 1 || key != undo_key_to_evdev_key(hotkey.trigger_key()) {
+    if value != 1 || key != hotkey_trigger_to_evdev_key(hotkey.trigger) {
         return false;
     }
 
-    let shift = modifiers.is_shift_pressed();
-    let ctrl = modifiers.is_ctrl_pressed();
-    let alt = modifiers.is_alt_pressed();
-
-    shift == hotkey.uses_shift() && ctrl == hotkey.uses_ctrl() && alt == hotkey.uses_alt()
+    hotkey.matches(hotkey.trigger, hotkey_modifiers_from_state(modifiers))
 }
 
 fn manual_correction_hotkey_matches(
-    undo_key: evdev::Key,
+    hotkey: HotkeySpec,
     modifiers: ModifierState,
     key: evdev::Key,
     value: i32,
 ) -> bool {
     value == 1
-        && key == undo_key
-        && !modifiers.is_shift_pressed()
-        && !modifiers.is_ctrl_pressed()
-        && !modifiers.is_alt_pressed()
+        && key == hotkey_trigger_to_evdev_key(hotkey.trigger)
+        && hotkey.matches(hotkey.trigger, hotkey_modifiers_from_state(modifiers))
+}
+
+fn hotkey_modifiers_from_state(modifiers: ModifierState) -> HotkeyModifiers {
+    HotkeyModifiers::new(
+        modifiers.is_shift_pressed(),
+        modifiers.is_ctrl_pressed(),
+        modifiers.is_alt_pressed(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::SelectedTextHotkey;
+    use crate::model::{SelectedTextHotkey, UndoKey};
     use evdev::Key;
 
     // Test helpers
@@ -2293,31 +2316,31 @@ mod tests {
     #[test]
     fn selected_text_hotkey_matches_shift_pause_press_only_with_exact_modifiers() {
         assert!(selected_text_hotkey_matches(
-            SelectedTextHotkey::ShiftPause,
+            HotkeySpec::from(SelectedTextHotkey::ShiftPause),
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_PAUSE,
             1,
         ));
         assert!(!selected_text_hotkey_matches(
-            SelectedTextHotkey::ShiftPause,
+            HotkeySpec::from(SelectedTextHotkey::ShiftPause),
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_PAUSE,
             0,
         ));
         assert!(!selected_text_hotkey_matches(
-            SelectedTextHotkey::ShiftPause,
+            HotkeySpec::from(SelectedTextHotkey::ShiftPause),
             ModifierState::default(),
             Key::KEY_PAUSE,
             1,
         ));
         assert!(!selected_text_hotkey_matches(
-            SelectedTextHotkey::ShiftPause,
+            HotkeySpec::from(SelectedTextHotkey::ShiftPause),
             modifiers_with(&[Key::KEY_LEFTCTRL]),
             Key::KEY_PAUSE,
             1,
         ));
         assert!(!selected_text_hotkey_matches(
-            SelectedTextHotkey::ShiftPause,
+            HotkeySpec::from(SelectedTextHotkey::ShiftPause),
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_F12,
             1,
@@ -2327,31 +2350,31 @@ mod tests {
     #[test]
     fn selected_text_hotkey_matches_configured_f12_and_scroll_lock_variants() {
         assert!(selected_text_hotkey_matches(
-            SelectedTextHotkey::ShiftF12,
+            HotkeySpec::from(SelectedTextHotkey::ShiftF12),
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_F12,
             1,
         ));
         assert!(selected_text_hotkey_matches(
-            SelectedTextHotkey::CtrlF12,
+            HotkeySpec::from(SelectedTextHotkey::CtrlF12),
             modifiers_with(&[Key::KEY_LEFTCTRL]),
             Key::KEY_F12,
             1,
         ));
         assert!(selected_text_hotkey_matches(
-            SelectedTextHotkey::AltScrollLock,
+            HotkeySpec::from(SelectedTextHotkey::AltScrollLock),
             modifiers_with(&[Key::KEY_LEFTALT]),
             Key::KEY_SCROLLLOCK,
             1,
         ));
         assert!(!selected_text_hotkey_matches(
-            SelectedTextHotkey::CtrlF12,
+            HotkeySpec::from(SelectedTextHotkey::CtrlF12),
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_F12,
             1,
         ));
         assert!(!selected_text_hotkey_matches(
-            SelectedTextHotkey::AltScrollLock,
+            HotkeySpec::from(SelectedTextHotkey::AltScrollLock),
             modifiers_with(&[Key::KEY_LEFTALT]),
             Key::KEY_SCROLLLOCK,
             0,
@@ -2359,39 +2382,56 @@ mod tests {
     }
 
     #[test]
-    fn manual_correction_hotkey_ignores_modified_undo_key() {
+    fn manual_correction_hotkey_matches_exact_modifiers() {
+        let f12 = HotkeySpec::from(UndoKey::F12);
+        let shift_f12 = HotkeySpec::from(SelectedTextHotkey::ShiftF12);
+        let ctrl_alt_f12 =
+            HotkeySpec::new(HotkeyModifiers::ctrl_alt(), crate::model::HotkeyTrigger::F12);
+
         assert!(manual_correction_hotkey_matches(
-            Key::KEY_F12,
+            f12,
             ModifierState::default(),
             Key::KEY_F12,
             1,
         ));
         assert!(!manual_correction_hotkey_matches(
-            Key::KEY_F12,
+            f12,
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_F12,
             1,
         ));
-        assert!(!manual_correction_hotkey_matches(
+        assert!(manual_correction_hotkey_matches(
+            shift_f12,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
             Key::KEY_F12,
+            1,
+        ));
+        assert!(manual_correction_hotkey_matches(
+            ctrl_alt_f12,
+            modifiers_with(&[Key::KEY_LEFTCTRL, Key::KEY_LEFTALT]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            f12,
             modifiers_with(&[Key::KEY_LEFTCTRL]),
             Key::KEY_F12,
             1,
         ));
         assert!(!manual_correction_hotkey_matches(
-            Key::KEY_F12,
+            f12,
             modifiers_with(&[Key::KEY_LEFTALT]),
             Key::KEY_F12,
             1,
         ));
         assert!(!manual_correction_hotkey_matches(
-            Key::KEY_F12,
+            f12,
             ModifierState::default(),
             Key::KEY_F12,
             0,
         ));
         assert!(!manual_correction_hotkey_matches(
-            Key::KEY_F12,
+            f12,
             ModifierState::default(),
             Key::KEY_F11,
             1,

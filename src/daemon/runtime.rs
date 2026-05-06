@@ -14,9 +14,8 @@ use crate::layout_switch::{
     LayoutSwitchAutoDetector,
 };
 use crate::model::{
-    DesktopEnvironment, DistroKind, LayoutSwitchCaptureState, LayoutSwitchCombo,
-    LayoutSwitchSetting, SelectedTextHotkey, SessionType, Settings, SystemContext, UndoKey,
-    UpdateSettingsResult,
+    DesktopEnvironment, DistroKind, HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo,
+    LayoutSwitchSetting, SessionType, Settings, SystemContext, UpdateSettingsResult,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::env;
@@ -48,8 +47,8 @@ pub struct RuntimeConfigSnapshot {
     pub layout_delay_ms: u64,
     pub backspace_ms: u64,
     pub typing_ms: u64,
-    pub undo_key: UndoKey,
-    pub selected_text_hotkey: SelectedTextHotkey,
+    pub manual_correction_hotkey: HotkeySpec,
+    pub selected_text_hotkey: HotkeySpec,
 }
 
 impl From<&AppConfig> for RuntimeConfigSnapshot {
@@ -62,7 +61,7 @@ impl From<&AppConfig> for RuntimeConfigSnapshot {
             layout_delay_ms: value.layout.delay_ms as u64,
             backspace_ms: value.delays.backspace_ms as u64,
             typing_ms: value.delays.typing_ms as u64,
-            undo_key: value.features.undo_key,
+            manual_correction_hotkey: value.features.manual_correction_hotkey,
             selected_text_hotkey: value.features.selected_text_switch_hotkey,
         }
     }

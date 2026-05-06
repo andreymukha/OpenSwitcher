@@ -5,8 +5,8 @@ use open_switcher::dbus::{
 };
 use open_switcher::model::{
     AutoDetectedLayoutSwitch, LayoutSwitchCapturePhase, LayoutSwitchCaptureState,
-    LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, SelectedTextHotkey, SettingsDto,
-    UndoKey, UpdateSettingsResult,
+    HotkeySpec, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, SelectedTextHotkey,
+    SettingsDto, UndoKey, UpdateSettingsResult,
 };
 use std::error::Error;
 use std::path::Path;
@@ -44,8 +44,11 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
         initial.auto_switch_enabled
     );
     assert_eq!(initial.layout_delay_ms, 30);
-    assert_eq!(initial.undo_key, UndoKey::Pause);
-    assert_eq!(initial.selected_text_hotkey, SelectedTextHotkey::ShiftPause);
+    assert_eq!(initial.manual_correction_hotkey, HotkeySpec::from(UndoKey::Pause));
+    assert_eq!(
+        initial.selected_text_hotkey,
+        HotkeySpec::from(SelectedTextHotkey::ShiftPause)
+    );
     assert_eq!(initial.layout_switch, initial_config.settings().layout_switch);
 
     let result: UpdateSettingsResult = proxy.call(
@@ -55,8 +58,8 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
             fix_two_capitals: false,
             fix_accidental_caps_lock: false,
             layout_delay_ms: 77,
-            undo_key: UndoKey::F12,
-            selected_text_hotkey: SelectedTextHotkey::AltF12,
+            manual_correction_hotkey: HotkeySpec::from(UndoKey::F12),
+            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::AltF12),
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::alt_shift(),
                 source: LayoutSwitchSource::Manual,
@@ -69,8 +72,11 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let updated: SettingsDto = proxy.call("GetSettings", &())?;
     assert!(!updated.auto_switch_enabled);
     assert_eq!(updated.layout_delay_ms, 77);
-    assert_eq!(updated.undo_key, UndoKey::F12);
-    assert_eq!(updated.selected_text_hotkey, SelectedTextHotkey::AltF12);
+    assert_eq!(updated.manual_correction_hotkey, HotkeySpec::from(UndoKey::F12));
+    assert_eq!(
+        updated.selected_text_hotkey,
+        HotkeySpec::from(SelectedTextHotkey::AltF12)
+    );
     assert_eq!(updated.layout_switch.combo, LayoutSwitchCombo::alt_shift());
     assert_eq!(updated.layout_switch.source, LayoutSwitchSource::Manual);
     let reloaded_client = Connection::session()?;
@@ -83,10 +89,13 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let config = AppConfig::load_or_create(&config_path)?;
     assert!(!config.features.auto_switch_enabled);
     assert_eq!(config.layout.delay_ms, 77);
-    assert_eq!(config.features.undo_key, UndoKey::F12);
+    assert_eq!(
+        config.features.manual_correction_hotkey,
+        HotkeySpec::from(UndoKey::F12)
+    );
     assert_eq!(
         config.features.selected_text_switch_hotkey,
-        SelectedTextHotkey::AltF12
+        HotkeySpec::from(SelectedTextHotkey::AltF12)
     );
     assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::alt_shift());
 
@@ -113,8 +122,8 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
                 fix_two_capitals: false,
                 fix_accidental_caps_lock: false,
                 layout_delay_ms: 999,
-                undo_key: UndoKey::Pause,
-                selected_text_hotkey: SelectedTextHotkey::ShiftPause,
+                manual_correction_hotkey: HotkeySpec::from(UndoKey::Pause),
+                selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::ShiftPause),
                 layout_switch: LayoutSwitchSetting {
                     combo: LayoutSwitchCombo::ctrl_shift(),
                     source: LayoutSwitchSource::Manual,
@@ -129,10 +138,13 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
 
     let config = AppConfig::load_or_create(&config_path)?;
     assert_eq!(config.layout.delay_ms, 30);
-    assert_eq!(config.features.undo_key, UndoKey::Pause);
+    assert_eq!(
+        config.features.manual_correction_hotkey,
+        HotkeySpec::from(UndoKey::Pause)
+    );
     assert_eq!(
         config.features.selected_text_switch_hotkey,
-        SelectedTextHotkey::ShiftPause
+        HotkeySpec::from(SelectedTextHotkey::ShiftPause)
     );
 
     Ok(())
@@ -159,8 +171,8 @@ fn dbus_update_settings_changes_daemon_visible_is_enabled() -> Result<(), Box<dy
             fix_two_capitals: false,
             fix_accidental_caps_lock: false,
             layout_delay_ms: 30,
-            undo_key: UndoKey::Pause,
-            selected_text_hotkey: SelectedTextHotkey::ShiftPause,
+            manual_correction_hotkey: HotkeySpec::from(UndoKey::Pause),
+            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::ShiftPause),
             layout_switch: LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::ctrl_shift(),
                 source: LayoutSwitchSource::Manual,

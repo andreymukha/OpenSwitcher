@@ -2,7 +2,7 @@ use super::dbus_client::SettingsDbusClient;
 use super::state::{DomainState, ViewState};
 use crate::error::{SettingsClientError, UiError};
 use crate::model::{
-    LayoutSwitchCaptureState, LayoutSwitchCombo, SelectedTextHotkey, UndoKey, UpdateSettingsResult,
+    HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, UpdateSettingsResult,
 };
 use crate::system::user_services::{CommandRunner, ProcessCommandRunner};
 use crate::system::UserServiceController;
@@ -165,8 +165,8 @@ where
         });
     }
 
-    pub fn update_undo_key(&self, value: UndoKey) {
-        let changed = self.with_state(|state| state.update_undo_key(value));
+    pub fn update_manual_correction_hotkey(&self, value: HotkeySpec) {
+        let changed = self.with_state(|state| state.update_manual_correction_hotkey(value));
         if changed {
             let _ = self.emit_view_state();
         }
@@ -179,7 +179,7 @@ where
         }
     }
 
-    pub fn update_selected_text_hotkey(&self, value: SelectedTextHotkey) {
+    pub fn update_selected_text_hotkey(&self, value: HotkeySpec) {
         let changed = self.with_state(|state| state.update_selected_text_hotkey(value));
         if changed {
             let _ = self.emit_view_state();

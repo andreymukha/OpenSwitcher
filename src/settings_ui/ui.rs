@@ -1265,15 +1265,6 @@ impl SettingsWindow {
             .clone()
     }
 
-    fn selected_text_hotkey_capture_area(&self) -> gtk::Box {
-        self.form
-            .borrow()
-            .as_ref()
-            .expect("form widgets must be installed before access")
-            .selected_text_hotkey_capture_area
-            .clone()
-    }
-
     fn selected_text_hotkey_dialog_ok_button(&self) -> gtk::Button {
         self.form
             .borrow()
@@ -1415,8 +1406,7 @@ impl SettingsWindow {
             });
         }
 
-        self.selected_text_hotkey_capture_area()
-            .add_controller(controller);
+        self.selected_text_hotkey_dialog().add_controller(controller);
     }
 
     // View state rendering

@@ -184,14 +184,14 @@ impl HotkeySpec {
 
     pub fn short_label(self) -> String {
         let mut parts = Vec::new();
-        if self.modifiers.shift {
-            parts.push("Shift");
-        }
         if self.modifiers.ctrl {
             parts.push("Ctrl");
         }
         if self.modifiers.alt {
             parts.push("Alt");
+        }
+        if self.modifiers.shift {
+            parts.push("Shift");
         }
         parts.push(self.trigger.short_label());
         parts.join("+")
@@ -1359,6 +1359,26 @@ mod tests {
         assert_eq!(
             HotkeySpec::from_str("shift+ctrl+alt+insert").unwrap(),
             shift_ctrl_alt_insert
+        );
+    }
+
+    #[test]
+    fn hotkey_spec_short_label_puts_shift_last() {
+        assert_eq!(
+            HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::F12).short_label(),
+            "Ctrl+Alt+Shift+F12"
+        );
+        assert_eq!(
+            HotkeySpec::new(HotkeyModifiers::shift_ctrl(), HotkeyTrigger::F12).short_label(),
+            "Ctrl+Shift+F12"
+        );
+        assert_eq!(
+            HotkeySpec::new(HotkeyModifiers::shift_alt(), HotkeyTrigger::F12).short_label(),
+            "Alt+Shift+F12"
+        );
+        assert_eq!(
+            HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12).short_label(),
+            "Shift+F12"
         );
     }
 

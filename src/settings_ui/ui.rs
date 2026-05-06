@@ -221,7 +221,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
         let ui = Rc::clone(&ui);
         ui.selected_text_hotkey_dialog_cancel_button()
             .connect_clicked(move |_| {
-                ui.reset_hotkey_dialog(ui.hotkey_dialog_state.borrow().target);
+                ui.reset_hotkey_dialog(hotkey_dialog_target(&ui.hotkey_dialog_state));
                 ui.close_hotkey_dialog();
             });
     }
@@ -259,7 +259,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
         let ui = Rc::clone(&ui);
         ui.selected_text_hotkey_dialog()
             .connect_close_request(move |dialog| {
-                ui.reset_hotkey_dialog(ui.hotkey_dialog_state.borrow().target);
+                ui.reset_hotkey_dialog(hotkey_dialog_target(&ui.hotkey_dialog_state));
                 dialog.hide();
                 glib::Propagation::Stop
             });
@@ -1375,7 +1375,7 @@ impl SettingsWindow {
             let ui = Rc::clone(self);
             controller.connect_key_pressed(move |_, key, _, event_state| {
                 if key == gdk::Key::Escape {
-                    let target = ui.hotkey_dialog_state.borrow().target;
+                    let target = hotkey_dialog_target(&ui.hotkey_dialog_state);
                     ui.reset_hotkey_dialog(target);
                     ui.close_hotkey_dialog();
                     return glib::Propagation::Stop;
@@ -1647,6 +1647,10 @@ fn hotkey_spec_from_dialog_state(
     hotkey_spec_from_key_event(&state, key, event_state)
 }
 
+fn hotkey_dialog_target(dialog_state: &RefCell<HotkeyDialogState>) -> HotkeyDialogTarget {
+    dialog_state.borrow().target
+}
+
 fn hotkey_spec_from_capture_state(
     dialog_state: &HotkeyDialogState,
     trigger: HotkeyTrigger,
@@ -1815,5 +1819,18 @@ mod tests {
             dialog_state.borrow().candidate,
             Some(HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12)),
         );
+    }
+
+    #[test]
+    fn hotkey_dialog_target_borrow_is_released_before_reset() {
+        let dialog_state = RefCell::new(HotkeyDialogState {
+            target: HotkeyDialogTarget::ManualCorrection,
+            ..HotkeyDialogState::default()
+        });
+
+        let target = hotkey_dialog_target(&dialog_state);
+        dialog_state.borrow_mut().set_target(target);
+
+        assert_eq!(dialog_state.borrow().target, HotkeyDialogTarget::ManualCorrection);
     }
 }

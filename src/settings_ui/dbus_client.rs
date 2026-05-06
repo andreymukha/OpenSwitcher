@@ -65,6 +65,18 @@ impl SettingsDbusClient {
             .map_err(SettingsClientError::Daemon)
     }
 
+    pub fn set_hotkey_capture_inhibited(
+        &self,
+        inhibited: bool,
+    ) -> Result<(), SettingsClientError> {
+        let connection = Connection::session().map_err(SettingsClientError::Connection)?;
+        let proxy =
+            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
+        proxy
+            .set_hotkey_capture_inhibited(inhibited)
+            .map_err(SettingsClientError::Daemon)
+    }
+
     pub fn spawn_capture_listener(&self, tx: Sender<LayoutSwitchCaptureState>) {
         thread::spawn(move || loop {
             let connection = match Connection::session() {

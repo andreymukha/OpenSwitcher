@@ -404,6 +404,7 @@ mod tests {
         RuntimeState {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
+            settings_hotkey_capture_inhibited: AtomicBool::new(false),
             layout_state: RwLock::new(initial_layout_state),
             backend: Mutex::new(Some(backend)),
             layout_setup: RwLock::new(LayoutSetup::Unsupported {
@@ -1160,6 +1161,22 @@ undo_key = "Pause"
         );
         assert!(!runtime.current_layout());
     }
+
+    #[test]
+    fn settings_hotkey_capture_inhibition_roundtrips() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+
+        assert!(!runtime.settings_hotkey_capture_inhibited());
+        runtime.set_settings_hotkey_capture_inhibited(true);
+        assert!(runtime.settings_hotkey_capture_inhibited());
+        runtime.set_settings_hotkey_capture_inhibited(false);
+        assert!(!runtime.settings_hotkey_capture_inhibited());
+    }
 }
 
 // Runtime state
@@ -1167,6 +1184,7 @@ undo_key = "Pause"
 pub struct RuntimeState {
     enabled: AtomicBool,
     should_exit: AtomicBool,
+    settings_hotkey_capture_inhibited: AtomicBool,
     layout_state: RwLock<CurrentLayoutState>,
     backend: Mutex<Option<Box<dyn LayoutBackend>>>,
     layout_setup: RwLock<LayoutSetup>,
@@ -1282,6 +1300,7 @@ impl RuntimeState {
         let runtime = Self {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
+            settings_hotkey_capture_inhibited: AtomicBool::new(false),
             layout_state: RwLock::new(layout_state),
             backend: Mutex::new(backend),
             layout_setup: RwLock::new(layout_setup),
@@ -1310,6 +1329,15 @@ impl RuntimeState {
 
     pub fn should_exit(&self) -> bool {
         self.should_exit.load(Ordering::SeqCst)
+    }
+
+    pub fn set_settings_hotkey_capture_inhibited(&self, inhibited: bool) {
+        self.settings_hotkey_capture_inhibited
+            .store(inhibited, Ordering::SeqCst);
+    }
+
+    pub fn settings_hotkey_capture_inhibited(&self) -> bool {
+        self.settings_hotkey_capture_inhibited.load(Ordering::SeqCst)
     }
 
     pub fn toggle_enabled(&self) -> bool {

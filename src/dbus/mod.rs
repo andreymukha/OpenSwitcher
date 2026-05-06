@@ -91,6 +91,7 @@ pub trait OpenSwitcher {
     fn cancel_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn finish_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn get_layout_switch_capture_state(&self) -> zbus::Result<LayoutSwitchCaptureState>;
+    fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> zbus::Result<()>;
     #[dbus_proxy(property)]
     fn is_enabled(&self) -> zbus::Result<bool>;
     #[dbus_proxy(property)]
@@ -214,6 +215,11 @@ impl OpenSwitcherDbusApi {
         self.runtime
             .layout_switch_capture_state()
             .map_err(|err| DbusError::from(err).into())
+    }
+
+    pub fn set_hotkey_capture_inhibited(&self, inhibited: bool) {
+        self.runtime
+            .set_settings_hotkey_capture_inhibited(inhibited);
     }
 
     #[dbus_interface(property)]

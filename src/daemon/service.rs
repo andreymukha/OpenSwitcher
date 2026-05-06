@@ -1143,7 +1143,17 @@ impl DaemonService {
             return Ok(());
         }
 
-        if selected_text_hotkey_matches(config.selected_text_hotkey, self.modifiers, key, value) {
+        let settings_hotkey_capture_inhibited =
+            self.runtime.settings_hotkey_capture_inhibited();
+
+        if selected_text_hotkey_matches_when_allowed(
+            config.selected_text_hotkey,
+            self.modifiers,
+            key,
+            value,
+            settings_hotkey_capture_inhibited,
+        )
+        {
             log_selected_text_debug(
                 "hotkey-matched",
                 &format!(
@@ -1166,12 +1176,14 @@ impl DaemonService {
             return result;
         }
 
-        if manual_correction_hotkey_matches(
+        if manual_correction_hotkey_matches_when_allowed(
             config.manual_correction_hotkey,
             self.modifiers,
             key,
             value,
-        ) {
+            settings_hotkey_capture_inhibited,
+        )
+        {
             self.suppressed_undo_key = Some(key);
             if self.begin_deferred_manual_current_word_correction(
                 manual_correction_key,
@@ -2117,6 +2129,17 @@ fn selected_text_hotkey_matches(
     hotkey.matches(hotkey.trigger, hotkey_modifiers_from_state(modifiers))
 }
 
+fn selected_text_hotkey_matches_when_allowed(
+    hotkey: HotkeySpec,
+    modifiers: ModifierState,
+    key: evdev::Key,
+    value: i32,
+    settings_hotkey_capture_inhibited: bool,
+) -> bool {
+    !settings_hotkey_capture_inhibited
+        && selected_text_hotkey_matches(hotkey, modifiers, key, value)
+}
+
 fn manual_correction_hotkey_matches(
     hotkey: HotkeySpec,
     modifiers: ModifierState,
@@ -2126,6 +2149,17 @@ fn manual_correction_hotkey_matches(
     value == 1
         && key == hotkey_trigger_to_evdev_key(hotkey.trigger)
         && hotkey.matches(hotkey.trigger, hotkey_modifiers_from_state(modifiers))
+}
+
+fn manual_correction_hotkey_matches_when_allowed(
+    hotkey: HotkeySpec,
+    modifiers: ModifierState,
+    key: evdev::Key,
+    value: i32,
+    settings_hotkey_capture_inhibited: bool,
+) -> bool {
+    !settings_hotkey_capture_inhibited
+        && manual_correction_hotkey_matches(hotkey, modifiers, key, value)
 }
 
 fn hotkey_modifiers_from_state(modifiers: ModifierState) -> HotkeyModifiers {
@@ -2397,6 +2431,24 @@ mod tests {
     }
 
     #[test]
+    fn selected_text_hotkey_does_not_match_when_settings_capture_is_inhibited() {
+        assert!(selected_text_hotkey_matches_when_allowed(
+            HotkeySpec::from(SelectedTextHotkey::ShiftF12),
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_F12,
+            1,
+            false,
+        ));
+        assert!(!selected_text_hotkey_matches_when_allowed(
+            HotkeySpec::from(SelectedTextHotkey::ShiftF12),
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_F12,
+            1,
+            true,
+        ));
+    }
+
+    #[test]
     fn manual_correction_hotkey_matches_exact_modifiers() {
         let f12 = HotkeySpec::from(UndoKey::F12);
         let shift_f12 = HotkeySpec::from(SelectedTextHotkey::ShiftF12);
@@ -2466,6 +2518,24 @@ mod tests {
             modifiers_with(&[Key::KEY_LEFTSHIFT, Key::KEY_LEFTALT]),
             Key::KEY_INSERT,
             1,
+        ));
+    }
+
+    #[test]
+    fn manual_correction_hotkey_does_not_match_when_settings_capture_is_inhibited() {
+        assert!(manual_correction_hotkey_matches_when_allowed(
+            HotkeySpec::from(UndoKey::F12),
+            ModifierState::default(),
+            Key::KEY_F12,
+            1,
+            false,
+        ));
+        assert!(!manual_correction_hotkey_matches_when_allowed(
+            HotkeySpec::from(UndoKey::F12),
+            ModifierState::default(),
+            Key::KEY_F12,
+            1,
+            true,
         ));
     }
 

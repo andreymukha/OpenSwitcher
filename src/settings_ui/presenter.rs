@@ -36,6 +36,7 @@ pub trait SettingsClientBackend: Clone + Send + Sync + 'static {
         -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn finish_layout_switch_capture(&self)
         -> Result<LayoutSwitchCaptureState, SettingsClientError>;
+    fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError>;
     fn spawn_capture_listener(&self, tx: Sender<LayoutSwitchCaptureState>);
 }
 
@@ -65,6 +66,10 @@ impl SettingsClientBackend for SettingsDbusClient {
         &self,
     ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
         SettingsDbusClient::finish_layout_switch_capture(self)
+    }
+
+    fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
+        SettingsDbusClient::set_hotkey_capture_inhibited(self, inhibited)
     }
 
     fn spawn_capture_listener(&self, tx: Sender<LayoutSwitchCaptureState>) {
@@ -284,6 +289,13 @@ where
         }
     }
 
+    pub fn set_hotkey_capture_inhibited(
+        &self,
+        inhibited: bool,
+    ) -> Result<(), SettingsClientError> {
+        self.inner.client.set_hotkey_capture_inhibited(inhibited)
+    }
+
     pub fn save(&self) -> SaveRequest {
         let snapshot = self.with_state(|state| state.begin_save());
         let Some(snapshot) = snapshot else {
@@ -384,6 +396,7 @@ mod tests {
     struct FakeSettingsClientState {
         save_results: VecDeque<Result<UpdateSettingsResult, SettingsClientError>>,
         saved_settings: Vec<Settings>,
+        hotkey_capture_inhibitions: Vec<bool>,
     }
 
     impl FakeSettingsClient {
@@ -393,6 +406,14 @@ mod tests {
 
         fn saved_settings(&self) -> Vec<Settings> {
             self.state.lock().unwrap().saved_settings.clone()
+        }
+
+        fn hotkey_capture_inhibitions(&self) -> Vec<bool> {
+            self.state
+                .lock()
+                .unwrap()
+                .hotkey_capture_inhibitions
+                .clone()
         }
     }
 
@@ -429,6 +450,15 @@ mod tests {
             &self,
         ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
             panic!("capture is not used in this test")
+        }
+
+        fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
+            self.state
+                .lock()
+                .unwrap()
+                .hotkey_capture_inhibitions
+                .push(inhibited);
+            Ok(())
         }
 
         fn spawn_capture_listener(&self, _tx: Sender<LayoutSwitchCaptureState>) {}
@@ -478,6 +508,24 @@ mod tests {
                 None => panic!("fake command runner has no queued result"),
             }
         }
+    }
+
+    // Hotkey capture inhibition
+    #[test]
+    fn presenter_forwards_hotkey_capture_inhibition_to_client() {
+        let client = FakeSettingsClient::default();
+        let runner = FakeCommandRunner::default();
+        let (event_tx, _event_rx) = async_channel::unbounded();
+        let presenter = SettingsPresenter::with_services(
+            client.clone(),
+            UserServiceController::new(runner),
+            event_tx,
+        );
+
+        presenter.set_hotkey_capture_inhibited(true).unwrap();
+        presenter.set_hotkey_capture_inhibited(false).unwrap();
+
+        assert_eq!(client.hotkey_capture_inhibitions(), vec![true, false]);
     }
 
     // Save flow

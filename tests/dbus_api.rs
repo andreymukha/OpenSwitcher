@@ -309,6 +309,25 @@ fn dbus_exposes_layout_switch_capture_session_controls() -> Result<(), Box<dyn E
     Ok(())
 }
 
+#[test]
+fn dbus_exposes_settings_hotkey_capture_inhibition() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("hotkey_capture_inhibit");
+    let _service = spawn_service(&config_path, &service_name)?;
+
+    let client = Connection::session()?;
+    let proxy = OpenSwitcherProxyBlocking::builder(&client)
+        .destination(service_name.clone())?
+        .path(OBJECT_PATH)?
+        .build()?;
+
+    proxy.set_hotkey_capture_inhibited(true)?;
+    proxy.set_hotkey_capture_inhibited(false)?;
+
+    Ok(())
+}
+
 // Test harness
 
 fn spawn_service(config_path: &Path, service_name: &str) -> Result<Connection, Box<dyn Error>> {

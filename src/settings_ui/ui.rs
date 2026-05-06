@@ -202,18 +202,18 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     ui.set_fix_accidental_caps_lock_handler(fix_accidental_caps_lock_handler);
 
     {
+        let presenter = presenter.clone();
         let ui = Rc::clone(&ui);
         ui.manual_hotkey_row().connect_activated(move |_| {
-            ui.reset_hotkey_dialog(HotkeyDialogTarget::ManualCorrection);
-            ui.open_hotkey_dialog();
+            ui.open_hotkey_dialog_for(&presenter, HotkeyDialogTarget::ManualCorrection);
         });
     }
 
     {
+        let presenter = presenter.clone();
         let ui = Rc::clone(&ui);
         ui.selected_text_hotkey_row().connect_activated(move |_| {
-            ui.reset_hotkey_dialog(HotkeyDialogTarget::SelectedText);
-            ui.open_hotkey_dialog();
+            ui.open_hotkey_dialog_for(&presenter, HotkeyDialogTarget::SelectedText);
         });
     }
 
@@ -258,9 +258,9 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     {
         let ui = Rc::clone(&ui);
         ui.selected_text_hotkey_dialog()
-            .connect_close_request(move |dialog| {
+            .connect_close_request(move |_| {
                 ui.reset_hotkey_dialog(hotkey_dialog_target(&ui.hotkey_dialog_state));
-                dialog.hide();
+                ui.close_hotkey_dialog();
                 glib::Propagation::Stop
             });
     }
@@ -1335,6 +1335,16 @@ impl SettingsWindow {
         }
     }
 
+    fn open_hotkey_dialog_for(&self, presenter: &SettingsPresenter, target: HotkeyDialogTarget) {
+        if let Err(error) = presenter.set_hotkey_capture_inhibited(true) {
+            self.show_client_error(error, false);
+            return;
+        }
+
+        self.reset_hotkey_dialog(target);
+        self.open_hotkey_dialog();
+    }
+
     fn open_hotkey_dialog(&self) {
         if let Some(form) = self.form.borrow().as_ref() {
             form.selected_text_hotkey_dialog.present();
@@ -1352,8 +1362,19 @@ impl SettingsWindow {
     }
 
     fn close_hotkey_dialog(&self) {
+        self.release_hotkey_capture_inhibition();
         if let Some(form) = self.form.borrow().as_ref() {
             form.selected_text_hotkey_dialog.hide();
+        }
+    }
+
+    fn release_hotkey_capture_inhibition(&self) {
+        let Some(presenter) = self.presenter.borrow().as_ref().cloned() else {
+            return;
+        };
+
+        if let Err(error) = presenter.set_hotkey_capture_inhibited(false) {
+            eprintln!("[settings] Failed to release hotkey capture inhibition: {error}");
         }
     }
 

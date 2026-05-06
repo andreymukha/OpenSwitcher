@@ -1622,7 +1622,9 @@ fn hotkey_modifier_from_key(key: gdk::Key) -> Option<HotkeyModifier> {
     match key {
         gdk::Key::Shift_L | gdk::Key::Shift_R => Some(HotkeyModifier::Shift),
         gdk::Key::Control_L | gdk::Key::Control_R => Some(HotkeyModifier::Ctrl),
-        gdk::Key::Alt_L | gdk::Key::Alt_R => Some(HotkeyModifier::Alt),
+        gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::ISO_Level3_Shift => {
+            Some(HotkeyModifier::Alt)
+        }
         _ => None,
     }
 }
@@ -1747,6 +1749,14 @@ mod tests {
         assert_eq!(hotkey_trigger_from_key(gdk::Key::F11), None);
         assert_eq!(hotkey_modifier_from_key(gdk::Key::Super_L), None);
         assert_eq!(hotkey_modifier_from_key(gdk::Key::space), None);
+    }
+
+    #[test]
+    fn hotkey_key_helpers_treat_altgr_as_alt_modifier() {
+        assert_eq!(
+            hotkey_modifier_from_key(gdk::Key::ISO_Level3_Shift),
+            Some(HotkeyModifier::Alt)
+        );
     }
 
     #[test]

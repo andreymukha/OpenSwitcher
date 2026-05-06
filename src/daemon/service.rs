@@ -1122,7 +1122,7 @@ impl DaemonService {
             );
             self.suppressed_separator_key = preserved_separator;
             self.finish_pending_word_commit(pending, &config)?;
-            if key == undo_key {
+            if manual_correction_hotkey_matches(undo_key, self.modifiers, key, value) {
                 return Ok(());
             }
         }
@@ -1154,7 +1154,7 @@ impl DaemonService {
             return result;
         }
 
-        if value == 1 && key == undo_key {
+        if manual_correction_hotkey_matches(undo_key, self.modifiers, key, value) {
             self.suppressed_undo_key = Some(key);
             if self.begin_deferred_manual_current_word_correction(undo_key, &config, origin)? {
                 return Ok(());
@@ -2100,6 +2100,19 @@ fn selected_text_hotkey_matches(
     shift == hotkey.uses_shift() && ctrl == hotkey.uses_ctrl() && alt == hotkey.uses_alt()
 }
 
+fn manual_correction_hotkey_matches(
+    undo_key: evdev::Key,
+    modifiers: ModifierState,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    value == 1
+        && key == undo_key
+        && !modifiers.is_shift_pressed()
+        && !modifiers.is_ctrl_pressed()
+        && !modifiers.is_alt_pressed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2342,6 +2355,46 @@ mod tests {
             modifiers_with(&[Key::KEY_LEFTALT]),
             Key::KEY_SCROLLLOCK,
             0,
+        ));
+    }
+
+    #[test]
+    fn manual_correction_hotkey_ignores_modified_undo_key() {
+        assert!(manual_correction_hotkey_matches(
+            Key::KEY_F12,
+            ModifierState::default(),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            Key::KEY_F12,
+            modifiers_with(&[Key::KEY_LEFTSHIFT]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            Key::KEY_F12,
+            modifiers_with(&[Key::KEY_LEFTCTRL]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            Key::KEY_F12,
+            modifiers_with(&[Key::KEY_LEFTALT]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            Key::KEY_F12,
+            ModifierState::default(),
+            Key::KEY_F12,
+            0,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            Key::KEY_F12,
+            ModifierState::default(),
+            Key::KEY_F11,
+            1,
         ));
     }
 

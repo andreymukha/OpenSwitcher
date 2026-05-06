@@ -480,6 +480,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     selected_hotkey_box.set_margin_bottom(18);
     selected_hotkey_box.set_margin_start(18);
     selected_hotkey_box.set_margin_end(18);
+    selected_hotkey_box.set_focusable(true);
 
     let selected_hotkey_heading = gtk::Label::new(Some("Нажмите горячую клавишу..."));
     selected_hotkey_heading.set_halign(gtk::Align::Start);
@@ -679,6 +680,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         selected_text_hotkey_value_label,
         selected_text_hotkey_value_icon,
         selected_text_hotkey_dialog,
+        selected_text_hotkey_capture_area: selected_hotkey_box,
         selected_text_hotkey_dialog_value_label,
         selected_text_hotkey_dialog_error_label,
         selected_text_hotkey_dialog_ok_button: selected_hotkey_ok_button,
@@ -775,6 +777,7 @@ struct FormWidgets {
     selected_text_hotkey_value_label: gtk::Label,
     selected_text_hotkey_value_icon: gtk::Image,
     selected_text_hotkey_dialog: adw::Window,
+    selected_text_hotkey_capture_area: gtk::Box,
     selected_text_hotkey_dialog_value_label: gtk::Label,
     selected_text_hotkey_dialog_error_label: gtk::Label,
     selected_text_hotkey_dialog_ok_button: gtk::Button,
@@ -1253,6 +1256,15 @@ impl SettingsWindow {
             .clone()
     }
 
+    fn selected_text_hotkey_capture_area(&self) -> gtk::Box {
+        self.form
+            .borrow()
+            .as_ref()
+            .expect("form widgets must be installed before access")
+            .selected_text_hotkey_capture_area
+            .clone()
+    }
+
     fn selected_text_hotkey_dialog_ok_button(&self) -> gtk::Button {
         self.form
             .borrow()
@@ -1327,6 +1339,10 @@ impl SettingsWindow {
         if let Some(form) = self.form.borrow().as_ref() {
             self.reset_selected_text_hotkey_dialog();
             form.selected_text_hotkey_dialog.present();
+            let capture_area = form.selected_text_hotkey_capture_area.clone();
+            glib::idle_add_local_once(move || {
+                capture_area.grab_focus();
+            });
         }
     }
 
@@ -1345,6 +1361,7 @@ impl SettingsWindow {
     // Selected-text hotkey capture
     fn install_selected_text_hotkey_capture(self: &Rc<Self>) {
         let controller = gtk::EventControllerKey::new();
+        controller.set_propagation_phase(gtk::PropagationPhase::Capture);
 
         {
             let ui = Rc::clone(self);
@@ -1391,7 +1408,7 @@ impl SettingsWindow {
             });
         }
 
-        self.selected_text_hotkey_dialog()
+        self.selected_text_hotkey_capture_area()
             .add_controller(controller);
     }
 

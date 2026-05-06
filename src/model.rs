@@ -1337,6 +1337,8 @@ mod tests {
     #[test]
     fn hotkey_spec_roundtrips_multi_modifier_examples() {
         let ctrl_alt_f12 = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+        let shift_ctrl_alt_f12 =
+            HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::F12);
         let shift_ctrl_alt_insert =
             HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::Insert);
 
@@ -1344,6 +1346,11 @@ mod tests {
         assert_eq!(
             HotkeySpec::from_str("ctrl+alt+f12").unwrap(),
             ctrl_alt_f12
+        );
+        assert_eq!(shift_ctrl_alt_f12.config_value(), "shift+ctrl+alt+f12");
+        assert_eq!(
+            HotkeySpec::from_str("shift+ctrl+alt+f12").unwrap(),
+            shift_ctrl_alt_f12
         );
         assert_eq!(
             shift_ctrl_alt_insert.config_value(),

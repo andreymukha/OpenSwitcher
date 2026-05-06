@@ -513,6 +513,24 @@ mod tests {
         assert!(view.save_enabled);
     }
 
+    #[test]
+    fn manual_and_selected_hotkey_updates_do_not_start_layout_switch_capture() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+
+        assert!(state.update_manual_correction_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::shift_ctrl_alt(),
+            crate::model::HotkeyTrigger::F12,
+        )));
+        assert!(state.update_selected_text_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::shift_ctrl_alt(),
+            crate::model::HotkeyTrigger::Insert,
+        )));
+
+        assert!(!state.view_state().layout_switch.capture_active);
+    }
+
     // Discard/reload state
 
     #[test]

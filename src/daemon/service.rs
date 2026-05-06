@@ -2349,6 +2349,9 @@ mod tests {
 
     #[test]
     fn selected_text_hotkey_matches_configured_f12_and_scroll_lock_variants() {
+        let shift_ctrl_alt_f12 =
+            HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), crate::model::HotkeyTrigger::F12);
+
         assert!(selected_text_hotkey_matches(
             HotkeySpec::from(SelectedTextHotkey::ShiftF12),
             modifiers_with(&[Key::KEY_LEFTSHIFT]),
@@ -2379,6 +2382,18 @@ mod tests {
             Key::KEY_SCROLLLOCK,
             0,
         ));
+        assert!(selected_text_hotkey_matches(
+            shift_ctrl_alt_f12,
+            modifiers_with(&[Key::KEY_LEFTSHIFT, Key::KEY_LEFTCTRL, Key::KEY_LEFTALT]),
+            Key::KEY_F12,
+            1,
+        ));
+        assert!(!selected_text_hotkey_matches(
+            shift_ctrl_alt_f12,
+            modifiers_with(&[Key::KEY_LEFTSHIFT, Key::KEY_LEFTCTRL]),
+            Key::KEY_F12,
+            1,
+        ));
     }
 
     #[test]
@@ -2387,6 +2402,10 @@ mod tests {
         let shift_f12 = HotkeySpec::from(SelectedTextHotkey::ShiftF12);
         let ctrl_alt_f12 =
             HotkeySpec::new(HotkeyModifiers::ctrl_alt(), crate::model::HotkeyTrigger::F12);
+        let shift_ctrl_alt_insert = HotkeySpec::new(
+            HotkeyModifiers::shift_ctrl_alt(),
+            crate::model::HotkeyTrigger::Insert,
+        );
 
         assert!(manual_correction_hotkey_matches(
             f12,
@@ -2434,6 +2453,18 @@ mod tests {
             f12,
             ModifierState::default(),
             Key::KEY_F11,
+            1,
+        ));
+        assert!(manual_correction_hotkey_matches(
+            shift_ctrl_alt_insert,
+            modifiers_with(&[Key::KEY_LEFTSHIFT, Key::KEY_LEFTCTRL, Key::KEY_LEFTALT]),
+            Key::KEY_INSERT,
+            1,
+        ));
+        assert!(!manual_correction_hotkey_matches(
+            shift_ctrl_alt_insert,
+            modifiers_with(&[Key::KEY_LEFTSHIFT, Key::KEY_LEFTALT]),
+            Key::KEY_INSERT,
             1,
         ));
     }

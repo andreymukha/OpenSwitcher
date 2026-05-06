@@ -1373,7 +1373,7 @@ impl SettingsWindow {
 
         {
             let ui = Rc::clone(self);
-            controller.connect_key_pressed(move |_, key, _, _| {
+            controller.connect_key_pressed(move |_, key, _, event_state| {
                 if key == gdk::Key::Escape {
                     let target = ui.hotkey_dialog_state.borrow().target;
                     ui.reset_hotkey_dialog(target);
@@ -1388,9 +1388,12 @@ impl SettingsWindow {
                     return glib::Propagation::Stop;
                 }
 
-                if let Some(trigger) = hotkey_trigger_from_key(key) {
-                    let state = ui.hotkey_dialog_state.borrow().clone();
-                    ui.set_hotkey_candidate(HotkeySpec::new(state.modifiers(), trigger));
+                if let Some(hotkey) = hotkey_spec_from_key_event(
+                    &ui.hotkey_dialog_state.borrow(),
+                    key,
+                    event_state,
+                ) {
+                    ui.set_hotkey_candidate(hotkey);
                     return glib::Propagation::Stop;
                 }
 
@@ -1628,6 +1631,39 @@ fn hotkey_trigger_from_key(key: gdk::Key) -> Option<HotkeyTrigger> {
     }
 }
 
+fn hotkey_spec_from_key_event(
+    dialog_state: &HotkeyDialogState,
+    key: gdk::Key,
+    event_state: gdk::ModifierType,
+) -> Option<HotkeySpec> {
+    hotkey_trigger_from_key(key)
+        .map(|trigger| hotkey_spec_from_capture_state(dialog_state, trigger, event_state))
+}
+
+fn hotkey_spec_from_capture_state(
+    dialog_state: &HotkeyDialogState,
+    trigger: HotkeyTrigger,
+    event_state: gdk::ModifierType,
+) -> HotkeySpec {
+    HotkeySpec::new(
+        hotkey_modifiers_from_capture_state(dialog_state, event_state),
+        trigger,
+    )
+}
+
+fn hotkey_modifiers_from_capture_state(
+    dialog_state: &HotkeyDialogState,
+    event_state: gdk::ModifierType,
+) -> HotkeyModifiers {
+    let tracked = dialog_state.modifiers();
+
+    HotkeyModifiers::new(
+        tracked.shift || event_state.contains(gdk::ModifierType::SHIFT_MASK),
+        tracked.ctrl || event_state.contains(gdk::ModifierType::CONTROL_MASK),
+        tracked.alt || event_state.contains(gdk::ModifierType::ALT_MASK),
+    )
+}
+
 fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'static str, String) {
     match error {
         SettingsClientError::Connection(source) => (
@@ -1701,5 +1737,57 @@ mod tests {
         all.ctrl = true;
         all.alt = true;
         assert_eq!(all.modifiers(), HotkeyModifiers::shift_ctrl_alt());
+    }
+
+    #[test]
+    fn hotkey_capture_uses_event_state_for_shift_ctrl_alt_f12() {
+        let mut dialog_state = HotkeyDialogState::default();
+        dialog_state.shift = true;
+        dialog_state.ctrl = true;
+
+        assert_eq!(
+            hotkey_spec_from_key_event(
+                &dialog_state,
+                gdk::Key::F12,
+                gdk::ModifierType::ALT_MASK,
+            ),
+            Some(HotkeySpec::new(
+                HotkeyModifiers::shift_ctrl_alt(),
+                HotkeyTrigger::F12,
+            )),
+        );
+    }
+
+    #[test]
+    fn hotkey_capture_uses_event_state_for_shift_ctrl_alt_insert() {
+        let mut dialog_state = HotkeyDialogState::default();
+        dialog_state.ctrl = true;
+        dialog_state.alt = true;
+
+        assert_eq!(
+            hotkey_spec_from_key_event(
+                &dialog_state,
+                gdk::Key::Insert,
+                gdk::ModifierType::SHIFT_MASK,
+            ),
+            Some(HotkeySpec::new(
+                HotkeyModifiers::shift_ctrl_alt(),
+                HotkeyTrigger::Insert,
+            )),
+        );
+    }
+
+    #[test]
+    fn hotkey_capture_rejects_invalid_key_without_candidate() {
+        let dialog_state = HotkeyDialogState::default();
+
+        assert_eq!(
+            hotkey_spec_from_key_event(
+                &dialog_state,
+                gdk::Key::space,
+                gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK,
+            ),
+            None,
+        );
     }
 }

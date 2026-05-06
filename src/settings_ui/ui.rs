@@ -1400,6 +1400,10 @@ impl SettingsWindow {
                     return glib::Propagation::Stop;
                 }
 
+                if hotkey_key_is_modifier_only(key) {
+                    return glib::Propagation::Stop;
+                }
+
                 if let Some(hotkey) =
                     hotkey_spec_from_dialog_state(&ui.hotkey_dialog_state, key, event_state)
                 {
@@ -1629,6 +1633,28 @@ fn hotkey_modifier_from_key(key: gdk::Key) -> Option<HotkeyModifier> {
     }
 }
 
+fn hotkey_key_is_modifier_only(key: gdk::Key) -> bool {
+    matches!(
+        key,
+        gdk::Key::ISO_First_Group
+            | gdk::Key::ISO_First_Group_Lock
+            | gdk::Key::ISO_Group_Latch
+            | gdk::Key::ISO_Group_Lock
+            | gdk::Key::ISO_Last_Group
+            | gdk::Key::ISO_Last_Group_Lock
+            | gdk::Key::ISO_Level3_Latch
+            | gdk::Key::ISO_Level3_Lock
+            | gdk::Key::ISO_Level5_Shift
+            | gdk::Key::ISO_Level5_Latch
+            | gdk::Key::ISO_Level5_Lock
+            | gdk::Key::ISO_Next_Group
+            | gdk::Key::ISO_Next_Group_Lock
+            | gdk::Key::ISO_Prev_Group
+            | gdk::Key::ISO_Prev_Group_Lock
+            | gdk::Key::Mode_switch
+    )
+}
+
 fn hotkey_trigger_from_key(key: gdk::Key) -> Option<HotkeyTrigger> {
     match key {
         gdk::Key::F9 => Some(HotkeyTrigger::F9),
@@ -1757,6 +1783,14 @@ mod tests {
             hotkey_modifier_from_key(gdk::Key::ISO_Level3_Shift),
             Some(HotkeyModifier::Alt)
         );
+    }
+
+    #[test]
+    fn hotkey_key_helpers_detect_unknown_modifier_keys_without_treating_space_as_modifier() {
+        assert!(hotkey_key_is_modifier_only(gdk::Key::ISO_Level5_Shift));
+        assert!(hotkey_key_is_modifier_only(gdk::Key::ISO_Next_Group));
+        assert!(hotkey_key_is_modifier_only(gdk::Key::ISO_Prev_Group));
+        assert!(!hotkey_key_is_modifier_only(gdk::Key::space));
     }
 
     #[test]

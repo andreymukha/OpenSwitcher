@@ -1388,11 +1388,9 @@ impl SettingsWindow {
                     return glib::Propagation::Stop;
                 }
 
-                if let Some(hotkey) = hotkey_spec_from_key_event(
-                    &ui.hotkey_dialog_state.borrow(),
-                    key,
-                    event_state,
-                ) {
+                if let Some(hotkey) =
+                    hotkey_spec_from_dialog_state(&ui.hotkey_dialog_state, key, event_state)
+                {
                     ui.set_hotkey_candidate(hotkey);
                     return glib::Propagation::Stop;
                 }
@@ -1640,6 +1638,15 @@ fn hotkey_spec_from_key_event(
         .map(|trigger| hotkey_spec_from_capture_state(dialog_state, trigger, event_state))
 }
 
+fn hotkey_spec_from_dialog_state(
+    dialog_state: &RefCell<HotkeyDialogState>,
+    key: gdk::Key,
+    event_state: gdk::ModifierType,
+) -> Option<HotkeySpec> {
+    let state = dialog_state.borrow();
+    hotkey_spec_from_key_event(&state, key, event_state)
+}
+
 fn hotkey_spec_from_capture_state(
     dialog_state: &HotkeyDialogState,
     trigger: HotkeyTrigger,
@@ -1788,6 +1795,25 @@ mod tests {
                 gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK,
             ),
             None,
+        );
+    }
+
+    #[test]
+    fn hotkey_dialog_state_borrow_is_released_before_candidate_update() {
+        let dialog_state = RefCell::new(HotkeyDialogState::default());
+
+        let hotkey = hotkey_spec_from_dialog_state(
+            &dialog_state,
+            gdk::Key::F12,
+            gdk::ModifierType::SHIFT_MASK,
+        )
+        .expect("supported hotkey should be captured");
+
+        dialog_state.borrow_mut().candidate = Some(hotkey);
+
+        assert_eq!(
+            dialog_state.borrow().candidate,
+            Some(HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12)),
         );
     }
 }

@@ -8,6 +8,272 @@ use zvariant::Type;
 pub const LAYOUT_DELAY_MIN_MS: u32 = 0;
 pub const LAYOUT_DELAY_MAX_MS: u32 = 500;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HotkeyModifiers {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+impl HotkeyModifiers {
+    pub const ALL: [Self; 8] = [
+        Self::none(),
+        Self::shift(),
+        Self::ctrl(),
+        Self::alt(),
+        Self::shift_ctrl(),
+        Self::shift_alt(),
+        Self::ctrl_alt(),
+        Self::shift_ctrl_alt(),
+    ];
+
+    pub const fn new(shift: bool, ctrl: bool, alt: bool) -> Self {
+        Self { shift, ctrl, alt }
+    }
+
+    pub const fn none() -> Self {
+        Self::new(false, false, false)
+    }
+
+    pub const fn shift() -> Self {
+        Self::new(true, false, false)
+    }
+
+    pub const fn ctrl() -> Self {
+        Self::new(false, true, false)
+    }
+
+    pub const fn alt() -> Self {
+        Self::new(false, false, true)
+    }
+
+    pub const fn shift_ctrl() -> Self {
+        Self::new(true, true, false)
+    }
+
+    pub const fn shift_alt() -> Self {
+        Self::new(true, false, true)
+    }
+
+    pub const fn ctrl_alt() -> Self {
+        Self::new(false, true, true)
+    }
+
+    pub const fn shift_ctrl_alt() -> Self {
+        Self::new(true, true, true)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        !self.shift && !self.ctrl && !self.alt
+    }
+
+    fn from_compact_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "" => Some(Self::none()),
+            "shift" => Some(Self::shift()),
+            "ctrl" => Some(Self::ctrl()),
+            "alt" => Some(Self::alt()),
+            "shiftctrl" => Some(Self::shift_ctrl()),
+            "shiftalt" => Some(Self::shift_alt()),
+            "ctrlalt" => Some(Self::ctrl_alt()),
+            "shiftctrlalt" => Some(Self::shift_ctrl_alt()),
+            _ => None,
+        }
+    }
+}
+
+impl Default for HotkeyModifiers {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HotkeyTrigger {
+    F9,
+    F10,
+    F12,
+    Pause,
+    ScrollLock,
+    Insert,
+    Menu,
+}
+
+impl HotkeyTrigger {
+    pub const ALL: [Self; 7] = [
+        Self::F9,
+        Self::F10,
+        Self::F12,
+        Self::Pause,
+        Self::ScrollLock,
+        Self::Insert,
+        Self::Menu,
+    ];
+
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Self::F9 => "f9",
+            Self::F10 => "f10",
+            Self::F12 => "f12",
+            Self::Pause => "pause",
+            Self::ScrollLock => "scroll_lock",
+            Self::Insert => "insert",
+            Self::Menu => "menu",
+        }
+    }
+
+    fn compact_alias(self) -> &'static str {
+        match self {
+            Self::F9 => "f9",
+            Self::F10 => "f10",
+            Self::F12 => "f12",
+            Self::Pause => "pause",
+            Self::ScrollLock => "scrolllock",
+            Self::Insert => "insert",
+            Self::Menu => "menu",
+        }
+    }
+
+    fn from_compact_suffix(value: &str) -> Option<(Self, &str)> {
+        for trigger in [
+            Self::ScrollLock,
+            Self::Insert,
+            Self::Pause,
+            Self::Menu,
+            Self::F10,
+            Self::F12,
+            Self::F9,
+        ] {
+            let suffix = trigger.compact_alias();
+            if let Some(prefix) = value.strip_suffix(suffix) {
+                return Some((trigger, prefix));
+            }
+        }
+
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HotkeySpec {
+    pub modifiers: HotkeyModifiers,
+    pub trigger: HotkeyTrigger,
+}
+
+impl HotkeySpec {
+    pub const fn new(modifiers: HotkeyModifiers, trigger: HotkeyTrigger) -> Self {
+        Self { modifiers, trigger }
+    }
+
+    pub fn config_value(self) -> String {
+        self.to_string()
+    }
+
+    pub fn parse(value: &str) -> Result<Self, HotkeySpecParseError> {
+        value.parse()
+    }
+
+    pub fn matches(self, trigger: HotkeyTrigger, modifiers: HotkeyModifiers) -> bool {
+        self.trigger == trigger && self.modifiers.shift == modifiers.shift
+            && self.modifiers.ctrl == modifiers.ctrl
+            && self.modifiers.alt == modifiers.alt
+    }
+
+    pub fn conflicts_exact(self, other: Self) -> bool {
+        self.trigger == other.trigger && self.modifiers.shift == other.modifiers.shift
+            && self.modifiers.ctrl == other.modifiers.ctrl
+            && self.modifiers.alt == other.modifiers.alt
+    }
+
+    pub const fn has_layout_switch_prefix_conflict(self, combo: LayoutSwitchCombo) -> bool {
+        match combo {
+            LayoutSwitchCombo::CtrlShift
+            | LayoutSwitchCombo::LeftCtrlLeftShift
+            | LayoutSwitchCombo::RightCtrlRightShift => self.modifiers.ctrl && self.modifiers.shift,
+            LayoutSwitchCombo::AltShift
+            | LayoutSwitchCombo::LeftAltLeftShift
+            | LayoutSwitchCombo::RightAltRightShift => self.modifiers.alt && self.modifiers.shift,
+            LayoutSwitchCombo::CapsLock
+            | LayoutSwitchCombo::CtrlSpace
+            | LayoutSwitchCombo::SuperSpace => false,
+        }
+    }
+}
+
+pub fn hotkeys_conflict_exact(left: HotkeySpec, right: HotkeySpec) -> bool {
+    left.conflicts_exact(right)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HotkeySpecParseError {
+    Empty,
+    UnsupportedTrigger { value: String },
+    UnsupportedModifier { value: String },
+}
+
+impl std::fmt::Display for HotkeySpecParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("hotkey cannot be empty"),
+            Self::UnsupportedTrigger { value } => {
+                write!(f, "unsupported hotkey trigger: {value}")
+            }
+            Self::UnsupportedModifier { value } => {
+                write!(f, "unsupported hotkey modifier: {value}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HotkeySpecParseError {}
+
+impl std::fmt::Display for HotkeySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.modifiers.shift {
+            f.write_str("shift+")?;
+        }
+        if self.modifiers.ctrl {
+            f.write_str("ctrl+")?;
+        }
+        if self.modifiers.alt {
+            f.write_str("alt+")?;
+        }
+
+        f.write_str(self.trigger.config_value())
+    }
+}
+
+impl FromStr for HotkeySpec {
+    type Err = HotkeySpecParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let raw = value.trim();
+        if raw.is_empty() {
+            return Err(HotkeySpecParseError::Empty);
+        }
+
+        let lower = raw.to_ascii_lowercase();
+        let compact: String = lower
+            .chars()
+            .filter(|c| !matches!(*c, '+' | '_' | '-' | ' '))
+            .collect();
+
+        let Some((trigger, modifier_prefix)) = HotkeyTrigger::from_compact_suffix(&compact) else {
+            return Err(HotkeySpecParseError::UnsupportedTrigger {
+                value: value.to_string(),
+            });
+        };
+
+        let Some(modifiers) = HotkeyModifiers::from_compact_prefix(modifier_prefix) else {
+            return Err(HotkeySpecParseError::UnsupportedModifier {
+                value: value.to_string(),
+            });
+        };
+
+        Ok(Self::new(modifiers, trigger))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[zvariant(signature = "s")]
 #[derive(Default)]
@@ -122,6 +388,31 @@ impl SelectedTextHotkey {
             Self::CtrlScrollLock => "Ctrl+ScrollLock",
             Self::AltScrollLock => "Alt+ScrollLock",
         }
+    }
+}
+
+impl From<UndoKey> for HotkeyTrigger {
+    fn from(value: UndoKey) -> Self {
+        match value {
+            UndoKey::Pause => Self::Pause,
+            UndoKey::F12 => Self::F12,
+            UndoKey::ScrollLock => Self::ScrollLock,
+        }
+    }
+}
+
+impl From<UndoKey> for HotkeySpec {
+    fn from(value: UndoKey) -> Self {
+        Self::new(HotkeyModifiers::none(), HotkeyTrigger::from(value))
+    }
+}
+
+impl From<SelectedTextHotkey> for HotkeySpec {
+    fn from(value: SelectedTextHotkey) -> Self {
+        Self::new(
+            HotkeyModifiers::new(value.uses_shift(), value.uses_ctrl(), value.uses_alt()),
+            HotkeyTrigger::from(value.trigger_key()),
+        )
     }
 }
 
@@ -783,6 +1074,224 @@ mod tests {
             assert_eq!(SelectedTextHotkey::from_str(raw).unwrap(), expected);
             assert_eq!(expected.to_string(), raw);
         }
+    }
+
+    #[test]
+    fn hotkey_spec_roundtrips_allowed_triggers() {
+        let triggers = [
+            (HotkeyTrigger::F9, "f9"),
+            (HotkeyTrigger::F10, "f10"),
+            (HotkeyTrigger::F12, "f12"),
+            (HotkeyTrigger::Pause, "pause"),
+            (HotkeyTrigger::ScrollLock, "scroll_lock"),
+            (HotkeyTrigger::Insert, "insert"),
+            (HotkeyTrigger::Menu, "menu"),
+        ];
+
+        for (trigger, expected) in triggers {
+            let spec = HotkeySpec::new(HotkeyModifiers::none(), trigger);
+            assert_eq!(spec.config_value(), expected);
+            assert_eq!(spec.to_string(), expected);
+            assert_eq!(HotkeySpec::from_str(expected).unwrap(), spec);
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_roundtrips_allowed_modifier_masks() {
+        let modifier_masks = [
+            (HotkeyModifiers::none(), "f12"),
+            (HotkeyModifiers::shift(), "shift+f12"),
+            (HotkeyModifiers::ctrl(), "ctrl+f12"),
+            (HotkeyModifiers::alt(), "alt+f12"),
+            (HotkeyModifiers::shift_ctrl(), "shift+ctrl+f12"),
+            (HotkeyModifiers::shift_alt(), "shift+alt+f12"),
+            (HotkeyModifiers::ctrl_alt(), "ctrl+alt+f12"),
+            (
+                HotkeyModifiers::shift_ctrl_alt(),
+                "shift+ctrl+alt+f12",
+            ),
+        ];
+
+        for (modifiers, expected) in modifier_masks {
+            let spec = HotkeySpec::new(modifiers, HotkeyTrigger::F12);
+            assert_eq!(spec.config_value(), expected);
+            assert_eq!(HotkeySpec::from_str(expected).unwrap(), spec);
+            assert!(spec.matches(HotkeyTrigger::F12, modifiers));
+            assert!(!spec.matches(HotkeyTrigger::F10, modifiers));
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_rejects_unsupported_triggers() {
+        for raw in [
+            "f1",
+            "f8",
+            "f11",
+            "delete",
+            "space",
+            "enter",
+            "tab",
+            "backspace",
+            "printscreen",
+            "left",
+        ] {
+            assert!(HotkeySpec::from_str(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_rejects_unsupported_modifiers() {
+        for raw in ["super+f12", "meta+f12", "win+f12", "super+space"] {
+            assert!(HotkeySpec::from_str(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_parses_legacy_undo_key_values() {
+        let values = [
+            ("Pause", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause)),
+            ("pause", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause)),
+            ("F12", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12)),
+            ("f12", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12)),
+            (
+                "ScrollLock",
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::ScrollLock),
+            ),
+            (
+                "scroll_lock",
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::ScrollLock),
+            ),
+        ];
+
+        for (raw, expected) in values {
+            assert_eq!(HotkeySpec::parse(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_parses_legacy_selected_text_hotkey_values() {
+        let values = [
+            (
+                "ShiftPause",
+                HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::Pause),
+            ),
+            (
+                "CtrlPause",
+                HotkeySpec::new(HotkeyModifiers::ctrl(), HotkeyTrigger::Pause),
+            ),
+            (
+                "AltPause",
+                HotkeySpec::new(HotkeyModifiers::alt(), HotkeyTrigger::Pause),
+            ),
+            (
+                "ShiftF12",
+                HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12),
+            ),
+            (
+                "CtrlF12",
+                HotkeySpec::new(HotkeyModifiers::ctrl(), HotkeyTrigger::F12),
+            ),
+            (
+                "AltF12",
+                HotkeySpec::new(HotkeyModifiers::alt(), HotkeyTrigger::F12),
+            ),
+            (
+                "ShiftScrollLock",
+                HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::ScrollLock),
+            ),
+            (
+                "CtrlScrollLock",
+                HotkeySpec::new(HotkeyModifiers::ctrl(), HotkeyTrigger::ScrollLock),
+            ),
+            (
+                "AltScrollLock",
+                HotkeySpec::new(HotkeyModifiers::alt(), HotkeyTrigger::ScrollLock),
+            ),
+            (
+                "shift_f12",
+                HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12),
+            ),
+            (
+                "ctrl_scroll_lock",
+                HotkeySpec::new(HotkeyModifiers::ctrl(), HotkeyTrigger::ScrollLock),
+            ),
+            (
+                "alt+pause",
+                HotkeySpec::new(HotkeyModifiers::alt(), HotkeyTrigger::Pause),
+            ),
+        ];
+
+        for (raw, expected) in values {
+            assert_eq!(HotkeySpec::from_str(raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_converts_legacy_hotkey_enums() {
+        for undo_key in UndoKey::ALL {
+            assert_eq!(
+                HotkeySpec::from(undo_key),
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::from(undo_key))
+            );
+        }
+
+        for selected_text_hotkey in SelectedTextHotkey::ALL {
+            assert_eq!(
+                HotkeySpec::from(selected_text_hotkey),
+                HotkeySpec::from_str(selected_text_hotkey.short_label()).unwrap()
+            );
+            assert_eq!(
+                HotkeySpec::from(selected_text_hotkey),
+                HotkeySpec::from_str(selected_text_hotkey.config_value()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_detects_exact_conflicts_only() {
+        let f12 = HotkeySpec::from_str("f12").unwrap();
+        let shift_f12 = HotkeySpec::from_str("shift+f12").unwrap();
+
+        assert_ne!(f12, shift_f12);
+        assert!(f12.conflicts_exact(f12));
+        assert!(!f12.conflicts_exact(shift_f12));
+        assert!(!hotkeys_conflict_exact(f12, shift_f12));
+    }
+
+    #[test]
+    fn hotkey_spec_roundtrips_multi_modifier_examples() {
+        let ctrl_alt_f12 = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+        let shift_ctrl_alt_insert =
+            HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::Insert);
+
+        assert_eq!(ctrl_alt_f12.config_value(), "ctrl+alt+f12");
+        assert_eq!(
+            HotkeySpec::from_str("ctrl+alt+f12").unwrap(),
+            ctrl_alt_f12
+        );
+        assert_eq!(
+            shift_ctrl_alt_insert.config_value(),
+            "shift+ctrl+alt+insert"
+        );
+        assert_eq!(
+            HotkeySpec::from_str("shift+ctrl+alt+insert").unwrap(),
+            shift_ctrl_alt_insert
+        );
+    }
+
+    #[test]
+    fn hotkey_spec_detects_layout_prefix_conflict_as_warning_helper() {
+        let ctrl_shift_f12 = HotkeySpec::new(HotkeyModifiers::shift_ctrl(), HotkeyTrigger::F12);
+        let alt_shift_insert =
+            HotkeySpec::new(HotkeyModifiers::shift_alt(), HotkeyTrigger::Insert);
+        let ctrl_alt_f12 = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+
+        assert!(ctrl_shift_f12.has_layout_switch_prefix_conflict(LayoutSwitchCombo::ctrl_shift()));
+        assert!(ctrl_shift_f12
+            .has_layout_switch_prefix_conflict(LayoutSwitchCombo::left_ctrl_left_shift()));
+        assert!(alt_shift_insert.has_layout_switch_prefix_conflict(LayoutSwitchCombo::alt_shift()));
+        assert!(!ctrl_alt_f12.has_layout_switch_prefix_conflict(LayoutSwitchCombo::alt_shift()));
+        assert!(!ctrl_alt_f12.has_layout_switch_prefix_conflict(LayoutSwitchCombo::ctrl_space()));
     }
 
     // Layout switch combo parsing

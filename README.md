@@ -77,6 +77,33 @@ Current runtime model:
 - User-level `systemd` integration for the `daemon + tray` application pair
 - Tray menu with status and control actions
 
+## Hotkey Settings
+
+Manual correction and selected-text conversion use the same curated hotkey model.
+The layout-switch shortcut remains a separate setting because it must match the desktop/session
+layout-switch behavior.
+
+Allowed trigger keys:
+- `F9`
+- `F10`
+- `F12`
+- `Pause`
+- `ScrollLock`
+- `Insert`
+- `Menu`
+
+Each trigger may be used with no modifiers or with any combination of `Shift`, `Ctrl`, and `Alt`.
+Examples: `F12`, `Shift+F12`, `Ctrl+Alt+F12`, `Ctrl+Alt+Shift+Insert`.
+
+OpenSwitcher intentionally does not accept arbitrary typing keys for these actions. Letters,
+digits, `Space`, `Enter`, `Tab`, `Backspace`, `Delete`, `Escape`, arrow keys, `F1`-`F8`, `F11`,
+and `PrintScreen` are not accepted as manual/selected-text hotkey triggers.
+
+The exact same hotkey cannot be assigned to manual correction and selected-text conversion at
+the same time. The same trigger with different modifiers is allowed, so `F12` and `Shift+F12`
+can coexist. If a hotkey contains the current layout-switch shortcut as a prefix, settings shows
+a warning but allows saving.
+
 ## Current Scope And Limitations
 
 - Linux only
@@ -152,7 +179,9 @@ Selected-text conversion uses a clipboard-based flow:
 - sends a paste shortcut
 - then attempts to restore the previous clipboard contents
 
-Hotkey capture can depend on the physical keyboard and desktop environment. On some laptops, `Pause`, `F12`, or `ScrollLock` may be affected by Fn-key handling or global desktop shortcuts.
+Hotkey capture can depend on the physical keyboard and desktop environment. On some laptops,
+function keys, `Pause`, `ScrollLock`, `Insert`, or `Menu` may be affected by Fn-key handling,
+firmware behavior, or global desktop shortcuts.
 
 Selected-text debug logging is opt-in. When enabled, selected-text debug summaries contain metadata only, such as length and line count, not text previews.
 
@@ -380,7 +409,7 @@ gdbus monitor \
 - Tray visibility depends on a compatible StatusNotifier/AppIndicator host.
 - The official runtime and autostart model depends on `systemd --user`.
 - Selected-text conversion temporarily uses the clipboard and attempts to restore previous clipboard contents after conversion.
-- Selected-text hotkey capture may depend on laptop Fn keys and desktop/global shortcut handling.
+- Manual and selected-text hotkey capture may depend on laptop Fn keys and desktop/global shortcut handling.
 - The autocorrection heuristic is intentionally conservative. Some short RU -> EN technical false negatives may remain, for example `cargo`, `rust`, `sudo`, `git`, `ssh`, `npm`, `jwt`.
 - Existing rustfmt drift and non-hermetic shell/platform tests are known technical debt for later cleanup.
 

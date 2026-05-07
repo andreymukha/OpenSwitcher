@@ -22,10 +22,10 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const LAYOUT_DEBUG_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG";
 const LAYOUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG_FILE";
@@ -35,6 +35,7 @@ const GNOME_MRU_SOURCES_KEY: &str = "mru-sources";
 pub const TRAY_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 pub const TRAY_RECOVERY_DELAY: Duration = Duration::from_millis(500);
 pub const MAX_TRAY_RECOVERY_ATTEMPTS: usize = 3;
+const SETTINGS_HOTKEY_CAPTURE_INHIBITION_LEASE: Duration = Duration::from_secs(120);
 
 // Runtime config snapshot
 
@@ -404,7 +405,8 @@ mod tests {
         RuntimeState {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
-            settings_hotkey_capture_inhibited: AtomicBool::new(false),
+            hotkey_capture_inhibition_started_at: Instant::now(),
+            settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
             layout_state: RwLock::new(initial_layout_state),
             backend: Mutex::new(Some(backend)),
             layout_setup: RwLock::new(LayoutSetup::Unsupported {
@@ -1177,6 +1179,31 @@ undo_key = "Pause"
         runtime.set_settings_hotkey_capture_inhibited(false);
         assert!(!runtime.settings_hotkey_capture_inhibited());
     }
+
+    #[test]
+    fn settings_hotkey_capture_inhibition_expires_after_lease() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+
+        runtime.set_settings_hotkey_capture_inhibited(true);
+        runtime.force_settings_hotkey_capture_inhibited_until_ms_for_test(
+            runtime.hotkey_capture_inhibition_now_ms().saturating_sub(1),
+        );
+
+        assert!(!runtime.settings_hotkey_capture_inhibited());
+    }
+
+    #[test]
+    fn settings_hotkey_capture_inhibition_deadline_is_exclusive() {
+        assert!(!settings_hotkey_capture_inhibited_at(10, 0));
+        assert!(settings_hotkey_capture_inhibited_at(9, 10));
+        assert!(!settings_hotkey_capture_inhibited_at(10, 10));
+        assert!(!settings_hotkey_capture_inhibited_at(11, 10));
+    }
 }
 
 // Runtime state
@@ -1184,7 +1211,8 @@ undo_key = "Pause"
 pub struct RuntimeState {
     enabled: AtomicBool,
     should_exit: AtomicBool,
-    settings_hotkey_capture_inhibited: AtomicBool,
+    hotkey_capture_inhibition_started_at: Instant,
+    settings_hotkey_capture_inhibited_until_ms: AtomicU64,
     layout_state: RwLock<CurrentLayoutState>,
     backend: Mutex<Option<Box<dyn LayoutBackend>>>,
     layout_setup: RwLock<LayoutSetup>,
@@ -1290,6 +1318,14 @@ pub fn run_tray_watchdog_iteration(
     runtime.request_exit();
 }
 
+fn settings_hotkey_capture_inhibited_at(now_ms: u64, inhibited_until_ms: u64) -> bool {
+    inhibited_until_ms != 0 && now_ms < inhibited_until_ms
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 impl RuntimeState {
     // Runtime state initialization and flags
 
@@ -1300,7 +1336,8 @@ impl RuntimeState {
         let runtime = Self {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
-            settings_hotkey_capture_inhibited: AtomicBool::new(false),
+            hotkey_capture_inhibition_started_at: Instant::now(),
+            settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
             layout_state: RwLock::new(layout_state),
             backend: Mutex::new(backend),
             layout_setup: RwLock::new(layout_setup),
@@ -1332,12 +1369,33 @@ impl RuntimeState {
     }
 
     pub fn set_settings_hotkey_capture_inhibited(&self, inhibited: bool) {
-        self.settings_hotkey_capture_inhibited
-            .store(inhibited, Ordering::SeqCst);
+        let inhibited_until_ms = if inhibited {
+            self.hotkey_capture_inhibition_now_ms()
+                .saturating_add(duration_millis(SETTINGS_HOTKEY_CAPTURE_INHIBITION_LEASE))
+                .max(1)
+        } else {
+            0
+        };
+        self.settings_hotkey_capture_inhibited_until_ms
+            .store(inhibited_until_ms, Ordering::SeqCst);
     }
 
     pub fn settings_hotkey_capture_inhibited(&self) -> bool {
-        self.settings_hotkey_capture_inhibited.load(Ordering::SeqCst)
+        settings_hotkey_capture_inhibited_at(
+            self.hotkey_capture_inhibition_now_ms(),
+            self.settings_hotkey_capture_inhibited_until_ms
+                .load(Ordering::SeqCst),
+        )
+    }
+
+    fn hotkey_capture_inhibition_now_ms(&self) -> u64 {
+        duration_millis(self.hotkey_capture_inhibition_started_at.elapsed())
+    }
+
+    #[cfg(test)]
+    fn force_settings_hotkey_capture_inhibited_until_ms_for_test(&self, inhibited_until_ms: u64) {
+        self.settings_hotkey_capture_inhibited_until_ms
+            .store(inhibited_until_ms, Ordering::SeqCst);
     }
 
     pub fn toggle_enabled(&self) -> bool {

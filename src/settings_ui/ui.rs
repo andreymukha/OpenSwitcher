@@ -665,6 +665,16 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     layout_switch_hint_label.set_margin_start(12);
     layout_switch_hint_label.set_margin_end(12);
     layout_switch_hint_label.hide();
+
+    let hotkey_warning_label = gtk::Label::new(None);
+    hotkey_warning_label.set_halign(gtk::Align::Start);
+    hotkey_warning_label.set_wrap(true);
+    hotkey_warning_label.add_css_class("warning");
+    hotkey_warning_label.set_margin_top(8);
+    hotkey_warning_label.set_margin_bottom(2);
+    hotkey_warning_label.set_margin_start(12);
+    hotkey_warning_label.set_margin_end(12);
+    hotkey_warning_label.hide();
     let general_page = build_general_page(
         &autostart_row,
         &auto_switch_row,
@@ -675,6 +685,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     let hotkeys_page = build_hotkeys_page(
         &undo_row,
         &selected_text_hotkey_row,
+        &hotkey_warning_label,
         &layout_switch_value_row,
         &layout_switch_hint_label,
     );
@@ -730,6 +741,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         dialog_error_label,
         dialog_ok_button,
         dialog_cancel_button,
+        hotkey_warning_label,
         layout_switch_hint_label,
         autostart_handler: None,
         auto_switch_handler: None,
@@ -777,6 +789,7 @@ fn build_general_page(
 fn build_hotkeys_page(
     undo_row: &adw::ActionRow,
     selected_text_hotkey_row: &adw::ActionRow,
+    hotkey_warning_label: &gtk::Label,
     layout_switch_value_row: &adw::ActionRow,
     layout_switch_hint_label: &gtk::Label,
 ) -> adw::Clamp {
@@ -788,6 +801,7 @@ fn build_hotkeys_page(
         .build();
     group.add(undo_row);
     group.add(selected_text_hotkey_row);
+    group.add(hotkey_warning_label);
     group.add(layout_switch_value_row);
     group.add(layout_switch_hint_label);
 
@@ -829,6 +843,7 @@ struct FormWidgets {
     dialog_error_label: gtk::Label,
     dialog_ok_button: gtk::Button,
     dialog_cancel_button: gtk::Button,
+    hotkey_warning_label: gtk::Label,
     layout_switch_hint_label: gtk::Label,
     autostart_handler: Option<SignalHandlerId>,
     auto_switch_handler: Option<SignalHandlerId>,
@@ -1543,11 +1558,6 @@ impl SettingsWindow {
                     .set_subtitle(&state.hotkey_error_text);
                 form.selected_text_hotkey_row
                     .set_subtitle(&state.hotkey_error_text);
-            } else if !state.layout_prefix_warning_text.is_empty() {
-                form.manual_hotkey_row
-                    .set_subtitle(&state.layout_prefix_warning_text);
-                form.selected_text_hotkey_row
-                    .set_subtitle(&state.layout_prefix_warning_text);
             } else {
                 form.manual_hotkey_row.set_subtitle(
                     "Исправляет слово перед курсором или отменяет последнее переключение",
@@ -1555,6 +1565,14 @@ impl SettingsWindow {
                 form.selected_text_hotkey_row.set_subtitle(
                     "Копирует выделение, конвертирует раскладку и вставляет текст обратно",
                 );
+            }
+
+            if state.layout_prefix_warning_text.is_empty() {
+                form.hotkey_warning_label.hide();
+            } else {
+                form.hotkey_warning_label
+                    .set_text(&state.layout_prefix_warning_text);
+                form.hotkey_warning_label.show();
             }
 
             form.layout_switch_value_label

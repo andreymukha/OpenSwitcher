@@ -26,6 +26,7 @@ The first release target is a Linux desktop application for EN/RU typing workflo
 
 Current release baseline:
 - tested on Linux Mint Cinnamon X11
+- Wayland is a required supported target; GNOME Wayland was previously validated and is scheduled for repeat smoke testing before release
 - focused on EN/RU typing only
 - official runtime and autostart model: `systemd --user`
 
@@ -108,10 +109,10 @@ a warning but allows saving.
 
 - Linux only
 - Tested baseline: Linux Mint Cinnamon X11
-- Other Linux desktop environments are best-effort unless explicitly stated
-- Broad Wayland support is not claimed for the first release
+- Wayland is a required supported target, with GNOME Wayland as the primary Wayland target
+- Other Linux desktop environments and Wayland compositors are best-effort unless explicitly stated
 - KDE support is not confirmed
-- GNOME Wayland is partial/best-effort, not fully supported
+- GNOME Wayland was previously validated and is scheduled for repeat smoke testing before release
 - Main supported typing scenario is EN/RU
 - Layout/backend support is still conservative and backend-driven
 - The current backend layer is designed for expansion, but support is not yet broad across all desktop environments
@@ -165,7 +166,7 @@ OpenSwitcher tries to detect the user's layout-switch shortcut from the current 
 Current behavior:
 - Cinnamon X11 reads Cinnamon keyboard settings first
 - if Cinnamon settings are empty or unusable, Cinnamon X11 falls back to `setxkbmap -query`
-- Xfce X11 and GNOME Wayland have separate best-effort detection paths
+- Xfce X11 and GNOME Wayland have separate detection paths
 - unsupported or unknown desktop environments may require a manual layout-switch override in settings
 
 The detected setting is stored in the daemon config. Manual choices made in settings are preserved and are not overwritten by auto-detection.
@@ -400,10 +401,10 @@ gdbus monitor \
 ## Known Limitations
 
 - OpenSwitcher is currently focused on EN/RU typing workflows only.
-- The first release is tested on Linux Mint Cinnamon X11. Other Linux desktop environments are best-effort unless explicitly stated.
-- Broad Wayland support is not claimed for this release.
+- The first release is tested on Linux Mint Cinnamon X11. Wayland is a required supported target, with GNOME Wayland as the primary Wayland target.
+- Other Linux desktop environments and Wayland compositors are best-effort unless explicitly stated.
 - KDE support is not confirmed.
-- GNOME Wayland is partial/best-effort, not fully supported.
+- GNOME Wayland was previously validated and is scheduled for repeat smoke testing before release.
 - Application-specific exclusions are not included in the first release.
 - A GNOME Shell extension is not included.
 - Tray visibility depends on a compatible StatusNotifier/AppIndicator host.

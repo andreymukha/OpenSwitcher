@@ -508,17 +508,17 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     selected_hotkey_header.set_title_widget(Some(&selected_hotkey_title));
     selected_hotkey_toolbar.add_top_bar(&selected_hotkey_header);
 
-    let selected_hotkey_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    selected_hotkey_box.set_margin_top(18);
-    selected_hotkey_box.set_margin_bottom(18);
-    selected_hotkey_box.set_margin_start(18);
-    selected_hotkey_box.set_margin_end(18);
-    selected_hotkey_box.set_focusable(true);
+    let hotkey_dialog_content_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    hotkey_dialog_content_box.set_margin_top(18);
+    hotkey_dialog_content_box.set_margin_bottom(18);
+    hotkey_dialog_content_box.set_margin_start(18);
+    hotkey_dialog_content_box.set_margin_end(18);
+    hotkey_dialog_content_box.set_focusable(true);
 
     let selected_hotkey_heading = gtk::Label::new(Some("Нажмите горячую клавишу..."));
     selected_hotkey_heading.set_halign(gtk::Align::Start);
     selected_hotkey_heading.add_css_class("title-3");
-    selected_hotkey_box.append(&selected_hotkey_heading);
+    hotkey_dialog_content_box.append(&selected_hotkey_heading);
 
     let selected_hotkey_hint = gtk::Label::new(Some(
         "Поддерживаются F9, F10, F12, Pause, ScrollLock, Insert или Menu с 0-3 модификаторами Shift, Ctrl и Alt.",
@@ -526,25 +526,25 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     selected_hotkey_hint.set_halign(gtk::Align::Start);
     selected_hotkey_hint.set_wrap(true);
     selected_hotkey_hint.add_css_class("dim-label");
-    selected_hotkey_box.append(&selected_hotkey_hint);
+    hotkey_dialog_content_box.append(&selected_hotkey_hint);
 
     let selected_hotkey_current_title = gtk::Label::new(Some("Распознано"));
     selected_hotkey_current_title.set_halign(gtk::Align::Start);
     selected_hotkey_current_title.add_css_class("caption-heading");
-    selected_hotkey_box.append(&selected_hotkey_current_title);
+    hotkey_dialog_content_box.append(&selected_hotkey_current_title);
 
     let selected_text_hotkey_dialog_value_label = gtk::Label::new(Some("Пока не выбрана"));
     selected_text_hotkey_dialog_value_label.set_halign(gtk::Align::Start);
     selected_text_hotkey_dialog_value_label.add_css_class("monospace");
     selected_text_hotkey_dialog_value_label.add_css_class("title-4");
-    selected_hotkey_box.append(&selected_text_hotkey_dialog_value_label);
+    hotkey_dialog_content_box.append(&selected_text_hotkey_dialog_value_label);
 
     let selected_text_hotkey_dialog_error_label = gtk::Label::new(None);
     selected_text_hotkey_dialog_error_label.set_halign(gtk::Align::Start);
     selected_text_hotkey_dialog_error_label.set_wrap(true);
     selected_text_hotkey_dialog_error_label.add_css_class("error");
     selected_text_hotkey_dialog_error_label.hide();
-    selected_hotkey_box.append(&selected_text_hotkey_dialog_error_label);
+    hotkey_dialog_content_box.append(&selected_text_hotkey_dialog_error_label);
 
     let selected_hotkey_actions = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     let selected_hotkey_cancel_button = gtk::Button::with_label("Отмена");
@@ -556,9 +556,9 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     selected_hotkey_actions.append(&selected_hotkey_cancel_button);
     selected_hotkey_actions.append(&selected_hotkey_spacer);
     selected_hotkey_actions.append(&selected_hotkey_ok_button);
-    selected_hotkey_box.append(&selected_hotkey_actions);
+    hotkey_dialog_content_box.append(&selected_hotkey_actions);
 
-    selected_hotkey_toolbar.set_content(Some(&selected_hotkey_box));
+    selected_hotkey_toolbar.set_content(Some(&hotkey_dialog_content_box));
     selected_text_hotkey_dialog.set_content(Some(&selected_hotkey_toolbar));
 
     let layout_switch_value_row = adw::ActionRow::builder()
@@ -716,7 +716,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         selected_text_hotkey_value_icon,
         selected_text_hotkey_dialog,
         selected_text_hotkey_title: selected_hotkey_title,
-        selected_text_hotkey_capture_area: selected_hotkey_box,
+        hotkey_dialog_content_box,
         selected_text_hotkey_dialog_value_label,
         selected_text_hotkey_dialog_error_label,
         selected_text_hotkey_dialog_ok_button: selected_hotkey_ok_button,
@@ -815,7 +815,7 @@ struct FormWidgets {
     selected_text_hotkey_value_icon: gtk::Image,
     selected_text_hotkey_dialog: adw::Window,
     selected_text_hotkey_title: adw::WindowTitle,
-    selected_text_hotkey_capture_area: gtk::Box,
+    hotkey_dialog_content_box: gtk::Box,
     selected_text_hotkey_dialog_value_label: gtk::Label,
     selected_text_hotkey_dialog_error_label: gtk::Label,
     selected_text_hotkey_dialog_ok_button: gtk::Button,
@@ -1379,9 +1379,9 @@ impl SettingsWindow {
     fn open_hotkey_dialog(&self) {
         if let Some(form) = self.form.borrow().as_ref() {
             form.selected_text_hotkey_dialog.present();
-            let capture_area = form.selected_text_hotkey_capture_area.clone();
+            let content_box = form.hotkey_dialog_content_box.clone();
             glib::idle_add_local_once(move || {
-                capture_area.grab_focus();
+                content_box.grab_focus();
             });
         }
     }

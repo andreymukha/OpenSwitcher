@@ -34,7 +34,7 @@ Current release baseline:
 
 | Environment | Session | Status | Verification |
 | --- | --- | --- | --- |
-| Linux Mint 22.2 Cinnamon | X11 | Supported baseline | Confirmed on the current laptop |
+| Linux Mint 22.2 Cinnamon | X11 | Supported baseline | Confirmed by local smoke testing |
 
 Environments not listed here are best-effort. Wayland is a required supported target; this table
 records only environments that have been explicitly confirmed in the current repository state.

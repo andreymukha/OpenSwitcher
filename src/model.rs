@@ -201,6 +201,19 @@ impl HotkeySpec {
         value.parse()
     }
 
+    pub const fn is_allowed(self) -> bool {
+        matches!(
+            self.trigger,
+            HotkeyTrigger::F9
+                | HotkeyTrigger::F10
+                | HotkeyTrigger::F12
+                | HotkeyTrigger::Pause
+                | HotkeyTrigger::ScrollLock
+                | HotkeyTrigger::Insert
+                | HotkeyTrigger::Menu
+        )
+    }
+
     pub fn matches(self, trigger: HotkeyTrigger, modifiers: HotkeyModifiers) -> bool {
         self.trigger == trigger && self.modifiers.shift == modifiers.shift
             && self.modifiers.ctrl == modifiers.ctrl
@@ -1194,6 +1207,26 @@ mod tests {
             assert_eq!(HotkeySpec::from_str(expected).unwrap(), spec);
             assert!(spec.matches(HotkeyTrigger::F12, modifiers));
             assert!(!spec.matches(HotkeyTrigger::F10, modifiers));
+        }
+    }
+
+    #[test]
+    fn hotkey_spec_allowed_helper_accepts_all_whitelisted_triggers_and_modifier_masks() {
+        let modifier_masks = [
+            HotkeyModifiers::none(),
+            HotkeyModifiers::shift(),
+            HotkeyModifiers::ctrl(),
+            HotkeyModifiers::alt(),
+            HotkeyModifiers::shift_ctrl(),
+            HotkeyModifiers::shift_alt(),
+            HotkeyModifiers::ctrl_alt(),
+            HotkeyModifiers::shift_ctrl_alt(),
+        ];
+
+        for trigger in HotkeyTrigger::ALL {
+            for modifiers in modifier_masks {
+                assert!(HotkeySpec::new(modifiers, trigger).is_allowed());
+            }
         }
     }
 

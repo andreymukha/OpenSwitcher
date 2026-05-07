@@ -5,8 +5,8 @@ use open_switcher::dbus::{
 };
 use open_switcher::model::{
     AutoDetectedLayoutSwitch, LayoutSwitchCapturePhase, LayoutSwitchCaptureState,
-    HotkeySpec, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, SelectedTextHotkey,
-    SettingsDto, UndoKey, UpdateSettingsResult,
+    HotkeyModifiers, HotkeySpec, HotkeyTrigger, LayoutSwitchCombo, LayoutSwitchSetting,
+    LayoutSwitchSource, SelectedTextHotkey, SettingsDto, UndoKey, UpdateSettingsResult,
 };
 use std::error::Error;
 use std::path::Path;
@@ -98,6 +98,51 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
         HotkeySpec::from(SelectedTextHotkey::AltF12)
     );
     assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::alt_shift());
+
+    Ok(())
+}
+
+#[test]
+fn dbus_roundtrip_preserves_complex_hotkey_specs() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("complex_hotkeys");
+    let _service = spawn_service(&config_path, &service_name)?;
+
+    let client = Connection::session()?;
+    let proxy = settings_proxy(&client, &service_name)?;
+    let manual_hotkey = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+    let selected_text_hotkey =
+        HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::Insert);
+
+    let result: UpdateSettingsResult = proxy.call(
+        "UpdateSettings",
+        &(SettingsDto {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
+            layout_delay_ms: 30,
+            manual_correction_hotkey: manual_hotkey,
+            selected_text_hotkey,
+            layout_switch: LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::alt_shift(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            },
+        }),
+    )?;
+
+    assert!(!result.restart_required);
+    let updated: SettingsDto = proxy.call("GetSettings", &())?;
+    assert_eq!(updated.manual_correction_hotkey, manual_hotkey);
+    assert_eq!(updated.selected_text_hotkey, selected_text_hotkey);
+
+    let config = AppConfig::load_or_create(&config_path)?;
+    assert_eq!(config.features.manual_correction_hotkey, manual_hotkey);
+    assert_eq!(
+        config.features.selected_text_switch_hotkey,
+        selected_text_hotkey
+    );
 
     Ok(())
 }

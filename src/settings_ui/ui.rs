@@ -751,7 +751,7 @@ fn build_general_page(
         .title("Исправления")
         .description("Параметры коррекции регистра для уже исправленного слова.")
         .build();
-    corrections_group.set_margin_top(8);
+    corrections_group.set_margin_top(20);
     corrections_group.add(fix_two_capitals_row);
     corrections_group.add(fix_accidental_caps_lock_row);
 

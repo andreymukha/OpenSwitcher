@@ -82,6 +82,15 @@ impl Default for HotkeyDialogTarget {
     }
 }
 
+impl HotkeyDialogTarget {
+    fn dialog_subtitle(self) -> &'static str {
+        match self {
+            Self::ManualCorrection => "Ручное исправление",
+            Self::SelectedText => "Выделенный текст",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HotkeyModifier {
     Shift,
@@ -484,7 +493,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     selected_text_hotkey_row.add_suffix(&selected_text_hotkey_value_label);
 
     let selected_text_hotkey_dialog = adw::Window::builder()
-        .title("Горячая клавиша для выделенного текста")
+        .title("Горячая клавиша")
         .default_width(360)
         .default_height(220)
         .modal(true)
@@ -706,6 +715,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         selected_text_hotkey_value_label,
         selected_text_hotkey_value_icon,
         selected_text_hotkey_dialog,
+        selected_text_hotkey_title: selected_hotkey_title,
         selected_text_hotkey_capture_area: selected_hotkey_box,
         selected_text_hotkey_dialog_value_label,
         selected_text_hotkey_dialog_error_label,
@@ -804,6 +814,7 @@ struct FormWidgets {
     selected_text_hotkey_value_label: gtk::Label,
     selected_text_hotkey_value_icon: gtk::Image,
     selected_text_hotkey_dialog: adw::Window,
+    selected_text_hotkey_title: adw::WindowTitle,
     selected_text_hotkey_capture_area: gtk::Box,
     selected_text_hotkey_dialog_value_label: gtk::Label,
     selected_text_hotkey_dialog_error_label: gtk::Label,
@@ -1189,6 +1200,9 @@ impl SettingsWindow {
     fn update_hotkey_dialog_widgets(&self) {
         let state = self.hotkey_dialog_state.borrow().clone();
         if let Some(form) = self.form.borrow().as_ref() {
+            form.selected_text_hotkey_title
+                .set_subtitle(state.target.dialog_subtitle());
+
             match state.candidate {
                 Some(hotkey) => form
                     .selected_text_hotkey_dialog_value_label
@@ -1963,6 +1977,18 @@ mod tests {
                 &view_state,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn hotkey_dialog_target_subtitle_matches_target() {
+        assert_eq!(
+            HotkeyDialogTarget::ManualCorrection.dialog_subtitle(),
+            "Ручное исправление"
+        );
+        assert_eq!(
+            HotkeyDialogTarget::SelectedText.dialog_subtitle(),
+            "Выделенный текст"
         );
     }
 

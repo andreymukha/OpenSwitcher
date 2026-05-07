@@ -237,6 +237,15 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     return;
                 };
 
+                let duplicate_error = {
+                    let view_state = ui.current_view_state.borrow();
+                    duplicate_hotkey_dialog_error(state.target, hotkey, &view_state)
+                };
+                if let Some(message) = duplicate_error {
+                    ui.set_hotkey_candidate_error(hotkey, message);
+                    return;
+                }
+
                 match state.target {
                     HotkeyDialogTarget::ManualCorrection => {
                         presenter.update_manual_correction_hotkey(hotkey);
@@ -1147,6 +1156,14 @@ impl SettingsWindow {
         self.update_hotkey_dialog_widgets();
     }
 
+    fn set_hotkey_candidate_error(&self, hotkey: HotkeySpec, message: impl Into<String>) {
+        let mut state = self.hotkey_dialog_state.borrow_mut();
+        state.candidate = Some(hotkey);
+        state.error = Some(message.into());
+        drop(state);
+        self.update_hotkey_dialog_widgets();
+    }
+
     fn update_capture_dialog_widgets(&self) {
         let state = self.capture_dialog_state.borrow().clone();
         if let Some(form) = self.form.borrow().as_ref() {
@@ -1189,7 +1206,7 @@ impl SettingsWindow {
             }
 
             form.selected_text_hotkey_dialog_ok_button
-                .set_sensitive(state.candidate.is_some());
+                .set_sensitive(state.candidate.is_some() && state.error.is_none());
         }
     }
 
@@ -1701,6 +1718,32 @@ fn hotkey_spec_from_capture_state(
     )
 }
 
+fn duplicate_hotkey_dialog_error(
+    target: HotkeyDialogTarget,
+    candidate: HotkeySpec,
+    view_state: &ViewState,
+) -> Option<String> {
+    match target {
+        HotkeyDialogTarget::ManualCorrection
+            if candidate.conflicts_exact(view_state.selected_text_hotkey) =>
+        {
+            Some(format!(
+                "Это сочетание уже используется для выделенного текста: {}.",
+                candidate.short_label()
+            ))
+        }
+        HotkeyDialogTarget::SelectedText
+            if candidate.conflicts_exact(view_state.manual_correction_hotkey) =>
+        {
+            Some(format!(
+                "Это сочетание уже используется для ручного исправления: {}.",
+                candidate.short_label()
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn hotkey_modifiers_from_capture_state(
     dialog_state: &HotkeyDialogState,
     event_state: gdk::ModifierType,
@@ -1873,6 +1916,53 @@ mod tests {
         assert_eq!(
             dialog_state.borrow().candidate,
             Some(HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12)),
+        );
+    }
+
+    #[test]
+    fn duplicate_hotkey_dialog_error_reports_manual_duplicate_before_accepting() {
+        let duplicate = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
+        let mut view_state = initial_view_state();
+        view_state.selected_text_hotkey = duplicate;
+
+        let error = duplicate_hotkey_dialog_error(
+            HotkeyDialogTarget::ManualCorrection,
+            duplicate,
+            &view_state,
+        )
+        .expect("duplicate should be reported");
+
+        assert!(error.contains("выделенного текста"));
+        assert!(error.contains("Ctrl+Alt+F12"));
+    }
+
+    #[test]
+    fn duplicate_hotkey_dialog_error_reports_selected_text_duplicate_before_accepting() {
+        let duplicate = HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::Insert);
+        let mut view_state = initial_view_state();
+        view_state.manual_correction_hotkey = duplicate;
+
+        let error =
+            duplicate_hotkey_dialog_error(HotkeyDialogTarget::SelectedText, duplicate, &view_state)
+                .expect("duplicate should be reported");
+
+        assert!(error.contains("ручного исправления"));
+        assert!(error.contains("Ctrl+Alt+Shift+Insert"));
+    }
+
+    #[test]
+    fn duplicate_hotkey_dialog_error_allows_same_trigger_with_different_modifiers() {
+        let mut view_state = initial_view_state();
+        view_state.manual_correction_hotkey =
+            HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12);
+
+        assert_eq!(
+            duplicate_hotkey_dialog_error(
+                HotkeyDialogTarget::SelectedText,
+                HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12),
+                &view_state,
+            ),
+            None
         );
     }
 

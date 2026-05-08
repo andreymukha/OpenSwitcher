@@ -464,20 +464,32 @@ fn combo_from_gnome_binding(binding: &str) -> Option<LayoutSwitchCombo> {
         return matches!(key.as_str(), "caps_lock").then_some(LayoutSwitchCombo::caps_lock());
     }
 
-    if modifiers.len() != 1 {
+    if let Some(combo) = combo_from_gnome_space_binding(&modifiers, key.as_str()) {
+        return Some(combo);
+    }
+
+    match modifiers.as_slice() {
+        [modifier] => combo_from_gnome_shift_pair(*modifier, key.as_str()),
+        _ => None,
+    }
+}
+
+fn combo_from_gnome_space_binding(
+    modifiers: &[GnomeAcceleratorToken],
+    key: &str,
+) -> Option<LayoutSwitchCombo> {
+    if key != "space" || modifiers.len() != 1 {
         return None;
     }
 
-    match (modifiers[0], key.as_str()) {
-        (GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Generic), "space")
-        | (GnomeAcceleratorToken::Super(GnomeAcceleratorSide::Left), "space") => {
-            Some(LayoutSwitchCombo::super_space())
-        }
-        (GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic), "space")
-        | (GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Left), "space") => {
+    match modifiers[0] {
+        GnomeAcceleratorToken::Super(
+            GnomeAcceleratorSide::Generic | GnomeAcceleratorSide::Left,
+        ) => Some(LayoutSwitchCombo::super_space()),
+        GnomeAcceleratorToken::Ctrl(GnomeAcceleratorSide::Generic | GnomeAcceleratorSide::Left) => {
             Some(LayoutSwitchCombo::ctrl_space())
         }
-        _ => combo_from_gnome_shift_pair(modifiers[0], key.as_str()),
+        _ => None,
     }
 }
 
@@ -913,6 +925,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn leaves_unsupported_gnome_bindings_unmapped() {
+        for binding in [
+            "XF86Keyboard",
+            "<Shift>XF86Keyboard",
+            "<Shift><Super>space",
+            "<Super><Shift>space",
+            "<Shift><Super_L>space",
+            "<Shift><Primary>space",
+            "<Primary><Shift>space",
+            "<Shift><Control_L>space",
+        ] {
+            assert_eq!(combo_from_gnome_binding(binding), None, "{binding}");
+        }
+    }
+
     // XFCE detection
 
     #[test]
@@ -1224,7 +1252,26 @@ mod tests {
     }
 
     #[test]
-    fn gnome_wayland_falls_back_with_supported_strategy_when_binding_is_not_recognized() {
+    fn ignores_unsupported_xf86_keyboard_binding_when_finding_supported_gnome_binding() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            gnome_primary_gsettings_values: vec![
+                "XF86Keyboard".to_string(),
+                "<Super>space".to_string(),
+            ],
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(gnome_wayland_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::super_space());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::GnomeWaylandGSettingsWmKeybindings
+        );
+    }
+
+    #[test]
+    fn gnome_wayland_falls_back_when_only_backward_shift_super_space_is_recognized_by_gnome() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
             gnome_primary_gsettings_values: vec!["XF86Keyboard".to_string()],
             gnome_backward_gsettings_values: vec!["<Shift><Super>space".to_string()],

@@ -32,6 +32,7 @@ const LAYOUT_DEBUG_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG";
 const LAYOUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG_FILE";
 const BACKGROUND_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(300);
 const GNOME_INPUT_SOURCES_SCHEMA: &str = "org.gnome.desktop.input-sources";
+const GNOME_SOURCES_KEY: &str = "sources";
 const GNOME_MRU_SOURCES_KEY: &str = "mru-sources";
 pub const TRAY_WATCHDOG_INTERVAL: Duration = Duration::from_millis(500);
 pub const TRAY_RECOVERY_DELAY: Duration = Duration::from_millis(500);
@@ -284,6 +285,14 @@ mod tests {
             if schema == "org.gnome.desktop.wm.keybindings" && key == "switch-input-source-backward"
             {
                 return Ok(Vec::new());
+            }
+
+            if schema == GNOME_INPUT_SOURCES_SCHEMA && key == GNOME_SOURCES_KEY {
+                return Ok(trusted_gnome_sources());
+            }
+
+            if schema == GNOME_INPUT_SOURCES_SCHEMA && key == GNOME_MRU_SOURCES_KEY {
+                return Ok(gnome_sources(&[("xkb", "us"), ("xkb", "ru")]));
             }
 
             Ok(vec![self.combo.xkb_option().to_string()])
@@ -910,21 +919,38 @@ undo_key = "Pause"
 
     struct LayoutObservationReaderStub {
         calls: Arc<AtomicUsize>,
-        values: Option<Vec<String>>,
+        sources: Option<Vec<String>>,
+        mru_sources: Option<Vec<String>>,
     }
 
     impl DesktopSettingsReader for LayoutObservationReaderStub {
         fn gsettings_string_list(
             &self,
-            _schema: &str,
-            _key: &str,
+            schema: &str,
+            key: &str,
         ) -> Result<Vec<String>, LayoutAutoDetectError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.values
-                .clone()
-                .ok_or(LayoutAutoDetectError::GSettingsFailed {
-                    stderr: "not configured".to_string(),
-                })
+            if schema == GNOME_INPUT_SOURCES_SCHEMA && key == GNOME_SOURCES_KEY {
+                return self
+                    .sources
+                    .clone()
+                    .ok_or(LayoutAutoDetectError::GSettingsFailed {
+                        stderr: "sources not configured".to_string(),
+                    });
+            }
+
+            if schema == GNOME_INPUT_SOURCES_SCHEMA && key == GNOME_MRU_SOURCES_KEY {
+                return self
+                    .mru_sources
+                    .clone()
+                    .ok_or(LayoutAutoDetectError::GSettingsFailed {
+                        stderr: "mru-sources not configured".to_string(),
+                    });
+            }
+
+            Err(LayoutAutoDetectError::GSettingsFailed {
+                stderr: format!("{schema}.{key} not configured"),
+            })
         }
 
         fn xfconf_string(
@@ -946,6 +972,50 @@ undo_key = "Pause"
         fn setxkbmap_query(&self) -> Result<String, LayoutAutoDetectError> {
             unimplemented!("not used in runtime tests")
         }
+    }
+
+    fn gnome_sources(pairs: &[(&str, &str)]) -> Vec<String> {
+        pairs
+            .iter()
+            .flat_map(|(source_type, source_id)| {
+                [(*source_type).to_string(), (*source_id).to_string()]
+            })
+            .collect()
+    }
+
+    fn trusted_gnome_sources() -> Vec<String> {
+        gnome_sources(&[("xkb", "us"), ("xkb", "ru")])
+    }
+
+    fn layout_observation_reader(
+        calls: Arc<AtomicUsize>,
+        mru_sources: Vec<String>,
+    ) -> LayoutObservationReaderStub {
+        LayoutObservationReaderStub {
+            calls,
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(mru_sources),
+        }
+    }
+
+    fn assert_trusted_observed_kind(
+        observation: Option<CurrentLayoutState>,
+        expected_kind: AppLayoutKind,
+    ) {
+        assert!(matches!(
+            observation,
+            Some(CurrentLayoutState::Known {
+                layout,
+                trustworthy: true,
+            }) if layout.kind == expected_kind
+        ));
+    }
+
+    fn assert_untrusted_observation(observation: Option<CurrentLayoutState>) {
+        assert!(matches!(
+            observation,
+            Some(CurrentLayoutState::Unknown { .. })
+        ));
     }
 
     struct SystemContextDetectorStub {
@@ -1015,7 +1085,8 @@ undo_key = "Pause"
 
         runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         });
 
         assert_eq!(
@@ -1047,7 +1118,8 @@ undo_key = "Pause"
 
         runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         });
         runtime.clear_pending_status_change();
 
@@ -1064,7 +1136,8 @@ undo_key = "Pause"
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&calls),
-            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -1094,7 +1167,8 @@ undo_key = "Pause"
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&calls),
-            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -1109,7 +1183,7 @@ undo_key = "Pause"
 
         runtime.refresh_current_layout_observation_with_reader(&reader);
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(
             runtime.current_layout_state(),
             known_layout_state(english_layout())
@@ -1118,12 +1192,138 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn gnome_wayland_observation_trusts_us_ru_sources_with_us_current_mru() {
+        let reader = layout_observation_reader(
+            Arc::new(AtomicUsize::new(0)),
+            gnome_sources(&[("xkb", "us"), ("xkb", "ru")]),
+        );
+
+        assert_trusted_observed_kind(
+            gnome_wayland_current_layout_state(&reader),
+            AppLayoutKind::English,
+        );
+    }
+
+    #[test]
+    fn gnome_wayland_observation_trusts_us_ru_sources_with_ru_current_mru() {
+        let reader = layout_observation_reader(
+            Arc::new(AtomicUsize::new(0)),
+            gnome_sources(&[("xkb", "ru"), ("xkb", "us")]),
+        );
+
+        assert_trusted_observed_kind(
+            gnome_wayland_current_layout_state(&reader),
+            AppLayoutKind::Russian,
+        );
+    }
+
+    #[test]
+    fn gnome_wayland_observation_rejects_ibus_current_without_falling_through_to_xkb() {
+        let reader = layout_observation_reader(
+            Arc::new(AtomicUsize::new(0)),
+            gnome_sources(&[("ibus", "mozc-jp"), ("xkb", "us")]),
+        );
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
+    fn gnome_wayland_observation_rejects_xkb_variants() {
+        let reader = layout_observation_reader(
+            Arc::new(AtomicUsize::new(0)),
+            gnome_sources(&[("xkb", "ru+phonetic"), ("xkb", "us")]),
+        );
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
+    fn gnome_wayland_observation_rejects_configured_xkb_variants() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(gnome_sources(&[("xkb", "us+intl"), ("xkb", "ru")])),
+            mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "us+intl")])),
+        };
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
+    fn gnome_wayland_observation_rejects_more_than_two_configured_xkb_sources() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru"), ("xkb", "de")])),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
+    fn gnome_wayland_observation_rejects_malformed_mru_sources() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(vec!["xkb".into(), "us".into(), "xkb".into()]),
+        };
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
+    fn gnome_wayland_observation_rejects_empty_mru_sources() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(Vec::new()),
+        };
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
+    fn gnome_wayland_observation_read_error_preserves_existing_observation() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: russian_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: russian_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            gnome_wayland_context(),
+        );
+
+        runtime.refresh_current_layout_observation_with_reader(&layout_observation_reader(
+            Arc::new(AtomicUsize::new(0)),
+            gnome_sources(&[("xkb", "us"), ("xkb", "ru")]),
+        ));
+        runtime.clear_pending_status_change();
+
+        runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: None,
+            mru_sources: None,
+        });
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
+        );
+        assert!(!runtime.take_pending_status_change());
+    }
+
+    #[test]
     fn periodic_sync_tick_late_upgrades_unknown_context_and_uses_gnome_wayland_observation() {
         let reader_calls = Arc::new(AtomicUsize::new(0));
         let detector_calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&reader_calls),
-            values: Some(vec!["xkb".into(), "ru".into(), "xkb".into(), "us".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "us")])),
         };
         let detector = SystemContextDetectorStub {
             calls: Arc::clone(&detector_calls),
@@ -1155,7 +1355,7 @@ undo_key = "Pause"
             known_layout_state(russian_layout())
         );
         assert!(runtime.take_pending_status_change());
-        assert_eq!(reader_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
         assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -1165,7 +1365,8 @@ undo_key = "Pause"
         let detector_calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&reader_calls),
-            values: Some(vec!["xkb".into(), "ru".into(), "xkb".into(), "us".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "us")])),
         };
         let detector = SystemContextDetectorStub {
             calls: Arc::clone(&detector_calls),
@@ -1251,7 +1452,8 @@ undo_key = "Pause"
         };
         let reader = LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            values: None,
+            sources: None,
+            mru_sources: None,
         };
         let mut config = AppConfig::default();
         config.layout.switch_combo = LayoutSwitchCombo::caps_lock();
@@ -1327,7 +1529,7 @@ undo_key = "Pause"
                 },
             }
         );
-        assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
@@ -1385,7 +1587,8 @@ undo_key = "Pause"
         };
         let reader = LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            values: None,
+            sources: None,
+            mru_sources: None,
         };
         let original = LayoutSwitchSetting {
             combo: LayoutSwitchCombo::alt_shift(),
@@ -1437,7 +1640,8 @@ undo_key = "Pause"
 
         runtime.refresh_current_layout_observation_with_reader(&LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            values: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         });
         runtime.clear_pending_status_change();
 
@@ -2321,6 +2525,12 @@ fn effective_current_layout_state(
 
 // GNOME Wayland observation
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GnomeInputSource {
+    source_type: String,
+    source_id: String,
+}
+
 fn gnome_wayland_layout_state_from_bool(layout_is_english: bool) -> CurrentLayoutState {
     gnome_wayland_current_layout_state_from_code(if layout_is_english { "us" } else { "ru" })
 }
@@ -2365,19 +2575,100 @@ fn gnome_wayland_current_layout_state_from_code(layout_code: &str) -> CurrentLay
 fn gnome_wayland_current_layout_state<R: DesktopSettingsReader>(
     reader: &R,
 ) -> Option<CurrentLayoutState> {
-    let values = reader
-        .gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_MRU_SOURCES_KEY)
-        .ok()?;
-    let (backend, layout_code) = match values.as_slice() {
-        [backend, layout_code, ..] => (backend.as_str(), layout_code.as_str()),
-        _ => return None,
-    };
+    let configured_sources =
+        match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_SOURCES_KEY) {
+            Ok(values) => values,
+            Err(error) => {
+                log_layout_debug(
+                    "gnome-wayland-observation",
+                    &format!("result=preserve reason=sources-read-error error={error}"),
+                );
+                return None;
+            }
+        };
+    let mru_sources =
+        match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_MRU_SOURCES_KEY) {
+            Ok(values) => values,
+            Err(error) => {
+                log_layout_debug(
+                    "gnome-wayland-observation",
+                    &format!("result=preserve reason=mru-read-error error={error}"),
+                );
+                return None;
+            }
+        };
 
-    if backend != "xkb" {
-        return None;
+    Some(gnome_wayland_current_layout_state_from_sources(
+        &configured_sources,
+        &mru_sources,
+    ))
+}
+
+fn gnome_wayland_current_layout_state_from_sources(
+    configured_sources: &[String],
+    mru_sources: &[String],
+) -> CurrentLayoutState {
+    let configured_sources = match gnome_input_sources_from_flat_values(configured_sources) {
+        Ok(sources) => sources,
+        Err(reason) => return gnome_wayland_unknown_layout_state(reason),
+    };
+    if !gnome_configured_sources_are_trusted_us_ru_pair(&configured_sources) {
+        return gnome_wayland_unknown_layout_state("unsupported-configured-sources");
     }
 
-    Some(gnome_wayland_current_layout_state_from_code(layout_code))
+    let mru_sources = match gnome_input_sources_from_flat_values(mru_sources) {
+        Ok(sources) if !sources.is_empty() => sources,
+        Ok(_) => return gnome_wayland_unknown_layout_state("empty-mru-sources"),
+        Err(reason) => return gnome_wayland_unknown_layout_state(reason),
+    };
+
+    let current = &mru_sources[0];
+    match trusted_gnome_xkb_layout_code(current) {
+        Some(layout_code) => gnome_wayland_current_layout_state_from_code(layout_code),
+        None => gnome_wayland_unknown_layout_state("unsupported-current-source"),
+    }
+}
+
+fn gnome_input_sources_from_flat_values(
+    values: &[String],
+) -> Result<Vec<GnomeInputSource>, &'static str> {
+    if values.len() % 2 != 0 {
+        return Err("malformed-input-sources");
+    }
+
+    Ok(values
+        .chunks_exact(2)
+        .map(|chunk| GnomeInputSource {
+            source_type: chunk[0].clone(),
+            source_id: chunk[1].clone(),
+        })
+        .collect())
+}
+
+fn gnome_configured_sources_are_trusted_us_ru_pair(sources: &[GnomeInputSource]) -> bool {
+    sources.len() == 2
+        && sources.iter().any(|source| trusted_gnome_xkb_layout_code(source) == Some("us"))
+        && sources
+            .iter()
+            .any(|source| trusted_gnome_xkb_layout_code(source) == Some("ru"))
+}
+
+fn trusted_gnome_xkb_layout_code(source: &GnomeInputSource) -> Option<&'static str> {
+    match (source.source_type.as_str(), source.source_id.as_str()) {
+        ("xkb", "us") => Some("us"),
+        ("xkb", "ru") => Some("ru"),
+        _ => None,
+    }
+}
+
+fn gnome_wayland_unknown_layout_state(reason: &'static str) -> CurrentLayoutState {
+    log_layout_debug(
+        "gnome-wayland-observation",
+        &format!("result=unknown reason={reason}"),
+    );
+    CurrentLayoutState::Unknown {
+        reason: format!("gnome-wayland-observation:{reason}"),
+    }
 }
 
 // Logging helpers

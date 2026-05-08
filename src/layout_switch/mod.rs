@@ -101,6 +101,32 @@ impl DesktopSettingsReader for CommandDesktopSettingsReader {
     }
 }
 
+impl<T: DesktopSettingsReader + ?Sized> DesktopSettingsReader for &T {
+    fn gsettings_string_list(
+        &self,
+        schema: &str,
+        key: &str,
+    ) -> Result<Vec<String>, LayoutAutoDetectError> {
+        (*self).gsettings_string_list(schema, key)
+    }
+
+    fn xfconf_string(
+        &self,
+        channel: &str,
+        property: &str,
+    ) -> Result<String, LayoutAutoDetectError> {
+        (*self).xfconf_string(channel, property)
+    }
+
+    fn xfconf_bool(&self, channel: &str, property: &str) -> Result<bool, LayoutAutoDetectError> {
+        (*self).xfconf_bool(channel, property)
+    }
+
+    fn setxkbmap_query(&self) -> Result<String, LayoutAutoDetectError> {
+        (*self).setxkbmap_query()
+    }
+}
+
 // Layout switch auto-detector
 
 #[derive(Clone, Copy, Debug, Default)]

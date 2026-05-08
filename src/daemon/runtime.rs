@@ -14,8 +14,9 @@ use crate::layout_switch::{
     LayoutSwitchAutoDetector,
 };
 use crate::model::{
-    DesktopEnvironment, DistroKind, HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo,
-    LayoutSwitchSetting, SessionType, Settings, SystemContext, UpdateSettingsResult,
+    DesktopEnvironment, DetectionConfidence, DistroKind, HotkeySpec, LayoutSwitchCaptureState,
+    LayoutSwitchCombo, LayoutSwitchSetting, SessionType, Settings, SystemContext,
+    UpdateSettingsResult,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::env;
@@ -156,6 +157,37 @@ impl ConfigService {
             .map(|config| config.features.auto_switch_enabled)
             .map_err(|_| SettingsError::LockPoisoned)
     }
+
+    fn apply_detected_layout_switch_runtime(
+        &self,
+        detected: LayoutSwitchSetting,
+    ) -> Result<bool, SettingsError> {
+        let mut config = self
+            .inner
+            .write()
+            .map_err(|_| SettingsError::LockPoisoned)?;
+
+        if !should_redetect_layout_switch_after_context_upgrade(&config) {
+            return Ok(false);
+        }
+
+        if runtime_layout_switch_redetect_would_downgrade(config.settings().layout_switch, detected)
+        {
+            return Ok(false);
+        }
+
+        Ok(apply_detected_layout_switch_if_changed(
+            &mut config,
+            detected,
+        ))
+    }
+
+    fn should_redetect_layout_switch_after_context_upgrade(&self) -> Result<bool, SettingsError> {
+        self.inner
+            .read()
+            .map(|config| should_redetect_layout_switch_after_context_upgrade(&config))
+            .map_err(|_| SettingsError::LockPoisoned)
+    }
 }
 
 fn should_detect_layout_switch(config: &AppConfig) -> bool {
@@ -163,6 +195,23 @@ fn should_detect_layout_switch(config: &AppConfig) -> bool {
         config.layout.switch_source,
         crate::model::LayoutSwitchSource::Manual
     )
+}
+
+fn should_redetect_layout_switch_after_context_upgrade(config: &AppConfig) -> bool {
+    matches!(
+        config.layout.switch_source,
+        crate::model::LayoutSwitchSource::AutoDetected
+            | crate::model::LayoutSwitchSource::AutoFallback
+    )
+}
+
+fn runtime_layout_switch_redetect_would_downgrade(
+    current: LayoutSwitchSetting,
+    detected: LayoutSwitchSetting,
+) -> bool {
+    current.is_locked_by_auto_detection()
+        && detected.source == crate::model::LayoutSwitchSource::AutoFallback
+        && detected.auto_detected.confidence != DetectionConfidence::High
 }
 
 fn detect_layout_switch_setting<R: DesktopSettingsReader>(
@@ -911,6 +960,46 @@ undo_key = "Pause"
         }
     }
 
+    fn runtime_with_config_and_context(
+        config: AppConfig,
+        system_context: SystemContext,
+    ) -> RuntimeState {
+        let enabled = config.features.auto_switch_enabled;
+        RuntimeState {
+            enabled: AtomicBool::new(enabled),
+            should_exit: AtomicBool::new(false),
+            hotkey_capture_inhibition_started_at: Instant::now(),
+            settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
+            layout_state: RwLock::new(CurrentLayoutState::Unknown {
+                reason: "test".to_string(),
+            }),
+            backend: Mutex::new(Some(Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Unknown {
+                    reason: "test".to_string(),
+                }),
+            }))),
+            layout_setup: RwLock::new(LayoutSetup::Unsupported {
+                reason: "test".to_string(),
+            }),
+            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
+            feature_availability: RwLock::new(FeatureAvailability {
+                auto_switch: false,
+                manual_word_fix: false,
+                selected_text_switch: true,
+                reason: Some("test".to_string()),
+            }),
+            system_context: RwLock::new(system_context),
+            current_layout_observation: RwLock::new(None),
+            config_service: ConfigService {
+                config_path: PathBuf::from("test-config.toml"),
+                inner: RwLock::new(config),
+            },
+            capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
+            background_sync_started: AtomicBool::new(false),
+            pending_status_change: AtomicBool::new(false),
+        }
+    }
+
     #[test]
     fn current_layout_state_prefers_gnome_wayland_observation() {
         let runtime = test_runtime_with_backend_and_context(
@@ -1131,6 +1220,203 @@ undo_key = "Pause"
             gnome_wayland_context(),
             partial
         ));
+    }
+
+    #[test]
+    fn late_context_upgrade_accepts_stale_x11_to_gnome_wayland() {
+        assert!(is_late_system_context_upgrade(
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+            gnome_wayland_context()
+        ));
+    }
+
+    #[test]
+    fn late_context_upgrade_rejects_wayland_to_unknown_downgrade() {
+        assert!(!is_late_system_context_upgrade(
+            gnome_wayland_context(),
+            SystemContext::default()
+        ));
+    }
+
+    #[test]
+    fn periodic_sync_tick_preserves_manual_layout_switch_on_stale_x11_upgrade() {
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let detector = SystemContextDetectorStub {
+            calls: Arc::clone(&detector_calls),
+            context: gnome_wayland_context(),
+        };
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            values: None,
+        };
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = LayoutSwitchCombo::caps_lock();
+        config.layout.switch_source = LayoutSwitchSource::Manual;
+        config.layout.auto_detected = AutoDetectedLayoutSwitch::default();
+        let runtime = runtime_with_config_and_context(
+            config,
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        );
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(runtime.system_context(), gnome_wayland_context());
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::caps_lock(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            }
+        );
+        assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn periodic_sync_tick_redetects_auto_layout_switch_on_stale_x11_upgrade() {
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            calls: Arc::clone(&reader_calls),
+            combo: LayoutSwitchCombo::super_space(),
+        };
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = LayoutSwitchCombo::alt_shift();
+        config.layout.switch_source = LayoutSwitchSource::AutoDetected;
+        config.layout.auto_detected = AutoDetectedLayoutSwitch {
+            strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+            confidence: DetectionConfidence::High,
+            context: SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        };
+        let runtime = runtime_with_config_and_context(
+            config,
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        );
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(runtime.system_context(), gnome_wayland_context());
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                    confidence: DetectionConfidence::High,
+                    context: gnome_wayland_context(),
+                },
+            }
+        );
+        assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn periodic_sync_tick_redetects_auto_fallback_layout_switch_on_stale_x11_upgrade() {
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+        let reader = CountingReader {
+            calls: Arc::new(AtomicUsize::new(0)),
+            combo: LayoutSwitchCombo::super_space(),
+        };
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = LayoutSwitchCombo::ctrl_shift();
+        config.layout.switch_source = LayoutSwitchSource::AutoFallback;
+        config.layout.auto_detected = AutoDetectedLayoutSwitch {
+            strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+            confidence: DetectionConfidence::Low,
+            context: SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        };
+        let runtime = runtime_with_config_and_context(
+            config,
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        );
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                    confidence: DetectionConfidence::High,
+                    context: gnome_wayland_context(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn periodic_sync_tick_does_not_downgrade_high_confidence_auto_to_low_fallback() {
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            values: None,
+        };
+        let original = LayoutSwitchSetting {
+            combo: LayoutSwitchCombo::alt_shift(),
+            source: LayoutSwitchSource::AutoDetected,
+            auto_detected: AutoDetectedLayoutSwitch {
+                strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                confidence: DetectionConfidence::High,
+                context: SystemContext {
+                    session_type: SessionType::X11,
+                    desktop_environment: DesktopEnvironment::Gnome,
+                    distro: DistroKind::Ubuntu,
+                },
+            },
+        };
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = original.combo;
+        config.layout.switch_source = original.source;
+        config.layout.auto_detected = original.auto_detected;
+        let runtime = runtime_with_config_and_context(
+            config,
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        );
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(runtime.system_context(), gnome_wayland_context());
+        assert_eq!(runtime.get_settings().unwrap().layout_switch, original);
     }
 
     #[test]
@@ -1611,7 +1897,9 @@ impl RuntimeState {
         reader: &R,
         detector: &D,
     ) -> BackendSyncResult {
-        self.refresh_system_context_with_detector(detector);
+        if self.refresh_system_context_with_detector(detector) {
+            self.redetect_layout_switch_after_context_upgrade(reader);
+        }
         self.refresh_current_layout_observation_with_reader(reader);
         self.sync_with_backend()
     }
@@ -1869,7 +2157,7 @@ impl RuntimeState {
         self.update_current_layout_observation(None, "clear-observation");
     }
 
-    fn refresh_system_context_with_detector<D: SystemContextSource>(&self, detector: &D) {
+    fn refresh_system_context_with_detector<D: SystemContextSource>(&self, detector: &D) -> bool {
         let previous = self.system_context();
         let next = match detector.detect_current() {
             Ok(next) => next,
@@ -1880,7 +2168,7 @@ impl RuntimeState {
                         "previous={previous:?} next=unavailable result=skipped reason=detect-error error={error}"
                     ),
                 );
-                return;
+                return false;
             }
         };
 
@@ -1891,7 +2179,7 @@ impl RuntimeState {
                     "previous={previous:?} next={next:?} result=skipped reason=not-late-upgrade"
                 ),
             );
-            return;
+            return false;
         }
 
         let mut context = self
@@ -1903,6 +2191,52 @@ impl RuntimeState {
             "system-context-redetect",
             &format!("previous={previous:?} next={next:?} result=applied"),
         );
+        true
+    }
+
+    fn redetect_layout_switch_after_context_upgrade<R: DesktopSettingsReader>(&self, reader: &R) {
+        let context = self.system_context();
+        match self
+            .config_service
+            .should_redetect_layout_switch_after_context_upgrade()
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                log_layout_debug(
+                    "layout-switch-redetect",
+                    &format!("context={context:?} result=skipped reason=manual-or-unknown"),
+                );
+                return;
+            }
+            Err(error) => {
+                log_layout_debug(
+                    "layout-switch-redetect",
+                    &format!("context={context:?} result=skipped error={error}"),
+                );
+                return;
+            }
+        }
+
+        let detector = LayoutSwitchAutoDetector::with_reader(reader);
+        let detected = detect_layout_switch_setting(context, &detector);
+
+        match self
+            .config_service
+            .apply_detected_layout_switch_runtime(detected)
+        {
+            Ok(true) => log_layout_debug(
+                "layout-switch-redetect",
+                &format!("context={context:?} result=applied setting={detected:?}"),
+            ),
+            Ok(false) => log_layout_debug(
+                "layout-switch-redetect",
+                &format!("context={context:?} result=unchanged-or-manual"),
+            ),
+            Err(error) => log_layout_debug(
+                "layout-switch-redetect",
+                &format!("context={context:?} result=skipped error={error}"),
+            ),
+        }
     }
 }
 
@@ -1925,9 +2259,28 @@ fn is_gnome_wayland_context(context: SystemContext) -> bool {
 }
 
 fn is_late_system_context_upgrade(current: SystemContext, candidate: SystemContext) -> bool {
-    candidate != current
-        && context_preserves_known_fields(current, candidate)
+    if candidate == current {
+        return false;
+    }
+
+    if is_stale_x11_to_gnome_wayland_upgrade(current, candidate) {
+        return true;
+    }
+
+    context_preserves_known_fields(current, candidate)
         && context_known_score(candidate) > context_known_score(current)
+}
+
+fn is_stale_x11_to_gnome_wayland_upgrade(current: SystemContext, candidate: SystemContext) -> bool {
+    current.session_type == SessionType::X11
+        && candidate.session_type == SessionType::Wayland
+        && candidate.desktop_environment == DesktopEnvironment::Gnome
+        && field_preserves_known(
+            current.desktop_environment,
+            candidate.desktop_environment,
+            DesktopEnvironment::Unknown,
+        )
+        && field_preserves_known(current.distro, candidate.distro, DistroKind::Unknown)
 }
 
 fn context_preserves_known_fields(current: SystemContext, candidate: SystemContext) -> bool {

@@ -514,6 +514,91 @@ mod tests {
     }
 
     #[test]
+    fn alt_shift_layout_prefix_warning_matches_alt_shift_hotkeys_without_blocking_save() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::alt_shift(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+        state.update_manual_correction_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::shift_alt(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+
+        let view = state.view_state();
+        assert!(view.dirty);
+        assert!(view.hotkey_error_text.is_empty());
+        assert!(view.layout_prefix_warning_text.contains("Alt+Shift"));
+        assert!(view.save_enabled);
+    }
+
+    #[test]
+    fn alt_shift_layout_prefix_warning_matches_ctrl_alt_shift_hotkeys_without_blocking_save() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::alt_shift(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+        state.update_selected_text_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::shift_ctrl_alt(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+
+        let view = state.view_state();
+        assert!(view.dirty);
+        assert!(view.hotkey_error_text.is_empty());
+        assert!(view.layout_prefix_warning_text.contains("Alt+Shift"));
+        assert!(view.save_enabled);
+    }
+
+    #[test]
+    fn exact_duplicate_blocks_save_but_shifted_same_trigger_is_allowed() {
+        let mut duplicate_state = DomainState::new();
+        duplicate_state.apply_loaded(Settings::default());
+        duplicate_state.apply_loaded_autostart(false);
+        duplicate_state.update_manual_correction_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::ctrl_alt(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+        duplicate_state.update_selected_text_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::ctrl_alt(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+
+        let duplicate_view = duplicate_state.view_state();
+        assert!(duplicate_view.dirty);
+        assert!(!duplicate_view.hotkey_error_text.is_empty());
+        assert!(!duplicate_view.save_enabled);
+
+        let mut shifted_state = DomainState::new();
+        shifted_state.apply_loaded(Settings::default());
+        shifted_state.apply_loaded_autostart(false);
+        shifted_state.update_manual_correction_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::none(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+        shifted_state.update_selected_text_hotkey(HotkeySpec::new(
+            crate::model::HotkeyModifiers::shift(),
+            crate::model::HotkeyTrigger::F12,
+        ));
+
+        let shifted_view = shifted_state.view_state();
+        assert!(shifted_view.dirty);
+        assert!(shifted_view.hotkey_error_text.is_empty());
+        assert!(shifted_view.save_enabled);
+    }
+
+    #[test]
     fn manual_and_selected_hotkey_updates_do_not_start_layout_switch_capture() {
         let mut state = DomainState::new();
         state.apply_loaded(Settings::default());

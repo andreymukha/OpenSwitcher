@@ -1865,6 +1865,7 @@ mod tests {
         assert!(hotkey_key_is_modifier_only(gdk::Key::ISO_Level5_Shift));
         assert!(hotkey_key_is_modifier_only(gdk::Key::ISO_Next_Group));
         assert!(hotkey_key_is_modifier_only(gdk::Key::ISO_Prev_Group));
+        assert!(hotkey_key_is_modifier_only(gdk::Key::Mode_switch));
         assert!(!hotkey_key_is_modifier_only(gdk::Key::space));
     }
 
@@ -1900,6 +1901,23 @@ mod tests {
     }
 
     #[test]
+    fn hotkey_capture_uses_event_state_for_ctrl_alt_f12() {
+        let dialog_state = HotkeyDialogState::default();
+
+        assert_eq!(
+            hotkey_spec_from_key_event(
+                &dialog_state,
+                gdk::Key::F12,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK,
+            ),
+            Some(HotkeySpec::new(
+                HotkeyModifiers::ctrl_alt(),
+                HotkeyTrigger::F12,
+            )),
+        );
+    }
+
+    #[test]
     fn hotkey_capture_uses_event_state_for_shift_ctrl_alt_insert() {
         let mut dialog_state = HotkeyDialogState::default();
         dialog_state.ctrl = true;
@@ -1926,10 +1944,32 @@ mod tests {
             hotkey_spec_from_key_event(
                 &dialog_state,
                 gdk::Key::space,
-                gdk::ModifierType::SHIFT_MASK | gdk::ModifierType::CONTROL_MASK,
+                gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::ALT_MASK,
             ),
             None,
         );
+    }
+
+    #[test]
+    fn hotkey_capture_ignores_layout_only_keysyms() {
+        let dialog_state = HotkeyDialogState::default();
+        let event_state = gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::ALT_MASK;
+
+        for key in [
+            gdk::Key::ISO_Next_Group,
+            gdk::Key::ISO_Prev_Group,
+            gdk::Key::ISO_Level5_Shift,
+            gdk::Key::Mode_switch,
+        ] {
+            assert!(hotkey_key_is_modifier_only(key), "{key:?}");
+            assert_eq!(
+                hotkey_spec_from_key_event(&dialog_state, key, event_state),
+                None,
+                "{key:?}"
+            );
+        }
     }
 
     #[test]

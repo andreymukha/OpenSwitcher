@@ -6,6 +6,7 @@ RUN_DIR="$SCRIPT_DIR/.run"
 LOG_DIR="$RUN_DIR/logs"
 PID_DIR="$RUN_DIR/pids"
 LINUX_INPUT_HELPER="$SCRIPT_DIR/scripts/linux_input_setup.sh"
+WAYLAND_DIAGNOSTICS_HELPER="$SCRIPT_DIR/scripts/wayland_diagnostics.sh"
 
 PROFILE="${OPEN_SWITCHER_PROFILE:-debug}"
 TARGET_DIR="$SCRIPT_DIR/target/$PROFILE"
@@ -44,6 +45,8 @@ mkdir -p "$LOG_DIR" "$PID_DIR"
 
 # shellcheck source=/dev/null
 source "$LINUX_INPUT_HELPER"
+# shellcheck source=/dev/null
+source "$WAYLAND_DIAGNOSTICS_HELPER"
 
 ensure_dbus_address() {
     if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -S "/run/user/$(id -u)/bus" ]]; then
@@ -204,6 +207,9 @@ run_doctor_command() {
     case "$target" in
     linux-input|"")
         openswitcher_linux_input_doctor
+        ;;
+    wayland)
+        openswitcher_wayland_doctor
         ;;
     -h|--help|help)
         usage
@@ -563,7 +569,7 @@ usage() {
 Использование:
   ./manage.sh dev <команда>
   ./manage.sh systemd <команда>
-  ./manage.sh doctor [linux-input]
+  ./manage.sh doctor [linux-input|wayland]
   ./manage.sh bootstrap linux-input
   ./manage.sh <команда>            # алиасы на dev-режим
 
@@ -588,6 +594,7 @@ systemd-команды:
 
 doctor-команды:
   doctor                Проверить Linux input setup для '/dev/input/*' и '/dev/uinput'
+  doctor wayland        Показать диагностику Wayland/GNOME окружения и uinput
 
 bootstrap-команды:
   bootstrap linux-input Установить udev rules и same-session ACL bridge для Linux input setup

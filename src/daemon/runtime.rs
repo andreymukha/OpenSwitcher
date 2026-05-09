@@ -1146,6 +1146,89 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn gnome_wayland_without_observation_rejects_untrusted_legacy_english_for_auto_correction() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: english_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            gnome_wayland_context(),
+        );
+
+        assert!(matches!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Unknown { .. }
+        ));
+        assert_eq!(
+            runtime.auto_correction_layout_kind(),
+            AppLayoutKind::Unknown
+        );
+        assert!(runtime.feature_availability().selected_text_switch);
+    }
+
+    #[test]
+    fn gnome_wayland_without_observation_rejects_untrusted_legacy_russian_for_auto_correction() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: russian_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: russian_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            gnome_wayland_context(),
+        );
+
+        assert!(matches!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Unknown { .. }
+        ));
+        assert_eq!(
+            runtime.auto_correction_layout_kind(),
+            AppLayoutKind::Unknown
+        );
+        assert!(runtime.feature_availability().selected_text_switch);
+    }
+
+    #[test]
+    fn x11_keeps_untrusted_legacy_state_behavior_unchanged() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: english_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            cinnamon_x11_context(),
+        );
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            }
+        );
+        assert_eq!(
+            runtime.auto_correction_layout_kind(),
+            AppLayoutKind::English
+        );
+    }
+
+    #[test]
     fn refresh_current_layout_observation_reads_gsettings_only_for_gnome_wayland() {
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
@@ -2870,6 +2953,17 @@ fn effective_current_layout_state(
     if is_gnome_wayland_context(context) {
         if let Some(observed_state) = observed_state {
             return observed_state.clone();
+        }
+        if matches!(
+            raw_state,
+            CurrentLayoutState::Known {
+                trustworthy: false,
+                ..
+            }
+        ) {
+            return CurrentLayoutState::Unknown {
+                reason: "gnome-wayland-observation:missing-untrusted-legacy-fallback".to_string(),
+            };
         }
     }
 

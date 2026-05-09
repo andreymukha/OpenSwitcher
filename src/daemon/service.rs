@@ -2,9 +2,9 @@ use crate::daemon::input_backend::{
     ActiveInputBackend, InputBackendLifecycle, KeyboardInputBackendOpener, OpenedInputBackend,
 };
 use crate::daemon::keyboard::{
-    hotkey_trigger_to_evdev_key, is_character, is_modifier, log_input_debug, KeyboardController,
-    ManualCurrentWordCompletion, ManualCurrentWordOutcome, ManualCurrentWordStartOutcome,
-    ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
+    hotkey_trigger_to_evdev_key, is_character, is_modifier, is_wayland_focus_switch_shortcut,
+    log_input_debug, KeyboardController, ManualCurrentWordCompletion, ManualCurrentWordOutcome,
+    ManualCurrentWordStartOutcome, ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
 };
 use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
@@ -15,7 +15,7 @@ use crate::daemon::switch_logic::{
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
-use crate::model::{HotkeyModifiers, HotkeySpec};
+use crate::model::{HotkeyModifiers, HotkeySpec, SessionType};
 use evdev::InputEventKind;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -1068,6 +1068,18 @@ impl DaemonService {
         let config = self.runtime.config_snapshot()?;
         self.modifiers.update(key, value);
         self.shared_modifiers.store(self.modifiers);
+
+        if should_invalidate_for_wayland_focus_switch_shortcut(
+            self.runtime.as_ref(),
+            self.modifiers,
+            key,
+            value,
+        ) {
+            self.handle_non_key_invalidation(
+                "wayland-focus-switch-invalidation",
+                "word context invalidated by Wayland focus-switch shortcut",
+            );
+        }
 
         if self.layout_shortcut_latched
             && !self
@@ -2170,10 +2182,22 @@ fn hotkey_modifiers_from_state(modifiers: ModifierState) -> HotkeyModifiers {
     )
 }
 
+pub(crate) fn should_invalidate_for_wayland_focus_switch_shortcut(
+    runtime: &RuntimeState,
+    modifiers: ModifierState,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    runtime.session_type() == SessionType::Wayland
+        && is_wayland_focus_switch_shortcut(modifiers, key, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SelectedTextHotkey, UndoKey};
+    use crate::model::{
+        DesktopEnvironment, DistroKind, SelectedTextHotkey, SessionType, SystemContext, UndoKey,
+    };
     use evdev::Key;
 
     // Test helpers
@@ -2192,6 +2216,14 @@ mod tests {
             modifiers.update(*key, 1);
         }
         modifiers
+    }
+
+    fn runtime_with_session_type(session_type: SessionType) -> RuntimeState {
+        RuntimeState::test_with_system_context(SystemContext {
+            session_type,
+            desktop_environment: DesktopEnvironment::Unknown,
+            distro: DistroKind::Unknown,
+        })
     }
 
     // Startup layout resync
@@ -3378,6 +3410,51 @@ mod tests {
         assert_eq!(correction_state, CurrentWordCorrectionState::Raw);
         assert_eq!(latch, None);
         assert_eq!(word_context, WordContext::default());
+    }
+
+    #[test]
+    fn wayland_focus_switch_policy_enables_shortcut_only_on_wayland() {
+        let modifiers = modifiers_with(&[Key::KEY_LEFTALT]);
+        let wayland_runtime = runtime_with_session_type(SessionType::Wayland);
+        let x11_runtime = runtime_with_session_type(SessionType::X11);
+        let unknown_runtime = runtime_with_session_type(SessionType::Unknown);
+
+        assert!(should_invalidate_for_wayland_focus_switch_shortcut(
+            &wayland_runtime,
+            modifiers,
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
+            &x11_runtime,
+            modifiers,
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
+            &unknown_runtime,
+            modifiers,
+            Key::KEY_TAB,
+            1,
+        ));
+    }
+
+    #[test]
+    fn wayland_focus_switch_policy_rejects_ctrl_modified_tab() {
+        let runtime = runtime_with_session_type(SessionType::Wayland);
+
+        assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
+            &runtime,
+            modifiers_with(&[Key::KEY_LEFTCTRL, Key::KEY_LEFTALT]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
+            &runtime,
+            modifiers_with(&[Key::KEY_LEFTCTRL, Key::KEY_LEFTMETA]),
+            Key::KEY_TAB,
+            1,
+        ));
     }
 
 }

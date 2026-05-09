@@ -1436,6 +1436,44 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn wayland_focus_switch_policy_uses_late_upgraded_runtime_context() {
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+        let runtime = runtime_with_config_and_context(
+            AppConfig::default(),
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Gnome,
+                distro: DistroKind::Ubuntu,
+            },
+        );
+        let mut modifiers = crate::daemon::keyboard::ModifierState::default();
+        modifiers.update(evdev::Key::KEY_LEFTALT, 1);
+
+        assert!(
+            !crate::daemon::service::should_invalidate_for_wayland_focus_switch_shortcut(
+                &runtime,
+                modifiers,
+                evdev::Key::KEY_TAB,
+                1,
+            )
+        );
+
+        assert!(runtime.refresh_system_context_with_detector(&detector));
+
+        assert!(
+            crate::daemon::service::should_invalidate_for_wayland_focus_switch_shortcut(
+                &runtime,
+                modifiers,
+                evdev::Key::KEY_TAB,
+                1,
+            )
+        );
+    }
+
+    #[test]
     fn late_context_upgrade_rejects_wayland_to_unknown_downgrade() {
         assert!(!is_late_system_context_upgrade(
             gnome_wayland_context(),
@@ -1846,6 +1884,42 @@ impl RuntimeState {
         runtime
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_with_system_context(system_context: SystemContext) -> Self {
+        let config_service = ConfigService {
+            config_path: PathBuf::from("test-config.toml"),
+            inner: RwLock::new(AppConfig::default()),
+        };
+        let enabled = config_service.auto_switch_enabled().unwrap_or(true);
+
+        Self {
+            enabled: AtomicBool::new(enabled),
+            should_exit: AtomicBool::new(false),
+            hotkey_capture_inhibition_started_at: Instant::now(),
+            settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
+            layout_state: RwLock::new(CurrentLayoutState::Unknown {
+                reason: "test".to_string(),
+            }),
+            backend: Mutex::new(None),
+            layout_setup: RwLock::new(LayoutSetup::Unsupported {
+                reason: "test".to_string(),
+            }),
+            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
+            feature_availability: RwLock::new(FeatureAvailability {
+                auto_switch: false,
+                manual_word_fix: false,
+                selected_text_switch: true,
+                reason: Some("test".to_string()),
+            }),
+            system_context: RwLock::new(system_context),
+            current_layout_observation: RwLock::new(None),
+            config_service,
+            capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
+            background_sync_started: AtomicBool::new(false),
+            pending_status_change: AtomicBool::new(false),
+        }
+    }
+
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
     }
@@ -1935,6 +2009,10 @@ impl RuntimeState {
             .system_context
             .read()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub(crate) fn session_type(&self) -> SessionType {
+        self.system_context().session_type
     }
 
     fn update_current_layout_observation(

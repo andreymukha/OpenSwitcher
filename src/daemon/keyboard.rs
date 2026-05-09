@@ -381,7 +381,8 @@ impl KeyboardController {
 
         let virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
         let pointer_watcher = PointerWatcher::spawn(pointer_paths);
-        let input_target_watcher = InputTargetWatcher::spawn();
+        let session_type = detect_current_session_type();
+        let input_target_watcher = InputTargetWatcher::spawn(session_type);
 
         println!("[OK] Open-Switcher запущен.");
         log_input_debug(
@@ -728,12 +729,11 @@ impl PointerWatcher {
 // Input target watcher
 
 impl InputTargetWatcher {
-    fn spawn() -> Self {
+    fn spawn(session_type: SessionType) -> Self {
         let changed_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
 
-        let session_type = detect_current_session_type();
         if !should_enable_x11_input_target_watcher(session_type) {
             log_input_debug(
                 "input-target-watcher-disabled",
@@ -850,6 +850,21 @@ fn detect_current_session_type() -> SessionType {
 
 fn should_enable_x11_input_target_watcher(session_type: SessionType) -> bool {
     session_type == SessionType::X11
+}
+
+pub(crate) fn is_wayland_focus_switch_shortcut(
+    modifiers: ModifierState,
+    key: Key,
+    value: i32,
+) -> bool {
+    if value != 1 || key != Key::KEY_TAB || modifiers.is_ctrl_pressed() {
+        return false;
+    }
+
+    let alt_pressed = modifiers.is_alt_pressed();
+    let meta_pressed = modifiers.is_meta_pressed();
+
+    (alt_pressed && !meta_pressed) || (meta_pressed && !alt_pressed)
 }
 
 fn format_session_type(session_type: SessionType) -> &'static str {
@@ -2309,6 +2324,74 @@ mod tests {
         assert!(!pressed(&[(Key::KEY_LEFTCTRL, 0)]).is_ctrl_pressed());
         assert!(!pressed(&[(Key::KEY_LEFTALT, 0)]).is_alt_pressed());
         assert!(!pressed(&[(Key::KEY_LEFTMETA, 0)]).is_meta_pressed());
+    }
+
+    #[test]
+    fn wayland_focus_switch_shortcut_matches_alt_or_super_tab() {
+        assert!(is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTALT, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_RIGHTALT, 1), (Key::KEY_LEFTSHIFT, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTMETA, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_RIGHTMETA, 1), (Key::KEY_RIGHTSHIFT, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+    }
+
+    #[test]
+    fn wayland_focus_switch_shortcut_rejects_non_focus_switch_events() {
+        assert!(!is_wayland_focus_switch_shortcut(
+            ModifierState::default(),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTSHIFT, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTCTRL, 1), (Key::KEY_LEFTALT, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTCTRL, 1), (Key::KEY_LEFTMETA, 1)]),
+            Key::KEY_TAB,
+            1,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTALT, 1)]),
+            Key::KEY_A,
+            1,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTMETA, 1)]),
+            Key::KEY_A,
+            1,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTALT, 1)]),
+            Key::KEY_TAB,
+            0,
+        ));
+        assert!(!is_wayland_focus_switch_shortcut(
+            pressed(&[(Key::KEY_LEFTALT, 1)]),
+            Key::KEY_TAB,
+            2,
+        ));
     }
 
     // Correction replay helpers

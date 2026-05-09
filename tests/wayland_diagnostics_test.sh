@@ -18,6 +18,17 @@ assert_contains() {
     fi
 }
 
+assert_not_contains() {
+    local haystack="$1"
+    local needle="$2"
+    if [[ "$haystack" == *"$needle"* ]]; then
+        echo "expected output not to contain: $needle" >&2
+        echo "--- output ---" >&2
+        printf '%s\n' "$haystack" >&2
+        exit 1
+    fi
+}
+
 write_gsettings_fixture() {
     local root="$1"
     mkdir -p "$root"
@@ -75,6 +86,7 @@ test_wayland_doctor_reports_trusted_gnome_wayland_context() {
         XDG_RUNTIME_DIR="$fixture/runtime" \
         DISPLAY=:0 \
         OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
         OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
             openswitcher_wayland_doctor 2>&1
     )"
@@ -84,6 +96,10 @@ test_wayland_doctor_reports_trusted_gnome_wayland_context() {
     assert_contains "$output" "Desktop hint: GNOME"
     assert_contains "$output" "Wayland socket: live"
     assert_contains "$output" "DISPLAY under Wayland: present (normal for XWayland)"
+    assert_contains "$output" "Wayland support status: supported (GNOME Wayland confirmed target)"
+    assert_contains "$output" "Layout switch detection backend: GNOME gsettings"
+    assert_contains "$output" "Layout observation backend: GNOME input-sources"
+    assert_contains "$output" "Layout-dependent correction: supported"
     assert_contains "$output" "GNOME keybinding primary: ['<Super>space']"
     assert_contains "$output" "GNOME keybinding primary summary: supported Super+Space"
     assert_contains "$output" "GNOME keybinding backward summary: unsupported"
@@ -114,6 +130,7 @@ test_wayland_doctor_reports_degraded_gnome_sources_without_failing() {
         WAYLAND_DISPLAY=missing-wayland \
         XDG_RUNTIME_DIR="$fixture/runtime" \
         OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
         OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
             openswitcher_wayland_doctor 2>&1
     )"
@@ -124,6 +141,101 @@ test_wayland_doctor_reports_degraded_gnome_sources_without_failing() {
     assert_contains "$output" "GNOME sources: untrusted"
     assert_contains "$output" "Current GNOME layout: unsupported"
     assert_contains "$output" "uinput access: unavailable"
+}
+
+test_wayland_doctor_reports_degraded_kde_wayland_without_gnome_backend() {
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    mkdir -p "$fixture/gsettings" "$fixture/dev"
+
+    local output
+    output="$(
+        XDG_SESSION_TYPE=wayland \
+        XDG_CURRENT_DESKTOP=KDE \
+        XDG_SESSION_DESKTOP=plasma \
+        DESKTOP_SESSION=plasma \
+        WAYLAND_DISPLAY=wayland-test \
+        XDG_RUNTIME_DIR="$fixture/runtime" \
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
+            openswitcher_wayland_doctor 2>&1
+    )"
+
+    assert_contains "$output" "Session hint: Wayland"
+    assert_contains "$output" "Desktop hint: KDE"
+    assert_contains "$output" "Wayland support status: degraded (best-effort; desktop not confirmed yet)"
+    assert_contains "$output" "Wayland warning: non-GNOME Wayland is diagnostics-first and needs manual smoke"
+    assert_contains "$output" "Layout switch detection backend: unavailable for this desktop"
+    assert_contains "$output" "Layout observation backend: unavailable for this desktop"
+    assert_contains "$output" "Layout-dependent correction: degraded"
+    assert_not_contains "$output" "Layout observation backend: GNOME input-sources"
+}
+
+test_wayland_doctor_reports_unconfirmed_wayland_desktops_as_best_effort() {
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    mkdir -p "$fixture/gsettings" "$fixture/dev"
+
+    local case_entry=""
+    for case_entry in "sway|sway" "Hyprland|Hyprland" "|Unknown"; do
+        local desktop_value="${case_entry%%|*}"
+        local expected_hint="${case_entry#*|}"
+
+        local output
+        output="$(
+            XDG_SESSION_TYPE=wayland \
+            XDG_CURRENT_DESKTOP="$desktop_value" \
+            XDG_SESSION_DESKTOP="$desktop_value" \
+            DESKTOP_SESSION="$desktop_value" \
+            WAYLAND_DISPLAY=wayland-test \
+            XDG_RUNTIME_DIR="$fixture/runtime" \
+            OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+            OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
+            OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
+                openswitcher_wayland_doctor 2>&1
+        )"
+
+        assert_contains "$output" "Session hint: Wayland"
+        assert_contains "$output" "Desktop hint: $expected_hint"
+        assert_contains "$output" "Wayland support status: unknown (best-effort; needs manual smoke)"
+        assert_contains "$output" "Wayland warning: non-GNOME Wayland is diagnostics-first and needs manual smoke"
+        assert_contains "$output" "Layout switch detection backend: unavailable for this desktop"
+        assert_contains "$output" "Layout observation backend: unavailable for this desktop"
+        assert_contains "$output" "Layout-dependent correction: unknown"
+    done
+}
+
+test_wayland_doctor_does_not_warn_for_x11() {
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    mkdir -p "$fixture/gsettings" "$fixture/dev"
+
+    local output
+    output="$(
+        XDG_SESSION_TYPE=x11 \
+        XDG_CURRENT_DESKTOP=KDE \
+        XDG_SESSION_DESKTOP=plasma \
+        DESKTOP_SESSION=plasma \
+        DISPLAY=:0 \
+        WAYLAND_DISPLAY= \
+        XDG_RUNTIME_DIR="$fixture/runtime" \
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
+            openswitcher_wayland_doctor 2>&1
+    )"
+
+    assert_contains "$output" "Session hint: X11"
+    assert_contains "$output" "Desktop hint: KDE"
+    assert_contains "$output" "Wayland support status: not applicable (X11 session)"
+    assert_not_contains "$output" "Wayland warning: non-GNOME Wayland"
 }
 
 test_wayland_doctor_reports_trusted_gb_gnome_sources() {
@@ -146,6 +258,7 @@ test_wayland_doctor_reports_trusted_gb_gnome_sources() {
         XDG_SESSION_TYPE=wayland \
         XDG_CURRENT_DESKTOP=GNOME \
         OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
         OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
             openswitcher_wayland_doctor 2>&1
     )"
@@ -169,6 +282,7 @@ test_manage_dispatches_wayland_doctor() {
         WAYLAND_DISPLAY=wayland-test \
         XDG_RUNTIME_DIR="$fixture/runtime" \
         OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_SYSTEMD_ENV_FILE=/dev/null \
         OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
             "$REPO_ROOT/manage.sh" doctor wayland 2>&1
     )"
@@ -180,6 +294,9 @@ test_manage_dispatches_wayland_doctor() {
 
 test_wayland_doctor_reports_trusted_gnome_wayland_context
 test_wayland_doctor_reports_degraded_gnome_sources_without_failing
+test_wayland_doctor_reports_degraded_kde_wayland_without_gnome_backend
+test_wayland_doctor_reports_unconfirmed_wayland_desktops_as_best_effort
+test_wayland_doctor_does_not_warn_for_x11
 test_wayland_doctor_reports_trusted_gb_gnome_sources
 test_manage_dispatches_wayland_doctor
 

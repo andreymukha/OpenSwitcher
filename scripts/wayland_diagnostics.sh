@@ -102,6 +102,34 @@ openswitcher_wayland_doctor_session_hint() {
     esac
 }
 
+openswitcher_wayland_doctor_session_kind() {
+    local xdg_session_type="$1"
+    local display="$2"
+    local wayland_socket_live="$3"
+
+    case "${xdg_session_type,,}" in
+        wayland)
+            printf '%s\n' "wayland"
+            ;;
+        x11)
+            if [[ "$wayland_socket_live" == "yes" ]]; then
+                printf '%s\n' "wayland"
+            else
+                printf '%s\n' "x11"
+            fi
+            ;;
+        *)
+            if [[ "$wayland_socket_live" == "yes" ]]; then
+                printf '%s\n' "wayland"
+            elif [[ -n "$display" ]]; then
+                printf '%s\n' "x11"
+            else
+                printf '%s\n' "unknown"
+            fi
+            ;;
+    esac
+}
+
 openswitcher_wayland_doctor_desktop_hint() {
     local value="$1"
 
@@ -120,6 +148,47 @@ openswitcher_wayland_doctor_desktop_hint() {
             ;;
         *)
             printf '%s\n' "$value"
+            ;;
+    esac
+}
+
+openswitcher_wayland_doctor_print_wayland_support_summary() {
+    local session_kind="$1"
+    local desktop_hint="$2"
+    local desktop_normalized="${desktop_hint,,}"
+
+    case "$session_kind" in
+        wayland)
+            if [[ "$desktop_normalized" == "gnome" ]]; then
+                printf '%s\n' "Wayland support status: supported (GNOME Wayland confirmed target)"
+                printf '%s\n' "Layout switch detection backend: GNOME gsettings"
+                printf '%s\n' "Layout observation backend: GNOME input-sources"
+                printf '%s\n' "Layout-dependent correction: supported"
+            elif [[ "$desktop_normalized" == "kde" ]]; then
+                printf '%s\n' "Wayland support status: degraded (best-effort; desktop not confirmed yet)"
+                printf '%s\n' "Wayland warning: non-GNOME Wayland is diagnostics-first and needs manual smoke"
+                printf '%s\n' "Layout switch detection backend: unavailable for this desktop"
+                printf '%s\n' "Layout observation backend: unavailable for this desktop"
+                printf '%s\n' "Layout-dependent correction: degraded"
+            else
+                printf '%s\n' "Wayland support status: unknown (best-effort; needs manual smoke)"
+                printf '%s\n' "Wayland warning: non-GNOME Wayland is diagnostics-first and needs manual smoke"
+                printf '%s\n' "Layout switch detection backend: unavailable for this desktop"
+                printf '%s\n' "Layout observation backend: unavailable for this desktop"
+                printf '%s\n' "Layout-dependent correction: unknown"
+            fi
+            ;;
+        x11)
+            printf '%s\n' "Wayland support status: not applicable (X11 session)"
+            printf '%s\n' "Layout switch detection backend: not applicable for this session"
+            printf '%s\n' "Layout observation backend: not applicable for this session"
+            printf '%s\n' "Layout-dependent correction: not applicable for Wayland diagnostics"
+            ;;
+        *)
+            printf '%s\n' "Wayland support status: unknown (session type unknown)"
+            printf '%s\n' "Layout switch detection backend: unknown"
+            printf '%s\n' "Layout observation backend: unknown"
+            printf '%s\n' "Layout-dependent correction: unknown"
             ;;
     esac
 }
@@ -315,6 +384,11 @@ openswitcher_wayland_doctor() {
     [[ -n "$desktop_hint_source" ]] || desktop_hint_source="$xdg_session_desktop"
     [[ -n "$desktop_hint_source" ]] || desktop_hint_source="$desktop_session"
 
+    local session_kind
+    session_kind="$(openswitcher_wayland_doctor_session_kind "$xdg_session_type" "$display" "$socket_live")"
+    local desktop_hint
+    desktop_hint="$(openswitcher_wayland_doctor_desktop_hint "$desktop_hint_source")"
+
     echo "OpenSwitcher Wayland doctor"
     echo
     echo "Session environment:"
@@ -332,8 +406,7 @@ openswitcher_wayland_doctor() {
     echo
     printf 'Session hint: %s\n' \
         "$(openswitcher_wayland_doctor_session_hint "$xdg_session_type" "$display" "$socket_live")"
-    printf 'Desktop hint: %s\n' \
-        "$(openswitcher_wayland_doctor_desktop_hint "$desktop_hint_source")"
+    printf 'Desktop hint: %s\n' "$desktop_hint"
     if [[ -n "$socket_path" && "$socket_live" == "yes" ]]; then
         printf 'Wayland socket: live (%s)\n' "$socket_path"
     elif [[ -n "$socket_path" ]]; then
@@ -343,6 +416,18 @@ openswitcher_wayland_doctor() {
     fi
     if [[ "${xdg_session_type,,}" == "wayland" && -n "$display" ]]; then
         printf '%s\n' "DISPLAY under Wayland: present (normal for XWayland)"
+    fi
+
+    echo
+    openswitcher_wayland_doctor_print_wayland_support_summary "$session_kind" "$desktop_hint"
+
+    if [[ "${desktop_hint,,}" != "gnome" ]]; then
+        echo
+        printf '%s\n' "GNOME diagnostics: skipped (desktop is not GNOME)"
+        echo
+        echo "uinput:"
+        openswitcher_wayland_doctor_uinput_summary
+        return 0
     fi
 
     echo

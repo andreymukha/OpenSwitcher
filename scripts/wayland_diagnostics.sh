@@ -203,7 +203,7 @@ openswitcher_wayland_doctor_sources_summary() {
         printf '%s\n' "GNOME sources: malformed"
     else
         local pair_count=$(( ${#source_values[@]} / 2 ))
-        local saw_us=0
+        local english_source=""
         local saw_ru=0
         local trusted=1
         local i=0
@@ -214,15 +214,20 @@ openswitcher_wayland_doctor_sources_summary() {
                 trusted=0
             fi
             case "$source_id" in
-                us) saw_us=1 ;;
+                us|gb)
+                    if [[ -n "$english_source" ]]; then
+                        trusted=0
+                    fi
+                    english_source="$source_id"
+                    ;;
                 ru) saw_ru=1 ;;
                 *) trusted=0 ;;
             esac
             i=$((i + 2))
         done
 
-        if (( pair_count == 2 && saw_us == 1 && saw_ru == 1 && trusted == 1 )); then
-            printf '%s\n' "GNOME sources: trusted xkb/us+xkb/ru"
+        if (( pair_count == 2 && saw_ru == 1 && trusted == 1 )) && [[ -n "$english_source" ]]; then
+            printf '%s\n' "GNOME sources: trusted xkb/${english_source}+xkb/ru"
         else
             printf '%s\n' "GNOME sources: untrusted"
         fi
@@ -236,7 +241,7 @@ openswitcher_wayland_doctor_sources_summary() {
         local current_type="${mru_values[0]}"
         local current_id="${mru_values[1]}"
         case "$current_type:$current_id" in
-            xkb:us)
+            xkb:us|xkb:gb)
                 printf '%s\n' "Current GNOME layout: English"
                 ;;
             xkb:ru)

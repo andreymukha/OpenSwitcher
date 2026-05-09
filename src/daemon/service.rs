@@ -3,8 +3,9 @@ use crate::daemon::input_backend::{
 };
 use crate::daemon::keyboard::{
     hotkey_trigger_to_evdev_key, is_character, is_modifier, is_wayland_focus_switch_shortcut,
-    log_input_debug, KeyboardController, ManualCurrentWordCompletion, ManualCurrentWordOutcome,
-    ManualCurrentWordStartOutcome, ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
+    log_input_debug, CorrectionExecutionOutcome, CorrectionLayoutSwitchOutcome, KeyboardController,
+    ManualCurrentWordCompletion, ManualCurrentWordOutcome, ManualCurrentWordStartOutcome,
+    ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
 };
 use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
@@ -108,8 +109,12 @@ struct DeferredManualCurrentWordSession {
 #[derive(Clone, Debug)]
 enum ManualCurrentWordFlow {
     Idle,
-    InFlight { session: DeferredManualCurrentWordSession },
-    DrainingDeferredInput { session: DeferredManualCurrentWordSession },
+    InFlight {
+        session: DeferredManualCurrentWordSession,
+    },
+    DrainingDeferredInput {
+        session: DeferredManualCurrentWordSession,
+    },
 }
 
 // D-Bus signal publishing diagnostics
@@ -253,6 +258,10 @@ fn auto_layout_correction_supported_for_layout(layout_kind: AppLayoutKind) -> bo
     matches!(layout_kind, AppLayoutKind::English | AppLayoutKind::Russian)
 }
 
+fn correction_outcome_allows_optimistic_layout_update(outcome: CorrectionExecutionOutcome) -> bool {
+    outcome.layout_switch == CorrectionLayoutSwitchOutcome::AppliedUinput
+}
+
 // Logging format helpers
 
 fn format_legacy_layout(is_english: bool) -> &'static str {
@@ -268,16 +277,12 @@ fn format_legacy_layout(is_english: bool) -> &'static str {
 fn pending_word_commit_action_label(pending: Option<&PendingWordCommit>) -> &'static str {
     match pending.map(|pending| &pending.action) {
         Some(PendingWordCommitAction::LayoutCorrection) => "layout-correction",
-        Some(PendingWordCommitAction::SameLayoutCaseCorrection { .. }) => {
-            "same-layout-correction"
-        }
+        Some(PendingWordCommitAction::SameLayoutCaseCorrection { .. }) => "same-layout-correction",
         None => "none",
     }
 }
 
-fn pending_word_commit_separator_key(
-    pending: Option<&PendingWordCommit>,
-) -> Option<evdev::Key> {
+fn pending_word_commit_separator_key(pending: Option<&PendingWordCommit>) -> Option<evdev::Key> {
     pending.map(|pending| pending.separator_key)
 }
 
@@ -357,7 +362,8 @@ fn take_pending_word_commit_for_early_finish(
     }
 
     let pending = pending_word_commit.take()?;
-    let preserved_separator_key = preserved_separator_after_early_finish(Some(&pending), key, value);
+    let preserved_separator_key =
+        preserved_separator_after_early_finish(Some(&pending), key, value);
     Some(PendingWordCommitEarlyFinishState {
         pending,
         preserved_separator_key,
@@ -374,8 +380,7 @@ fn should_commit_manually_corrected_current_word(
     matches!(
         current_word_correction_state,
         CurrentWordCorrectionState::ManuallyCorrected
-    )
-        && buffer_len > 0
+    ) && buffer_len > 0
         && matches!(
             key,
             evdev::Key::KEY_SPACE | evdev::Key::KEY_TAB | evdev::Key::KEY_ENTER
@@ -456,10 +461,7 @@ fn should_clear_manual_hotkey_latch_on_key_press(
     event_timestamp: SystemTime,
 ) -> bool {
     manual_hotkey_latch.is_some_and(|latch| {
-        value == 1
-            && key != undo_key
-            && !is_modifier(key)
-            && event_timestamp > latch.armed_at
+        value == 1 && key != undo_key && !is_modifier(key) && event_timestamp > latch.armed_at
     })
 }
 
@@ -673,9 +675,12 @@ impl DaemonService {
 
             for event in events {
                 if let InputEventKind::Key(key) = event.kind() {
-                    if let Err(error) =
-                        self.handle_key_event(key, event.value(), event.timestamp(), InputOrigin::Physical)
-                    {
+                    if let Err(error) = self.handle_key_event(
+                        key,
+                        event.value(),
+                        event.timestamp(),
+                        InputOrigin::Physical,
+                    ) {
                         log_input_debug(
                             "event-handler-error",
                             &format!("key={key:?} value={} error={error}", event.value()),
@@ -768,7 +773,11 @@ impl DaemonService {
             &mut self.manual_current_word_flow,
             ManualCurrentWordFlow::Idle,
         ) {
-            ManualCurrentWordFlow::InFlight { session } if session.request_id == completion.request_id => session,
+            ManualCurrentWordFlow::InFlight { session }
+                if session.request_id == completion.request_id =>
+            {
+                session
+            }
             other => {
                 self.manual_current_word_flow = other;
                 return Ok(());
@@ -795,7 +804,8 @@ impl DaemonService {
                     used_current_buffer: true,
                     extra_backspaces: plan.extra_backspaces,
                 };
-                let _ = finalize_manual_correction(&mut self.buffer, &mut self.word_context, &applied);
+                let _ =
+                    finalize_manual_correction(&mut self.buffer, &mut self.word_context, &applied);
                 self.current_word_correction_state = CurrentWordCorrectionState::ManuallyCorrected;
                 self.manual_hotkey_latch = None;
                 self.manual_current_word_flow =
@@ -821,7 +831,10 @@ impl DaemonService {
     }
 
     fn abort_manual_current_word_flow(&mut self, reason: &str) {
-        let flow = std::mem::replace(&mut self.manual_current_word_flow, ManualCurrentWordFlow::Idle);
+        let flow = std::mem::replace(
+            &mut self.manual_current_word_flow,
+            ManualCurrentWordFlow::Idle,
+        );
         let details = match &flow {
             ManualCurrentWordFlow::InFlight { session }
             | ManualCurrentWordFlow::DrainingDeferredInput { session } => format!(
@@ -854,7 +867,9 @@ impl DaemonService {
         };
 
         let Some(event) = event else {
-            if let ManualCurrentWordFlow::DrainingDeferredInput { session } = &self.manual_current_word_flow {
+            if let ManualCurrentWordFlow::DrainingDeferredInput { session } =
+                &self.manual_current_word_flow
+            {
                 if should_restart_manual_current_word_after_drain(
                     session.deferred_input.len(),
                     session.retry_after_drain_requested,
@@ -875,13 +890,20 @@ impl DaemonService {
             return Ok(());
         };
 
-        self.handle_key_event(event.key, event.value, event.timestamp, InputOrigin::DeferredReplay)
+        self.handle_key_event(
+            event.key,
+            event.value,
+            event.timestamp,
+            InputOrigin::DeferredReplay,
+        )
     }
 
     fn manual_current_word_flow_seen_real_next_step(&self) -> bool {
         match &self.manual_current_word_flow {
             ManualCurrentWordFlow::InFlight { session }
-            | ManualCurrentWordFlow::DrainingDeferredInput { session } => session.seen_real_next_step,
+            | ManualCurrentWordFlow::DrainingDeferredInput { session } => {
+                session.seen_real_next_step
+            }
             ManualCurrentWordFlow::Idle => false,
         }
     }
@@ -1155,8 +1177,7 @@ impl DaemonService {
             return Ok(());
         }
 
-        let settings_hotkey_capture_inhibited =
-            self.runtime.settings_hotkey_capture_inhibited();
+        let settings_hotkey_capture_inhibited = self.runtime.settings_hotkey_capture_inhibited();
 
         if selected_text_hotkey_matches_when_allowed(
             config.selected_text_hotkey,
@@ -1164,8 +1185,7 @@ impl DaemonService {
             key,
             value,
             settings_hotkey_capture_inhibited,
-        )
-        {
+        ) {
             log_selected_text_debug(
                 "hotkey-matched",
                 &format!(
@@ -1194,8 +1214,7 @@ impl DaemonService {
             key,
             value,
             settings_hotkey_capture_inhibited,
-        )
-        {
+        ) {
             self.suppressed_undo_key = Some(key);
             if self.begin_deferred_manual_current_word_correction(
                 manual_correction_key,
@@ -1471,9 +1490,10 @@ impl DaemonService {
                     && !self.modifiers.is_meta_pressed();
 
                 if plain_character_input {
-                    self.current_word_correction_state = next_current_word_state_after_plain_character_input(
-                        self.current_word_correction_state,
-                    );
+                    self.current_word_correction_state =
+                        next_current_word_state_after_plain_character_input(
+                            self.current_word_correction_state,
+                        );
                     // Once we are typing the current word again, the cursor is no longer
                     // "after a finished word". Keep only the active buffer state.
                     self.word_context.valid = true;
@@ -1719,8 +1739,22 @@ impl DaemonService {
             return Ok(None);
         };
         let modifiers = self.modifiers;
-        self.keyboard_mut()?
+        let outcome = self
+            .keyboard_mut()?
             .apply_correction(&prepared.plan, config, modifiers)?;
+        if correction_path == CorrectionPath::AutoWordCommit
+            && correction_outcome_allows_optimistic_layout_update(outcome)
+        {
+            let updated = self.runtime.optimistic_gnome_wayland_uinput_layout_switch();
+            log_layout_debug(
+                "gnome-wayland-optimistic-layout-switch",
+                &format!(
+                    "path={} outcome={:?} updated={updated}",
+                    correction_path.as_str(),
+                    outcome.layout_switch
+                ),
+            );
+        }
         self.finish_manual_correction_sync(config, correction_path)?;
         Ok(Some(AppliedManualCorrection {
             corrected_buffer: prepared.plan.buffer,
@@ -1959,11 +1993,7 @@ impl DaemonService {
             &format!(
                 "enabled={} current_layout={}",
                 enabled,
-                if layout {
-                    "EN"
-                } else {
-                    "RU"
-                }
+                if layout { "EN" } else { "RU" }
             ),
         );
         self.try_publish_signal_event(
@@ -1973,7 +2003,11 @@ impl DaemonService {
         self.runtime.clear_pending_status_change();
     }
 
-    fn try_publish_signal_event(&mut self, event: DbusSignalEvent, event_kind: DbusSignalEventKind) {
+    fn try_publish_signal_event(
+        &mut self,
+        event: DbusSignalEvent,
+        event_kind: DbusSignalEventKind,
+    ) {
         if self.signal_publisher.try_publish(event) {
             return;
         }
@@ -2003,10 +2037,7 @@ impl DaemonService {
         Ok(())
     }
 
-    fn install_opened_input_backend(
-        &mut self,
-        opened: OpenedInputBackend<ActiveInputBackend>,
-    ) {
+    fn install_opened_input_backend(&mut self, opened: OpenedInputBackend<ActiveInputBackend>) {
         let ActiveInputBackend {
             keyboard,
             selected_text_runner,
@@ -2020,7 +2051,10 @@ impl DaemonService {
     }
 
     fn handle_runtime_input_failure(&mut self, error: &SwitcherError) -> bool {
-        if self.input_backend.record_runtime_failure(error, Instant::now()) {
+        if self
+            .input_backend
+            .record_runtime_failure(error, Instant::now())
+        {
             self.reset_transient_input_state("input-backend-unavailable");
             self.drop_active_input_backend();
             return true;
@@ -2063,7 +2097,9 @@ impl DaemonService {
     }
 
     fn keyboard_mut(&mut self) -> Result<&mut KeyboardController, SwitcherError> {
-        self.keyboard.as_mut().ok_or(SwitcherError::KeyboardNotFound)
+        self.keyboard
+            .as_mut()
+            .ok_or(SwitcherError::KeyboardNotFound)
     }
 
     fn invalidate_word_context(&mut self) {
@@ -2415,8 +2451,10 @@ mod tests {
 
     #[test]
     fn selected_text_hotkey_matches_configured_f12_and_scroll_lock_variants() {
-        let shift_ctrl_alt_f12 =
-            HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), crate::model::HotkeyTrigger::F12);
+        let shift_ctrl_alt_f12 = HotkeySpec::new(
+            HotkeyModifiers::shift_ctrl_alt(),
+            crate::model::HotkeyTrigger::F12,
+        );
 
         assert!(selected_text_hotkey_matches(
             HotkeySpec::from(SelectedTextHotkey::ShiftF12),
@@ -2484,8 +2522,10 @@ mod tests {
     fn manual_correction_hotkey_matches_exact_modifiers() {
         let f12 = HotkeySpec::from(UndoKey::F12);
         let shift_f12 = HotkeySpec::from(SelectedTextHotkey::ShiftF12);
-        let ctrl_alt_f12 =
-            HotkeySpec::new(HotkeyModifiers::ctrl_alt(), crate::model::HotkeyTrigger::F12);
+        let ctrl_alt_f12 = HotkeySpec::new(
+            HotkeyModifiers::ctrl_alt(),
+            crate::model::HotkeyTrigger::F12,
+        );
         let shift_ctrl_alt_insert = HotkeySpec::new(
             HotkeyModifiers::shift_ctrl_alt(),
             crate::model::HotkeyTrigger::Insert,
@@ -2586,6 +2626,27 @@ mod tests {
         ));
         assert!(!auto_layout_correction_supported_for_layout(
             AppLayoutKind::Unknown
+        ));
+    }
+
+    #[test]
+    fn optimistic_layout_update_is_allowed_only_after_applied_uinput() {
+        use crate::daemon::keyboard::{CorrectionExecutionOutcome, CorrectionLayoutSwitchOutcome};
+
+        assert!(correction_outcome_allows_optimistic_layout_update(
+            CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::AppliedUinput,
+            }
+        ));
+        assert!(!correction_outcome_allows_optimistic_layout_update(
+            CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::AppliedX11,
+            }
+        ));
+        assert!(!correction_outcome_allows_optimistic_layout_update(
+            CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+            }
         ));
     }
 
@@ -2717,7 +2778,10 @@ mod tests {
         assert!(word_context.valid);
         assert_eq!(word_context.word_before_cursor, corrected_buffer);
         assert!(word_context.followed_by_separator);
-        assert_eq!(correction_state, CurrentWordCorrectionState::ManuallyCorrected);
+        assert_eq!(
+            correction_state,
+            CurrentWordCorrectionState::ManuallyCorrected
+        );
         assert_eq!(manual_hotkey_latch, latch);
     }
 
@@ -2970,17 +3034,11 @@ mod tests {
         };
         let mut pending_word_commit = Some(pending.clone());
 
-        let early_finish = take_pending_word_commit_for_early_finish(
-            &mut pending_word_commit,
-            Key::KEY_A,
-            1,
-        )
-        .unwrap();
-        let repeated = take_pending_word_commit_for_early_finish(
-            &mut pending_word_commit,
-            Key::KEY_B,
-            1,
-        );
+        let early_finish =
+            take_pending_word_commit_for_early_finish(&mut pending_word_commit, Key::KEY_A, 1)
+                .unwrap();
+        let repeated =
+            take_pending_word_commit_for_early_finish(&mut pending_word_commit, Key::KEY_B, 1);
 
         assert_eq!(
             early_finish,
@@ -3001,11 +3059,8 @@ mod tests {
         };
         let mut pending_word_commit = Some(pending.clone());
 
-        let early_finish = take_pending_word_commit_for_early_finish(
-            &mut pending_word_commit,
-            Key::KEY_A,
-            0,
-        );
+        let early_finish =
+            take_pending_word_commit_for_early_finish(&mut pending_word_commit, Key::KEY_A, 0);
 
         assert_eq!(early_finish, None);
         assert_eq!(pending_word_commit, Some(pending));
@@ -3033,11 +3088,8 @@ mod tests {
     fn early_finish_state_ignores_missing_pending_commit() {
         let mut pending_word_commit = None;
 
-        let early_finish = take_pending_word_commit_for_early_finish(
-            &mut pending_word_commit,
-            Key::KEY_A,
-            1,
-        );
+        let early_finish =
+            take_pending_word_commit_for_early_finish(&mut pending_word_commit, Key::KEY_A, 1);
 
         assert_eq!(early_finish, None);
         assert_eq!(pending_word_commit, None);
@@ -3456,5 +3508,4 @@ mod tests {
             1,
         ));
     }
-
 }

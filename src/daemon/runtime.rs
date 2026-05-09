@@ -425,6 +425,16 @@ mod tests {
         }
     }
 
+    fn british_english_layout() -> SystemLayout {
+        SystemLayout {
+            backend_key: "gb".to_string(),
+            normalized_code: LayoutCode::Gb,
+            display_name: "English (UK)".to_string(),
+            kind: AppLayoutKind::English,
+            index: Some(0),
+        }
+    }
+
     fn russian_layout() -> SystemLayout {
         SystemLayout {
             backend_key: "ru".to_string(),
@@ -987,6 +997,10 @@ undo_key = "Pause"
         gnome_sources(&[("xkb", "us"), ("xkb", "ru")])
     }
 
+    fn trusted_gnome_gb_sources() -> Vec<String> {
+        gnome_sources(&[("xkb", "gb"), ("xkb", "ru")])
+    }
+
     fn layout_observation_reader(
         calls: Arc<AtomicUsize>,
         mru_sources: Vec<String>,
@@ -1218,6 +1232,34 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn gnome_wayland_observation_trusts_gb_ru_sources_with_gb_current_mru() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_gb_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "gb"), ("xkb", "ru")])),
+        };
+
+        assert_eq!(
+            gnome_wayland_current_layout_state(&reader),
+            Some(known_layout_state(british_english_layout()))
+        );
+    }
+
+    #[test]
+    fn gnome_wayland_observation_trusts_gb_ru_sources_with_ru_current_mru() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_gb_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "gb")])),
+        };
+
+        assert_eq!(
+            gnome_wayland_current_layout_state(&reader),
+            Some(known_layout_state(russian_layout()))
+        );
+    }
+
+    #[test]
     fn gnome_wayland_observation_rejects_ibus_current_without_falling_through_to_xkb() {
         let reader = layout_observation_reader(
             Arc::new(AtomicUsize::new(0)),
@@ -1249,10 +1291,25 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn gnome_wayland_observation_rejects_configured_gb_variant() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(gnome_sources(&[("xkb", "gb+intl"), ("xkb", "ru")])),
+            mru_sources: Some(gnome_sources(&[("xkb", "gb+intl"), ("xkb", "ru")])),
+        };
+
+        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+    }
+
+    #[test]
     fn gnome_wayland_observation_rejects_more_than_two_configured_xkb_sources() {
         let reader = LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru"), ("xkb", "de")])),
+            sources: Some(gnome_sources(&[
+                ("xkb", "us"),
+                ("xkb", "ru"),
+                ("xkb", "de"),
+            ])),
             mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
 
@@ -1693,6 +1750,170 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn optimistic_gnome_wayland_uinput_update_switches_us_english_to_russian() {
+        let runtime = test_runtime_with_backend_and_context(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+            gnome_wayland_context(),
+        );
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+
+        assert!(runtime.optimistic_gnome_wayland_uinput_layout_switch_with_reader(&reader));
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(russian_layout())
+        );
+    }
+
+    #[test]
+    fn optimistic_gnome_wayland_uinput_update_switches_russian_to_configured_gb() {
+        let runtime = test_runtime_with_backend_and_context(
+            known_layout_state(russian_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(russian_layout())),
+            }),
+            gnome_wayland_context(),
+        );
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_gb_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "gb")])),
+        };
+
+        assert!(runtime.optimistic_gnome_wayland_uinput_layout_switch_with_reader(&reader));
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(british_english_layout())
+        );
+    }
+
+    #[test]
+    fn optimistic_gnome_wayland_uinput_update_rejects_untrusted_sources() {
+        let cases: &[(&[(&str, &str)], &[(&str, &str)])] = &[
+            (
+                &[("xkb", "us"), ("xkb", "ru")],
+                &[("ibus", "mozc-jp"), ("xkb", "us")],
+            ),
+            (
+                &[("xkb", "ru+phonetic"), ("xkb", "us")],
+                &[("xkb", "ru+phonetic"), ("xkb", "us")],
+            ),
+            (
+                &[("xkb", "us+dvorak"), ("xkb", "ru")],
+                &[("xkb", "us+dvorak"), ("xkb", "ru")],
+            ),
+            (
+                &[("xkb", "us+colemak"), ("xkb", "ru")],
+                &[("xkb", "us+colemak"), ("xkb", "ru")],
+            ),
+            (
+                &[("xkb", "us+intl"), ("xkb", "ru")],
+                &[("xkb", "us+intl"), ("xkb", "ru")],
+            ),
+            (
+                &[("xkb", "gb+intl"), ("xkb", "ru")],
+                &[("xkb", "gb+intl"), ("xkb", "ru")],
+            ),
+            (
+                &[("xkb", "us"), ("xkb", "ru"), ("xkb", "de")],
+                &[("xkb", "us"), ("xkb", "ru")],
+            ),
+        ];
+
+        for (sources, mru_sources) in cases {
+            let runtime = test_runtime_with_backend_and_context(
+                known_layout_state(english_layout()),
+                Box::new(SnapshotBackend {
+                    snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+                }),
+                gnome_wayland_context(),
+            );
+            let reader = LayoutObservationReaderStub {
+                calls: Arc::new(AtomicUsize::new(0)),
+                sources: Some(gnome_sources(sources)),
+                mru_sources: Some(gnome_sources(mru_sources)),
+            };
+
+            assert!(
+                !runtime.optimistic_gnome_wayland_uinput_layout_switch_with_reader(&reader),
+                "sources={sources:?} mru_sources={mru_sources:?}"
+            );
+
+            assert_eq!(
+                runtime.current_layout_state(),
+                known_layout_state(english_layout())
+            );
+        }
+    }
+
+    #[test]
+    fn optimistic_gnome_wayland_uinput_update_rejects_non_gnome_wayland() {
+        let runtime = test_runtime_with_backend_and_context(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+            cinnamon_x11_context(),
+        );
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+
+        assert!(!runtime.optimistic_gnome_wayland_uinput_layout_switch_with_reader(&reader));
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
+        );
+    }
+
+    #[test]
+    fn background_observation_can_reconcile_optimistic_gnome_wayland_update() {
+        let runtime = test_runtime_with_backend_and_context(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+            gnome_wayland_context(),
+        );
+        let before_switch_reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+        let reconciliation_reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+
+        assert!(
+            runtime.optimistic_gnome_wayland_uinput_layout_switch_with_reader(&before_switch_reader)
+        );
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(russian_layout())
+        );
+
+        runtime.refresh_current_layout_observation_with_reader(&reconciliation_reader);
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
+        );
+    }
+
+    #[test]
     fn settings_hotkey_capture_inhibition_roundtrips() {
         let runtime = test_runtime_with_backend(
             known_layout_state(english_layout()),
@@ -2114,6 +2335,60 @@ impl RuntimeState {
                 layout_label(layout_is_english)
             ),
         );
+    }
+
+    pub(crate) fn optimistic_gnome_wayland_uinput_layout_switch(&self) -> bool {
+        self.optimistic_gnome_wayland_uinput_layout_switch_with_reader(
+            &CommandDesktopSettingsReader,
+        )
+    }
+
+    fn optimistic_gnome_wayland_uinput_layout_switch_with_reader<R: DesktopSettingsReader>(
+        &self,
+        reader: &R,
+    ) -> bool {
+        if !is_gnome_wayland_context(self.system_context()) {
+            log_layout_debug(
+                "gnome-wayland-optimistic-layout-switch",
+                "result=skipped reason=non-gnome-wayland-context",
+            );
+            return false;
+        }
+
+        let pair = match trusted_gnome_layout_pair_from_reader(reader) {
+            Some(pair) => pair,
+            None => return false,
+        };
+
+        let current_state = self.current_layout_state();
+        let next_layout = match current_state {
+            CurrentLayoutState::Known { layout, .. } => match layout.kind {
+                AppLayoutKind::English => pair.russian_layout,
+                AppLayoutKind::Russian => pair.english_layout,
+                AppLayoutKind::Other | AppLayoutKind::Unknown => {
+                    log_layout_debug(
+                        "gnome-wayland-optimistic-layout-switch",
+                        "result=skipped reason=current-layout-unsupported",
+                    );
+                    return false;
+                }
+            },
+            CurrentLayoutState::Unknown { .. } => {
+                log_layout_debug(
+                    "gnome-wayland-optimistic-layout-switch",
+                    "result=skipped reason=current-layout-unknown",
+                );
+                return false;
+            }
+        };
+
+        let next_state = known_layout_state_from_layout(next_layout);
+        let _ = self.update_current_layout_cache(
+            next_state.clone(),
+            "gnome-wayland-optimistic-layout-cache",
+        );
+        self.update_current_layout_observation(Some(next_state), "gnome-wayland-optimistic-uinput");
+        true
     }
 
     pub fn current_layout_state(&self) -> CurrentLayoutState {
@@ -2609,6 +2884,13 @@ struct GnomeInputSource {
     source_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedGnomeLayoutPair {
+    pub english_layout: SystemLayout,
+    pub russian_layout: SystemLayout,
+    pub current_layout: SystemLayout,
+}
+
 fn gnome_wayland_layout_state_from_bool(layout_is_english: bool) -> CurrentLayoutState {
     gnome_wayland_current_layout_state_from_code(if layout_is_english { "us" } else { "ru" })
 }
@@ -2619,6 +2901,13 @@ fn gnome_wayland_current_layout_state_from_code(layout_code: &str) -> CurrentLay
             "us".to_string(),
             LayoutCode::Us,
             "English".to_string(),
+            AppLayoutKind::English,
+            Some(0),
+        ),
+        "gb" => (
+            "gb".to_string(),
+            LayoutCode::Gb,
+            "English (UK)".to_string(),
             AppLayoutKind::English,
             Some(0),
         ),
@@ -2682,29 +2971,100 @@ fn gnome_wayland_current_layout_state<R: DesktopSettingsReader>(
     ))
 }
 
+fn trusted_gnome_layout_pair_from_reader<R: DesktopSettingsReader>(
+    reader: &R,
+) -> Option<TrustedGnomeLayoutPair> {
+    let configured_sources =
+        match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_SOURCES_KEY) {
+            Ok(values) => values,
+            Err(error) => {
+                log_layout_debug(
+                    "gnome-wayland-optimistic-layout-switch",
+                    &format!("result=skipped reason=sources-read-error error={error}"),
+                );
+                return None;
+            }
+        };
+    let mru_sources =
+        match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_MRU_SOURCES_KEY) {
+            Ok(values) => values,
+            Err(error) => {
+                log_layout_debug(
+                    "gnome-wayland-optimistic-layout-switch",
+                    &format!("result=skipped reason=mru-read-error error={error}"),
+                );
+                return None;
+            }
+        };
+
+    match trusted_gnome_layout_pair_from_sources(&configured_sources, &mru_sources) {
+        Ok(pair) => Some(pair),
+        Err(reason) => {
+            log_layout_debug(
+                "gnome-wayland-optimistic-layout-switch",
+                &format!("result=skipped reason={reason}"),
+            );
+            None
+        }
+    }
+}
+
 fn gnome_wayland_current_layout_state_from_sources(
     configured_sources: &[String],
     mru_sources: &[String],
 ) -> CurrentLayoutState {
-    let configured_sources = match gnome_input_sources_from_flat_values(configured_sources) {
-        Ok(sources) => sources,
-        Err(reason) => return gnome_wayland_unknown_layout_state(reason),
-    };
-    if !gnome_configured_sources_are_trusted_us_ru_pair(&configured_sources) {
-        return gnome_wayland_unknown_layout_state("unsupported-configured-sources");
+    match trusted_gnome_layout_pair_from_sources(configured_sources, mru_sources) {
+        Ok(pair) => known_layout_state_from_layout(pair.current_layout),
+        Err(reason) => gnome_wayland_unknown_layout_state(reason),
     }
+}
+
+pub(crate) fn trusted_gnome_layout_pair_from_sources(
+    configured_sources: &[String],
+    mru_sources: &[String],
+) -> Result<TrustedGnomeLayoutPair, &'static str> {
+    let configured_sources = gnome_input_sources_from_flat_values(configured_sources)?;
+    if configured_sources.len() != 2 {
+        return Err("unsupported-configured-sources");
+    }
+
+    let mut english_layout = None;
+    let mut russian_layout = None;
+    for (index, source) in configured_sources.iter().enumerate() {
+        match trusted_gnome_xkb_layout(source, index as u32) {
+            Some(layout) if layout.kind == AppLayoutKind::English && english_layout.is_none() => {
+                english_layout = Some(layout);
+            }
+            Some(layout) if layout.kind == AppLayoutKind::Russian && russian_layout.is_none() => {
+                russian_layout = Some(layout);
+            }
+            _ => return Err("unsupported-configured-sources"),
+        }
+    }
+
+    let english_layout = english_layout.ok_or("unsupported-configured-sources")?;
+    let russian_layout = russian_layout.ok_or("unsupported-configured-sources")?;
 
     let mru_sources = match gnome_input_sources_from_flat_values(mru_sources) {
         Ok(sources) if !sources.is_empty() => sources,
-        Ok(_) => return gnome_wayland_unknown_layout_state("empty-mru-sources"),
-        Err(reason) => return gnome_wayland_unknown_layout_state(reason),
+        Ok(_) => return Err("empty-mru-sources"),
+        Err(reason) => return Err(reason),
     };
 
     let current = &mru_sources[0];
-    match trusted_gnome_xkb_layout_code(current) {
-        Some(layout_code) => gnome_wayland_current_layout_state_from_code(layout_code),
-        None => gnome_wayland_unknown_layout_state("unsupported-current-source"),
-    }
+    let current_layout = if gnome_input_source_matches_layout(current, &english_layout) {
+        english_layout.clone()
+    } else if gnome_input_source_matches_layout(current, &russian_layout) {
+        russian_layout.clone()
+    } else {
+        return Err("unsupported-current-source");
+    };
+
+    Ok(TrustedGnomeLayoutPair {
+        english_layout,
+        russian_layout,
+        current_layout,
+    })
 }
 
 fn gnome_input_sources_from_flat_values(
@@ -2723,20 +3083,49 @@ fn gnome_input_sources_from_flat_values(
         .collect())
 }
 
-fn gnome_configured_sources_are_trusted_us_ru_pair(sources: &[GnomeInputSource]) -> bool {
-    sources.len() == 2
-        && sources.iter().any(|source| trusted_gnome_xkb_layout_code(source) == Some("us"))
-        && sources
-            .iter()
-            .any(|source| trusted_gnome_xkb_layout_code(source) == Some("ru"))
+fn known_layout_state_from_layout(layout: SystemLayout) -> CurrentLayoutState {
+    CurrentLayoutState::Known {
+        layout,
+        trustworthy: true,
+    }
 }
 
-fn trusted_gnome_xkb_layout_code(source: &GnomeInputSource) -> Option<&'static str> {
-    match (source.source_type.as_str(), source.source_id.as_str()) {
-        ("xkb", "us") => Some("us"),
-        ("xkb", "ru") => Some("ru"),
-        _ => None,
-    }
+fn trusted_gnome_xkb_layout(source: &GnomeInputSource, index: u32) -> Option<SystemLayout> {
+    let (normalized_code, display_name, kind) =
+        match (source.source_type.as_str(), source.source_id.as_str()) {
+            ("xkb", "us") => (
+                LayoutCode::Us,
+                "English".to_string(),
+                AppLayoutKind::English,
+            ),
+            ("xkb", "gb") => (
+                LayoutCode::Gb,
+                "English (UK)".to_string(),
+                AppLayoutKind::English,
+            ),
+            ("xkb", "ru") => (
+                LayoutCode::Ru,
+                "Russian".to_string(),
+                AppLayoutKind::Russian,
+            ),
+            _ => return None,
+        };
+
+    Some(SystemLayout {
+        backend_key: source.source_id.clone(),
+        normalized_code,
+        display_name,
+        kind,
+        index: Some(index),
+    })
+}
+
+fn gnome_input_source_matches_layout(source: &GnomeInputSource, layout: &SystemLayout) -> bool {
+    source.source_type == "xkb"
+        && layout
+            .normalized_code
+            .normalized_str()
+            .is_some_and(|code| source.source_id == code)
 }
 
 fn gnome_wayland_unknown_layout_state(reason: &'static str) -> CurrentLayoutState {

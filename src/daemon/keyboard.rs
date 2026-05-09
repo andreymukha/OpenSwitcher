@@ -128,7 +128,7 @@ enum WriterTransactionKind {
 enum WriterTransaction {
     Execute {
         kind: WriterTransactionKind,
-        reply: mpsc::Sender<Result<(), SwitcherError>>,
+        reply: mpsc::Sender<Result<CorrectionExecutionOutcome, SwitcherError>>,
     },
 }
 
@@ -148,6 +148,18 @@ pub enum ManualCurrentWordOutcome {
 pub enum ManualCurrentWordStartOutcome {
     Started(u64),
     RejectedBeforeMutation(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CorrectionExecutionOutcome {
+    pub layout_switch: CorrectionLayoutSwitchOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CorrectionLayoutSwitchOutcome {
+    NotNeeded,
+    AppliedUinput,
+    AppliedX11,
 }
 
 // Real keyboard device
@@ -446,12 +458,12 @@ impl KeyboardController {
         self.virtual_device.handle().type_separator(key)
     }
 
-    pub fn apply_correction(
+    pub(crate) fn apply_correction(
         &mut self,
         plan: &CorrectionPlan,
         config: &RuntimeConfigSnapshot,
         modifiers: ModifierState,
-    ) -> Result<(), SwitcherError> {
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
         self.virtual_device
             .handle()
             .apply_correction(plan.clone(), config.clone(), modifiers)
@@ -1078,17 +1090,16 @@ impl VirtualKeyboardWriter {
                 plan,
                 config,
                 modifiers,
-            })
-        {
+            }) {
             Ok(()) => Ok(ManualCurrentWordStartOutcome::Started(request_id)),
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 Err(SwitcherError::VirtualKeyboardWriterDisconnected)
             }
-            Err(mpsc::TrySendError::Full(_)) => Ok(
-                ManualCurrentWordStartOutcome::RejectedBeforeMutation(
+            Err(mpsc::TrySendError::Full(_)) => {
+                Ok(ManualCurrentWordStartOutcome::RejectedBeforeMutation(
                     "virtual-keyboard-writer-saturated".to_string(),
-                ),
-            ),
+                ))
+            }
         }
     }
 
@@ -1144,7 +1155,7 @@ impl VirtualKeyboardHandle {
         plan: CorrectionPlan,
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
-    ) -> Result<(), SwitcherError> {
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
         self.run_transaction(WriterTransactionKind::ApplyCorrection {
             plan,
             config,
@@ -1163,17 +1174,23 @@ impl VirtualKeyboardHandle {
             config,
             modifiers,
         })
+        .map(|_| ())
     }
 
     fn send_copy_shortcut(&self, modifiers: ModifierState) -> Result<(), SwitcherError> {
         self.run_transaction(WriterTransactionKind::CopyShortcut { modifiers })
+            .map(|_| ())
     }
 
     fn send_paste_shortcut(&self, modifiers: ModifierState) -> Result<(), SwitcherError> {
         self.run_transaction(WriterTransactionKind::PasteShortcut { modifiers })
+            .map(|_| ())
     }
 
-    fn run_transaction(&self, kind: WriterTransactionKind) -> Result<(), SwitcherError> {
+    fn run_transaction(
+        &self,
+        kind: WriterTransactionKind,
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
         self.ensure_alive()?;
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send_transaction_command(WriterTransaction::Execute {
@@ -1915,7 +1932,7 @@ fn run_correction(
     modifiers: ModifierState,
     x11_switcher: &mut Option<X11LayoutSwitcher>,
     switch_layout: bool,
-) -> Result<(), SwitcherError> {
+) -> Result<CorrectionExecutionOutcome, SwitcherError> {
     log_input_debug(
         "correction-transaction",
         &format!(
@@ -1939,8 +1956,8 @@ fn run_correction(
         thread::sleep(Duration::from_millis(config.backspace_ms));
     }
 
-    if switch_layout {
-        if let Some(switcher) = x11_switcher {
+    let layout_switch = if switch_layout {
+        if x11_switcher.is_some() {
             log_input_debug(
                 "correction-layout-switch",
                 &format!(
@@ -1948,33 +1965,6 @@ fn run_correction(
                     config.layout_switch_combo, config.layout_delay_ms
                 ),
             );
-            if let Err(e) = switcher.switch_layout(config.layout_switch_combo) {
-                log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
-                log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=x11 result=error fallback=uinput",
-                        config.layout_switch_combo
-                    ),
-                );
-                let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
-                uinput_switcher.switch_layout(config.layout_switch_combo)?;
-                log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=uinput result=ok hold_ms={}",
-                        config.layout_switch_combo, config.layout_delay_ms
-                    ),
-                );
-            } else {
-                log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=x11 result=ok",
-                        config.layout_switch_combo
-                    ),
-                );
-            }
         } else {
             log_input_debug(
                 "correction-layout-switch",
@@ -1983,18 +1973,36 @@ fn run_correction(
                     config.layout_switch_combo, config.layout_delay_ms
                 ),
             );
-            let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
-            uinput_switcher.switch_layout(config.layout_switch_combo)?;
-            log_input_debug(
+        }
+
+        let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
+        let x11 = x11_switcher
+            .as_mut()
+            .map(|switcher| switcher as &mut dyn LayoutSwitcher);
+        let outcome =
+            switch_layout_with_fallback(x11, &mut uinput_switcher, config.layout_switch_combo)?;
+        match outcome {
+            CorrectionLayoutSwitchOutcome::AppliedX11 => log_input_debug(
                 "correction-layout-switch",
                 &format!(
-                    "combo={:?} strategy=uinput result=ok",
+                    "combo={:?} strategy=x11 result=ok",
                     config.layout_switch_combo
                 ),
-            );
+            ),
+            CorrectionLayoutSwitchOutcome::AppliedUinput => log_input_debug(
+                "correction-layout-switch",
+                &format!(
+                    "combo={:?} strategy=uinput result=ok hold_ms={}",
+                    config.layout_switch_combo, config.layout_delay_ms
+                ),
+            ),
+            CorrectionLayoutSwitchOutcome::NotNeeded => {}
         }
         thread::sleep(Duration::from_millis(config.layout_delay_ms));
-    }
+        outcome
+    } else {
+        CorrectionLayoutSwitchOutcome::NotNeeded
+    };
 
     for stroke in &plan.buffer {
         let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
@@ -2015,7 +2023,33 @@ fn run_correction(
     }
 
     restore_modifiers(device, modifiers)?;
-    Ok(())
+    Ok(CorrectionExecutionOutcome { layout_switch })
+}
+
+fn switch_layout_with_fallback(
+    x11_switcher: Option<&mut dyn LayoutSwitcher>,
+    uinput_switcher: &mut dyn LayoutSwitcher,
+    combo: LayoutSwitchCombo,
+) -> Result<CorrectionLayoutSwitchOutcome, SwitcherError> {
+    if let Some(switcher) = x11_switcher {
+        if let Err(e) = switcher.switch_layout(combo) {
+            log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
+            log_input_debug(
+                "correction-layout-switch",
+                &format!(
+                    "combo={:?} strategy=x11 result=error fallback=uinput",
+                    combo
+                ),
+            );
+            uinput_switcher.switch_layout(combo)?;
+            return Ok(CorrectionLayoutSwitchOutcome::AppliedUinput);
+        }
+
+        return Ok(CorrectionLayoutSwitchOutcome::AppliedX11);
+    }
+
+    uinput_switcher.switch_layout(combo)?;
+    Ok(CorrectionLayoutSwitchOutcome::AppliedUinput)
 }
 
 // Virtual keyboard writer loop
@@ -2062,7 +2096,7 @@ fn run_virtual_keyboard_writer_loop(
                     true,
                 );
                 let outcome = match result {
-                    Ok(()) => ManualCurrentWordOutcome::Succeeded(plan),
+                    Ok(_) => ManualCurrentWordOutcome::Succeeded(plan),
                     Err(error) => {
                         log_input_debug(
                             "manual-current-word-writer-error",
@@ -2112,13 +2146,19 @@ fn run_virtual_keyboard_writer_loop(
                             modifiers,
                             &[uinput::event::keyboard::Key::LeftControl],
                             Some(&uinput::event::keyboard::Key::C),
-                        ),
+                        )
+                        .map(|_| CorrectionExecutionOutcome {
+                            layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                        }),
                         WriterTransactionKind::PasteShortcut { modifiers } => run_shortcut(
                             &mut device,
                             modifiers,
                             &[uinput::event::keyboard::Key::LeftControl],
                             Some(&uinput::event::keyboard::Key::V),
-                        ),
+                        )
+                        .map(|_| CorrectionExecutionOutcome {
+                            layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                        }),
                     };
                     let _ = reply.send(result);
                 }
@@ -2415,6 +2455,83 @@ mod tests {
         assert!(replay_shift_for_stroke(&uppercase_target, false));
     }
 
+    struct FakeLayoutSwitcher {
+        calls: usize,
+        fail: bool,
+    }
+
+    impl LayoutSwitcher for FakeLayoutSwitcher {
+        fn switch_layout(&mut self, _combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+            self.calls += 1;
+            if self.fail {
+                Err(SwitcherError::Io(io::Error::other("switch failed")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn layout_switch_outcome_reports_applied_x11_when_x11_succeeds() {
+        let mut x11 = FakeLayoutSwitcher {
+            calls: 0,
+            fail: false,
+        };
+        let mut uinput = FakeLayoutSwitcher {
+            calls: 0,
+            fail: false,
+        };
+
+        let outcome = switch_layout_with_fallback(
+            Some(&mut x11),
+            &mut uinput,
+            LayoutSwitchCombo::super_space(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CorrectionLayoutSwitchOutcome::AppliedX11);
+        assert_eq!(x11.calls, 1);
+        assert_eq!(uinput.calls, 0);
+    }
+
+    #[test]
+    fn layout_switch_outcome_reports_applied_uinput_for_uinput_strategy() {
+        let mut uinput = FakeLayoutSwitcher {
+            calls: 0,
+            fail: false,
+        };
+
+        let outcome =
+            switch_layout_with_fallback(None, &mut uinput, LayoutSwitchCombo::super_space())
+                .unwrap();
+
+        assert_eq!(outcome, CorrectionLayoutSwitchOutcome::AppliedUinput);
+        assert_eq!(uinput.calls, 1);
+    }
+
+    #[test]
+    fn layout_switch_outcome_reports_applied_uinput_after_x11_fallback() {
+        let mut x11 = FakeLayoutSwitcher {
+            calls: 0,
+            fail: true,
+        };
+        let mut uinput = FakeLayoutSwitcher {
+            calls: 0,
+            fail: false,
+        };
+
+        let outcome = switch_layout_with_fallback(
+            Some(&mut x11),
+            &mut uinput,
+            LayoutSwitchCombo::super_space(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, CorrectionLayoutSwitchOutcome::AppliedUinput);
+        assert_eq!(x11.calls, 1);
+        assert_eq!(uinput.calls, 1);
+    }
+
     // Device discovery
 
     #[test]
@@ -2664,7 +2781,9 @@ mod tests {
         let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
         drop(command_rx);
 
-        let error = handle.run_transaction(copy_shortcut_transaction()).unwrap_err();
+        let error = handle
+            .run_transaction(copy_shortcut_transaction())
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -2676,7 +2795,9 @@ mod tests {
     fn transaction_returns_disconnected_when_reply_sender_is_dropped() {
         let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
         let worker = thread::spawn(move || {
-            let command = command_rx.recv().expect("transaction command should be sent");
+            let command = command_rx
+                .recv()
+                .expect("transaction command should be sent");
             match command {
                 WriterCommand::Transaction(WriterTransaction::Execute { reply, .. }) => {
                     drop(reply);
@@ -2685,7 +2806,9 @@ mod tests {
             }
         });
 
-        let error = handle.run_transaction(copy_shortcut_transaction()).unwrap_err();
+        let error = handle
+            .run_transaction(copy_shortcut_transaction())
+            .unwrap_err();
         worker.join().expect("worker should finish");
 
         assert!(matches!(
@@ -2696,10 +2819,20 @@ mod tests {
 
     #[test]
     fn transaction_returns_worker_reply_result() {
-        fn run_with_reply(reply_result: Result<(), SwitcherError>) -> Result<(), SwitcherError> {
+        fn not_needed_outcome() -> CorrectionExecutionOutcome {
+            CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+            }
+        }
+
+        fn run_with_reply(
+            reply_result: Result<CorrectionExecutionOutcome, SwitcherError>,
+        ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
             let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
             let worker = thread::spawn(move || {
-                let command = command_rx.recv().expect("transaction command should be sent");
+                let command = command_rx
+                    .recv()
+                    .expect("transaction command should be sent");
                 match command {
                     WriterCommand::Transaction(WriterTransaction::Execute { reply, .. }) => {
                         reply.send(reply_result).expect("caller should await reply");
@@ -2713,10 +2846,12 @@ mod tests {
             result
         }
 
-        assert!(run_with_reply(Ok(())).is_ok());
+        assert_eq!(
+            run_with_reply(Ok(not_needed_outcome())).unwrap(),
+            not_needed_outcome()
+        );
 
-        let error =
-            run_with_reply(Err(SwitcherError::VirtualKeyboardWriterSaturated)).unwrap_err();
+        let error = run_with_reply(Err(SwitcherError::VirtualKeyboardWriterSaturated)).unwrap_err();
         assert!(matches!(
             error,
             SwitcherError::VirtualKeyboardWriterSaturated
@@ -2731,7 +2866,9 @@ mod tests {
             .send(WriterCommand::Shutdown)
             .expect("pre-fill should succeed");
 
-        let error = handle.run_transaction(copy_shortcut_transaction()).unwrap_err();
+        let error = handle
+            .run_transaction(copy_shortcut_transaction())
+            .unwrap_err();
         drop(command_rx);
 
         assert!(matches!(
@@ -2983,5 +3120,4 @@ mod tests {
             ManualCurrentWordOutcome::Succeeded(_)
         ));
     }
-
 }

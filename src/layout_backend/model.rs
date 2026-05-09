@@ -29,6 +29,7 @@ impl NormalizedLayoutCode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LayoutCode {
     Us,
+    Gb,
     Ru,
     Other(NormalizedLayoutCode),
     Unknown,
@@ -38,6 +39,7 @@ impl LayoutCode {
     pub fn from_normalized(value: &str) -> Result<Self, LayoutCodeNormalizationError> {
         match value {
             "us" => Ok(Self::Us),
+            "gb" => Ok(Self::Gb),
             "ru" => Ok(Self::Ru),
             "unknown" => Ok(Self::Unknown),
             other => NormalizedLayoutCode::new(other.to_string()).map(Self::Other),
@@ -47,6 +49,7 @@ impl LayoutCode {
     pub fn normalized_str(&self) -> Option<&str> {
         match self {
             Self::Us => Some("us"),
+            Self::Gb => Some("gb"),
             Self::Ru => Some("ru"),
             Self::Other(value) => Some(value.as_str()),
             Self::Unknown => None,
@@ -115,6 +118,7 @@ mod tests {
     #[test]
     fn accepts_known_normalized_layout_codes() {
         assert_eq!(LayoutCode::from_normalized("us").unwrap(), LayoutCode::Us);
+        assert_eq!(LayoutCode::from_normalized("gb").unwrap(), LayoutCode::Gb);
         assert_eq!(LayoutCode::from_normalized("ru").unwrap(), LayoutCode::Ru);
     }
 

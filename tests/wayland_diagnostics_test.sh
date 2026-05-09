@@ -126,6 +126,34 @@ test_wayland_doctor_reports_degraded_gnome_sources_without_failing() {
     assert_contains "$output" "uinput access: unavailable"
 }
 
+test_wayland_doctor_reports_trusted_gb_gnome_sources() {
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' RETURN
+
+    mkdir -p "$fixture/gsettings" "$fixture/dev"
+    printf '%s\n' "['<Super>space']" \
+        >"$fixture/gsettings/org.gnome.desktop.wm.keybindings.switch-input-source"
+    printf '%s\n' "[]" \
+        >"$fixture/gsettings/org.gnome.desktop.wm.keybindings.switch-input-source-backward"
+    printf '%s\n' "[('xkb', 'gb'), ('xkb', 'ru')]" \
+        >"$fixture/gsettings/org.gnome.desktop.input-sources.sources"
+    printf '%s\n' "[('xkb', 'gb'), ('xkb', 'ru')]" \
+        >"$fixture/gsettings/org.gnome.desktop.input-sources.mru-sources"
+
+    local output
+    output="$(
+        XDG_SESSION_TYPE=wayland \
+        XDG_CURRENT_DESKTOP=GNOME \
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
+        OPEN_SWITCHER_WAYLAND_DOCTOR_GSETTINGS_DIR="$fixture/gsettings" \
+            openswitcher_wayland_doctor 2>&1
+    )"
+
+    assert_contains "$output" "GNOME sources: trusted xkb/gb+xkb/ru"
+    assert_contains "$output" "Current GNOME layout: English"
+}
+
 test_manage_dispatches_wayland_doctor() {
     local fixture
     fixture="$(mktemp -d)"
@@ -152,6 +180,7 @@ test_manage_dispatches_wayland_doctor() {
 
 test_wayland_doctor_reports_trusted_gnome_wayland_context
 test_wayland_doctor_reports_degraded_gnome_sources_without_failing
+test_wayland_doctor_reports_trusted_gb_gnome_sources
 test_manage_dispatches_wayland_doctor
 
 echo "wayland_diagnostics_test.sh: ok"

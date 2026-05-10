@@ -1,3 +1,10 @@
+open-switcher (0.1.0-2) unstable; urgency=medium
+
+  * Import desktop session environment before starting user services.
+  * Install XDG autostart fallback for desktop-session login.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Sun, 10 May 2026 21:12:53 +0300
+
 open-switcher (0.1.0-1) unstable; urgency=medium
 
   * Initial Debian package for GitHub Release distribution.

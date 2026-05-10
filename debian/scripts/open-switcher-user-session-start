@@ -18,6 +18,70 @@ is_active_graphical_session() {
     esac
 }
 
+session_environment_value() {
+    session="$1"
+    key="$2"
+    leader="$(loginctl show-session "$session" -p Leader --value 2>/dev/null || true)"
+
+    [ -n "$leader" ] || return 1
+    [ -r "/proc/$leader/environ" ] || return 1
+
+    tr '\0' '\n' <"/proc/$leader/environ" \
+        | sed -n "s/^$key=//p" \
+        | sed -n '1p'
+}
+
+home_for_user() {
+    user="$1"
+    getent passwd "$user" 2>/dev/null | cut -d: -f6 | sed -n '1p'
+}
+
+import_session_environment() {
+    session="$1"
+    uid="$2"
+    user="$3"
+
+    display="$(session_environment_value "$session" DISPLAY || true)"
+    [ -n "$display" ] || display="$(loginctl show-session "$session" -p Display --value 2>/dev/null || true)"
+    wayland_display="$(session_environment_value "$session" WAYLAND_DISPLAY || true)"
+    xauthority="$(session_environment_value "$session" XAUTHORITY || true)"
+    xdg_session_type="$(session_environment_value "$session" XDG_SESSION_TYPE || true)"
+    [ -n "$xdg_session_type" ] || xdg_session_type="$(loginctl show-session "$session" -p Type --value 2>/dev/null || true)"
+    xdg_current_desktop="$(session_environment_value "$session" XDG_CURRENT_DESKTOP || true)"
+    [ -n "$xdg_current_desktop" ] || xdg_current_desktop="$(loginctl show-session "$session" -p Desktop --value 2>/dev/null || true)"
+    xdg_session_desktop="$(session_environment_value "$session" XDG_SESSION_DESKTOP || true)"
+    desktop_session="$(session_environment_value "$session" DESKTOP_SESSION || true)"
+    [ -n "$desktop_session" ] || desktop_session="$xdg_current_desktop"
+
+    if [ -z "$xauthority" ]; then
+        home="$(home_for_user "$user")"
+        if [ -n "$home" ] && [ -f "$home/.Xauthority" ]; then
+            xauthority="$home/.Xauthority"
+        fi
+    fi
+
+    set -- \
+        "XDG_RUNTIME_DIR=/run/user/$uid" \
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
+    [ -n "$display" ] && set -- "$@" "DISPLAY=$display"
+    [ -n "$wayland_display" ] && set -- "$@" "WAYLAND_DISPLAY=$wayland_display"
+    [ -n "$xauthority" ] && set -- "$@" "XAUTHORITY=$xauthority"
+    [ -n "$xdg_session_type" ] && set -- "$@" "XDG_SESSION_TYPE=$xdg_session_type"
+    [ -n "$xdg_current_desktop" ] && set -- "$@" "XDG_CURRENT_DESKTOP=$xdg_current_desktop"
+    [ -n "$xdg_session_desktop" ] && set -- "$@" "XDG_SESSION_DESKTOP=$xdg_session_desktop"
+    [ -n "$desktop_session" ] && set -- "$@" "DESKTOP_SESSION=$desktop_session"
+
+    runuser -u "$user" -- env "$@" systemctl --user import-environment \
+        DISPLAY \
+        WAYLAND_DISPLAY \
+        XAUTHORITY \
+        XDG_SESSION_TYPE \
+        XDG_CURRENT_DESKTOP \
+        XDG_SESSION_DESKTOP \
+        DESKTOP_SESSION \
+        DBUS_SESSION_BUS_ADDRESS || true
+}
+
 start_for_session() {
     session="$1"
     uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
@@ -27,6 +91,8 @@ start_for_session() {
     [ -n "$user" ] || return 0
     [ -d "/run/user/$uid" ] || return 0
     [ -S "/run/user/$uid/bus" ] || return 0
+
+    import_session_environment "$session" "$uid" "$user"
 
     runuser -u "$user" -- env \
         "XDG_RUNTIME_DIR=/run/user/$uid" \

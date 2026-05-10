@@ -27,6 +27,7 @@ override_dh_auto_test: check-rust-toolchain
 	$(CARGO) test --locked
 	$(CARGO) test --locked --features settings-ui --lib
 	bash tests/wayland_diagnostics_test.sh
+	bash tests/debian_package_scripts_test.sh
 
 override_dh_auto_install:
 	install -D -m 0755 target/release/open-switcher debian/open-switcher/usr/bin/open-switcher-daemon

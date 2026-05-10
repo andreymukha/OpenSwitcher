@@ -205,17 +205,21 @@ For Linux Mint / Ubuntu-like systems:
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
+  debhelper \
+  dpkg-dev \
   build-essential \
   pkg-config \
   libdbus-1-dev \
   libudev-dev \
   libgtk-4-dev \
-  libadwaita-1-dev
+  libadwaita-1-dev \
+  desktop-file-utils
 ```
 
 Optional helper packages on Debian/Ubuntu-like systems:
 - `acl` for `setfacl` during `./manage.sh bootstrap linux-input`
 - `libglib2.0-bin` for `gdbus` in the D-Bus examples below
+- `lintian` for optional local Debian package checks
 
 ## Building
 
@@ -248,6 +252,34 @@ cargo test -q --all-targets --features settings-ui
 ```
 
 CI also runs the `settings-ui` feature tests so feature-gated coverage is not skipped accidentally.
+
+### Building a `.deb` from source
+
+OpenSwitcher packages are built with the project Rust toolchain from `rust-toolchain.toml` through
+`rustup`. The `cargo`/`rustc` packages from apt may be too old and are not the source of truth for
+this GitHub Release package build path.
+
+Install the non-Rust Debian build dependencies listed above, then build the package:
+
+```bash
+./manage.sh package deb
+```
+
+The command checks `rustup`, verifies that the required toolchain is available, runs
+`dpkg-buildpackage -us -uc -b -d -tc`, validates the desktop files, and copies package artifacts to:
+
+```text
+dist/packages/
+```
+
+Install the locally built package with:
+
+```bash
+sudo apt install ./dist/packages/open-switcher_*_amd64.deb
+```
+
+The optional `open-switcher-dbgsym_*.ddeb` file contains debug symbols. It is useful for debugging
+but is not needed for normal installation.
 
 ## Development Workflow
 

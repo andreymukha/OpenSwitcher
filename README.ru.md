@@ -206,17 +206,21 @@ Selected-text debug logging включается только явно. Если
 ```bash
 sudo apt-get update
 sudo apt-get install -y \
+  debhelper \
+  dpkg-dev \
   build-essential \
   pkg-config \
   libdbus-1-dev \
   libudev-dev \
   libgtk-4-dev \
-  libadwaita-1-dev
+  libadwaita-1-dev \
+  desktop-file-utils
 ```
 
 Дополнительные полезные пакеты для Debian/Ubuntu-подобных систем:
 - `acl` для `setfacl` во время `./manage.sh bootstrap linux-input`
 - `libglib2.0-bin` для `gdbus` в примерах D-Bus ниже
+- `lintian` для опциональной локальной проверки Debian-пакета
 
 ## Сборка
 
@@ -249,6 +253,34 @@ cargo test -q --all-targets --features settings-ui
 ```
 
 CI также запускает `settings-ui` feature tests, чтобы feature-gated покрытие не пропускалось случайно.
+
+### Сборка `.deb` из исходников
+
+Пакеты OpenSwitcher собираются через проектный Rust toolchain из `rust-toolchain.toml` с помощью
+`rustup`. Пакеты `cargo`/`rustc` из apt могут быть слишком старыми и не являются источником истины
+для этого пути сборки GitHub Release package.
+
+Установи non-Rust Debian build dependencies из списка выше, затем собери пакет:
+
+```bash
+./manage.sh package deb
+```
+
+Команда проверяет `rustup`, проверяет доступность нужного toolchain, запускает
+`dpkg-buildpackage -us -uc -b -d -tc`, валидирует desktop-файлы и копирует package artifacts в:
+
+```text
+dist/packages/
+```
+
+Установить локально собранный пакет можно так:
+
+```bash
+sudo apt install ./dist/packages/open-switcher_*_amd64.deb
+```
+
+Файл `open-switcher-dbgsym_*.ddeb` содержит debug symbols. Он полезен для диагностики, но не нужен
+для обычной установки.
 
 ## Процесс разработки
 

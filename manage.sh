@@ -7,6 +7,8 @@ LOG_DIR="$RUN_DIR/logs"
 PID_DIR="$RUN_DIR/pids"
 LINUX_INPUT_HELPER="$SCRIPT_DIR/scripts/linux_input_setup.sh"
 WAYLAND_DIAGNOSTICS_HELPER="$SCRIPT_DIR/scripts/wayland_diagnostics.sh"
+RUST_TOOLCHAIN_FILE="$SCRIPT_DIR/rust-toolchain.toml"
+PACKAGE_OUTPUT_DIR="${OPEN_SWITCHER_PACKAGE_OUTPUT_DIR:-$SCRIPT_DIR/dist/packages}"
 
 PROFILE="${OPEN_SWITCHER_PROFILE:-debug}"
 TARGET_DIR="$SCRIPT_DIR/target/$PROFILE"
@@ -398,6 +400,180 @@ build_binaries() {
         --bin open-switcher-settings
 }
 
+project_rust_toolchain() {
+    if [[ ! -f "$RUST_TOOLCHAIN_FILE" ]]; then
+        echo "Файл rust-toolchain.toml не найден: $RUST_TOOLCHAIN_FILE" >&2
+        exit 1
+    fi
+
+    local toolchain
+    toolchain="$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$RUST_TOOLCHAIN_FILE" | head -n 1)"
+    if [[ -z "$toolchain" ]]; then
+        echo "Не удалось прочитать channel из rust-toolchain.toml." >&2
+        exit 1
+    fi
+
+    printf '%s\n' "$toolchain"
+}
+
+find_rustup_binary() {
+    if command -v rustup >/dev/null 2>&1; then
+        command -v rustup
+        return 0
+    fi
+
+    if [[ -x "$HOME/.cargo/bin/rustup" ]]; then
+        printf '%s\n' "$HOME/.cargo/bin/rustup"
+        return 0
+    fi
+
+    return 1
+}
+
+require_project_rust_toolchain() {
+    local toolchain="$1"
+    local rustup_bin
+
+    if ! rustup_bin="$(find_rustup_binary)"; then
+        echo "Для сборки .deb нужен rustup и toolchain из rust-toolchain.toml." >&2
+        echo "Установи rustup, затем выполни:" >&2
+        echo "  rustup toolchain install $toolchain" >&2
+        exit 1
+    fi
+
+    if ! "$rustup_bin" run "$toolchain" cargo --version >/dev/null 2>&1; then
+        echo "Для сборки .deb нужен rustup toolchain '$toolchain' из rust-toolchain.toml." >&2
+        echo "Установи его командой:" >&2
+        echo "  rustup toolchain install $toolchain" >&2
+        exit 1
+    fi
+
+    echo "Rust toolchain: $("$rustup_bin" run "$toolchain" cargo --version)"
+}
+
+require_command_for_package() {
+    local command_name="$1"
+    local package_hint="$2"
+
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Не найдена команда '$command_name'. Установи пакет: $package_hint" >&2
+        exit 1
+    fi
+}
+
+require_debian_package_dependencies() {
+    local -a required_packages=(
+        debhelper
+        dpkg-dev
+        build-essential
+        pkg-config
+        libdbus-1-dev
+        libudev-dev
+        libgtk-4-dev
+        libadwaita-1-dev
+        desktop-file-utils
+    )
+    local -a missing_packages=()
+
+    require_command_for_package dpkg-query dpkg
+    require_command_for_package dpkg-buildpackage dpkg-dev
+    require_command_for_package dpkg-parsechangelog dpkg-dev
+    require_command_for_package dpkg-architecture dpkg-dev
+    require_command_for_package desktop-file-validate desktop-file-utils
+
+    local package status
+    for package in "${required_packages[@]}"; do
+        status="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+        if [[ "$status" != "install ok installed" ]]; then
+            missing_packages+=("$package")
+        fi
+    done
+
+    if [[ "${#missing_packages[@]}" -gt 0 ]]; then
+        echo "Не хватает системных Debian build dependencies:" >&2
+        printf '  %s\n' "${missing_packages[@]}" >&2
+        echo >&2
+        echo "Установи их командой:" >&2
+        echo "  sudo apt-get install ${missing_packages[*]}" >&2
+        echo >&2
+        echo "cargo/rustc из apt здесь не требуются: Rust берётся из rustup toolchain проекта." >&2
+        exit 1
+    fi
+}
+
+copy_debian_package_artifacts() {
+    local version arch deb_source ddeb_source deb_target ddeb_target
+    version="$(dpkg-parsechangelog -S Version)"
+    arch="$(dpkg-architecture -qDEB_HOST_ARCH)"
+    deb_source="$SCRIPT_DIR/../open-switcher_${version}_${arch}.deb"
+    ddeb_source="$SCRIPT_DIR/../open-switcher-dbgsym_${version}_${arch}.ddeb"
+    deb_target="$PACKAGE_OUTPUT_DIR/open-switcher_${version}_${arch}.deb"
+    ddeb_target="$PACKAGE_OUTPUT_DIR/open-switcher-dbgsym_${version}_${arch}.ddeb"
+
+    if [[ ! -f "$deb_source" ]]; then
+        echo "Ожидаемый .deb не найден после сборки: $deb_source" >&2
+        exit 1
+    fi
+
+    mkdir -p "$PACKAGE_OUTPUT_DIR"
+    rm -f "$PACKAGE_OUTPUT_DIR"/open-switcher_*.deb "$PACKAGE_OUTPUT_DIR"/open-switcher-dbgsym_*.ddeb
+    cp "$deb_source" "$deb_target"
+    echo "Package artifact: $deb_target"
+
+    if [[ -f "$ddeb_source" ]]; then
+        cp "$ddeb_source" "$ddeb_target"
+        echo "Debug-symbol artifact: $ddeb_target"
+    else
+        echo "Debug-symbol package не найден; это не обязательно для обычной установки."
+    fi
+}
+
+run_package_post_checks() {
+    desktop-file-validate \
+        debian/open-switcher.desktop \
+        debian/autostart/open-switcher-autostart.desktop
+    git diff --check
+
+    if command -v lintian >/dev/null 2>&1; then
+        lintian "$PACKAGE_OUTPUT_DIR"/open-switcher_*.deb
+    else
+        echo "warning: lintian не установлен; lintian check пропущен." >&2
+    fi
+}
+
+build_debian_package() {
+    local toolchain
+    toolchain="$(project_rust_toolchain)"
+
+    echo "Сборка .deb использует Rust toolchain проекта через rustup: $toolchain"
+    echo "dpkg-buildpackage запускается с -d осознанно: apt cargo/rustc не являются источником истины."
+
+    require_project_rust_toolchain "$toolchain"
+    require_debian_package_dependencies
+
+    dpkg-buildpackage -us -uc -b -d -tc
+    copy_debian_package_artifacts
+    run_package_post_checks
+}
+
+run_package_command() {
+    local command="${1:-}"
+
+    case "$command" in
+    deb)
+        build_debian_package
+        ;;
+    ""|-h|--help|help)
+        usage
+        ;;
+    *)
+        echo "Неизвестная package-команда: $command" >&2
+        usage >&2
+        exit 1
+        ;;
+    esac
+}
+
 ensure_systemd_command() {
     if ! command -v systemctl >/dev/null 2>&1; then
         echo "systemctl не найден в PATH." >&2
@@ -569,6 +745,7 @@ usage() {
 Использование:
   ./manage.sh dev <команда>
   ./manage.sh systemd <команда>
+  ./manage.sh package <команда>
   ./manage.sh doctor [linux-input|wayland]
   ./manage.sh bootstrap linux-input
   ./manage.sh <команда>            # алиасы на dev-режим
@@ -591,6 +768,9 @@ systemd-команды:
   systemd logs [name]   Показать journalctl-логи: daemon | tray | all
   systemd enable        Включить автозапуск user units и XDG fallback
   systemd disable       Выключить автозапуск user units и XDG fallback
+
+package-команды:
+  package deb           Собрать .deb через rustup toolchain проекта в dist/packages/
 
 doctor-команды:
   doctor                Проверить Linux input setup для '/dev/input/*' и '/dev/uinput'
@@ -704,6 +884,9 @@ case "$namespace" in
         ;;
     systemd)
         run_systemd_command "${2:-}" "${3:-}"
+        ;;
+    package)
+        run_package_command "${2:-}"
         ;;
     doctor)
         run_doctor_command "${2:-linux-input}"

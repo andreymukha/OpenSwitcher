@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OpenSwitcher
+Comment=Start OpenSwitcher tray service
+Exec=/usr/lib/open-switcher/open-switcher-launch
+Icon=open-switcher
+Categories=Utility;
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,4 +1,5 @@
 debian/open-switcher.desktop usr/share/applications/
+debian/autostart/open-switcher-autostart.desktop etc/xdg/autostart/
 debian/scripts/open-switcher-input-acl-bridge usr/lib/open-switcher/
 debian/scripts/open-switcher-launch usr/lib/open-switcher/
 debian/scripts/open-switcher-user-session-start usr/lib/open-switcher/

@@ -36,6 +36,7 @@ Current release baseline:
 | Environment | Session | Status | Verification |
 | --- | --- | --- | --- |
 | Linux Mint 22.2 Cinnamon | X11 | Supported baseline | Confirmed by local smoke testing |
+| Ubuntu 24.04 LTS GNOME 46 | Wayland | Supported Wayland target | Confirmed by local Wayland smoke testing |
 
 Environments not listed here are best-effort. The current confirmed Wayland target is GNOME
 Wayland; other Wayland desktops/compositors are diagnostics-first until tested and backed by

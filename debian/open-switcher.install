@@ -1,0 +1,6 @@
+debian/open-switcher.desktop usr/share/applications/
+debian/scripts/open-switcher-input-acl-bridge usr/lib/open-switcher/
+debian/scripts/open-switcher-launch usr/lib/open-switcher/
+debian/scripts/open-switcher-user-session-start usr/lib/open-switcher/
+debian/scripts/open-switcher-user-session-stop usr/lib/open-switcher/
+dist/icons/hicolor/512x512/apps/open-switcher.png usr/share/icons/hicolor/512x512/apps/

@@ -1,0 +1,32 @@
+Source: open-switcher
+Section: utils
+Priority: optional
+Maintainer: Andrey Mukha <6871314+andreymukha@users.noreply.github.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libdbus-1-dev,
+ libudev-dev,
+ libgtk-4-dev,
+ libadwaita-1-dev,
+Standards-Version: 4.6.2
+Homepage: https://github.com/andreymukha/OpenSwitcher
+Rules-Requires-Root: no
+
+Package: open-switcher
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ systemd,
+ udev,
+ acl,
+ dbus-user-session,
+Description: EN/RU keyboard layout correction utility for Linux desktops
+ OpenSwitcher is a Linux desktop utility for EN/RU typing workflows.
+ It provides automatic correction of words typed in the wrong keyboard layout,
+ manual correction hotkeys, selected-text layout conversion, tray integration,
+ and a settings UI. The application runs as a user daemon with tray/settings
+ frontends and integrates with systemd user services.

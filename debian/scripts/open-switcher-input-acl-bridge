@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+is_active_graphical_session() {
+    session="$1"
+    active="$(loginctl show-session "$session" -p Active --value 2>/dev/null || true)"
+    remote="$(loginctl show-session "$session" -p Remote --value 2>/dev/null || true)"
+    session_type="$(loginctl show-session "$session" -p Type --value 2>/dev/null || true)"
+    session_class="$(loginctl show-session "$session" -p Class --value 2>/dev/null || true)"
+
+    [ "$active" = "yes" ] || return 1
+    [ "$remote" != "yes" ] || return 1
+    [ "$session_class" = "user" ] || return 1
+
+    case "$session_type" in
+        wayland|x11) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+active_graphical_uids() {
+    loginctl list-sessions --no-legend 2>/dev/null | while read -r session _rest; do
+        [ -n "$session" ] || continue
+        if is_active_graphical_session "$session"; then
+            loginctl show-session "$session" -p User --value 2>/dev/null || true
+        fi
+    done | sort -u
+}
+
+is_supported_input_device() {
+    device="$1"
+    props="$(udevadm info -q property -n "$device" 2>/dev/null || true)"
+
+    echo "$props" | grep -Eq '^ID_INPUT_KEYBOARD=1$' && return 0
+    echo "$props" | grep -Eq '^ID_INPUT_MOUSE=1$' && return 0
+    echo "$props" | grep -Eq '^ID_INPUT_TOUCHPAD=1$' && return 0
+    echo "$props" | grep -Eq '^ID_INPUT_TRACKPOINT=1$' && return 0
+    echo "$props" | grep -Eq '^ID_INPUT_POINTINGSTICK=1$' && return 0
+
+    return 1
+}
+
+input_devices() {
+    for device in /dev/input/event*; do
+        [ -e "$device" ] || continue
+        if is_supported_input_device "$device"; then
+            printf '%s\n' "$device"
+        fi
+    done
+
+    for device in /dev/uinput /dev/input/uinput; do
+        [ -e "$device" ] || continue
+        printf '%s\n' "$device"
+    done
+}
+
+command -v loginctl >/dev/null 2>&1 || exit 0
+command -v udevadm >/dev/null 2>&1 || exit 0
+command -v setfacl >/dev/null 2>&1 || exit 0
+
+uids="$(active_graphical_uids)"
+[ -n "$uids" ] || exit 0
+
+devices="$(input_devices | sort -u)"
+[ -n "$devices" ] || exit 0
+
+printf '%s\n' "$uids" | while read -r uid; do
+    [ -n "$uid" ] || continue
+    printf '%s\n' "$devices" | while read -r device; do
+        [ -n "$device" ] || continue
+        setfacl -m "u:$uid:rw" "$device" || true
+    done
+done

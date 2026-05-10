@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OpenSwitcher
+Comment=Start OpenSwitcher
+Exec=/usr/lib/open-switcher/open-switcher-launch
+Icon=open-switcher
+Categories=Utility;
+Terminal=false

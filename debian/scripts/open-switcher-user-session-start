@@ -1,0 +1,51 @@
+#!/bin/sh
+set -eu
+
+is_active_graphical_session() {
+    session="$1"
+    active="$(loginctl show-session "$session" -p Active --value 2>/dev/null || true)"
+    remote="$(loginctl show-session "$session" -p Remote --value 2>/dev/null || true)"
+    session_type="$(loginctl show-session "$session" -p Type --value 2>/dev/null || true)"
+    session_class="$(loginctl show-session "$session" -p Class --value 2>/dev/null || true)"
+
+    [ "$active" = "yes" ] || return 1
+    [ "$remote" != "yes" ] || return 1
+    [ "$session_class" = "user" ] || return 1
+
+    case "$session_type" in
+        wayland|x11) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+start_for_session() {
+    session="$1"
+    uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
+    user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
+
+    [ -n "$uid" ] || return 0
+    [ -n "$user" ] || return 0
+    [ -d "/run/user/$uid" ] || return 0
+    [ -S "/run/user/$uid/bus" ] || return 0
+
+    runuser -u "$user" -- env \
+        "XDG_RUNTIME_DIR=/run/user/$uid" \
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+        systemctl --user daemon-reload || true
+
+    runuser -u "$user" -- env \
+        "XDG_RUNTIME_DIR=/run/user/$uid" \
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+        systemctl --user start open-switcher-tray.service || true
+}
+
+command -v loginctl >/dev/null 2>&1 || exit 0
+command -v runuser >/dev/null 2>&1 || exit 0
+command -v systemctl >/dev/null 2>&1 || exit 0
+
+loginctl list-sessions --no-legend 2>/dev/null | while read -r session _rest; do
+    [ -n "$session" ] || continue
+    if is_active_graphical_session "$session"; then
+        start_for_session "$session"
+    fi
+done

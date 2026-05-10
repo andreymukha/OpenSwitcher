@@ -1,0 +1,47 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_INCREMENTAL = 0
+export CARGO_PROFILE_DEV_DEBUG = 0
+export CARGO_PROFILE_TEST_DEBUG = 0
+
+RUST_TOOLCHAIN := 1.95.0
+RUSTUP := $(or $(shell command -v rustup 2>/dev/null),$(wildcard $(HOME)/.cargo/bin/rustup))
+CARGO := $(if $(RUSTUP),$(RUSTUP) run $(RUST_TOOLCHAIN) cargo,cargo)
+
+%:
+	dh $@
+
+check-rust-toolchain:
+	@version="$$( $(CARGO) --version | sed -n 's/^cargo \([0-9][^ ]*\).*/\1/p' )"; \
+	if [ "$$version" != "$(RUST_TOOLCHAIN)" ]; then \
+		echo "error: OpenSwitcher package build requires cargo $(RUST_TOOLCHAIN); got $${version:-unknown}." >&2; \
+		echo "hint: install rustup toolchain $(RUST_TOOLCHAIN) or put matching cargo on PATH." >&2; \
+		exit 1; \
+	fi
+
+override_dh_auto_build: check-rust-toolchain
+	$(CARGO) build --release --locked --features settings-ui
+
+override_dh_auto_test: check-rust-toolchain
+	$(CARGO) test --locked
+	$(CARGO) test --locked --features settings-ui --lib
+	bash tests/wayland_diagnostics_test.sh
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/open-switcher debian/open-switcher/usr/bin/open-switcher-daemon
+	install -D -m 0755 target/release/open-switcher-tray debian/open-switcher/usr/bin/open-switcher-tray
+	install -D -m 0755 target/release/open-switcher-settings debian/open-switcher/usr/bin/open-switcher-settings
+
+override_dh_installudev:
+	dh_installudev --name=openswitcher-input --priority=80
+
+execute_after_dh_install:
+	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-acl-bridge
+	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-launch
+	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-user-session-start
+	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-user-session-stop
+
+override_dh_installsystemduser:
+	dh_installsystemduser --name=open-switcher-daemon
+	dh_installsystemduser --name=open-switcher-tray

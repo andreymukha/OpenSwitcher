@@ -193,6 +193,14 @@ openswitcher_wayland_doctor_print_wayland_support_summary() {
     esac
 }
 
+openswitcher_wayland_doctor_print_tray_acceptance_summary() {
+    echo "Tray acceptance:"
+    printf '%s\n' "Tray visibility: required for supported environment acceptance"
+    printf '%s\n' "Tray absence: does not by itself prove daemon/D-Bus/settings failure"
+    printf '%s\n' "Tray missing checks: daemon status, D-Bus response, settings window, tray service status, tray service logs"
+    printf '%s\n' "Supported environment smoke: daemon running; D-Bus responds; settings opens; tray visible; tray menu opens; settings opens from tray; user stop path works; tray systemd restart works"
+}
+
 openswitcher_wayland_doctor_gsettings_get() {
     local schema="$1"
     local key="$2"
@@ -420,6 +428,9 @@ openswitcher_wayland_doctor() {
 
     echo
     openswitcher_wayland_doctor_print_wayland_support_summary "$session_kind" "$desktop_hint"
+
+    echo
+    openswitcher_wayland_doctor_print_tray_acceptance_summary
 
     if [[ "${desktop_hint,,}" != "gnome" ]]; then
         echo

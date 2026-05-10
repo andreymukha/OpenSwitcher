@@ -128,6 +128,8 @@ a warning but allows saving.
 - Application-specific exclusions are not included in the first release
 - A GNOME Shell extension is not included
 - Tray support depends on the desktop environment providing a compatible StatusNotifier/AppIndicator host
+- A missing tray icon does not by itself prove that the daemon, D-Bus, or settings are broken
+- A visible, working tray is still required for any environment considered fully supported
 - The official runtime and autostart model depends on `systemd --user`
 - The settings UI is built behind the `settings-ui` Cargo feature
 
@@ -416,6 +418,8 @@ gdbus monitor \
 - Application-specific exclusions are not included in the first release.
 - A GNOME Shell extension is not included.
 - Tray visibility depends on a compatible StatusNotifier/AppIndicator host.
+- Tray visibility is checked separately from daemon, D-Bus, and settings health.
+- A missing tray icon does not by itself prove daemon failure, but it is a user-facing acceptance failure for any fully supported environment.
 - The official runtime and autostart model depends on `systemd --user`.
 - Selected-text conversion temporarily uses the clipboard and attempts to restore previous clipboard contents after conversion.
 - Manual and selected-text hotkey capture may depend on laptop Fn keys and desktop/global shortcut handling.
@@ -434,6 +438,17 @@ Recommended local sanity-check order:
 6. `./manage.sh systemd start`
 7. `./manage.sh systemd status`
 8. `./manage.sh systemd logs`
+
+Supported-environment smoke checklist:
+
+1. The daemon is running.
+2. D-Bus responds on `org.oswitch.core`.
+3. The settings window opens.
+4. The tray icon is visible.
+5. The tray menu opens.
+6. Settings can be opened from the tray.
+7. The application can be stopped or disabled through the intended user-facing path.
+8. Restarting the tray service through `systemd --user` works correctly.
 
 ## Troubleshooting
 
@@ -466,6 +481,10 @@ Check:
 
 ### Tray icon does not appear
 
+A missing tray icon should be diagnosed separately from daemon health. The daemon, D-Bus, and
+settings may still work, but a visible and working tray is required for an environment to be
+considered fully supported.
+
 Likely causes:
 - the tray process is not running
 - the desktop environment does not expose a compatible tray host
@@ -476,6 +495,14 @@ Check:
 ```bash
 ./manage.sh dev status
 ./manage.sh systemd status
+./manage.sh systemd logs tray
+gdbus call \
+  --session \
+  --dest org.freedesktop.DBus \
+  --object-path /org/freedesktop/DBus \
+  --method org.freedesktop.DBus.NameHasOwner \
+  org.oswitch.core
+./manage.sh dev settings
 ```
 
 ## License

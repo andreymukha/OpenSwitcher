@@ -519,13 +519,24 @@ copy_debian_package_artifacts() {
     rm -f "$PACKAGE_OUTPUT_DIR"/open-switcher_*.deb "$PACKAGE_OUTPUT_DIR"/open-switcher-dbgsym_*.ddeb
     cp "$deb_source" "$deb_target"
     echo "Package artifact: $deb_target"
+    echo "Install this canonical project artifact with:"
+    echo "  sudo apt install $(installable_package_path "$deb_target")"
 
     if [[ -f "$ddeb_source" ]]; then
         cp "$ddeb_source" "$ddeb_target"
         echo "Debug-symbol artifact: $ddeb_target"
+        echo "The .ddeb file is optional and only needed for debugging."
     else
         echo "Debug-symbol package не найден; это не обязательно для обычной установки."
     fi
+}
+
+installable_package_path() {
+    local path="$1"
+    case "$path" in
+        /*) printf '%s\n' "$path" ;;
+        *) printf './%s\n' "$path" ;;
+    esac
 }
 
 run_package_post_checks() {

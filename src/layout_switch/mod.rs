@@ -264,7 +264,8 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                     )
                 })
                 .unwrap_or_else(|| {
-                    self.detect_cinnamon_x11_setxkbmap_fallback(context)
+                    self.detect_cinnamon_x11_wm_keybindings_fallback(context)
+                        .unwrap_or_else(|| self.detect_cinnamon_x11_setxkbmap_fallback(context))
                 }),
             Err(error) => {
                 eprintln!(
@@ -278,6 +279,36 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                 )
             }
         }
+    }
+
+    fn detect_cinnamon_x11_wm_keybindings_fallback(
+        &self,
+        context: SystemContext,
+    ) -> Option<LayoutSwitchSetting> {
+        if let Some(combo) = self.detect_wm_input_source_binding(
+            GNOME_SWITCH_INPUT_SOURCE_KEY,
+            "primary",
+            "Cinnamon",
+        ) {
+            return Some(detected_setting(
+                combo,
+                DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                context,
+            ));
+        }
+
+        self.detect_wm_input_source_binding(
+            GNOME_SWITCH_INPUT_SOURCE_BACKWARD_KEY,
+            "backward",
+            "Cinnamon",
+        )
+        .map(|combo| {
+            detected_setting(
+                combo,
+                DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                context,
+            )
+        })
     }
 
     fn detect_cinnamon_x11_setxkbmap_fallback(
@@ -319,9 +350,11 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
     }
 
     fn detect_gnome_wayland(&self, context: SystemContext) -> LayoutSwitchSetting {
-        if let Some(combo) =
-            self.detect_gnome_wayland_binding(GNOME_SWITCH_INPUT_SOURCE_KEY, "primary")
-        {
+        if let Some(combo) = self.detect_wm_input_source_binding(
+            GNOME_SWITCH_INPUT_SOURCE_KEY,
+            "primary",
+            "GNOME",
+        ) {
             return detected_setting(
                 combo,
                 DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
@@ -329,9 +362,11 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
             );
         }
 
-        if let Some(combo) =
-            self.detect_gnome_wayland_binding(GNOME_SWITCH_INPUT_SOURCE_BACKWARD_KEY, "backward")
-        {
+        if let Some(combo) = self.detect_wm_input_source_binding(
+            GNOME_SWITCH_INPUT_SOURCE_BACKWARD_KEY,
+            "backward",
+            "GNOME",
+        ) {
             return detected_setting(
                 combo,
                 DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
@@ -347,7 +382,12 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
         )
     }
 
-    fn detect_gnome_wayland_binding(&self, key: &str, source: &str) -> Option<LayoutSwitchCombo> {
+    fn detect_wm_input_source_binding(
+        &self,
+        key: &str,
+        source: &str,
+        desktop_label: &str,
+    ) -> Option<LayoutSwitchCombo> {
         match self
             .reader
             .gsettings_string_list(GNOME_WM_KEYBINDINGS_SCHEMA, key)
@@ -357,7 +397,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                 .find_map(|binding| combo_from_gnome_binding(binding)),
             Err(error) => {
                 eprintln!(
-                    "[layout-switch] Failed to read GNOME {source} input source binding, using fallback: {error}"
+                    "[layout-switch] Failed to read {desktop_label} {source} input source binding, using fallback: {error}"
                 );
                 None
             }
@@ -1067,6 +1107,7 @@ mod tests {
     fn cinnamon_x11_gsettings_combo_wins_over_setxkbmap_fallback() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
             cinnamon_gsettings_values: vec!["grp:alt_shift_toggle".to_string()],
+            gnome_primary_gsettings_values: vec!["<Super>space".to_string()],
             setxkbmap_query_should_fail: true,
             ..StubReader::default()
         });
@@ -1078,6 +1119,32 @@ mod tests {
             setting.auto_detected.strategy,
             DetectionStrategy::CinnamonX11GSettingsXkbOptions
         );
+    }
+
+    #[test]
+    fn cinnamon_x11_uses_wm_keybindings_when_xkb_options_have_no_layout_combo() {
+        let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
+            cinnamon_gsettings_values: vec!["terminate:ctrl_alt_bksp".to_string()],
+            gnome_primary_gsettings_values: vec![
+                "<Super>space".to_string(),
+                "XF86Keyboard".to_string(),
+            ],
+            gnome_backward_gsettings_values: vec![
+                "<Shift><Super>space".to_string(),
+                "<Shift>XF86Keyboard".to_string(),
+            ],
+            setxkbmap_query_should_fail: true,
+            ..StubReader::default()
+        });
+
+        let setting = detector.detect(cinnamon_x11_context()).unwrap();
+        assert_eq!(setting.combo, LayoutSwitchCombo::super_space());
+        assert_eq!(setting.source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            setting.auto_detected.strategy,
+            DetectionStrategy::CinnamonX11GSettingsXkbOptions
+        );
+        assert_eq!(setting.auto_detected.confidence, DetectionConfidence::High);
     }
 
     #[test]
@@ -1115,6 +1182,8 @@ mod tests {
     fn cinnamon_x11_uses_setxkbmap_when_gsettings_has_no_supported_combo() {
         let detector = LayoutSwitchAutoDetector::with_reader(StubReader {
             cinnamon_gsettings_values: vec!["grp:toggle".to_string()],
+            gnome_primary_gsettings_values: vec!["XF86Keyboard".to_string()],
+            gnome_backward_gsettings_values: vec!["<Shift><Super>space".to_string()],
             setxkbmap_query_output: setxkbmap_query_with_options(
                 "grp:rctrl_rshift_toggle,grp_led:scroll",
             ),

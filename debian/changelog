@@ -1,3 +1,9 @@
+open-switcher (0.1.0-3) unstable; urgency=medium
+
+  * Detect Cinnamon X11 layout switch shortcuts from wm keybindings.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Sun, 10 May 2026 22:56:25 +0300
+
 open-switcher (0.1.0-2) unstable; urgency=medium
 
   * Import desktop session environment before starting user services.

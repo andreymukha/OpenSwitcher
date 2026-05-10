@@ -5,6 +5,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 MOCK_BIN="$TMP_DIR/bin"
 CALL_LOG="$TMP_DIR/calls.log"
+OUTPUT_LOG="$TMP_DIR/output.log"
 PACKAGE_OUTPUT_DIR="$TMP_DIR/packages"
 VERSION="0.1.0-test"
 ARCH="amd64"
@@ -97,13 +98,16 @@ chmod +x "$MOCK_BIN"/*
 PATH="$MOCK_BIN:$PATH" \
     CALL_LOG="$CALL_LOG" \
     OPEN_SWITCHER_PACKAGE_OUTPUT_DIR="$PACKAGE_OUTPUT_DIR" \
-    "$REPO_ROOT/manage.sh" package deb
+    "$REPO_ROOT/manage.sh" package deb >"$OUTPUT_LOG" 2>&1
+cat "$OUTPUT_LOG"
 
 grep -Fq "rustup run 1.95.0 cargo --version" "$CALL_LOG"
 grep -Fq "dpkg-buildpackage -us -uc -b -d -tc" "$CALL_LOG"
 grep -Fq "desktop-file-validate debian/open-switcher.desktop debian/autostart/open-switcher-autostart.desktop" "$CALL_LOG"
 grep -Fq "git diff --check" "$CALL_LOG"
 grep -Fq "lintian $DIST_DEB" "$CALL_LOG"
+grep -Fq "sudo apt install $DIST_DEB" "$OUTPUT_LOG"
+grep -Fq "The .ddeb file is optional and only needed for debugging." "$OUTPUT_LOG"
 
 [[ -f "$DIST_DEB" ]]
 [[ -f "$DIST_DDEB" ]]

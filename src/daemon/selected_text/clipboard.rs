@@ -11,6 +11,7 @@ const COPY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const COPY_TIMEOUT: Duration = Duration::from_millis(900);
 const COPY_CHANGE_STABLE_FOR: Duration = Duration::from_millis(60);
 const COPY_MIN_ACCEPT_DELAY: Duration = Duration::from_millis(120);
+const SENTINEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(120);
 const PASTE_SETTLE_TIMEOUT: Duration = Duration::from_millis(140);
 
 pub(super) trait ClipboardAccess {
@@ -100,10 +101,16 @@ impl SelectedTextOperation {
 
         clipboard.set_text(&sentinel)?;
         log_selected_text_debug("clipboard-set-sentinel", &format!("sentinel={sentinel}"));
+        let sentinel_confirmed = wait_for_clipboard_sentinel(clipboard, &sentinel);
         transport.copy_selection()?;
         log_selected_text_debug("copy-sent", "selection copy shortcut dispatched");
 
-        let selected_text = match wait_for_copied_text(clipboard, &sentinel, &previous_clipboard)? {
+        let selected_text = match wait_for_copied_text(
+            clipboard,
+            &sentinel,
+            &previous_clipboard,
+            sentinel_confirmed,
+        )? {
             CopyOutcome::SelectedText(text) => {
                 log_selected_text_debug(
                     "copy-received",
@@ -150,6 +157,60 @@ impl SelectedTextOperation {
     }
 }
 
+fn wait_for_clipboard_sentinel(clipboard: &mut impl ClipboardAccess, sentinel: &str) -> bool {
+    let started = Instant::now();
+    let mut attempt = 0usize;
+
+    loop {
+        attempt += 1;
+        match clipboard.get_text() {
+            Ok(text) if text == sentinel => {
+                log_selected_text_debug(
+                    "sentinel-confirmed",
+                    &format!(
+                        "attempt={attempt} elapsed_ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                );
+                return true;
+            }
+            Ok(text) => {
+                if attempt == 1 || attempt.is_multiple_of(10) {
+                    log_selected_text_debug(
+                        "sentinel-poll-mismatch",
+                        &format!(
+                            "attempt={attempt} elapsed_ms={} text={}",
+                            started.elapsed().as_millis(),
+                            summarize_text(&text)
+                        ),
+                    );
+                }
+            }
+            Err(error) => {
+                if attempt == 1 || attempt.is_multiple_of(10) {
+                    log_selected_text_debug(
+                        "sentinel-poll-error",
+                        &format!(
+                            "attempt={attempt} elapsed_ms={} error={error}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                }
+            }
+        }
+
+        if started.elapsed() >= SENTINEL_CONFIRM_TIMEOUT {
+            log_selected_text_debug(
+                "sentinel-timeout",
+                &format!("elapsed_ms={}", started.elapsed().as_millis()),
+            );
+            return false;
+        }
+
+        thread::sleep(COPY_POLL_INTERVAL);
+    }
+}
+
 fn snapshot_clipboard(clipboard: &mut impl ClipboardAccess) -> ClipboardSnapshot {
     match clipboard.get_text() {
         Ok(text) => ClipboardSnapshot::Text(text),
@@ -161,12 +222,13 @@ fn wait_for_copied_text(
     clipboard: &mut impl ClipboardAccess,
     sentinel: &str,
     previous_clipboard: &ClipboardSnapshot,
+    sentinel_confirmed_before_copy: bool,
 ) -> Result<CopyOutcome, SelectedTextError> {
     let started = Instant::now();
     let mut attempt = 0usize;
     let mut candidate_text: Option<String> = None;
     let mut candidate_changed_at: Option<Instant> = None;
-    let mut observed_sentinel = false;
+    let mut observed_sentinel = sentinel_confirmed_before_copy;
 
     loop {
         attempt += 1;
@@ -194,7 +256,8 @@ fn wait_for_copied_text(
                     previous_clipboard,
                     ClipboardSnapshot::Text(previous) if previous == &text
                 );
-                let should_ignore = elapsed < COPY_MIN_ACCEPT_DELAY || matches_previous;
+                let should_ignore =
+                    elapsed < COPY_MIN_ACCEPT_DELAY || (matches_previous && !observed_sentinel);
 
                 if should_ignore && (is_new_candidate || attempt == 1 || attempt.is_multiple_of(20))
                 {
@@ -258,7 +321,7 @@ fn wait_for_copied_text(
                     previous_clipboard,
                     ClipboardSnapshot::Text(previous) if previous == &text
                 );
-                if matches_previous {
+                if matches_previous && !observed_sentinel {
                     log_selected_text_debug(
                         "copy-poll-timeout-stale",
                         &format!(
@@ -584,5 +647,22 @@ mod tests {
         assert_eq!(result, SelectedTextSwitchResult::NoSelectedText);
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(clipboard.current_text.as_deref(), Some("old clipboard"));
+    }
+
+    #[test]
+    fn accepts_selected_text_matching_previous_clipboard_after_sentinel_was_observed() {
+        let selected_text = "А терминал можно вынести отдельно ";
+        let previous_clipboard = ClipboardSnapshot::Text(selected_text.to_string());
+        let mut clipboard = TestClipboard::default();
+        clipboard.queue_read(Ok("sentinel".into()));
+        clipboard.queue_read(Ok(selected_text.into()));
+
+        let result =
+            wait_for_copied_text(&mut clipboard, "sentinel", &previous_clipboard, true).unwrap();
+
+        assert!(matches!(
+            result,
+            CopyOutcome::SelectedText(text) if text == selected_text
+        ));
     }
 }

@@ -1,3 +1,19 @@
+open-switcher (0.1.0-15) unstable; urgency=medium
+
+  * Run the default Shift+Pause selected-text hotkey on key press and clear
+    stale Pause suppression for keyboards that do not emit a reliable release.
+  * Keep converted selected text available briefly longer on X11 before
+    restoring the previous clipboard contents.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 16:15:13 +0200
+
+open-switcher (0.1.0-4) unstable; urgency=medium
+
+  * Allow Cinnamon X11 startup auto-correction to use a known cached layout
+    when the first backend resync is temporarily unavailable.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 14:47:33 +0200
+
 open-switcher (0.1.0-3) unstable; urgency=medium
 
   * Detect Cinnamon X11 layout switch shortcuts from wm keybindings.

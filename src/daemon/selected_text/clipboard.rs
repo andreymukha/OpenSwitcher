@@ -12,7 +12,7 @@ const COPY_TIMEOUT: Duration = Duration::from_millis(900);
 const COPY_CHANGE_STABLE_FOR: Duration = Duration::from_millis(60);
 const COPY_MIN_ACCEPT_DELAY: Duration = Duration::from_millis(120);
 const SENTINEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(120);
-const PASTE_SETTLE_TIMEOUT: Duration = Duration::from_millis(140);
+const PASTE_SETTLE_TIMEOUT: Duration = Duration::from_millis(300);
 
 pub(super) trait ClipboardAccess {
     fn get_text(&mut self) -> Result<String, SelectedTextError>;
@@ -664,5 +664,10 @@ mod tests {
             result,
             CopyOutcome::SelectedText(text) if text == selected_text
         ));
+    }
+
+    #[test]
+    fn paste_settle_window_covers_delayed_x11_clipboard_requests() {
+        assert!(PASTE_SETTLE_TIMEOUT >= Duration::from_millis(300));
     }
 }

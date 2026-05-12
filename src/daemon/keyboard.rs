@@ -1,7 +1,10 @@
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
-use crate::model::{HotkeyTrigger, LayoutSwitchCombo, SessionType, UndoKey};
+use crate::model::{
+    DesktopEnvironment, DistroKind, HotkeyTrigger, LayoutSwitchCombo, SessionType, SystemContext,
+    UndoKey,
+};
 use crate::system::SystemContextDetector;
 use evdev::{enumerate, Device, InputEvent, Key, LedType};
 use std::collections::HashSet;
@@ -37,6 +40,9 @@ const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
 const TRANSACTION_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const SHUTDOWN_JOIN_RETRY_WINDOW: Duration = Duration::from_millis(50);
+const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
+const CINNAMON_DBUS_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
+const CINNAMON_DBUS_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 // Backend readiness state
 
@@ -160,6 +166,14 @@ pub(crate) enum CorrectionLayoutSwitchOutcome {
     NotNeeded,
     AppliedUinput,
     AppliedX11,
+    AppliedCinnamonDbusXtest,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorrectionReplayStrategy {
+    Generic,
+    CinnamonDbusXtest,
+    CinnamonDbusXtestUnavailable,
 }
 
 // Real keyboard device
@@ -1925,12 +1939,417 @@ fn is_case_sensitive_letter_key(key: Key) -> bool {
     )
 }
 
+trait CinnamonX11XtestReplay {
+    fn prepare_for_layout_correction(&mut self, plan: &CorrectionPlan)
+        -> Result<(), SwitcherError>;
+    fn key_down(&mut self, key: Key) -> Result<(), SwitcherError>;
+    fn key_up(&mut self, key: Key) -> Result<(), SwitcherError>;
+}
+
+enum CinnamonX11XtestRuntime {
+    NotSelected,
+    Unavailable(String),
+    Available(Box<CinnamonX11XtestReplayer>),
+}
+
+type CinnamonInputSource = (
+    String,
+    String,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i32,
+    bool,
+);
+
+struct CinnamonX11XtestReplayer {
+    x11: x11rb::rust_connection::RustConnection,
+    root: u32,
+    dbus: zbus::blocking::Connection,
+}
+
+impl CinnamonX11XtestReplayer {
+    fn new() -> Result<Self, SwitcherError> {
+        let (x11, screen_num) = x11rb::connect(None)
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+        use x11rb::connection::Connection as _;
+
+        use x11rb::protocol::xkb::ConnectionExt as _;
+        x11.xkb_use_extension(1, 0)
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+            .reply()
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+
+        use x11rb::protocol::xtest::ConnectionExt as _;
+        x11.xtest_get_version(2, 2)
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+            .reply()
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+
+        let root = x11.setup().roots[screen_num].root;
+        let dbus = zbus::blocking::Connection::session()?;
+        Ok(Self { x11, root, dbus })
+    }
+
+    fn proxy(&self) -> Result<zbus::blocking::Proxy<'_>, SwitcherError> {
+        zbus::blocking::Proxy::new(&self.dbus, "org.Cinnamon", "/org/Cinnamon", "org.Cinnamon")
+            .map_err(SwitcherError::from)
+    }
+
+    fn input_sources(&self) -> Result<Vec<CinnamonInputSource>, SwitcherError> {
+        self.proxy()?
+            .call("GetInputSources", &())
+            .map_err(Into::into)
+    }
+
+    fn active_source_index(&self) -> Result<Option<i32>, SwitcherError> {
+        Ok(self
+            .input_sources()?
+            .into_iter()
+            .find(|source| source.11)
+            .map(|source| source.2))
+    }
+
+    fn target_source_index(&self) -> Result<i32, SwitcherError> {
+        let sources = self.input_sources()?;
+        let Some(active) = sources.iter().find(|source| source.11) else {
+            return Err(SwitcherError::Io(io::Error::other(
+                "cinnamon-dbus-xtest-before-mutation: no active input source",
+            )));
+        };
+
+        let active_is_russian = is_cinnamon_russian_source(active);
+        let active_is_english = is_cinnamon_english_source(active);
+        if !active_is_russian && !active_is_english {
+            return Err(SwitcherError::Io(io::Error::other(format!(
+                "cinnamon-dbus-xtest-before-mutation: unsupported active source {}",
+                active.1
+            ))));
+        }
+
+        let target = if active_is_russian {
+            sources
+                .iter()
+                .find(|source| is_cinnamon_english_source(source))
+        } else {
+            sources
+                .iter()
+                .find(|source| is_cinnamon_russian_source(source))
+        };
+
+        target.map(|source| source.2).ok_or_else(|| {
+            SwitcherError::Io(io::Error::other(
+                "cinnamon-dbus-xtest-before-mutation: target input source not found",
+            ))
+        })
+    }
+
+    fn activate_and_verify_source(&self, target_index: i32) -> Result<(), SwitcherError> {
+        let proxy = self.proxy()?;
+        let _: () = proxy.call("ActivateInputSourceIndex", &(target_index,))?;
+        let started = Instant::now();
+
+        while started.elapsed() < CINNAMON_DBUS_SWITCH_TIMEOUT {
+            let active_index = self.active_source_index()?;
+            let xkb_group = self.xkb_group()?;
+            if active_index == Some(target_index) && i32::from(xkb_group) == target_index {
+                return Ok(());
+            }
+            thread::sleep(CINNAMON_DBUS_SWITCH_POLL_INTERVAL);
+        }
+
+        Err(SwitcherError::Io(io::Error::other(format!(
+            "cinnamon-dbus-xtest-before-mutation: activation did not settle target={target_index} active={:?} xkb_group={:?}",
+            self.active_source_index().ok().flatten(),
+            self.xkb_group().ok(),
+        ))))
+    }
+
+    fn xkb_group(&self) -> Result<u8, SwitcherError> {
+        use x11rb::protocol::xkb::{self, ConnectionExt as _};
+        let state = self
+            .x11
+            .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+            .reply()
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+
+        Ok(u8::from(state.group))
+    }
+
+    fn validate_plan_keycodes(&self, plan: &CorrectionPlan) -> Result<(), SwitcherError> {
+        self.validate_keycode(Key::KEY_BACKSPACE)?;
+        self.validate_keycode(Key::KEY_LEFTSHIFT)?;
+        self.validate_keycode(Key::KEY_SPACE)?;
+        for stroke in &plan.buffer {
+            self.validate_keycode(stroke.key)?;
+        }
+        Ok(())
+    }
+
+    fn validate_keycode(&self, key: Key) -> Result<u8, SwitcherError> {
+        let keycode = evdev_key_to_x11_keycode(key)?;
+        use x11rb::connection::Connection as _;
+        let setup = self.x11.setup();
+        if keycode < setup.min_keycode || keycode > setup.max_keycode {
+            return Err(SwitcherError::Io(io::Error::other(format!(
+                "cinnamon-dbus-xtest-before-mutation: keycode out of X11 range key={key:?} keycode={keycode} min={} max={}",
+                setup.min_keycode, setup.max_keycode
+            ))));
+        }
+
+        use x11rb::protocol::xproto::ConnectionExt as _;
+        let mapping = self
+            .x11
+            .get_keyboard_mapping(keycode, 1)
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+            .reply()
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+        if mapping.keysyms.iter().all(|keysym| *keysym == 0) {
+            return Err(SwitcherError::Io(io::Error::other(format!(
+                "cinnamon-dbus-xtest-before-mutation: keycode has empty mapping key={key:?} keycode={keycode}",
+            ))));
+        }
+
+        Ok(keycode)
+    }
+
+    fn fake_key(&self, key: Key, pressed: bool) -> Result<(), SwitcherError> {
+        let keycode = self.validate_keycode(key)?;
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xproto;
+        use x11rb::protocol::xtest::ConnectionExt as _;
+        self.x11
+            .xtest_fake_input(
+                if pressed {
+                    xproto::KEY_PRESS_EVENT
+                } else {
+                    xproto::KEY_RELEASE_EVENT
+                },
+                keycode,
+                x11rb::CURRENT_TIME,
+                self.root,
+                0,
+                0,
+                0,
+            )
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+            .check()
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+        self.x11
+            .flush()
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+        Ok(())
+    }
+
+    fn type_key(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.key_down(key)?;
+        thread::sleep(Duration::from_millis(2));
+        self.key_up(key)
+    }
+}
+
+impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
+    fn prepare_for_layout_correction(
+        &mut self,
+        plan: &CorrectionPlan,
+    ) -> Result<(), SwitcherError> {
+        self.validate_plan_keycodes(plan)?;
+        let target_index = self.target_source_index()?;
+        self.activate_and_verify_source(target_index)
+    }
+
+    fn key_down(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.fake_key(key, true)
+    }
+
+    fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.fake_key(key, false)
+    }
+}
+
+fn is_cinnamon_russian_source(source: &CinnamonInputSource) -> bool {
+    source.1 == "ru" || source.4 == "ru"
+}
+
+fn is_cinnamon_english_source(source: &CinnamonInputSource) -> bool {
+    matches!(source.1.as_str(), "us" | "gb") || matches!(source.4.as_str(), "us" | "gb")
+}
+
+fn evdev_key_to_x11_keycode(key: Key) -> Result<u8, SwitcherError> {
+    let raw = key.code() + X11_EVDEV_KEYCODE_OFFSET;
+    u8::try_from(raw).map_err(|_| {
+        SwitcherError::Io(io::Error::other(format!(
+            "cinnamon-dbus-xtest-before-mutation: evdev keycode cannot fit in X11 keycode key={key:?} raw={raw}",
+        )))
+    })
+}
+
+fn select_correction_replay_strategy(
+    context: SystemContext,
+    switch_layout: bool,
+    cinnamon_xtest_available: bool,
+) -> CorrectionReplayStrategy {
+    if !switch_layout {
+        return CorrectionReplayStrategy::Generic;
+    }
+
+    if context.session_type == SessionType::X11
+        && context.desktop_environment == DesktopEnvironment::Cinnamon
+    {
+        if cinnamon_xtest_available {
+            CorrectionReplayStrategy::CinnamonDbusXtest
+        } else {
+            CorrectionReplayStrategy::CinnamonDbusXtestUnavailable
+        }
+    } else {
+        CorrectionReplayStrategy::Generic
+    }
+}
+
+fn release_modifiers_xtest(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    for key in pressed_modifier_keys(modifiers) {
+        replay.key_up(key)?;
+    }
+    Ok(())
+}
+
+fn restore_modifiers_xtest(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    for key in pressed_modifier_keys(modifiers) {
+        replay.key_down(key)?;
+    }
+    Ok(())
+}
+
+fn pressed_modifier_keys(modifiers: ModifierState) -> Vec<Key> {
+    let mut keys = Vec::new();
+    if modifiers.left_ctrl {
+        keys.push(Key::KEY_LEFTCTRL);
+    }
+    if modifiers.right_ctrl {
+        keys.push(Key::KEY_RIGHTCTRL);
+    }
+    if modifiers.left_shift {
+        keys.push(Key::KEY_LEFTSHIFT);
+    }
+    if modifiers.right_shift {
+        keys.push(Key::KEY_RIGHTSHIFT);
+    }
+    if modifiers.left_alt {
+        keys.push(Key::KEY_LEFTALT);
+    }
+    if modifiers.right_alt {
+        keys.push(Key::KEY_RIGHTALT);
+    }
+    if modifiers.left_meta {
+        keys.push(Key::KEY_LEFTMETA);
+    }
+    if modifiers.right_meta {
+        keys.push(Key::KEY_RIGHTMETA);
+    }
+    keys
+}
+
+fn xtest_key_tap(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    key: Key,
+    delay: Duration,
+) -> Result<(), SwitcherError> {
+    replay.key_down(key)?;
+    thread::sleep(Duration::from_millis(2));
+    replay.key_up(key)?;
+    thread::sleep(delay);
+    Ok(())
+}
+
+fn run_cinnamon_x11_xtest_correction(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    plan: &CorrectionPlan,
+    config: &RuntimeConfigSnapshot,
+    modifiers: ModifierState,
+) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+    replay.prepare_for_layout_correction(plan)?;
+    release_modifiers_xtest(replay, modifiers)?;
+
+    for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
+        xtest_key_tap(
+            replay,
+            Key::KEY_BACKSPACE,
+            Duration::from_millis(config.backspace_ms),
+        )?;
+    }
+
+    for stroke in &plan.buffer {
+        let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
+        if effective_shift {
+            replay.key_down(Key::KEY_LEFTSHIFT)?;
+            thread::sleep(Duration::from_millis(1));
+        }
+        xtest_key_tap(replay, stroke.key, Duration::from_millis(config.typing_ms))?;
+        if effective_shift {
+            replay.key_up(Key::KEY_LEFTSHIFT)?;
+        }
+    }
+
+    restore_modifiers_xtest(replay, modifiers)?;
+    Ok(CorrectionExecutionOutcome {
+        layout_switch: CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest,
+    })
+}
+
+fn detect_current_system_context() -> SystemContext {
+    SystemContextDetector::detect_current().unwrap_or(SystemContext {
+        session_type: SessionType::Unknown,
+        desktop_environment: DesktopEnvironment::Unknown,
+        distro: DistroKind::Unknown,
+    })
+}
+
+fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11XtestRuntime {
+    if select_correction_replay_strategy(context, true, true)
+        != CorrectionReplayStrategy::CinnamonDbusXtest
+    {
+        return CinnamonX11XtestRuntime::NotSelected;
+    }
+
+    match CinnamonX11XtestReplayer::new() {
+        Ok(replayer) => {
+            log_input_debug(
+                "correction-replay-strategy",
+                "session_type=x11 desktop=cinnamon strategy=cinnamon-dbus-xtest result=ready",
+            );
+            CinnamonX11XtestRuntime::Available(Box::new(replayer))
+        }
+        Err(error) => {
+            log_input_debug(
+                "correction-replay-strategy",
+                &format!(
+                    "session_type=x11 desktop=cinnamon strategy=cinnamon-dbus-xtest result=unavailable error={error}"
+                ),
+            );
+            CinnamonX11XtestRuntime::Unavailable(error.to_string())
+        }
+    }
+}
+
 fn run_correction(
     device: &mut uinput::Device,
     plan: &CorrectionPlan,
     config: &RuntimeConfigSnapshot,
     modifiers: ModifierState,
     x11_switcher: &mut Option<X11LayoutSwitcher>,
+    cinnamon_x11_xtest: &mut CinnamonX11XtestRuntime,
     switch_layout: bool,
 ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
     log_input_debug(
@@ -1946,6 +2365,35 @@ fn run_correction(
             config.backspace_ms,
         ),
     );
+
+    if switch_layout {
+        match cinnamon_x11_xtest {
+            CinnamonX11XtestRuntime::Available(replay) => {
+                log_input_debug(
+                    "correction-layout-switch",
+                    "strategy=cinnamon-dbus-xtest phase=prepare",
+                );
+                let outcome =
+                    run_cinnamon_x11_xtest_correction(replay.as_mut(), plan, config, modifiers)?;
+                log_input_debug(
+                    "correction-layout-switch",
+                    "strategy=cinnamon-dbus-xtest result=ok",
+                );
+                return Ok(outcome);
+            }
+            CinnamonX11XtestRuntime::Unavailable(reason) => {
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!("strategy=cinnamon-dbus-xtest result=error reason={reason}"),
+                );
+                return Err(SwitcherError::Io(io::Error::other(format!(
+                    "cinnamon-dbus-xtest-before-mutation: {reason}"
+                ))));
+            }
+            CinnamonX11XtestRuntime::NotSelected => {}
+        }
+    }
+
     release_modifiers(device, modifiers)?;
     for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
         device.press(&uinput::event::keyboard::Key::BackSpace)?;
@@ -1995,6 +2443,10 @@ fn run_correction(
                     "combo={:?} strategy=uinput result=ok hold_ms={}",
                     config.layout_switch_combo, config.layout_delay_ms
                 ),
+            ),
+            CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest => log_input_debug(
+                "correction-layout-switch",
+                "strategy=cinnamon-dbus-xtest result=ok",
             ),
             CorrectionLayoutSwitchOutcome::NotNeeded => {}
         }
@@ -2059,9 +2511,11 @@ fn run_virtual_keyboard_writer_loop(
     command_rx: mpsc::Receiver<WriterCommand>,
     completion_tx: mpsc::Sender<ManualCurrentWordCompletion>,
 ) -> Result<(), SwitcherError> {
-    let session_type = detect_current_session_type();
+    let context = detect_current_system_context();
+    let session_type = context.session_type;
     let mut x11_switcher =
         initialize_x11_switcher_for_session(session_type, X11LayoutSwitcher::new);
+    let mut cinnamon_x11_xtest = initialize_cinnamon_x11_xtest_runtime(context);
 
     for command in command_rx {
         match command {
@@ -2073,11 +2527,43 @@ fn run_virtual_keyboard_writer_loop(
                 }
                 WriterFastCommand::TypeSeparator { key } => {
                     log_input_debug("type-separator-execute", &format!("key={key:?}"));
-                    device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
-                    device.synchronize()?;
-                    thread::sleep(Duration::from_millis(2));
-                    device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
-                    device.synchronize()?;
+                    let typed_with_xtest = match &mut cinnamon_x11_xtest {
+                        CinnamonX11XtestRuntime::Available(replay) => match replay.type_key(key) {
+                            Ok(()) => {
+                                log_input_debug(
+                                    "type-separator-execute",
+                                    &format!("key={key:?} strategy=cinnamon-dbus-xtest result=ok"),
+                                );
+                                true
+                            }
+                            Err(error) => {
+                                log_input_debug(
+                                    "type-separator-execute",
+                                    &format!(
+                                        "key={key:?} strategy=cinnamon-dbus-xtest result=error fallback=uinput error={error}"
+                                    ),
+                                );
+                                false
+                            }
+                        },
+                        CinnamonX11XtestRuntime::Unavailable(reason) => {
+                            log_input_debug(
+                                "type-separator-execute",
+                                &format!(
+                                    "key={key:?} strategy=cinnamon-dbus-xtest result=unavailable fallback=uinput reason={reason}"
+                                ),
+                            );
+                            false
+                        }
+                        CinnamonX11XtestRuntime::NotSelected => false,
+                    };
+                    if !typed_with_xtest {
+                        device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
+                        device.synchronize()?;
+                        thread::sleep(Duration::from_millis(2));
+                        device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
+                        device.synchronize()?;
+                    }
                 }
             },
             WriterCommand::DeferredManualCurrentWordCorrection {
@@ -2093,6 +2579,7 @@ fn run_virtual_keyboard_writer_loop(
                     &config,
                     modifiers,
                     &mut x11_switcher,
+                    &mut cinnamon_x11_xtest,
                     true,
                 );
                 let outcome = match result {
@@ -2127,6 +2614,7 @@ fn run_virtual_keyboard_writer_loop(
                             &config,
                             modifiers,
                             &mut x11_switcher,
+                            &mut cinnamon_x11_xtest,
                             true,
                         ),
                         WriterTransactionKind::ApplySameLayoutCorrection {
@@ -2139,6 +2627,7 @@ fn run_virtual_keyboard_writer_loop(
                             &config,
                             modifiers,
                             &mut x11_switcher,
+                            &mut cinnamon_x11_xtest,
                             false,
                         ),
                         WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
@@ -2206,6 +2695,7 @@ impl SharedModifierState {
 mod tests {
     use super::*;
     use crate::model::{default_manual_correction_hotkey, default_selected_text_hotkey};
+    use crate::model::{DesktopEnvironment, DistroKind, SystemContext};
     use std::cell::Cell;
     use std::fs;
     use std::io;
@@ -2471,6 +2961,131 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeCinnamonX11XtestReplay {
+        prepare_error: Option<&'static str>,
+        calls: Vec<String>,
+    }
+
+    impl CinnamonX11XtestReplay for FakeCinnamonX11XtestReplay {
+        fn prepare_for_layout_correction(
+            &mut self,
+            _plan: &CorrectionPlan,
+        ) -> Result<(), SwitcherError> {
+            self.calls.push("prepare".to_string());
+            if let Some(error) = self.prepare_error.take() {
+                return Err(SwitcherError::Io(io::Error::other(error)));
+            }
+            Ok(())
+        }
+
+        fn key_down(&mut self, key: Key) -> Result<(), SwitcherError> {
+            self.calls.push(format!("down:{key:?}"));
+            Ok(())
+        }
+
+        fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
+            self.calls.push(format!("up:{key:?}"));
+            Ok(())
+        }
+    }
+
+    fn test_context(
+        session_type: SessionType,
+        desktop_environment: DesktopEnvironment,
+    ) -> SystemContext {
+        SystemContext {
+            session_type,
+            desktop_environment,
+            distro: DistroKind::Unknown,
+        }
+    }
+
+    #[test]
+    fn cinnamon_x11_switching_correction_selects_cinnamon_dbus_xtest_replay() {
+        let strategy = select_correction_replay_strategy(
+            test_context(SessionType::X11, DesktopEnvironment::Cinnamon),
+            true,
+            true,
+        );
+
+        assert_eq!(strategy, CorrectionReplayStrategy::CinnamonDbusXtest);
+    }
+
+    #[test]
+    fn non_cinnamon_x11_switching_correction_keeps_generic_replay() {
+        let strategy = select_correction_replay_strategy(
+            test_context(SessionType::X11, DesktopEnvironment::Xfce),
+            true,
+            true,
+        );
+
+        assert_eq!(strategy, CorrectionReplayStrategy::Generic);
+    }
+
+    #[test]
+    fn gnome_wayland_switching_correction_keeps_generic_replay() {
+        let strategy = select_correction_replay_strategy(
+            test_context(SessionType::Wayland, DesktopEnvironment::Gnome),
+            true,
+            true,
+        );
+
+        assert_eq!(strategy, CorrectionReplayStrategy::Generic);
+    }
+
+    #[test]
+    fn cinnamon_x11_replay_readiness_failure_aborts_before_backspace() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            prepare_error: Some("dbus unavailable"),
+            calls: Vec::new(),
+        };
+
+        let result = run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &CorrectionPlan {
+                buffer: vec![crate::daemon::switch_logic::Keystroke {
+                    key: Key::KEY_G,
+                    shift: true,
+                    caps_lock: false,
+                }],
+                extra_backspaces: 0,
+            },
+            &test_runtime_config_snapshot(),
+            ModifierState::default(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(replay.calls, vec!["prepare"]);
+        assert!(!replay.calls.iter().any(|call| call.contains("BACKSPACE")));
+    }
+
+    #[test]
+    fn cinnamon_x11_replay_keycode_mapping_failure_aborts_before_backspace() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            prepare_error: Some("keycode unavailable"),
+            calls: Vec::new(),
+        };
+
+        let result = run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &CorrectionPlan {
+                buffer: vec![crate::daemon::switch_logic::Keystroke {
+                    key: Key::KEY_H,
+                    shift: false,
+                    caps_lock: false,
+                }],
+                extra_backspaces: 0,
+            },
+            &test_runtime_config_snapshot(),
+            ModifierState::default(),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(replay.calls, vec!["prepare"]);
+        assert!(!replay.calls.iter().any(|call| call.contains("BACKSPACE")));
+    }
+
     #[test]
     fn layout_switch_outcome_reports_applied_x11_when_x11_succeeds() {
         let mut x11 = FakeLayoutSwitcher {
@@ -2633,6 +3248,7 @@ mod tests {
     #[test]
     fn writer_stop_marks_alive_false_before_shutdown_completes() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
         command_tx
             .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
                 key: Key::KEY_SPACE,
@@ -2646,8 +3262,8 @@ mod tests {
                 alive: alive.clone(),
             },
             join_handle: Some(thread::spawn(move || {
-                thread::sleep(Duration::from_millis(40));
-                drop(command_rx);
+                let _keep_receiver_alive = command_rx;
+                let _ = release_rx.recv();
             })),
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
@@ -2658,12 +3274,16 @@ mod tests {
             writer.stop();
         });
 
-        thread::sleep(Duration::from_millis(5));
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while alive.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
         assert!(
             !alive.load(Ordering::SeqCst),
             "writer must stop advertising itself as alive immediately on teardown"
         );
 
+        drop(release_tx);
         stopper.join().expect("stop thread should finish");
     }
 

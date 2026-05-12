@@ -230,6 +230,18 @@ fn automatic_layout_actions_allowed(sync_result: &BackendSyncResult) -> bool {
     !matches!(sync_result, BackendSyncResult::Skipped)
 }
 
+fn startup_autocorrection_allowed_after_resync(
+    sync_result: &BackendSyncResult,
+    cached_layout_kind: AppLayoutKind,
+) -> bool {
+    match sync_result {
+        BackendSyncResult::Updated { .. } | BackendSyncResult::Unchanged => true,
+        BackendSyncResult::Skipped => {
+            auto_layout_correction_supported_for_layout(cached_layout_kind)
+        }
+    }
+}
+
 fn next_layout_for_user_shortcut(
     sync_result: &BackendSyncResult,
     current_layout_kind: AppLayoutKind,
@@ -427,6 +439,26 @@ fn should_swallow_suppressed_undo_release(
     value: i32,
 ) -> bool {
     suppressed_undo_key == Some(key) && value == 0
+}
+
+fn should_clear_stale_suppressed_undo_on_press(
+    suppressed_undo_key: Option<evdev::Key>,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    suppressed_undo_key == Some(key) && value == 1
+}
+
+fn should_clear_stale_suppressed_selected_hotkey_on_press(
+    suppressed_hotkey_key: Option<evdev::Key>,
+    key: evdev::Key,
+    value: i32,
+) -> bool {
+    suppressed_hotkey_key == Some(key) && value == 1
+}
+
+fn selected_text_hotkey_runs_on_press(key: evdev::Key) -> bool {
+    key == evdev::Key::KEY_PAUSE
 }
 
 fn manual_current_word_physical_event_action(
@@ -965,14 +997,41 @@ impl DaemonService {
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
+                self.maybe_run_pending_selected_text_switch()?;
+                return Ok(());
             }
-            self.maybe_run_pending_selected_text_switch()?;
-            return Ok(());
+
+            if should_clear_stale_suppressed_selected_hotkey_on_press(
+                self.suppressed_hotkey_key,
+                key,
+                value,
+            ) {
+                log_input_debug(
+                    "suppressed-selected-hotkey-clear",
+                    &format!("reason=stale-press key={key:?} value={value}"),
+                );
+                self.suppressed_hotkey_key = None;
+                if self.pending_selected_text_switch {
+                    self.maybe_run_pending_selected_text_switch()?;
+                    return Ok(());
+                }
+            } else {
+                self.maybe_run_pending_selected_text_switch()?;
+                return Ok(());
+            }
         }
 
         if should_swallow_suppressed_undo_release(self.suppressed_undo_key, key, value) {
             self.suppressed_undo_key = None;
             return Ok(());
+        }
+
+        if should_clear_stale_suppressed_undo_on_press(self.suppressed_undo_key, key, value) {
+            log_input_debug(
+                "suppressed-undo-clear",
+                &format!("reason=stale-press key={key:?} value={value}"),
+            );
+            self.suppressed_undo_key = None;
         }
 
         if self.suppressed_undo_key == Some(key) {
@@ -1197,6 +1256,11 @@ impl DaemonService {
             );
             self.suppressed_hotkey_key = Some(key);
             self.pending_selected_text_switch = true;
+            if selected_text_hotkey_runs_on_press(key) {
+                self.suppressed_hotkey_key = None;
+                self.maybe_run_pending_selected_text_switch()?;
+                self.suppressed_hotkey_key = Some(key);
+            }
             return Ok(());
         }
 
@@ -1722,7 +1786,7 @@ impl DaemonService {
         self.pending_selected_text_switch = false;
         log_selected_text_debug(
             "hotkey-trigger",
-            "running selected-text switch after trigger key release",
+            "running selected-text switch after hotkey trigger",
         );
         self.apply_selected_text_switch()
     }
@@ -2147,11 +2211,19 @@ impl DaemonService {
             }
             BackendSyncResult::Skipped => {
                 let attempts_remaining = self.startup_layout_resync.record_failure();
+                let cached_layout_kind = self.current_layout_kind();
+                let fallback_allowed = startup_autocorrection_allowed_after_resync(
+                    &BackendSyncResult::Skipped,
+                    cached_layout_kind,
+                );
                 log_layout_debug(
                     "startup-resync",
-                    &format!("source=backend skipped=true attempts_remaining={attempts_remaining}"),
+                    &format!(
+                        "source=backend skipped=true attempts_remaining={attempts_remaining} \
+                         cached_layout_kind={cached_layout_kind:?} fallback_allowed={fallback_allowed}"
+                    ),
                 );
-                Ok(false)
+                Ok(fallback_allowed)
             }
         }
     }
@@ -2315,6 +2387,30 @@ mod tests {
         assert!(!state.is_pending());
         assert_eq!(state.record_failure(), 0);
         assert_eq!(state, StartupLayoutResyncState::Completed);
+    }
+
+    #[test]
+    fn startup_autocorrection_allows_known_cached_layout_when_resync_is_skipped() {
+        assert!(startup_autocorrection_allowed_after_resync(
+            &BackendSyncResult::Skipped,
+            AppLayoutKind::English,
+        ));
+        assert!(startup_autocorrection_allowed_after_resync(
+            &BackendSyncResult::Skipped,
+            AppLayoutKind::Russian,
+        ));
+    }
+
+    #[test]
+    fn startup_autocorrection_does_not_guess_unknown_cached_layout_when_resync_is_skipped() {
+        assert!(!startup_autocorrection_allowed_after_resync(
+            &BackendSyncResult::Skipped,
+            AppLayoutKind::Unknown,
+        ));
+        assert!(!startup_autocorrection_allowed_after_resync(
+            &BackendSyncResult::Skipped,
+            AppLayoutKind::Other,
+        ));
     }
 
     // Layout shortcut decisions
@@ -3317,6 +3413,51 @@ mod tests {
             Some(Key::KEY_PAUSE),
             Key::KEY_A,
             0,
+        ));
+    }
+
+    #[test]
+    fn stale_suppressed_pause_press_is_cleared_for_keyboards_without_pause_release() {
+        assert!(should_clear_stale_suppressed_undo_on_press(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(!should_clear_stale_suppressed_undo_on_press(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_PAUSE,
+            2,
+        ));
+        assert!(!should_clear_stale_suppressed_undo_on_press(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_A,
+            1,
+        ));
+    }
+
+    #[test]
+    fn selected_text_pause_hotkey_runs_without_waiting_for_release() {
+        assert!(selected_text_hotkey_runs_on_press(Key::KEY_PAUSE));
+        assert!(!selected_text_hotkey_runs_on_press(Key::KEY_F12));
+        assert!(!selected_text_hotkey_runs_on_press(Key::KEY_SCROLLLOCK));
+    }
+
+    #[test]
+    fn stale_suppressed_selected_hotkey_press_is_cleared_without_swallowing_current_press() {
+        assert!(should_clear_stale_suppressed_selected_hotkey_on_press(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_PAUSE,
+            1,
+        ));
+        assert!(!should_clear_stale_suppressed_selected_hotkey_on_press(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_PAUSE,
+            0,
+        ));
+        assert!(!should_clear_stale_suppressed_selected_hotkey_on_press(
+            Some(Key::KEY_PAUSE),
+            Key::KEY_F12,
+            1,
         ));
     }
 

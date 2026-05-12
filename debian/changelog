@@ -1,3 +1,15 @@
+open-switcher (0.1.0-17) unstable; urgency=medium
+
+  * Keep the settings sidebar fixed while page content scrolls.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 22:24:04 +0200
+
+open-switcher (0.1.0-16) unstable; urgency=medium
+
+  * Add an About page to the settings UI.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 21:43:04 +0200
+
 open-switcher (0.1.0-15) unstable; urgency=medium
 
   * Run the default Shift+Pause selected-text hotkey on key press and clear

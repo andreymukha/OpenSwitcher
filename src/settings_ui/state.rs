@@ -1,6 +1,6 @@
 use crate::model::{
     hotkeys_conflict_exact, AutoDetectedLayoutSwitch, HotkeySpec, LayoutSwitchCombo,
-    LayoutSwitchSource, Settings,
+    LayoutSwitchSource, Settings, SystemContext,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct ViewState {
     pub selected_text_hotkey: HotkeySpec,
     pub hotkey_error_text: String,
     pub layout_prefix_warning_text: String,
+    pub runtime_context: SystemContext,
     pub layout_switch: LayoutSwitchViewState,
     pub loading: bool,
     pub saving: bool,
@@ -304,8 +305,10 @@ impl DomainState {
             .map(|enabled| enabled != self.autostart_enabled)
             .unwrap_or(false);
         let dirty = settings_dirty || autostart_dirty;
-        let hotkey_error_text =
-            hotkey_error_text(self.draft.manual_correction_hotkey, self.draft.selected_text_hotkey);
+        let hotkey_error_text = hotkey_error_text(
+            self.draft.manual_correction_hotkey,
+            self.draft.selected_text_hotkey,
+        );
         let layout_prefix_warning_text = layout_prefix_warning_text(
             self.draft.layout_switch.combo,
             self.draft.manual_correction_hotkey,
@@ -323,6 +326,11 @@ impl DomainState {
             selected_text_hotkey: self.draft.selected_text_hotkey,
             hotkey_error_text,
             layout_prefix_warning_text,
+            runtime_context: if loaded {
+                self.draft.layout_switch.auto_detected.context
+            } else {
+                SystemContext::default()
+            },
             layout_switch: LayoutSwitchViewState {
                 combo: self.draft.layout_switch.combo,
                 combo_label: self.draft.layout_switch.combo.short_label().to_string(),
@@ -713,6 +721,33 @@ mod tests {
         assert_eq!(view.layout_switch.source, LayoutSwitchSource::AutoDetected);
         assert!(!view.layout_switch.show_fallback_hint);
         assert!(view.layout_switch.fallback_hint_text.is_empty());
+    }
+
+    #[test]
+    fn view_state_exposes_auto_detected_runtime_context_for_about_page() {
+        let mut state = DomainState::new();
+        let context = SystemContext {
+            session_type: SessionType::X11,
+            desktop_environment: DesktopEnvironment::Cinnamon,
+            distro: DistroKind::LinuxMint,
+        };
+        state.apply_loaded(Settings {
+            layout_switch: crate::model::LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                    confidence: DetectionConfidence::High,
+                    context,
+                },
+            },
+            ..Settings::default()
+        });
+        state.apply_loaded_autostart(false);
+
+        let view = state.view_state();
+
+        assert_eq!(view.runtime_context, context);
     }
 
     // Layout switch manual override/capture

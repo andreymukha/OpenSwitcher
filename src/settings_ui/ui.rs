@@ -3,13 +3,14 @@ use super::presenter::{PresenterEvent, SaveRequest, SettingsPresenter};
 use super::state::{LayoutSwitchActionsState, LayoutSwitchViewState, ViewState};
 use crate::error::SettingsClientError;
 use crate::model::{
-    HotkeyModifiers, HotkeySpec, HotkeyTrigger, LayoutSwitchCapturePhase,
-    LayoutSwitchCaptureState, LayoutSwitchCombo,
+    DesktopEnvironment, HotkeyModifiers, HotkeySpec, HotkeyTrigger, LayoutSwitchCapturePhase,
+    LayoutSwitchCaptureState, LayoutSwitchCombo, LayoutSwitchSource, SessionType, SystemContext,
 };
 use adw::prelude::*;
 use gtk::gdk;
 use gtk::glib::{self, SignalHandlerId};
 use std::cell::{Cell, RefCell};
+use std::fs;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ const PAGE_MAX_WIDTH: i32 = 560;
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(60);
 const CAPTURE_FOCUS_SETTLE_DELAY: Duration = Duration::from_millis(150);
 const CAPTURE_TIMEOUT_TOAST: &str = "Захват комбинации отменён по таймауту.";
+const GITHUB_URL: &str = "https://github.com/andreymukha/OpenSwitcher";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum SettingsWindowMode {
@@ -573,6 +575,25 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     layout_switch_value_row.add_suffix(&layout_switch_value_icon);
     layout_switch_value_row.add_suffix(&layout_switch_value_label);
 
+    let distro_pretty_name = current_distro_pretty_name();
+    let (about_version_row, _about_version_value_label) =
+        build_about_value_row("Версия", env!("CARGO_PKG_VERSION"));
+    let (about_os_row, _about_os_value_label) =
+        build_about_value_row("ОС", operating_system_label());
+    let (about_distro_row, _about_distro_value_label) =
+        build_about_value_row("Дистрибутив", &distro_pretty_name);
+    let (about_arch_row, _about_arch_value_label) =
+        build_about_value_row("Архитектура", std::env::consts::ARCH);
+    let (about_session_row, about_session_value_label) = build_about_value_row("Сессия", "Unknown");
+    let (about_desktop_row, about_desktop_value_label) =
+        build_about_value_row("Рабочее окружение", "Unknown");
+    let (about_layout_combo_row, about_layout_combo_value_label) =
+        build_about_value_row("Комбинация переключения", "Unknown");
+    let (about_layout_source_row, about_layout_source_value_label) =
+        build_about_value_row("Источник определения", "Unknown");
+    let (about_license_row, _about_license_value_label) = build_about_value_row("Лицензия", "MIT");
+    let (about_github_row, _about_github_value_label) = build_about_value_row("GitHub", GITHUB_URL);
+
     let layout_switch_dialog = adw::Window::builder()
         .title("Выбор комбинации раскладки")
         .default_width(380)
@@ -689,15 +710,40 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         &layout_switch_value_row,
         &layout_switch_hint_label,
     );
+    let about_page = build_about_page(AboutPageRows {
+        app: [
+            &about_version_row,
+            &about_os_row,
+            &about_distro_row,
+            &about_arch_row,
+        ],
+        runtime: [
+            &about_session_row,
+            &about_desktop_row,
+            &about_layout_combo_row,
+            &about_layout_source_row,
+        ],
+        project: [&about_license_row, &about_github_row],
+    });
 
     let stack = gtk::Stack::builder()
         .hexpand(true)
         .vexpand(true)
         .transition_type(gtk::StackTransitionType::SlideLeftRight)
         .build();
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
     stack.add_titled(&general_page, Some("general"), "Общие");
     stack.add_titled(&hotkeys_page, Some("hotkeys"), "Горячие клавиши");
+    stack.add_titled(&about_page, Some("about"), "О программе");
     stack.set_visible_child_name("general");
+
+    let page_scroller = gtk::ScrolledWindow::new();
+    page_scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
+    page_scroller.set_vscrollbar_policy(gtk::PolicyType::Automatic);
+    page_scroller.set_hexpand(true);
+    page_scroller.set_vexpand(true);
+    page_scroller.set_child(Some(&stack));
 
     let sidebar = gtk::StackSidebar::new();
     sidebar.set_stack(&stack);
@@ -710,7 +756,7 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
     container.set_margin_start(12);
     container.set_margin_end(12);
     container.append(&sidebar);
-    container.append(&stack);
+    container.append(&page_scroller);
 
     FormWidgets {
         container,
@@ -735,6 +781,10 @@ fn build_form_widgets(parent_window: &adw::ApplicationWindow) -> FormWidgets {
         layout_switch_value_row,
         layout_switch_value_label,
         layout_switch_value_icon,
+        about_session_value_label,
+        about_desktop_value_label,
+        about_layout_combo_value_label,
+        about_layout_source_value_label,
         layout_switch_dialog,
         dialog_capture_hint,
         dialog_current_combo_label,
@@ -813,6 +863,61 @@ fn build_hotkeys_page(
     clamp
 }
 
+struct AboutPageRows<'a> {
+    app: [&'a adw::ActionRow; 4],
+    runtime: [&'a adw::ActionRow; 4],
+    project: [&'a adw::ActionRow; 2],
+}
+
+fn build_about_page(rows: AboutPageRows<'_>) -> adw::Clamp {
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+    let app_group = adw::PreferencesGroup::builder()
+        .title("OpenSwitcher")
+        .description("Сведения о приложении и текущем окружении.")
+        .build();
+    for row in rows.app {
+        app_group.add(row);
+    }
+
+    let runtime_group = adw::PreferencesGroup::builder()
+        .title("Окружение")
+        .description("Данные, которые OpenSwitcher использует для работы с раскладкой.")
+        .build();
+    runtime_group.set_margin_top(20);
+    for row in rows.runtime {
+        runtime_group.add(row);
+    }
+
+    let project_group = adw::PreferencesGroup::builder().title("Проект").build();
+    project_group.set_margin_top(20);
+    for row in rows.project {
+        project_group.add(row);
+    }
+
+    content.append(&app_group);
+    content.append(&runtime_group);
+    content.append(&project_group);
+
+    let clamp = adw::Clamp::new();
+    clamp.set_maximum_size(PAGE_MAX_WIDTH);
+    clamp.set_child(Some(&content));
+    clamp
+}
+
+fn build_about_value_row(title: &str, value: &str) -> (adw::ActionRow, gtk::Label) {
+    let row = adw::ActionRow::builder().title(title).build();
+    let value_label = gtk::Label::new(Some(value));
+    value_label.set_halign(gtk::Align::End);
+    value_label.set_valign(gtk::Align::Center);
+    value_label.set_selectable(true);
+    value_label.set_wrap(true);
+    value_label.set_xalign(1.0);
+    value_label.add_css_class("monospace");
+    row.add_suffix(&value_label);
+    (row, value_label)
+}
+
 // Settings window widgets
 struct FormWidgets {
     container: gtk::Box,
@@ -837,6 +942,10 @@ struct FormWidgets {
     layout_switch_value_row: adw::ActionRow,
     layout_switch_value_label: gtk::Label,
     layout_switch_value_icon: gtk::Image,
+    about_session_value_label: gtk::Label,
+    about_desktop_value_label: gtk::Label,
+    about_layout_combo_value_label: gtk::Label,
+    about_layout_source_value_label: gtk::Label,
     layout_switch_dialog: adw::Window,
     dialog_capture_hint: gtk::Label,
     dialog_current_combo_label: gtk::Label,
@@ -901,14 +1010,7 @@ impl SettingsWindow {
 
         let form_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         form_container.set_vexpand(true);
-
-        let form_scroller = gtk::ScrolledWindow::new();
-        form_scroller.set_hscrollbar_policy(gtk::PolicyType::Never);
-        form_scroller.set_vscrollbar_policy(gtk::PolicyType::Automatic);
-        form_scroller.set_hexpand(true);
-        form_scroller.set_vexpand(true);
-        form_scroller.set_child(Some(&form_container));
-        content_box.append(&form_scroller);
+        content_box.append(&form_container);
 
         let actions_separator = gtk::Separator::new(gtk::Orientation::Horizontal);
         content_box.append(&actions_separator);
@@ -1577,6 +1679,25 @@ impl SettingsWindow {
 
             form.layout_switch_value_label
                 .set_text(&state.layout_switch.combo_label);
+            form.about_session_value_label
+                .set_text(format_session_type_for_about(
+                    state.runtime_context.session_type,
+                ));
+            form.about_desktop_value_label
+                .set_text(format_desktop_environment_for_about(
+                    state.runtime_context.desktop_environment,
+                ));
+            form.about_layout_combo_value_label
+                .set_text(if state.loaded {
+                    &state.layout_switch.combo_label
+                } else {
+                    "Unknown"
+                });
+            form.about_layout_source_value_label
+                .set_text(format_layout_switch_source_for_about(
+                    state.layout_switch.source,
+                    state.loaded,
+                ));
 
             let manual_actions_enabled = state.layout_switch.editable;
             let row_is_actionable =
@@ -1646,6 +1767,7 @@ fn initial_view_state() -> ViewState {
         selected_text_hotkey: default_settings.selected_text_hotkey,
         hotkey_error_text: String::new(),
         layout_prefix_warning_text: String::new(),
+        runtime_context: SystemContext::default(),
         layout_switch: LayoutSwitchViewState {
             combo: default_settings.layout_switch.combo,
             combo_label: default_settings.layout_switch.combo.short_label().to_string(),
@@ -1787,6 +1909,100 @@ fn hotkey_modifiers_from_capture_state(
         tracked.ctrl || event_state.contains(gdk::ModifierType::CONTROL_MASK),
         tracked.alt || event_state.contains(gdk::ModifierType::ALT_MASK),
     )
+}
+
+fn current_distro_pretty_name() -> String {
+    fs::read_to_string("/etc/os-release")
+        .ok()
+        .and_then(|content| parse_os_release_pretty_name(&content))
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn parse_os_release_pretty_name(content: &str) -> Option<String> {
+    content.lines().find_map(|line| {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            return None;
+        }
+
+        let (key, value) = line.split_once('=')?;
+        if key != "PRETTY_NAME" {
+            return None;
+        }
+
+        let value = unquote_os_release_value(value.trim());
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn unquote_os_release_value(value: &str) -> String {
+    let Some(quote) = value
+        .chars()
+        .next()
+        .filter(|quote| *quote == '"' || *quote == '\'')
+    else {
+        return value.to_string();
+    };
+
+    if !value.ends_with(quote) || value.len() < 2 {
+        return value.to_string();
+    }
+
+    let inner = &value[1..value.len() - 1];
+    let mut result = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for ch in inner.chars() {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+        } else if quote == '"' && ch == '\\' {
+            escaped = true;
+        } else {
+            result.push(ch);
+        }
+    }
+    if escaped {
+        result.push('\\');
+    }
+    result
+}
+
+fn operating_system_label() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        value => value,
+    }
+}
+
+fn format_session_type_for_about(session_type: SessionType) -> &'static str {
+    match session_type {
+        SessionType::X11 => "X11",
+        SessionType::Wayland => "Wayland",
+        SessionType::Unknown => "Unknown",
+    }
+}
+
+fn format_desktop_environment_for_about(desktop_environment: DesktopEnvironment) -> &'static str {
+    match desktop_environment {
+        DesktopEnvironment::Cinnamon => "Cinnamon",
+        DesktopEnvironment::Gnome => "GNOME",
+        DesktopEnvironment::Xfce => "XFCE",
+        DesktopEnvironment::Kde => "KDE",
+        DesktopEnvironment::Unknown => "Unknown",
+    }
+}
+
+fn format_layout_switch_source_for_about(source: LayoutSwitchSource, loaded: bool) -> &'static str {
+    if !loaded {
+        return "Unknown";
+    }
+
+    match source {
+        LayoutSwitchSource::Manual => "Manual",
+        LayoutSwitchSource::AutoDetected => "AutoDetected",
+        LayoutSwitchSource::AutoFallback => "AutoFallback",
+        LayoutSwitchSource::Unknown => "Unknown",
+    }
 }
 
 fn describe_client_error(error: &SettingsClientError, loading: bool) -> (&'static str, String) {
@@ -2061,5 +2277,35 @@ mod tests {
         dialog_state.borrow_mut().set_target(target);
 
         assert_eq!(dialog_state.borrow().target, HotkeyDialogTarget::ManualCorrection);
+    }
+
+    #[test]
+    fn os_release_pretty_name_parser_reads_quoted_value() {
+        let content = r#"
+ID=linuxmint
+PRETTY_NAME="Linux Mint 22.2"
+VERSION_ID="22.2"
+"#;
+
+        assert_eq!(
+            parse_os_release_pretty_name(content),
+            Some("Linux Mint 22.2".to_string())
+        );
+    }
+
+    #[test]
+    fn os_release_pretty_name_parser_handles_unquoted_value() {
+        let content = "ID=ubuntu\nPRETTY_NAME=Ubuntu 24.04.3 LTS\n";
+
+        assert_eq!(
+            parse_os_release_pretty_name(content),
+            Some("Ubuntu 24.04.3 LTS".to_string())
+        );
+    }
+
+    #[test]
+    fn os_release_pretty_name_parser_ignores_missing_or_empty_value() {
+        assert_eq!(parse_os_release_pretty_name("ID=linuxmint\n"), None);
+        assert_eq!(parse_os_release_pretty_name("PRETTY_NAME=\"\"\n"), None);
     }
 }

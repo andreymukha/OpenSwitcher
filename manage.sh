@@ -502,11 +502,13 @@ require_debian_package_dependencies() {
 }
 
 copy_debian_package_artifacts() {
-    local version arch deb_source ddeb_source deb_target ddeb_target
+    local version arch deb_source ddeb_source changes_source buildinfo_source deb_target ddeb_target
     version="$(dpkg-parsechangelog -S Version)"
     arch="$(dpkg-architecture -qDEB_HOST_ARCH)"
     deb_source="$SCRIPT_DIR/../open-switcher_${version}_${arch}.deb"
     ddeb_source="$SCRIPT_DIR/../open-switcher-dbgsym_${version}_${arch}.ddeb"
+    changes_source="$SCRIPT_DIR/../open-switcher_${version}_${arch}.changes"
+    buildinfo_source="$SCRIPT_DIR/../open-switcher_${version}_${arch}.buildinfo"
     deb_target="$PACKAGE_OUTPUT_DIR/open-switcher_${version}_${arch}.deb"
     ddeb_target="$PACKAGE_OUTPUT_DIR/open-switcher-dbgsym_${version}_${arch}.ddeb"
 
@@ -529,6 +531,9 @@ copy_debian_package_artifacts() {
     else
         echo "Debug-symbol package не найден; это не обязательно для обычной установки."
     fi
+
+    rm -f "$deb_source" "$ddeb_source" "$changes_source" "$buildinfo_source"
+    echo "Temporary parent-directory Debian artifacts cleaned up."
 }
 
 installable_package_path() {

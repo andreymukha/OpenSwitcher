@@ -12,12 +12,14 @@ ARCH="amd64"
 PARENT_DIR="$(dirname "$REPO_ROOT")"
 PARENT_DEB="$PARENT_DIR/open-switcher_${VERSION}_${ARCH}.deb"
 PARENT_DDEB="$PARENT_DIR/open-switcher-dbgsym_${VERSION}_${ARCH}.ddeb"
+PARENT_CHANGES="$PARENT_DIR/open-switcher_${VERSION}_${ARCH}.changes"
+PARENT_BUILDINFO="$PARENT_DIR/open-switcher_${VERSION}_${ARCH}.buildinfo"
 DIST_DEB="$PACKAGE_OUTPUT_DIR/open-switcher_${VERSION}_${ARCH}.deb"
 DIST_DDEB="$PACKAGE_OUTPUT_DIR/open-switcher-dbgsym_${VERSION}_${ARCH}.ddeb"
 
 cleanup() {
     rm -rf "$TMP_DIR"
-    rm -f "$PARENT_DEB" "$PARENT_DDEB" "$DIST_DEB" "$DIST_DDEB"
+    rm -f "$PARENT_DEB" "$PARENT_DDEB" "$PARENT_CHANGES" "$PARENT_BUILDINFO" "$DIST_DEB" "$DIST_DDEB"
 }
 trap cleanup EXIT
 
@@ -69,6 +71,8 @@ set -euo pipefail
 echo "dpkg-buildpackage \$*" >>"\$CALL_LOG"
 printf 'deb' >"$PARENT_DEB"
 printf 'ddeb' >"$PARENT_DDEB"
+printf 'changes' >"$PARENT_CHANGES"
+printf 'buildinfo' >"$PARENT_BUILDINFO"
 MOCK
 
 cat >"$MOCK_BIN/desktop-file-validate" <<'MOCK'
@@ -111,5 +115,9 @@ grep -Fq "The .ddeb file is optional and only needed for debugging." "$OUTPUT_LO
 
 [[ -f "$DIST_DEB" ]]
 [[ -f "$DIST_DDEB" ]]
+[[ ! -e "$PARENT_DEB" ]]
+[[ ! -e "$PARENT_DDEB" ]]
+[[ ! -e "$PARENT_CHANGES" ]]
+[[ ! -e "$PARENT_BUILDINFO" ]]
 
 echo "manage_package_deb_test.sh: ok"

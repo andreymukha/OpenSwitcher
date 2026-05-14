@@ -1,3 +1,21 @@
+open-switcher (0.1.0-20) unstable; urgency=medium
+
+  * Use Cinnamon active input source as current-layout source of truth on X11.
+  * Start autostart sessions through the XDG launcher gate instead of early
+    systemd user enablement.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Thu, 14 May 2026 00:12:47 +0200
+
+open-switcher (0.1.0-19) unstable; urgency=medium
+
+  * Respect the user autostart setting instead of globally enabling user units.
+  * Avoid input-backend reopen churn when the X11 active-window watcher is
+    unavailable.
+  * Refresh startup context and layout state before the first autocorrection
+    decision after autostart.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Wed, 13 May 2026 23:32:21 +0200
+
 open-switcher (0.1.0-17) unstable; urgency=medium
 
   * Keep the settings sidebar fixed while page content scrolls.

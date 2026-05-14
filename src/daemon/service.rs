@@ -1923,6 +1923,7 @@ impl DaemonService {
         correction_path: CorrectionPath,
     ) -> Result<(), SwitcherError> {
         let cached_layout_before = self.runtime.current_layout_state();
+        self.runtime.refresh_current_layout_observation();
         let post_correction_sync = self.runtime.sync_with_backend();
         let cached_layout_after = self.runtime.current_layout_state();
         let legacy_layout_after = self.runtime.current_layout();
@@ -2102,6 +2103,8 @@ impl DaemonService {
     }
 
     fn install_opened_input_backend(&mut self, opened: OpenedInputBackend<ActiveInputBackend>) {
+        self.drop_active_input_backend();
+
         let ActiveInputBackend {
             keyboard,
             selected_text_runner,
@@ -2128,14 +2131,13 @@ impl DaemonService {
     }
 
     fn drop_active_input_backend(&mut self) {
+        // Drop selected-text transport clones before stopping the writer so the
+        // virtual keyboard shutdown is not held open by an idle helper worker.
+        self.selected_text_runner = None;
+
         if let Some(mut keyboard) = self.keyboard.take() {
-            keyboard.release_grab_best_effort();
             keyboard.shutdown();
         }
-        // Selected-text jobs do not own the physical keyboard grab, so for this
-        // critical input-lock fix it is sufficient to drop the runner after
-        // keyboard control has already been returned to the user.
-        self.selected_text_runner = None;
     }
 
     // Transient input state reset / invalidation
@@ -2189,12 +2191,12 @@ impl DaemonService {
 
         let layout_before = self.runtime.current_layout();
 
-        match self.runtime.sync_with_backend() {
+        match self.runtime.periodic_sync_tick() {
             BackendSyncResult::Updated { current, .. } => {
                 self.startup_layout_resync.complete();
                 log_layout_debug(
                     "startup-resync",
-                    &format!("source=backend updated=true current={current:?}"),
+                    &format!("source=periodic updated=true current={current:?}"),
                 );
                 if self.runtime.current_layout() != layout_before {
                     self.publish_status_changed();
@@ -2205,7 +2207,7 @@ impl DaemonService {
                 self.startup_layout_resync.complete();
                 log_layout_debug(
                     "startup-resync",
-                    "source=backend updated=false current=unchanged",
+                    "source=periodic updated=false current=unchanged",
                 );
                 Ok(true)
             }
@@ -2219,7 +2221,7 @@ impl DaemonService {
                 log_layout_debug(
                     "startup-resync",
                     &format!(
-                        "source=backend skipped=true attempts_remaining={attempts_remaining} \
+                        "source=periodic skipped=true attempts_remaining={attempts_remaining} \
                          cached_layout_kind={cached_layout_kind:?} fallback_allowed={fallback_allowed}"
                     ),
                 );

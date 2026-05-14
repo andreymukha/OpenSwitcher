@@ -476,14 +476,6 @@ mod tests {
     }
 
     impl FakeCommandRunner {
-        fn push_ok(&self, stdout: &str) {
-            self.state
-                .lock()
-                .unwrap()
-                .results
-                .push_back(Ok(stdout.to_string()));
-        }
-
         fn push_err(&self, code: i32, stderr: &str) {
             self.state
                 .lock()
@@ -537,14 +529,15 @@ mod tests {
             restart_required: false,
         }));
 
+        let temp_dir = tempfile::tempdir().unwrap();
+        let autostart_file = temp_dir.path().join("open-switcher.desktop");
         let runner = FakeCommandRunner::default();
         runner.push_err(1, "enable failed");
-        runner.push_ok("disabled\n");
 
         let (event_tx, event_rx) = async_channel::unbounded();
         let presenter = SettingsPresenter::with_services(
             client.clone(),
-            UserServiceController::new(runner),
+            UserServiceController::with_autostart_file(runner, autostart_file),
             event_tx,
         );
 

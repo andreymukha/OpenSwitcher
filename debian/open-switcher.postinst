@@ -3,7 +3,24 @@ set -e
 
 #DEBHELPER#
 
+remove_legacy_global_user_enablement() {
+    daemon_link="/etc/systemd/user/default.target.wants/open-switcher-daemon.service"
+    tray_link="/etc/systemd/user/graphical-session.target.wants/open-switcher-tray.service"
+
+    if [ -L "$daemon_link" ] \
+        && [ "$(readlink "$daemon_link")" = "/usr/lib/systemd/user/open-switcher-daemon.service" ]; then
+        rm -f "$daemon_link"
+    fi
+
+    if [ -L "$tray_link" ] \
+        && [ "$(readlink "$tray_link")" = "/usr/lib/systemd/user/open-switcher-tray.service" ]; then
+        rm -f "$tray_link"
+    fi
+}
+
 if [ "$1" = "configure" ]; then
+    remove_legacy_global_user_enablement
+
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload-rules || true
         udevadm trigger --subsystem-match=input --action=change || true

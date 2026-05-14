@@ -44,5 +44,5 @@ execute_after_dh_install:
 	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-user-session-stop
 
 override_dh_installsystemduser:
-	dh_installsystemduser --name=open-switcher-daemon
-	dh_installsystemduser --name=open-switcher-tray
+	dh_installsystemduser --no-enable --name=open-switcher-daemon
+	dh_installsystemduser --no-enable --name=open-switcher-tray

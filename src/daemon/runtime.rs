@@ -456,7 +456,15 @@ mod tests {
         initial_layout_state: CurrentLayoutState,
         backend: Box<dyn LayoutBackend>,
     ) -> RuntimeState {
-        test_runtime_with_backend_and_context(initial_layout_state, backend, cinnamon_x11_context())
+        test_runtime_with_backend_and_context(
+            initial_layout_state,
+            backend,
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Xfce,
+                distro: DistroKind::LinuxMint,
+            },
+        )
     }
 
     fn test_runtime_with_backend_and_context(
@@ -1032,6 +1040,36 @@ undo_key = "Pause"
         ));
     }
 
+    #[derive(Clone)]
+    struct CinnamonInputSourceReaderStub {
+        calls: Arc<AtomicUsize>,
+        sources: Result<Vec<CinnamonInputSource>, String>,
+    }
+
+    impl CinnamonInputSourceReader for CinnamonInputSourceReaderStub {
+        fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.sources.clone()
+        }
+    }
+
+    fn cinnamon_input_source(source_id: &str, index: i32, active: bool) -> CinnamonInputSource {
+        CinnamonInputSource {
+            source_type: "xkb".to_string(),
+            source_id: source_id.to_string(),
+            index,
+            layout_code: source_id.to_string(),
+            active,
+        }
+    }
+
+    fn cinnamon_sources(active_source_id: &str) -> Vec<CinnamonInputSource> {
+        vec![
+            cinnamon_input_source("us", 0, active_source_id == "us"),
+            cinnamon_input_source("ru", 1, active_source_id == "ru"),
+        ]
+    }
+
     struct SystemContextDetectorStub {
         calls: Arc<AtomicUsize>,
         context: SystemContext,
@@ -1108,6 +1146,68 @@ undo_key = "Pause"
             known_layout_state(english_layout())
         );
         assert!(runtime.current_layout());
+        assert_eq!(
+            runtime.auto_correction_layout_kind(),
+            AppLayoutKind::English
+        );
+    }
+
+    #[test]
+    fn cinnamon_x11_current_layout_observation_reads_active_us_as_english() {
+        assert_eq!(
+            cinnamon_x11_current_layout_state_from_sources(&cinnamon_sources("us")),
+            known_layout_state(english_layout())
+        );
+    }
+
+    #[test]
+    fn cinnamon_x11_current_layout_observation_reads_active_ru_as_russian() {
+        assert_eq!(
+            cinnamon_x11_current_layout_state_from_sources(&cinnamon_sources("ru")),
+            known_layout_state(russian_layout())
+        );
+    }
+
+    #[test]
+    fn cinnamon_x11_current_layout_observation_rejects_unknown_active_source() {
+        let sources = vec![
+            cinnamon_input_source("us", 0, false),
+            cinnamon_input_source("de", 1, true),
+        ];
+
+        assert_untrusted_observation(Some(cinnamon_x11_current_layout_state_from_sources(
+            &sources,
+        )));
+    }
+
+    #[test]
+    fn current_layout_state_prefers_cinnamon_x11_observation() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: russian_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(russian_layout())),
+            }),
+            cinnamon_x11_context(),
+        );
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "us")])),
+        };
+        let cinnamon_reader = CinnamonInputSourceReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Ok(cinnamon_sources("us")),
+        };
+
+        runtime.refresh_current_layout_observation_with_readers(&reader, &cinnamon_reader);
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(english_layout())
+        );
         assert_eq!(
             runtime.auto_correction_layout_kind(),
             AppLayoutKind::English
@@ -1200,7 +1300,40 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn x11_keeps_untrusted_legacy_state_behavior_unchanged() {
+    fn non_cinnamon_x11_keeps_untrusted_legacy_state_behavior_unchanged() {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: english_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Xfce,
+                distro: DistroKind::LinuxMint,
+            },
+        );
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            }
+        );
+        assert_eq!(
+            runtime.auto_correction_layout_kind(),
+            AppLayoutKind::English
+        );
+    }
+
+    #[test]
+    fn cinnamon_x11_without_observation_rejects_untrusted_legacy_state() {
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
                 layout: english_layout(),
@@ -1215,16 +1348,13 @@ undo_key = "Pause"
             cinnamon_x11_context(),
         );
 
-        assert_eq!(
+        assert!(matches!(
             runtime.current_layout_state(),
-            CurrentLayoutState::Known {
-                layout: english_layout(),
-                trustworthy: false,
-            }
-        );
+            CurrentLayoutState::Unknown { .. }
+        ));
         assert_eq!(
             runtime.auto_correction_layout_kind(),
-            AppLayoutKind::English
+            AppLayoutKind::Unknown
         );
     }
 
@@ -1244,7 +1374,11 @@ undo_key = "Pause"
             Box::new(SnapshotBackend {
                 snapshot: SnapshotOutcome::State(known_layout_state(russian_layout())),
             }),
-            cinnamon_x11_context(),
+            SystemContext {
+                session_type: SessionType::X11,
+                desktop_environment: DesktopEnvironment::Xfce,
+                distro: DistroKind::LinuxMint,
+            },
         );
 
         runtime.refresh_current_layout_observation_with_reader(&reader);
@@ -1284,6 +1418,41 @@ undo_key = "Pause"
         assert_eq!(
             runtime.current_layout_state(),
             known_layout_state(english_layout())
+        );
+        assert!(runtime.take_pending_status_change());
+    }
+
+    #[test]
+    fn refresh_current_layout_observation_uses_cinnamon_reader_for_cinnamon_x11() {
+        let gsettings_calls = Arc::new(AtomicUsize::new(0));
+        let cinnamon_calls = Arc::new(AtomicUsize::new(0));
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::clone(&gsettings_calls),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+        let cinnamon_reader = CinnamonInputSourceReaderStub {
+            calls: Arc::clone(&cinnamon_calls),
+            sources: Ok(cinnamon_sources("ru")),
+        };
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+            cinnamon_x11_context(),
+        );
+
+        runtime.refresh_current_layout_observation_with_readers(&reader, &cinnamon_reader);
+
+        assert_eq!(gsettings_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cinnamon_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(russian_layout())
         );
         assert!(runtime.take_pending_status_change());
     }
@@ -1497,6 +1666,47 @@ undo_key = "Pause"
         assert!(runtime.take_pending_status_change());
         assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
         assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn periodic_sync_tick_uses_cinnamon_observation_for_cinnamon_x11() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: cinnamon_x11_context(),
+        };
+        let cinnamon_reader = CinnamonInputSourceReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Ok(cinnamon_sources("ru")),
+        };
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Known {
+                layout: english_layout(),
+                trustworthy: false,
+            },
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(CurrentLayoutState::Known {
+                    layout: english_layout(),
+                    trustworthy: false,
+                }),
+            }),
+            cinnamon_x11_context(),
+        );
+
+        assert_eq!(
+            runtime.periodic_sync_tick_with_readers(&reader, &detector, &cinnamon_reader),
+            BackendSyncResult::Unchanged
+        );
+
+        assert_eq!(
+            runtime.current_layout_state(),
+            known_layout_state(russian_layout())
+        );
+        assert!(runtime.take_pending_status_change());
     }
 
     #[test]
@@ -1758,6 +1968,58 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn periodic_sync_tick_late_upgrades_cinnamon_x11_before_first_autocorrect() {
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let detector = SystemContextDetectorStub {
+            calls: Arc::clone(&detector_calls),
+            context: cinnamon_x11_context(),
+        };
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            calls: Arc::clone(&reader_calls),
+            combo: LayoutSwitchCombo::super_space(),
+        };
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = LayoutSwitchCombo::ctrl_shift();
+        config.layout.switch_source = LayoutSwitchSource::AutoFallback;
+        config.layout.auto_detected = AutoDetectedLayoutSwitch {
+            strategy: DetectionStrategy::NoSupportedStrategy,
+            confidence: DetectionConfidence::Unsupported,
+            context: SystemContext {
+                session_type: SessionType::Unknown,
+                desktop_environment: DesktopEnvironment::Unknown,
+                distro: DistroKind::LinuxMint,
+            },
+        };
+        let runtime = runtime_with_config_and_context(
+            config,
+            SystemContext {
+                session_type: SessionType::Unknown,
+                desktop_environment: DesktopEnvironment::Unknown,
+                distro: DistroKind::LinuxMint,
+            },
+        );
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(runtime.system_context(), cinnamon_x11_context());
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                    confidence: DetectionConfidence::High,
+                    context: cinnamon_x11_context(),
+                },
+            }
+        );
+        assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
+        assert!(reader_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
     fn periodic_sync_tick_does_not_downgrade_high_confidence_auto_to_low_fallback() {
         let detector = SystemContextDetectorStub {
             calls: Arc::new(AtomicUsize::new(0)),
@@ -1980,9 +2242,8 @@ undo_key = "Pause"
             mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
 
-        assert!(
-            runtime.optimistic_gnome_wayland_uinput_layout_switch_with_reader(&before_switch_reader)
-        );
+        assert!(runtime
+            .optimistic_gnome_wayland_uinput_layout_switch_with_reader(&before_switch_reader));
         assert_eq!(
             runtime.current_layout_state(),
             known_layout_state(russian_layout())
@@ -2081,6 +2342,59 @@ trait SystemContextSource {
 impl SystemContextSource for SystemContextDetector {
     fn detect_current(&self) -> Result<SystemContext, SystemContextError> {
         Self::detect_current()
+    }
+}
+
+trait CinnamonInputSourceReader {
+    fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String>;
+}
+
+struct CommandCinnamonInputSourceReader;
+
+type CinnamonInputSourceRow = (
+    String,
+    String,
+    i32,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i32,
+    bool,
+);
+
+impl CinnamonInputSourceReader for CommandCinnamonInputSourceReader {
+    fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String> {
+        let connection =
+            zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
+        let proxy = zbus::blocking::Proxy::new(
+            &connection,
+            "org.Cinnamon",
+            "/org/Cinnamon",
+            "org.Cinnamon",
+        )
+        .map_err(|error| error.to_string())?;
+        let rows: Vec<CinnamonInputSourceRow> = proxy
+            .call("GetInputSources", &())
+            .map_err(|error| error.to_string())?;
+
+        Ok(rows
+            .into_iter()
+            .map(CinnamonInputSource::from_row)
+            .collect())
+    }
+}
+
+#[cfg(test)]
+struct PreserveCinnamonInputSourceReader;
+
+#[cfg(test)]
+impl CinnamonInputSourceReader for PreserveCinnamonInputSourceReader {
+    fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String> {
+        Err("cinnamon reader unavailable in this path".to_string())
     }
 }
 
@@ -2529,18 +2843,36 @@ impl RuntimeState {
     }
 
     pub fn periodic_sync_tick(&self) -> BackendSyncResult {
-        self.periodic_sync_tick_with(&CommandDesktopSettingsReader, &SystemContextDetector)
+        self.periodic_sync_tick_with_readers(
+            &CommandDesktopSettingsReader,
+            &SystemContextDetector,
+            &CommandCinnamonInputSourceReader,
+        )
     }
 
+    #[cfg(test)]
     fn periodic_sync_tick_with<R: DesktopSettingsReader, D: SystemContextSource>(
         &self,
         reader: &R,
         detector: &D,
     ) -> BackendSyncResult {
+        self.periodic_sync_tick_with_readers(reader, detector, &PreserveCinnamonInputSourceReader)
+    }
+
+    fn periodic_sync_tick_with_readers<
+        R: DesktopSettingsReader,
+        D: SystemContextSource,
+        C: CinnamonInputSourceReader,
+    >(
+        &self,
+        reader: &R,
+        detector: &D,
+        cinnamon_reader: &C,
+    ) -> BackendSyncResult {
         if self.refresh_system_context_with_detector(detector) {
             self.redetect_layout_switch_after_context_upgrade(reader);
         }
-        self.refresh_current_layout_observation_with_reader(reader);
+        self.refresh_current_layout_observation_with_readers(reader, cinnamon_reader);
         self.sync_with_backend()
     }
 
@@ -2777,13 +3109,39 @@ impl RuntimeState {
 
     // GNOME Wayland observation
 
-    fn refresh_current_layout_observation(&self) {
-        self.refresh_current_layout_observation_with_reader(&CommandDesktopSettingsReader);
+    pub(crate) fn refresh_current_layout_observation(&self) {
+        self.refresh_current_layout_observation_with_readers(
+            &CommandDesktopSettingsReader,
+            &CommandCinnamonInputSourceReader,
+        );
     }
 
+    #[cfg(test)]
     fn refresh_current_layout_observation_with_reader<R: DesktopSettingsReader>(&self, reader: &R) {
+        self.refresh_current_layout_observation_with_readers(
+            reader,
+            &PreserveCinnamonInputSourceReader,
+        );
+    }
+
+    fn refresh_current_layout_observation_with_readers<
+        R: DesktopSettingsReader,
+        C: CinnamonInputSourceReader,
+    >(
+        &self,
+        reader: &R,
+        cinnamon_reader: &C,
+    ) {
         if !is_gnome_wayland_context(self.system_context()) {
-            self.clear_current_layout_observation();
+            if is_cinnamon_x11_context(self.system_context()) {
+                let Some(next_observation) = cinnamon_x11_current_layout_state(cinnamon_reader)
+                else {
+                    return;
+                };
+                self.update_current_layout_observation(Some(next_observation), "runtime-sync");
+            } else {
+                self.clear_current_layout_observation();
+            }
             return;
         }
 
@@ -2898,6 +3256,11 @@ fn is_gnome_wayland_context(context: SystemContext) -> bool {
         && context.desktop_environment == DesktopEnvironment::Gnome
 }
 
+fn is_cinnamon_x11_context(context: SystemContext) -> bool {
+    context.session_type == SessionType::X11
+        && context.desktop_environment == DesktopEnvironment::Cinnamon
+}
+
 fn is_late_system_context_upgrade(current: SystemContext, candidate: SystemContext) -> bool {
     if candidate == current {
         return false;
@@ -2950,7 +3313,7 @@ fn effective_current_layout_state(
     observed_state: Option<&CurrentLayoutState>,
     context: SystemContext,
 ) -> CurrentLayoutState {
-    if is_gnome_wayland_context(context) {
+    if is_gnome_wayland_context(context) || is_cinnamon_x11_context(context) {
         if let Some(observed_state) = observed_state {
             return observed_state.clone();
         }
@@ -2962,12 +3325,157 @@ fn effective_current_layout_state(
             }
         ) {
             return CurrentLayoutState::Unknown {
-                reason: "gnome-wayland-observation:missing-untrusted-legacy-fallback".to_string(),
+                reason: if is_gnome_wayland_context(context) {
+                    "gnome-wayland-observation:missing-untrusted-legacy-fallback".to_string()
+                } else {
+                    "cinnamon-x11-observation:missing-untrusted-legacy-fallback".to_string()
+                },
             };
         }
     }
 
     raw_state.clone()
+}
+
+// Cinnamon X11 observation
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CinnamonInputSource {
+    source_type: String,
+    source_id: String,
+    index: i32,
+    layout_code: String,
+    active: bool,
+}
+
+impl CinnamonInputSource {
+    fn from_row(row: CinnamonInputSourceRow) -> Self {
+        Self {
+            source_type: row.0,
+            source_id: row.1,
+            index: row.2,
+            layout_code: row.4,
+            active: row.11,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrustedCinnamonLayoutPair {
+    english_layout: SystemLayout,
+    russian_layout: SystemLayout,
+    current_layout: SystemLayout,
+}
+
+fn cinnamon_x11_current_layout_state<R: CinnamonInputSourceReader>(
+    reader: &R,
+) -> Option<CurrentLayoutState> {
+    let sources = match reader.cinnamon_input_sources() {
+        Ok(sources) => sources,
+        Err(error) => {
+            log_layout_debug(
+                "cinnamon-x11-observation",
+                &format!("result=preserve reason=sources-read-error error={error}"),
+            );
+            return None;
+        }
+    };
+
+    Some(cinnamon_x11_current_layout_state_from_sources(&sources))
+}
+
+fn cinnamon_x11_current_layout_state_from_sources(
+    sources: &[CinnamonInputSource],
+) -> CurrentLayoutState {
+    match trusted_cinnamon_layout_pair_from_sources(sources) {
+        Ok(pair) => known_layout_state_from_layout(pair.current_layout),
+        Err(reason) => cinnamon_x11_unknown_layout_state(reason),
+    }
+}
+
+fn trusted_cinnamon_layout_pair_from_sources(
+    sources: &[CinnamonInputSource],
+) -> Result<TrustedCinnamonLayoutPair, &'static str> {
+    if sources.len() != 2 {
+        return Err("unsupported-configured-sources");
+    }
+
+    let mut english_layout = None;
+    let mut russian_layout = None;
+    let mut current_layout = None;
+
+    for source in sources {
+        let Some(layout) = trusted_cinnamon_xkb_layout(source) else {
+            return Err("unsupported-configured-sources");
+        };
+
+        if source.active {
+            current_layout = Some(layout.clone());
+        }
+
+        match layout.kind {
+            AppLayoutKind::English if english_layout.is_none() => english_layout = Some(layout),
+            AppLayoutKind::Russian if russian_layout.is_none() => russian_layout = Some(layout),
+            _ => return Err("unsupported-configured-sources"),
+        }
+    }
+
+    Ok(TrustedCinnamonLayoutPair {
+        english_layout: english_layout.ok_or("unsupported-configured-sources")?,
+        russian_layout: russian_layout.ok_or("unsupported-configured-sources")?,
+        current_layout: current_layout.ok_or("missing-active-source")?,
+    })
+}
+
+fn trusted_cinnamon_xkb_layout(source: &CinnamonInputSource) -> Option<SystemLayout> {
+    if source.source_type != "xkb" {
+        return None;
+    }
+
+    let layout_code = if matches!(source.source_id.as_str(), "us" | "gb" | "ru") {
+        source.source_id.as_str()
+    } else if matches!(source.layout_code.as_str(), "us" | "gb" | "ru") {
+        source.layout_code.as_str()
+    } else {
+        return None;
+    };
+
+    let (normalized_code, display_name, kind) = match layout_code {
+        "us" => (
+            LayoutCode::Us,
+            "English".to_string(),
+            AppLayoutKind::English,
+        ),
+        "gb" => (
+            LayoutCode::Gb,
+            "English (UK)".to_string(),
+            AppLayoutKind::English,
+        ),
+        "ru" => (
+            LayoutCode::Ru,
+            "Russian".to_string(),
+            AppLayoutKind::Russian,
+        ),
+        _ => return None,
+    };
+
+    Some(SystemLayout {
+        backend_key: source.source_id.clone(),
+        normalized_code,
+        display_name,
+        kind,
+        index: u32::try_from(source.index).ok(),
+    })
+}
+
+fn cinnamon_x11_unknown_layout_state(reason: &'static str) -> CurrentLayoutState {
+    log_layout_debug(
+        "cinnamon-x11-observation",
+        &format!("result=unknown reason={reason}"),
+    );
+    CurrentLayoutState::Unknown {
+        reason: format!("cinnamon-x11-observation:{reason}"),
+    }
 }
 
 // GNOME Wayland observation

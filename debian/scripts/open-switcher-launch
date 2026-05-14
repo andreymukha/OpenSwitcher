@@ -1,7 +1,38 @@
 #!/bin/sh
 set -eu
 
+mode="${1:---manual}"
+
+case "$mode" in
+    --manual|--autostart) ;;
+    *)
+        echo "usage: open-switcher-launch [--manual|--autostart]" >&2
+        exit 2
+        ;;
+esac
+
 command -v systemctl >/dev/null 2>&1 || exit 1
+
+autostart_file() {
+    if [ -n "${XDG_CONFIG_HOME:-}" ]; then
+        printf '%s\n' "$XDG_CONFIG_HOME/autostart/open-switcher.desktop"
+        return
+    fi
+
+    if [ -n "${HOME:-}" ]; then
+        printf '%s\n' "$HOME/.config/autostart/open-switcher.desktop"
+        return
+    fi
+
+    printf '%s\n' ".config/autostart/open-switcher.desktop"
+}
+
+autostart_enabled() {
+    file="$(autostart_file)"
+    [ -r "$file" ] || return 1
+    grep -Fxq "Exec=/usr/lib/open-switcher/open-switcher-launch --autostart" "$file" || return 1
+    grep -Fxq "X-GNOME-Autostart-enabled=true" "$file" || return 1
+}
 
 systemctl --user import-environment \
     DISPLAY \
@@ -12,5 +43,9 @@ systemctl --user import-environment \
     XDG_SESSION_DESKTOP \
     DESKTOP_SESSION \
     DBUS_SESSION_BUS_ADDRESS || true
+
+if [ "$mode" = "--autostart" ] && ! autostart_enabled; then
+    exit 0
+fi
 
 systemctl --user start open-switcher-tray.service

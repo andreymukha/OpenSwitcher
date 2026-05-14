@@ -141,7 +141,9 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
         let next_state = match error {
             SwitcherError::KeyboardNotFound
             | SwitcherError::KeyboardAccessDenied { .. }
-            | SwitcherError::UinputAccessDenied { .. } => Some(InputBackendState::WaitingForInputAccess),
+            | SwitcherError::UinputAccessDenied { .. } => {
+                Some(InputBackendState::WaitingForInputAccess)
+            }
             SwitcherError::Io(io_error)
                 if matches!(io_error.raw_os_error(), Some(19))
                     || io_error.to_string().contains("No such device") =>
@@ -194,7 +196,10 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
                     ),
                 );
                 opened.backend.shutdown();
-                self.schedule_retry_with_reason("input backend readiness incomplete".to_string(), now);
+                self.schedule_retry_with_reason(
+                    "input backend readiness incomplete".to_string(),
+                    now,
+                );
                 Ok(None)
             }
             Err(error) if error.is_recoverable_input_error() => {
@@ -261,6 +266,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct FakeBackend {
+        active_backends: Option<Rc<RefCell<usize>>>,
         shutdowns: Rc<RefCell<usize>>,
     }
 
@@ -270,8 +276,22 @@ mod tests {
         }
     }
 
+    impl Drop for FakeBackend {
+        fn drop(&mut self) {
+            if let Some(active_backends) = &self.active_backends {
+                let mut active_backends = active_backends.borrow_mut();
+                *active_backends = active_backends.saturating_sub(1);
+            }
+        }
+    }
+
     enum FakeOutcome {
         Ok {
+            shutdowns: Rc<RefCell<usize>>,
+            readiness: InputBackendReadiness,
+        },
+        OkTracked {
+            active_backends: Rc<RefCell<usize>>,
             shutdowns: Rc<RefCell<usize>>,
             readiness: InputBackendReadiness,
         },
@@ -297,10 +317,25 @@ mod tests {
                     readiness,
                 } => Ok(OpenedInputBackend {
                     backend: FakeBackend {
+                        active_backends: None,
                         shutdowns: shutdowns.clone(),
                     },
                     readiness: *readiness,
                 }),
+                FakeOutcome::OkTracked {
+                    active_backends,
+                    shutdowns,
+                    readiness,
+                } => {
+                    *active_backends.borrow_mut() += 1;
+                    Ok(OpenedInputBackend {
+                        backend: FakeBackend {
+                            active_backends: Some(active_backends.clone()),
+                            shutdowns: shutdowns.clone(),
+                        },
+                        readiness: *readiness,
+                    })
+                }
                 FakeOutcome::KeyboardAccessDenied => Err(SwitcherError::KeyboardAccessDenied {
                     path: PathBuf::from("/dev/input/event3"),
                     source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
@@ -432,6 +467,37 @@ mod tests {
         assert!(reopened.is_none());
         assert_eq!(lifecycle.state(), InputBackendState::WaitingForInputAccess);
         assert_eq!(*shutdowns.borrow(), 1);
+    }
+
+    #[test]
+    fn repeated_incomplete_recoveries_shutdown_and_drop_each_partial_backend() {
+        let active_backends = Rc::new(RefCell::new(0));
+        let shutdowns = Rc::new(RefCell::new(0));
+        let opener = FakeOpener {
+            outcome: FakeOutcome::OkTracked {
+                active_backends: active_backends.clone(),
+                shutdowns: shutdowns.clone(),
+                readiness: InputBackendReadiness {
+                    keyboard_open: true,
+                    writer_ready: true,
+                    watchers_ready: false,
+                    event_processing_ready: false,
+                },
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+        let mut now = Instant::now();
+
+        for expected_shutdowns in 1..=3 {
+            let reopened = lifecycle
+                .try_recover(SharedModifierState::default(), now)
+                .expect("recovery should stay recoverable");
+
+            assert!(reopened.is_none());
+            assert_eq!(*active_backends.borrow(), 0);
+            assert_eq!(*shutdowns.borrow(), expected_shutdowns);
+            now += Duration::from_secs(5);
+        }
     }
 
     #[test]

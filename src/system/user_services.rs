@@ -8,9 +8,10 @@ pub const DAEMON_UNIT: &str = "open-switcher-daemon.service";
 pub const TRAY_UNIT: &str = "open-switcher-tray.service";
 
 const XDG_AUTOSTART_FILE: &str = "open-switcher.desktop";
-const XDG_AUTOSTART_EXEC_LINE: &str = "Exec=systemctl --user start open-switcher-tray.service";
+const XDG_AUTOSTART_EXEC_LINE: &str =
+    "Exec=/usr/lib/open-switcher/open-switcher-launch --autostart";
 const XDG_AUTOSTART_ENABLED_LINE: &str = "X-GNOME-Autostart-enabled=true";
-const XDG_AUTOSTART_CONTENT: &str = "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=systemctl --user start open-switcher-tray.service\nX-GNOME-Autostart-enabled=true\n";
+const XDG_AUTOSTART_CONTENT: &str = "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=/usr/lib/open-switcher/open-switcher-launch --autostart\nX-GNOME-Autostart-enabled=true\n";
 
 pub trait CommandRunner: Clone {
     fn run(&self, command: &[&str]) -> Result<String, ServiceManagerError>;
@@ -64,28 +65,28 @@ impl<R: CommandRunner> UserServiceController<R> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_autostart_file(runner: R, autostart_file: PathBuf) -> Self {
+        Self {
+            runner,
+            autostart_file,
+        }
+    }
+
     pub fn enable_autostart(&self) -> Result<(), ServiceManagerError> {
-        self.run(["systemctl", "--user", "enable", DAEMON_UNIT])?;
-        self.run(["systemctl", "--user", "enable", TRAY_UNIT])?;
+        self.disable_legacy_systemd_autostart()?;
         self.install_xdg_autostart_fallback()?;
         Ok(())
     }
 
     pub fn disable_autostart(&self) -> Result<(), ServiceManagerError> {
-        self.run(["systemctl", "--user", "disable", DAEMON_UNIT])?;
-        self.run(["systemctl", "--user", "disable", TRAY_UNIT])?;
+        self.disable_legacy_systemd_autostart()?;
         self.remove_xdg_autostart_fallback()?;
         Ok(())
     }
 
     pub fn is_autostart_enabled(&self) -> Result<bool, ServiceManagerError> {
-        match self.run(["systemctl", "--user", "is-enabled", DAEMON_UNIT]) {
-            Ok(output) => Ok(output.trim() == "enabled" && self.xdg_autostart_fallback_installed()),
-            Err(ServiceManagerError::CommandFailed {
-                code: Some(1 | 4), ..
-            }) => Ok(false),
-            Err(error) => Err(error),
-        }
+        Ok(self.xdg_autostart_fallback_installed())
     }
 
     pub fn start_daemon_service(&self) -> Result<(), ServiceManagerError> {
@@ -100,6 +101,12 @@ impl<R: CommandRunner> UserServiceController<R> {
 
     fn run(&self, command: [&str; 4]) -> Result<String, ServiceManagerError> {
         self.runner.run(&command)
+    }
+
+    fn disable_legacy_systemd_autostart(&self) -> Result<(), ServiceManagerError> {
+        self.run(["systemctl", "--user", "disable", DAEMON_UNIT])?;
+        self.run(["systemctl", "--user", "disable", TRAY_UNIT])?;
+        Ok(())
     }
 
     fn install_xdg_autostart_fallback(&self) -> Result<(), ServiceManagerError> {
@@ -136,7 +143,9 @@ impl<R: CommandRunner> UserServiceController<R> {
 
 fn xdg_autostart_fallback_content_installed(content: &str) -> bool {
     let has_tray_service_exec = content.lines().any(|line| line == XDG_AUTOSTART_EXEC_LINE);
-    let has_enabled = content.lines().any(|line| line == XDG_AUTOSTART_ENABLED_LINE);
+    let has_enabled = content
+        .lines()
+        .any(|line| line == XDG_AUTOSTART_ENABLED_LINE);
 
     has_tray_service_exec && has_enabled
 }
@@ -150,7 +159,11 @@ fn default_xdg_autostart_file() -> PathBuf {
     config_home.join("autostart").join(XDG_AUTOSTART_FILE)
 }
 
-fn file_service_manager_error(action: &str, path: &Path, error: std::io::Error) -> ServiceManagerError {
+fn file_service_manager_error(
+    action: &str,
+    path: &Path,
+    error: std::io::Error,
+) -> ServiceManagerError {
     ServiceManagerError::SpawnFailed {
         command: vec![action.to_string(), path.display().to_string()],
         message: error.to_string(),
@@ -160,10 +173,10 @@ fn file_service_manager_error(action: &str, path: &Path, error: std::io::Error) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::env;
     use std::ffi::OsString;
     use std::fs;
-    use std::collections::VecDeque;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -272,17 +285,20 @@ mod tests {
     }
 
     fn expected_xdg_autostart_content() -> &'static str {
-        "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=systemctl --user start open-switcher-tray.service\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=/usr/lib/open-switcher/open-switcher-launch --autostart\nX-GNOME-Autostart-enabled=true\n"
     }
 
     #[test]
-    fn enable_autostart_only_enables_daemon_and_tray() {
-        with_temp_xdg_config_home(|_| {
+    fn enable_autostart_disables_legacy_user_units_and_installs_xdg_fallback() {
+        with_temp_xdg_config_home(|config_home| {
             let mut runner = FakeCommandRunner::default();
             runner.push_ok("");
             runner.push_ok("");
 
-            let services = UserServiceController::new(runner.clone());
+            let services = UserServiceController::with_autostart_file(
+                runner.clone(),
+                xdg_autostart_file(config_home),
+            );
             services.enable_autostart().unwrap();
 
             assert_eq!(
@@ -291,13 +307,13 @@ mod tests {
                     vec![
                         "systemctl".to_string(),
                         "--user".to_string(),
-                        "enable".to_string(),
+                        "disable".to_string(),
                         "open-switcher-daemon.service".to_string(),
                     ],
                     vec![
                         "systemctl".to_string(),
                         "--user".to_string(),
-                        "enable".to_string(),
+                        "disable".to_string(),
                         "open-switcher-tray.service".to_string(),
                     ],
                 ]
@@ -372,17 +388,17 @@ mod tests {
     }
 
     #[test]
-    fn autostart_checkbox_state_comes_from_daemon_unit_enabled_state() {
+    fn autostart_checkbox_state_comes_from_xdg_autostart_fallback() {
         with_temp_xdg_config_home(|config_home| {
             let autostart_file = xdg_autostart_file(config_home);
             fs::create_dir_all(autostart_file.parent().unwrap()).unwrap();
             fs::write(&autostart_file, expected_xdg_autostart_content()).unwrap();
 
-            let mut runner = FakeCommandRunner::default();
-            runner.push_ok("enabled\n");
+            let runner = FakeCommandRunner::default();
 
-            let services = UserServiceController::new(runner);
+            let services = UserServiceController::new(runner.clone());
             assert!(services.is_autostart_enabled().unwrap());
+            assert!(runner.commands().is_empty());
         });
     }
 
@@ -393,12 +409,11 @@ mod tests {
             fs::create_dir_all(autostart_file.parent().unwrap()).unwrap();
             fs::write(
                 &autostart_file,
-                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=systemctl --user start open-switcher-tray.service\nX-GNOME-Autostart-enabled=true\nX-Cinnamon-Autostart-enabled=true\n",
+                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nComment=Start OpenSwitcher tray service\nExec=/usr/lib/open-switcher/open-switcher-launch --autostart\nX-GNOME-Autostart-enabled=true\nX-Cinnamon-Autostart-enabled=true\n",
             )
             .unwrap();
 
-            let mut runner = FakeCommandRunner::default();
-            runner.push_ok("enabled\n");
+            let runner = FakeCommandRunner::default();
 
             let services = UserServiceController::new(runner);
             assert!(services.is_autostart_enabled().unwrap());
@@ -416,8 +431,7 @@ mod tests {
             )
             .unwrap();
 
-            let mut runner = FakeCommandRunner::default();
-            runner.push_ok("enabled\n");
+            let runner = FakeCommandRunner::default();
 
             let services = UserServiceController::new(runner);
             assert!(!services.is_autostart_enabled().unwrap());
@@ -431,12 +445,11 @@ mod tests {
             fs::create_dir_all(autostart_file.parent().unwrap()).unwrap();
             fs::write(
                 &autostart_file,
-                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nExec=systemctl --user start open-switcher-tray.service\n",
+                "[Desktop Entry]\nType=Application\nName=OpenSwitcher\nExec=/usr/lib/open-switcher/open-switcher-launch --autostart\n",
             )
             .unwrap();
 
-            let mut runner = FakeCommandRunner::default();
-            runner.push_ok("enabled\n");
+            let runner = FakeCommandRunner::default();
 
             let services = UserServiceController::new(runner);
             assert!(!services.is_autostart_enabled().unwrap());
@@ -446,8 +459,7 @@ mod tests {
     #[test]
     fn missing_xdg_autostart_fallback_is_reported_as_autostart_off() {
         with_temp_xdg_config_home(|_| {
-            let mut runner = FakeCommandRunner::default();
-            runner.push_ok("enabled\n");
+            let runner = FakeCommandRunner::default();
 
             let services = UserServiceController::new(runner);
             assert!(!services.is_autostart_enabled().unwrap());
@@ -455,10 +467,9 @@ mod tests {
     }
 
     #[test]
-    fn disabled_daemon_unit_is_reported_as_autostart_off() {
+    fn legacy_enabled_daemon_unit_without_xdg_fallback_is_reported_as_autostart_off() {
         with_temp_xdg_config_home(|_| {
-            let mut runner = FakeCommandRunner::default();
-            runner.push_err(1, "");
+            let runner = FakeCommandRunner::default();
 
             let services = UserServiceController::new(runner);
             assert!(!services.is_autostart_enabled().unwrap());
@@ -466,13 +477,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_daemon_unit_is_reported_as_autostart_off() {
+    fn is_autostart_enabled_does_not_query_systemd_enable_state() {
         with_temp_xdg_config_home(|_| {
-            let mut runner = FakeCommandRunner::default();
-            runner.push_err(4, "");
+            let runner = FakeCommandRunner::default();
 
-            let services = UserServiceController::new(runner);
+            let services = UserServiceController::new(runner.clone());
             assert!(!services.is_autostart_enabled().unwrap());
+            assert!(runner.commands().is_empty());
         });
     }
 

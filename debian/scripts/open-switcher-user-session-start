@@ -86,6 +86,7 @@ start_for_session() {
     session="$1"
     uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
     user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
+    home="$(home_for_user "$user")"
 
     [ -n "$uid" ] || return 0
     [ -n "$user" ] || return 0
@@ -102,7 +103,13 @@ start_for_session() {
     runuser -u "$user" -- env \
         "XDG_RUNTIME_DIR=/run/user/$uid" \
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-        systemctl --user start open-switcher-tray.service || true
+        systemctl --user disable open-switcher-daemon.service open-switcher-tray.service || true
+
+    runuser -u "$user" -- env \
+        "XDG_RUNTIME_DIR=/run/user/$uid" \
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+        "HOME=$home" \
+        /usr/lib/open-switcher/open-switcher-launch --autostart || true
 }
 
 command -v loginctl >/dev/null 2>&1 || exit 0

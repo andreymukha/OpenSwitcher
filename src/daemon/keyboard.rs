@@ -768,13 +768,7 @@ impl InputTargetWatcher {
                     format_session_type(session_type)
                 ),
             );
-            return Self {
-                changed_flag,
-                stop_flag,
-                alive,
-                required: false,
-                handle: None,
-            };
+            return Self::disabled(changed_flag, stop_flag, alive);
         }
 
         let Ok(mut monitor) = ActiveWindowMonitor::connect() else {
@@ -782,13 +776,7 @@ impl InputTargetWatcher {
                 "input-target-watcher-disabled",
                 "reason=x11-active-window-unavailable",
             );
-            return Self {
-                changed_flag,
-                stop_flag,
-                alive,
-                required: true,
-                handle: None,
-            };
+            return Self::disabled(changed_flag, stop_flag, alive);
         };
 
         let worker_changed_flag = Arc::clone(&changed_flag);
@@ -848,6 +836,20 @@ impl InputTargetWatcher {
             alive,
             required: true,
             handle: Some(handle),
+        }
+    }
+
+    fn disabled(
+        changed_flag: Arc<AtomicBool>,
+        stop_flag: Arc<AtomicBool>,
+        alive: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            changed_flag,
+            stop_flag,
+            alive,
+            required: false,
+            handle: None,
         }
     }
 
@@ -3576,6 +3578,17 @@ mod tests {
             required: false,
             handle: None,
         };
+
+        assert!(watcher.is_ready());
+    }
+
+    #[test]
+    fn input_target_watcher_readiness_is_true_when_x11_monitor_is_unavailable() {
+        let watcher = InputTargetWatcher::disabled(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
 
         assert!(watcher.is_ready());
     }

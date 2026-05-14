@@ -2,7 +2,7 @@
 Type=Application
 Name=OpenSwitcher
 Comment=Start OpenSwitcher tray service
-Exec=/usr/lib/open-switcher/open-switcher-launch
+Exec=/usr/lib/open-switcher/open-switcher-launch --autostart
 Icon=open-switcher
 Categories=Utility;
 Terminal=false

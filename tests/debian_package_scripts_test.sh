@@ -7,7 +7,7 @@ assert_contains() {
     local file="$1"
     local expected="$2"
 
-    if ! grep -Fq "$expected" "$file"; then
+    if ! grep -Fq -- "$expected" "$file"; then
         echo "expected '$file' to contain: $expected" >&2
         exit 1
     fi
@@ -25,11 +25,15 @@ assert_file_exists() {
 test_launch_imports_graphical_environment_before_start() {
     local file="$REPO_ROOT/debian/scripts/open-switcher-launch"
 
+    assert_contains "$file" "--manual"
+    assert_contains "$file" "--autostart"
     assert_contains "$file" "systemctl --user import-environment"
     assert_contains "$file" "DISPLAY"
     assert_contains "$file" "XAUTHORITY"
     assert_contains "$file" "XDG_SESSION_TYPE"
     assert_contains "$file" "XDG_CURRENT_DESKTOP"
+    assert_contains "$file" ".config/autostart/open-switcher.desktop"
+    assert_contains "$file" "X-GNOME-Autostart-enabled=true"
     assert_contains "$file" "systemctl --user start open-switcher-tray.service"
 }
 
@@ -40,22 +44,36 @@ test_package_session_start_imports_loginctl_environment() {
     assert_contains "$file" "Type --value"
     assert_contains "$file" "Desktop --value"
     assert_contains "$file" "systemctl --user import-environment"
-    assert_contains "$file" "systemctl --user start open-switcher-tray.service"
+    assert_contains "$file" "systemctl --user disable open-switcher-daemon.service open-switcher-tray.service"
+    assert_contains "$file" "/usr/lib/open-switcher/open-switcher-launch --autostart"
 }
 
 test_package_installs_xdg_autostart_fallback() {
     local autostart="$REPO_ROOT/debian/autostart/open-switcher-autostart.desktop"
+    local desktop="$REPO_ROOT/debian/open-switcher.desktop"
     local install_file="$REPO_ROOT/debian/open-switcher.install"
 
     assert_file_exists "$autostart"
-    assert_contains "$autostart" "Exec=/usr/lib/open-switcher/open-switcher-launch"
+    assert_contains "$desktop" "Exec=/usr/lib/open-switcher/open-switcher-launch --manual"
+    assert_contains "$autostart" "Exec=/usr/lib/open-switcher/open-switcher-launch --autostart"
     assert_contains "$autostart" "NoDisplay=true"
     assert_contains "$autostart" "X-GNOME-Autostart-enabled=true"
     assert_contains "$install_file" "debian/autostart/open-switcher-autostart.desktop etc/xdg/autostart/"
 }
 
+test_package_does_not_globally_enable_user_units() {
+    local rules="$REPO_ROOT/debian/rules"
+    local postinst="$REPO_ROOT/debian/open-switcher.postinst"
+
+    assert_contains "$rules" "dh_installsystemduser --no-enable --name=open-switcher-daemon"
+    assert_contains "$rules" "dh_installsystemduser --no-enable --name=open-switcher-tray"
+    assert_contains "$postinst" "/etc/systemd/user/default.target.wants/open-switcher-daemon.service"
+    assert_contains "$postinst" "/etc/systemd/user/graphical-session.target.wants/open-switcher-tray.service"
+}
+
 test_launch_imports_graphical_environment_before_start
 test_package_session_start_imports_loginctl_environment
 test_package_installs_xdg_autostart_fallback
+test_package_does_not_globally_enable_user_units
 
 echo "debian_package_scripts_test.sh: ok"

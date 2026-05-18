@@ -1,64 +1,9 @@
-open-switcher (0.1.0-20) unstable; urgency=medium
-
-  * Use Cinnamon active input source as current-layout source of truth on X11.
-  * Start autostart sessions through the XDG launcher gate instead of early
-    systemd user enablement.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Thu, 14 May 2026 00:12:47 +0200
-
-open-switcher (0.1.0-19) unstable; urgency=medium
-
-  * Respect the user autostart setting instead of globally enabling user units.
-  * Avoid input-backend reopen churn when the X11 active-window watcher is
-    unavailable.
-  * Refresh startup context and layout state before the first autocorrection
-    decision after autostart.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Wed, 13 May 2026 23:32:21 +0200
-
-open-switcher (0.1.0-17) unstable; urgency=medium
-
-  * Keep the settings sidebar fixed while page content scrolls.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 22:24:04 +0200
-
-open-switcher (0.1.0-16) unstable; urgency=medium
-
-  * Add an About page to the settings UI.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 21:43:04 +0200
-
-open-switcher (0.1.0-15) unstable; urgency=medium
-
-  * Run the default Shift+Pause selected-text hotkey on key press and clear
-    stale Pause suppression for keyboards that do not emit a reliable release.
-  * Keep converted selected text available briefly longer on X11 before
-    restoring the previous clipboard contents.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 16:15:13 +0200
-
-open-switcher (0.1.0-4) unstable; urgency=medium
-
-  * Allow Cinnamon X11 startup auto-correction to use a known cached layout
-    when the first backend resync is temporarily unavailable.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 12 May 2026 14:47:33 +0200
-
-open-switcher (0.1.0-3) unstable; urgency=medium
-
-  * Detect Cinnamon X11 layout switch shortcuts from wm keybindings.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Sun, 10 May 2026 22:56:25 +0300
-
-open-switcher (0.1.0-2) unstable; urgency=medium
-
-  * Import desktop session environment before starting user services.
-  * Install XDG autostart fallback for desktop-session login.
-
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Sun, 10 May 2026 21:12:53 +0300
-
 open-switcher (0.1.0-1) unstable; urgency=medium
 
-  * Initial Debian package for GitHub Release distribution.
+  * Initial public GitHub Release package.
+  * Package daemon, tray, settings UI, desktop launchers, icon, udev rule, and
+    user systemd units.
+  * Support the initial EN/RU desktop workflow on Ubuntu GNOME Wayland and
+    Linux Mint Cinnamon X11.
 
- -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Sun, 10 May 2026 06:00:00 +0300
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Mon, 18 May 2026 12:00:00 +0200

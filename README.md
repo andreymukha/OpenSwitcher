@@ -42,7 +42,23 @@ Environments not listed here are best-effort. The current confirmed Wayland targ
 Wayland; other Wayland desktops/compositors are diagnostics-first until tested and backed by
 desktop-specific layout detection/observation support.
 
-## Quick Start
+## Installation
+
+For normal use, download the Debian package from the GitHub Release and install it locally:
+
+```bash
+sudo apt install ./open-switcher_0.1.0-1_amd64.deb
+```
+
+Then start OpenSwitcher from the desktop application menu. The settings window controls whether
+OpenSwitcher starts automatically after login/reboot; launching it manually from the application
+menu always starts it even when autostart is disabled.
+
+The package installs the required application files, user systemd units, desktop launchers, icon,
+and Linux input udev rule. A normal package install should not require manually running
+`./manage.sh bootstrap linux-input`, enabling user units, or editing `/dev/input` permissions.
+
+## Development Quick Start
 
 ```bash
 ./manage.sh dev build
@@ -147,13 +163,17 @@ a warning but allows saving.
 
 OpenSwitcher reads real input devices from `/dev/input/event*` and writes virtual key events through `/dev/uinput`.
 
-Check whether the current session is ready:
+When OpenSwitcher is installed from the `.deb` package, the package installs the udev rule needed
+for normal runtime access. The commands below are mainly for source-tree development and
+troubleshooting.
+
+Check whether the current development session is ready:
 
 ```bash
 ./manage.sh doctor
 ```
 
-If the doctor reports denied access, run the official setup step:
+If the doctor reports denied access while running from the source tree, run the setup helper:
 
 ```bash
 ./manage.sh bootstrap linux-input
@@ -164,8 +184,6 @@ What the bootstrap does:
 - reloads udev rules when `udevadm` is available
 - applies a same-session ACL bridge for the current user when `setfacl` is available
 - reruns `./manage.sh doctor` to confirm the result
-
-This setup layer is explicit on purpose so it can later be reused by packaging without redesigning the Linux input model.
 
 Notes:
 - `./manage.sh bootstrap linux-input` works without `setfacl`, but the same-session ACL bridge is only applied when `setfacl` is available. On Debian/Ubuntu-like systems that command is typically provided by the `acl` package.
@@ -324,7 +342,11 @@ OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
 
 ## `systemd --user` Runtime
 
-This is the official runtime model for the published application.
+The published package uses `systemd --user` internally for the `daemon + tray` runtime model.
+Normal users should install the `.deb`, start OpenSwitcher from the desktop application menu, and
+use the settings UI to control autostart.
+
+The commands below are mainly for local source-tree development and manual debugging.
 
 Install user units, desktop entry, and locally installed binaries:
 
@@ -459,9 +481,9 @@ gdbus monitor \
 - The autocorrection heuristic is intentionally conservative. Some short RU -> EN technical false negatives may remain, for example `cargo`, `rust`, `sudo`, `git`, `ssh`, `npm`, `jwt`.
 - Existing rustfmt drift and non-hermetic shell/platform tests are known technical debt for later cleanup.
 
-## Practical Smoke Test
+## Development Smoke Test
 
-Recommended local sanity-check order:
+Recommended source-tree sanity-check order:
 
 1. `./manage.sh dev build`
 2. `./manage.sh dev start`

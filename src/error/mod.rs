@@ -169,11 +169,11 @@ impl SwitcherError {
     pub fn linux_input_setup_hint(&self) -> Option<String> {
         match self {
             SwitcherError::KeyboardAccessDenied { path, .. } => Some(format!(
-                "Linux input setup is not ready.\nKeyboard access is denied for: {}\nRun `./manage.sh doctor`\nRun `./manage.sh bootstrap linux-input`",
+                "Linux input setup is not ready.\nKeyboard access is denied for: {}\nInstall or reinstall the OpenSwitcher .deb package:\n  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb\nSign out and sign in again, then run `./manage.sh doctor`.",
                 path.display()
             )),
             SwitcherError::UinputAccessDenied { path, .. } => Some(format!(
-                "Linux input setup is not ready.\nuinput access is denied for: {}\nRun `./manage.sh doctor`\nRun `./manage.sh bootstrap linux-input`",
+                "Linux input setup is not ready.\nuinput access is denied for: {}\nInstall or reinstall the OpenSwitcher .deb package:\n  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb\nSign out and sign in again, then run `./manage.sh doctor`.",
                 path.display()
             )),
             _ => None,
@@ -214,7 +214,10 @@ mod tests {
             .expect("setup hint must be present");
 
         assert!(hint.contains("./manage.sh doctor"));
-        assert!(hint.contains("./manage.sh bootstrap linux-input"));
+        assert!(hint.contains("OpenSwitcher .deb"));
+        assert!(hint.contains("sudo apt install --reinstall"));
+        assert!(hint.contains("Sign out and sign in again"));
+        assert!(!hint.contains("./manage.sh bootstrap linux-input"));
     }
 
     #[test]
@@ -229,6 +232,9 @@ mod tests {
             .expect("setup hint must be present");
 
         assert!(hint.contains("./manage.sh doctor"));
-        assert!(hint.contains("./manage.sh bootstrap linux-input"));
+        assert!(hint.contains("OpenSwitcher .deb"));
+        assert!(hint.contains("sudo apt install --reinstall"));
+        assert!(hint.contains("Sign out and sign in again"));
+        assert!(!hint.contains("./manage.sh bootstrap linux-input"));
     }
 }

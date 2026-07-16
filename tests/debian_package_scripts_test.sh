@@ -22,6 +22,16 @@ assert_file_exists() {
     fi
 }
 
+assert_not_contains() {
+    local file="$1"
+    local unexpected="$2"
+
+    if grep -Fq -- "$unexpected" "$file"; then
+        echo "expected '$file' not to contain: $unexpected" >&2
+        exit 1
+    fi
+}
+
 test_launch_imports_graphical_environment_before_start() {
     local file="$REPO_ROOT/debian/scripts/open-switcher-launch"
 
@@ -71,9 +81,30 @@ test_package_does_not_globally_enable_user_units() {
     assert_contains "$postinst" "/etc/systemd/user/graphical-session.target.wants/open-switcher-tray.service"
 }
 
+test_privileged_input_setup_uses_package_owned_trust_anchors() {
+    local install_file="$REPO_ROOT/debian/open-switcher.install"
+    local rules="$REPO_ROOT/debian/rules"
+    local postinst="$REPO_ROOT/debian/open-switcher.postinst"
+    local prerm="$REPO_ROOT/debian/open-switcher.prerm"
+    local postrm="$REPO_ROOT/debian/open-switcher.postrm"
+    local file=""
+
+    assert_contains "$install_file" "debian/scripts/open-switcher-input-acl-bridge usr/lib/open-switcher/"
+    assert_contains "$rules" "dh_installudev --name=openswitcher-input --priority=80"
+    assert_contains "$rules" "chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-acl-bridge"
+    assert_contains "$postinst" "/usr/lib/open-switcher/open-switcher-input-acl-bridge"
+
+    for file in "$install_file" "$rules" "$postinst" "$prerm" "$postrm"; do
+        assert_not_contains "$file" "scripts/linux_input_setup.sh"
+        assert_not_contains "$file" "dist/udev"
+        assert_not_contains "$file" "OPEN_SWITCHER_LINUX_INPUT_"
+    done
+}
+
 test_launch_imports_graphical_environment_before_start
 test_package_session_start_imports_loginctl_environment
 test_package_installs_xdg_autostart_fallback
 test_package_does_not_globally_enable_user_units
+test_privileged_input_setup_uses_package_owned_trust_anchors
 
 echo "debian_package_scripts_test.sh: ok"

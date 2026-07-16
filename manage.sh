@@ -195,8 +195,10 @@ start_component() {
                 echo "Похоже, не выполнен Linux input setup." >&2
                 echo "Проверь:" >&2
                 echo "  ./manage.sh doctor" >&2
-                echo "Исправь:" >&2
-                echo "  ./manage.sh bootstrap linux-input" >&2
+                echo "Установи или переустанови собранный OpenSwitcher .deb:" >&2
+                echo "  ./manage.sh package deb" >&2
+                echo "  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb" >&2
+                echo "Затем выйди из пользовательской сессии, войди снова и повтори doctor." >&2
             fi
         fi
         exit 1
@@ -225,52 +227,17 @@ run_doctor_command() {
 }
 
 bootstrap_linux_input() {
-    openswitcher_linux_input_reject_production_overrides || return 1
-
-    local target_user
-    target_user="$(id -un)"
-
-    if [[ "$EUID" -eq 0 ]]; then
-        openswitcher_linux_input_bootstrap_root "$SCRIPT_DIR" "${SUDO_USER:-$target_user}"
-    else
-        if ! command -v sudo >/dev/null 2>&1; then
-            echo "sudo не найден. Для Linux input bootstrap нужен root-level setup." >&2
-            echo 'После установки sudo запусти: ./manage.sh bootstrap linux-input' >&2
-            exit 1
-        fi
-
-        sudo -- /usr/bin/env -i \
-            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-            /bin/bash --noprofile --norc -c '
-                set -euo pipefail
-                unset \
-                    OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT \
-                    OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES \
-                    OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
-                source "$1"
-                openswitcher_linux_input_bootstrap_root "$2" "$3"
-            ' openswitcher-linux-input-bootstrap \
-            "$LINUX_INPUT_HELPER" \
-            "$SCRIPT_DIR" \
-            "$target_user"
-    fi
-
-    echo
-    echo "Повторная проверка Linux input setup..."
-    if openswitcher_linux_input_doctor; then
-        return 0
-    fi
-
-    echo >&2
-    echo "Bootstrap завершён, но доступ в текущей сессии всё ещё не подтверждён." >&2
-    if ! command -v setfacl >/dev/null 2>&1; then
-        echo "Причина: отсутствует `setfacl`, поэтому same-session ACL bridge не был применён." >&2
-    fi
-    if ! command -v udevadm >/dev/null 2>&1; then
-        echo "Причина: отсутствует `udevadm`, поэтому live reload udev rules не был выполнен." >&2
-    fi
-    echo "Если устройства не переподхватились автоматически, перелогинься и повтори `./manage.sh doctor`." >&2
-    exit 1
+    echo "Source-tree Linux input bootstrap is disabled." >&2
+    echo "Working-tree code was not run as root." >&2
+    echo "Do not run ./manage.sh with sudo." >&2
+    echo "Build the canonical package:" >&2
+    echo "  ./manage.sh package deb" >&2
+    echo "Install or reinstall it:" >&2
+    echo "  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb" >&2
+    echo "Sign out and sign in again, then verify:" >&2
+    echo "  ./manage.sh doctor" >&2
+    echo "System state was not changed." >&2
+    return 1
 }
 
 run_bootstrap_command() {
@@ -771,7 +738,7 @@ usage() {
   ./manage.sh systemd <команда>
   ./manage.sh package <команда>
   ./manage.sh doctor [linux-input|wayland]
-  ./manage.sh bootstrap linux-input
+  ./manage.sh bootstrap linux-input # устаревшая compatibility-команда; ничего не меняет
   ./manage.sh <команда>            # алиасы на dev-режим
 
 dev-команды:
@@ -800,8 +767,8 @@ doctor-команды:
   doctor                Проверить Linux input setup для '/dev/input/*' и '/dev/uinput'
   doctor wayland        Показать диагностику Wayland/GNOME окружения и uinput
 
-bootstrap-команды:
-  bootstrap linux-input Установить udev rules и same-session ACL bridge для Linux input setup
+compatibility-команды:
+  bootstrap linux-input Показать безопасную миграцию на package-only Linux input setup (ничего не меняет)
 
 Переменные окружения:
   OPEN_SWITCHER_PROFILE=debug|release   По умолчанию: debug

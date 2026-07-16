@@ -56,15 +56,23 @@ sudo apt install ./open-switcher_0.1.0-1_amd64.deb
 стартует программу, даже если автозапуск выключен.
 
 Пакет устанавливает файлы приложения, пользовательские systemd units, desktop launchers, иконку и
-udev rule для Linux input. При обычной установке пакета не нужно вручную запускать
-`./manage.sh bootstrap linux-input`, включать user units или править доступы к `/dev/input`.
+package-owned настройку Linux input. Установка или переустановка `.deb` — единственный
+поддерживаемый привилегированный путь настройки; скрипты из working tree не устанавливают udev
+rules и не меняют ACL устройств. Никогда не запускай `./manage.sh` через `sudo`.
 
 ## Быстрый старт для разработки
 
+При первой настройке разработки на машине один раз собери и установи `.deb` перед запуском
+локальных бинарников:
+
 ```bash
+./manage.sh package deb
+sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+# После установки пакета один раз выйди из сессии и войди снова.
 ./manage.sh dev build
 ./manage.sh doctor
-./manage.sh bootstrap linux-input
+# Если пакетный экземпляр запущен, сначала останови его:
+systemctl --user stop open-switcher-tray.service open-switcher-daemon.service
 ./manage.sh dev start
 ./manage.sh dev settings
 ```
@@ -164,30 +172,27 @@ OpenSwitcher намеренно не принимает произвольные
 
 OpenSwitcher читает реальные input-устройства из `/dev/input/event*` и пишет виртуальные нажатия через `/dev/uinput`.
 
-При установке OpenSwitcher из `.deb` пакет устанавливает udev rule, нужный для обычного runtime
-доступа. Команды ниже нужны в основном для разработки из исходников и устранения проблем.
+`.deb` OpenSwitcher — единственный поддерживаемый канал привилегированной настройки Linux input.
+Package-owned maintainer scripts устанавливают udev rule и настраивают runtime-доступ; код из
+working tree не запускается с правами root.
 
-Проверить, готова ли текущая dev-сессия:
+Перед запуском из исходников собери и установи (или переустанови) пакет:
+
+```bash
+./manage.sh package deb
+sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+```
+
+Выйди из пользовательской сессии, войди снова и проверь текущую сессию:
 
 ```bash
 ./manage.sh doctor
 ```
 
-Если doctor сообщает об отказе в доступе при запуске из исходников, запусти setup helper:
-
-```bash
-./manage.sh bootstrap linux-input
-```
-
-Что делает bootstrap:
-- устанавливает udev rule проекта из `dist/udev/80-openswitcher-input.rules`
-- перезагружает udev rules, если доступен `udevadm`
-- применяет same-session ACL bridge для текущего пользователя, если доступен `setfacl`
-- повторно запускает `./manage.sh doctor` и подтверждает результат
-
-Примечания:
-- `./manage.sh bootstrap linux-input` работает и без `setfacl`, но same-session ACL bridge применяется только если `setfacl` доступен. В Debian/Ubuntu-подобных системах эта команда обычно приходит из пакета `acl`.
-- runtime auto-detect раскладки может использовать environment-specific инструменты, например `gsettings`, `xfconf-query` или `setxkbmap`, в зависимости от текущего окружения.
+Если пакетный daemon уже запущен во время разработки, останови его перед запуском локального dev
+daemon. Не запускай `manage.sh` через `sudo`. Runtime auto-detect раскладки может использовать
+environment-specific инструменты, например `gsettings`, `xfconf-query` или `setxkbmap`, в
+зависимости от текущего окружения.
 
 ## Определение переключателя раскладки
 
@@ -235,7 +240,6 @@ sudo apt-get install -y \
 ```
 
 Дополнительные полезные пакеты для Debian/Ubuntu-подобных систем:
-- `acl` для `setfacl` во время `./manage.sh bootstrap linux-input`
 - `libglib2.0-bin` для `gdbus` в примерах D-Bus ниже
 - `lintian` для опциональной локальной проверки Debian-пакета
 
@@ -293,8 +297,10 @@ dist/packages/
 Установить локально собранный пакет можно так:
 
 ```bash
-sudo apt install ./dist/packages/open-switcher_*_amd64.deb
+sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
 ```
+
+Эта установка пакета также выполняет обязательную настройку Linux input для разработки из исходников.
 
 Файл `open-switcher-dbgsym_*.ddeb` содержит debug symbols. Он полезен для диагностики, но не нужен
 для обычной установки.

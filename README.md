@@ -55,15 +55,23 @@ OpenSwitcher starts automatically after login/reboot; launching it manually from
 menu always starts it even when autostart is disabled.
 
 The package installs the required application files, user systemd units, desktop launchers, icon,
-and Linux input udev rule. A normal package install should not require manually running
-`./manage.sh bootstrap linux-input`, enabling user units, or editing `/dev/input` permissions.
+and package-owned Linux input setup. Installing or reinstalling the `.deb` is the only supported
+privileged setup path; source-tree scripts never install udev rules or change device ACLs. Never
+run `./manage.sh` with `sudo`.
 
 ## Development Quick Start
 
+For the first development setup on a machine, build and install the `.deb` once before starting
+local binaries:
+
 ```bash
+./manage.sh package deb
+sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+# Sign out and sign in once after installing the package.
 ./manage.sh dev build
 ./manage.sh doctor
-./manage.sh bootstrap linux-input
+# Stop the packaged instance first if it is running:
+systemctl --user stop open-switcher-tray.service open-switcher-daemon.service
 ./manage.sh dev start
 ./manage.sh dev settings
 ```
@@ -163,31 +171,26 @@ a warning but allows saving.
 
 OpenSwitcher reads real input devices from `/dev/input/event*` and writes virtual key events through `/dev/uinput`.
 
-When OpenSwitcher is installed from the `.deb` package, the package installs the udev rule needed
-for normal runtime access. The commands below are mainly for source-tree development and
-troubleshooting.
+The OpenSwitcher `.deb` is the only supported channel for privileged Linux input setup. Its
+package-owned maintainer scripts install the udev rule and apply the runtime access setup; no code
+from the working tree is run as root.
 
-Check whether the current development session is ready:
+Build and install (or reinstall) the package before running from the source tree:
+
+```bash
+./manage.sh package deb
+sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+```
+
+Sign out and sign in again, then check the current session:
 
 ```bash
 ./manage.sh doctor
 ```
 
-If the doctor reports denied access while running from the source tree, run the setup helper:
-
-```bash
-./manage.sh bootstrap linux-input
-```
-
-What the bootstrap does:
-- installs the project udev rule from `dist/udev/80-openswitcher-input.rules`
-- reloads udev rules when `udevadm` is available
-- applies a same-session ACL bridge for the current user when `setfacl` is available
-- reruns `./manage.sh doctor` to confirm the result
-
-Notes:
-- `./manage.sh bootstrap linux-input` works without `setfacl`, but the same-session ACL bridge is only applied when `setfacl` is available. On Debian/Ubuntu-like systems that command is typically provided by the `acl` package.
-- runtime layout auto-detect may use desktop-specific tools such as `gsettings`, `xfconf-query`, or `setxkbmap` depending on the current environment.
+If the packaged daemon is already running while developing, stop it before starting the local dev
+daemon. Do not run `manage.sh` through `sudo`. Runtime layout auto-detect may use desktop-specific
+tools such as `gsettings`, `xfconf-query`, or `setxkbmap` depending on the current environment.
 
 ## Layout Switch Detection
 
@@ -235,7 +238,6 @@ sudo apt-get install -y \
 ```
 
 Optional helper packages on Debian/Ubuntu-like systems:
-- `acl` for `setfacl` during `./manage.sh bootstrap linux-input`
 - `libglib2.0-bin` for `gdbus` in the D-Bus examples below
 - `lintian` for optional local Debian package checks
 
@@ -293,8 +295,10 @@ dist/packages/
 Install the locally built package with:
 
 ```bash
-sudo apt install ./dist/packages/open-switcher_*_amd64.deb
+sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
 ```
+
+This package installation is also the required Linux input setup for source-tree development.
 
 The optional `open-switcher-dbgsym_*.ddeb` file contains debug symbols. It is useful for debugging
 but is not needed for normal installation.

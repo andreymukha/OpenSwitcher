@@ -1,41 +1,11 @@
 #!/usr/bin/env bash
 
-openswitcher_linux_input_reject_production_overrides() {
-    local override_name=""
-    local -a override_names=(
-        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT
-        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES
-        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
-    )
-
-    for override_name in "${override_names[@]}"; do
-        if [[ -v "$override_name" ]] && [[ -n "${!override_name}" ]]; then
-            echo "Refusing Linux input production bootstrap: test-only override $override_name is not allowed for production bootstrap." >&2
-            return 1
-        fi
-    done
-}
-
 openswitcher_linux_input_dev_root() {
     printf '%s\n' "${OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT:-/dev}"
 }
 
 openswitcher_linux_input_proc_devices_path() {
     printf '%s\n' "${OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES:-/proc/bus/input/devices}"
-}
-
-openswitcher_linux_input_rule_name() {
-    printf '%s\n' "80-openswitcher-input.rules"
-}
-
-openswitcher_linux_input_rule_install_path() {
-    local rules_dir="${OPEN_SWITCHER_LINUX_INPUT_RULES_DIR:-/etc/udev/rules.d}"
-    _openswitcher_linux_input_rule_install_path_for_dir "$rules_dir"
-}
-
-_openswitcher_linux_input_rule_install_path_for_dir() {
-    local rules_dir="$1"
-    printf '%s/%s\n' "$rules_dir" "$(openswitcher_linux_input_rule_name)"
 }
 
 _openswitcher_linux_input_add_unique_path() {
@@ -358,10 +328,12 @@ openswitcher_linux_input_doctor() {
     echo "Result: Linux input setup is not ready."
 
     if [[ "$keyboard_status" == "not-found" ]]; then
-        echo 'Run `./manage.sh doctor` after connecting the keyboard device or fixing the Linux input setup.'
-    else
-        echo 'Run `./manage.sh bootstrap linux-input` to install the required Linux input setup.'
+        echo "Connect the keyboard device before checking the setup again."
     fi
+    echo 'Install or reinstall the OpenSwitcher .deb package:'
+    echo '  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb'
+    echo 'Sign out and sign in again, then run:'
+    echo '  ./manage.sh doctor'
 
     return 1
 }
@@ -373,105 +345,4 @@ _openswitcher_linux_input_realpath() {
     else
         printf '%s\n' "$path"
     fi
-}
-
-openswitcher_linux_input_apply_session_acl() {
-    local target_user="$1"
-    shift
-
-    local path=""
-    local resolved_path=""
-    local seen=()
-    for path in "$@"; do
-        [[ -n "$path" ]] || continue
-        [[ -e "$path" ]] || continue
-        resolved_path="$(_openswitcher_linux_input_realpath "$path")"
-        _openswitcher_linux_input_add_unique_path "$resolved_path" seen
-    done
-
-    if [[ "${#seen[@]}" -eq 0 ]]; then
-        return 0
-    fi
-
-    local acl_path=""
-    for acl_path in "${seen[@]}"; do
-        setfacl -m "u:${target_user}:rw" "$acl_path"
-    done
-}
-
-_openswitcher_linux_input_bootstrap_with_paths() {
-    local repo_root="$1"
-    local target_user="$2"
-    local dev_root="$3"
-    local proc_devices="$4"
-    local rules_dir="$5"
-
-    local rule_source="$repo_root/dist/udev/$(openswitcher_linux_input_rule_name)"
-    local rule_target
-    rule_target="$(_openswitcher_linux_input_rule_install_path_for_dir "$rules_dir")"
-
-    if [[ ! -f "$rule_source" ]]; then
-        echo "Linux input bootstrap asset not found: $rule_source" >&2
-        return 1
-    fi
-
-    mkdir -p "$(dirname "$rule_target")"
-    install -m 0644 "$rule_source" "$rule_target"
-    echo "Installed udev rule: $rule_target"
-
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm control --reload-rules
-        udevadm trigger --subsystem-match=input --action=change || true
-        udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
-        echo "Reloaded udev rules and triggered input devices."
-    else
-        echo "udevadm not found; permanent rule was installed but live udev reload was skipped."
-    fi
-
-    if command -v setfacl >/dev/null 2>&1; then
-        local acl_paths=()
-        local path=""
-        while IFS= read -r path; do
-            [[ -n "$path" ]] || continue
-            acl_paths+=("$path")
-        done < <(_openswitcher_linux_input_collect_keyboard_candidates_with_paths \
-            "$dev_root" "$proc_devices")
-        while IFS= read -r path; do
-            [[ -n "$path" ]] || continue
-            acl_paths+=("$path")
-        done < <(_openswitcher_linux_input_collect_pointer_candidates_with_paths \
-            "$dev_root" "$proc_devices")
-        acl_paths+=("$(_openswitcher_linux_input_find_uinput_path_with_dev_root \
-            "$dev_root")")
-
-        openswitcher_linux_input_apply_session_acl "$target_user" "${acl_paths[@]}"
-        echo "Applied same-session ACL bridge for user: $target_user"
-    else
-        echo "setfacl not found; same-session ACL bridge was skipped."
-    fi
-}
-
-openswitcher_linux_input_bootstrap_test() {
-    local repo_root="$1"
-    local target_user="$2"
-    local dev_root="$3"
-    local proc_devices="$4"
-    local rules_dir="$5"
-
-    _openswitcher_linux_input_bootstrap_with_paths \
-        "$repo_root" "$target_user" "$dev_root" "$proc_devices" "$rules_dir"
-}
-
-openswitcher_linux_input_bootstrap_root() {
-    local repo_root="$1"
-    local target_user="$2"
-
-    openswitcher_linux_input_reject_production_overrides || return 1
-
-    _openswitcher_linux_input_bootstrap_with_paths \
-        "$repo_root" \
-        "$target_user" \
-        /dev \
-        /proc/bus/input/devices \
-        /etc/udev/rules.d
 }

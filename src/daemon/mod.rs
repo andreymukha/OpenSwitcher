@@ -107,7 +107,15 @@ fn start_dbus_endpoint(
     runtime: Arc<RuntimeState>,
     service_name: &str,
 ) -> Result<(Connection, CaptureOwnerMonitor), SwitcherError> {
-    let connection = ConnectionBuilder::session()?.name(service_name)?.build()?;
+    let (connection, monitor) = prepare_dbus_endpoint(runtime)?;
+    connection.request_name(service_name)?;
+    Ok((connection, monitor))
+}
+
+fn prepare_dbus_endpoint(
+    runtime: Arc<RuntimeState>,
+) -> Result<(Connection, CaptureOwnerMonitor), SwitcherError> {
+    let connection = ConnectionBuilder::session()?.build()?;
     let monitor = CaptureOwnerMonitor::start(&connection, runtime.clone())?;
     connection
         .object_server()
@@ -126,15 +134,21 @@ mod tests {
     use zbus::blocking::Proxy;
 
     #[test]
-    fn dbus_endpoint_registers_capture_api_after_monitor_is_ready() -> Result<(), Box<dyn Error>> {
+    fn dbus_endpoint_is_published_only_after_monitor_and_api_are_ready(
+    ) -> Result<(), Box<dyn Error>> {
         let temp_dir = TempDir::new()?;
         let runtime = Arc::new(RuntimeState::new(ConfigService::load(
             temp_dir.path().join("config.toml"),
         )?));
         let service_name = unique_service_name();
 
-        let (_service, mut monitor) = start_dbus_endpoint(runtime, service_name.as_str())?;
+        let (service, mut monitor) = prepare_dbus_endpoint(runtime)?;
         let client = Connection::session()?;
+        let bus = DBusProxy::new(&client)?;
+        assert!(!bus.name_has_owner(service_name.as_str().try_into()?)?);
+
+        service.request_name(service_name.as_str())?;
+        assert!(bus.name_has_owner(service_name.as_str().try_into()?)?);
         let proxy = Proxy::new(&client, service_name.as_str(), OBJECT_PATH, INTERFACE_NAME)?;
         let state: LayoutSwitchCaptureState = proxy.call("GetLayoutSwitchCaptureState", &())?;
 

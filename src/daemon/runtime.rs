@@ -1,5 +1,5 @@
 use crate::config::AppConfig;
-use crate::daemon::capture::LayoutSwitchCaptureSession;
+use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
 use crate::error::{
     CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
 };
@@ -247,6 +247,7 @@ fn apply_detected_layout_switch_if_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::capture::{CaptureEventDisposition, CaptureOwner, CAPTURE_SOFT_LEASE};
     use crate::error::LayoutAutoDetectError;
     use crate::layout_backend::{
         AppLayoutKind, BackendCapabilities, CurrentLayoutState, LayoutBackendError,
@@ -2297,6 +2298,84 @@ undo_key = "Pause"
         assert!(!settings_hotkey_capture_inhibited_at(10, 10));
         assert!(!settings_hotkey_capture_inhibited_at(11, 10));
     }
+
+    #[test]
+    fn runtime_capture_routes_and_reports_terminal_state_atomically() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+        let owner = CaptureOwner::from(":1.42");
+        let now = Instant::now();
+        runtime
+            .start_layout_switch_capture_owned_at(owner, now)
+            .unwrap();
+
+        let outcome = runtime
+            .route_layout_switch_capture_event_at(now, evdev::Key::KEY_A, 1)
+            .unwrap();
+
+        assert_eq!(outcome.disposition, CaptureEventDisposition::ForwardDirect);
+        assert!(outcome
+            .state_change
+            .as_ref()
+            .is_some_and(|state| !state.is_active()));
+        assert!(!runtime.layout_switch_capture_state().unwrap().is_active());
+    }
+
+    #[test]
+    fn runtime_capture_expiry_is_observed_without_input() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+        let owner = CaptureOwner::from(":1.42");
+        let now = Instant::now();
+        runtime
+            .start_layout_switch_capture_owned_at(owner, now)
+            .unwrap();
+
+        let state = runtime
+            .expire_layout_switch_capture_at(now + CAPTURE_SOFT_LEASE)
+            .unwrap()
+            .expect("soft lease must expire without a key event");
+
+        assert!(!state.is_active());
+        assert!(!runtime.layout_switch_capture_state().unwrap().is_active());
+    }
+
+    #[test]
+    fn runtime_capture_reset_clears_debt_for_backend_epoch_change() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+        let owner = CaptureOwner::from(":1.42");
+        let now = Instant::now();
+        runtime
+            .start_layout_switch_capture_owned_at(owner.clone(), now)
+            .unwrap();
+        let press = runtime
+            .route_layout_switch_capture_event_at(now, evdev::Key::KEY_LEFTCTRL, 1)
+            .unwrap();
+        assert_eq!(press.disposition, CaptureEventDisposition::Suppress);
+        runtime
+            .cancel_layout_switch_capture_owned_at(&owner, now)
+            .unwrap();
+
+        runtime.reset_layout_switch_capture_input_epoch().unwrap();
+        let release = runtime
+            .route_layout_switch_capture_event_at(now, evdev::Key::KEY_LEFTCTRL, 0)
+            .unwrap();
+
+        assert_eq!(release.disposition, CaptureEventDisposition::PassThrough);
+    }
 }
 
 // Runtime state
@@ -3018,32 +3097,106 @@ impl RuntimeState {
         Ok(session.finish())
     }
 
+    pub fn start_layout_switch_capture_owned_at(
+        &self,
+        owner: CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        session.start_owned(owner, now)
+    }
+
+    pub fn renew_layout_switch_capture_owned_at(
+        &self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        session.renew_owned(owner, now)
+    }
+
+    pub fn cancel_layout_switch_capture_owned_at(
+        &self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        session.cancel_owned(owner, now)
+    }
+
+    pub fn finish_layout_switch_capture_owned_at(
+        &self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        session.finish_owned(owner, now)
+    }
+
+    pub fn layout_switch_capture_owner_disappeared_at(
+        &self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<Option<LayoutSwitchCaptureState>, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.owner_disappeared(owner, now))
+    }
+
+    pub fn expire_layout_switch_capture_at(
+        &self,
+        now: Instant,
+    ) -> Result<Option<LayoutSwitchCaptureState>, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.expire_at(now))
+    }
+
+    pub fn route_layout_switch_capture_event_at(
+        &self,
+        now: Instant,
+        key: evdev::Key,
+        value: i32,
+    ) -> Result<CaptureEventOutcome, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.route_event_at(now, key, value))
+    }
+
+    pub fn reset_layout_switch_capture_input_epoch(
+        &self,
+    ) -> Result<Option<LayoutSwitchCaptureState>, CaptureError> {
+        let mut session = self
+            .capture_session
+            .lock()
+            .map_err(|_| CaptureError::LockPoisoned)?;
+        Ok(session.reset_input_epoch())
+    }
+
     pub fn layout_switch_capture_state(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
         let session = self
             .capture_session
             .lock()
             .map_err(|_| CaptureError::LockPoisoned)?;
         Ok(session.current_state())
-    }
-
-    pub fn is_capture_active(&self) -> Result<bool, CaptureError> {
-        let session = self
-            .capture_session
-            .lock()
-            .map_err(|_| CaptureError::LockPoisoned)?;
-        Ok(session.is_active())
-    }
-
-    pub fn handle_capture_key_event(
-        &self,
-        key: evdev::Key,
-        value: i32,
-    ) -> Result<Option<LayoutSwitchCaptureState>, CaptureError> {
-        let mut session = self
-            .capture_session
-            .lock()
-            .map_err(|_| CaptureError::LockPoisoned)?;
-        Ok(session.handle_key_event(key, value))
     }
 
     // Layout backend initialization

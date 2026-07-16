@@ -1,3 +1,4 @@
+use crate::daemon::capture::CaptureEventDisposition;
 use crate::daemon::input_backend::{
     ActiveInputBackend, InputBackendLifecycle, KeyboardInputBackendOpener, OpenedInputBackend,
 };
@@ -16,7 +17,7 @@ use crate::daemon::switch_logic::{
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::SwitcherError;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
-use crate::model::{HotkeyModifiers, HotkeySpec, SessionType};
+use crate::model::{HotkeyModifiers, HotkeySpec, LayoutSwitchCaptureState, SessionType};
 use evdev::InputEventKind;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -85,6 +86,43 @@ enum InputOrigin {
     Physical,
     DeferredReplay,
     DeferredRetry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureRoutingControl {
+    Continue,
+    Return,
+}
+
+fn apply_capture_routing_disposition<F>(
+    disposition: CaptureEventDisposition,
+    modifiers: &mut ModifierState,
+    shared_modifiers: &SharedModifierState,
+    key: evdev::Key,
+    value: i32,
+    mut forward_event: F,
+) -> Result<CaptureRoutingControl, SwitcherError>
+where
+    F: FnMut(evdev::Key, i32) -> Result<(), SwitcherError>,
+{
+    match disposition {
+        CaptureEventDisposition::Suppress => Ok(CaptureRoutingControl::Return),
+        CaptureEventDisposition::ForwardDirect => {
+            modifiers.update(key, value);
+            shared_modifiers.store(*modifiers);
+            forward_event(key, value)?;
+            Ok(CaptureRoutingControl::Return)
+        }
+        CaptureEventDisposition::PassThrough => Ok(CaptureRoutingControl::Continue),
+    }
+}
+
+fn should_route_capture_before_manual_current_word(origin: InputOrigin) -> bool {
+    matches!(origin, InputOrigin::Physical)
+}
+
+fn bounded_capture_poll_timeout(timeout: Duration) -> Duration {
+    timeout.min(INPUT_EVENT_WAIT_TIMEOUT)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -661,7 +699,7 @@ impl DaemonService {
             self.maybe_retry_input_backend()?;
             self.poll_manual_current_word_completion()?;
 
-            let fetch_timeout = self.event_fetch_timeout();
+            let fetch_timeout = bounded_capture_poll_timeout(self.event_fetch_timeout());
             let events = if let Some(keyboard) = self.keyboard.as_mut() {
                 match keyboard.fetch_events_timeout(fetch_timeout) {
                     Ok(events) => events,
@@ -678,6 +716,12 @@ impl DaemonService {
                 std::thread::sleep(INPUT_EVENT_WAIT_TIMEOUT);
                 Vec::new()
             };
+
+            if let Err(error) = self.poll_layout_switch_capture_expiry() {
+                log_input_debug("capture-expiry-poll-error", &format!("error={error}"));
+                self.shutdown();
+                return Err(error);
+            }
 
             if should_publish_pending_status_change(self.runtime.take_pending_status_change()) {
                 self.publish_status_changed();
@@ -770,6 +814,57 @@ impl DaemonService {
             ManualCurrentWordFlow::InFlight { .. } => MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT,
             ManualCurrentWordFlow::DrainingDeferredInput { .. } => Duration::ZERO,
         }
+    }
+
+    fn observe_layout_switch_capture_state_change(
+        &mut self,
+        state_change: Option<LayoutSwitchCaptureState>,
+    ) {
+        let Some(state) = state_change else {
+            return;
+        };
+        let terminal = !state.is_active();
+        self.try_publish_signal_event(
+            DbusSignalEvent::LayoutSwitchCaptureStateChanged(state),
+            DbusSignalEventKind::CaptureStateChanged,
+        );
+        if terminal {
+            self.invalidate_word_context();
+        }
+    }
+
+    fn poll_layout_switch_capture_expiry(&mut self) -> Result<(), SwitcherError> {
+        let state_change = self
+            .runtime
+            .expire_layout_switch_capture_at(Instant::now())?;
+        self.observe_layout_switch_capture_state_change(state_change);
+        Ok(())
+    }
+
+    fn route_layout_switch_capture_event(
+        &mut self,
+        key: evdev::Key,
+        value: i32,
+    ) -> Result<CaptureRoutingControl, SwitcherError> {
+        let outcome =
+            self.runtime
+                .route_layout_switch_capture_event_at(Instant::now(), key, value)?;
+        self.observe_layout_switch_capture_state_change(outcome.state_change);
+
+        let keyboard = &mut self.keyboard;
+        apply_capture_routing_disposition(
+            outcome.disposition,
+            &mut self.modifiers,
+            &self.shared_modifiers,
+            key,
+            value,
+            |key, value| {
+                keyboard
+                    .as_mut()
+                    .ok_or(SwitcherError::KeyboardNotFound)?
+                    .forward_event(key, value)
+            },
+        )
     }
 
     fn handle_non_key_invalidation(&mut self, stage: &str, message: &str) {
@@ -1041,38 +1136,6 @@ impl DaemonService {
             return Ok(());
         }
 
-        match manual_current_word_physical_event_action(
-            self.has_active_manual_current_word_flow(),
-            hotkey_trigger_to_evdev_key(
-                self.runtime
-                    .config_snapshot()?
-                    .manual_correction_hotkey
-                    .trigger,
-            ),
-            self.manual_current_word_flow_seen_real_next_step(),
-            key,
-            value,
-            origin,
-        ) {
-            ManualCurrentWordPhysicalEventAction::ProcessImmediately => {}
-            ManualCurrentWordPhysicalEventAction::Swallow => return Ok(()),
-            ManualCurrentWordPhysicalEventAction::RequestRetryAfterDrain => {
-                self.request_manual_current_word_retry_after_drain(key);
-                return Ok(());
-            }
-            ManualCurrentWordPhysicalEventAction::Enqueue {
-                marks_real_next_step,
-            } => {
-                self.enqueue_deferred_physical_input_event(
-                    key,
-                    value,
-                    event_timestamp,
-                    marks_real_next_step,
-                )?;
-                return Ok(());
-            }
-        }
-
         if should_swallow_suppressed_separator_release(self.suppressed_separator_key, key, value) {
             log_input_debug(
                 "separator-release-swallow",
@@ -1129,21 +1192,42 @@ impl DaemonService {
             return Ok(());
         }
 
-        if self.runtime.is_capture_active()? {
-            self.modifiers.update(key, value);
-
-            if let Some(state) = self.runtime.handle_capture_key_event(key, value)? {
-                self.try_publish_signal_event(
-                    DbusSignalEvent::LayoutSwitchCaptureStateChanged(state),
-                    DbusSignalEventKind::CaptureStateChanged,
-                );
-            }
-
-            if !self.runtime.is_capture_active()? {
-                self.invalidate_word_context();
-            }
-
+        if should_route_capture_before_manual_current_word(origin)
+            && self.route_layout_switch_capture_event(key, value)? == CaptureRoutingControl::Return
+        {
             return Ok(());
+        }
+
+        match manual_current_word_physical_event_action(
+            self.has_active_manual_current_word_flow(),
+            hotkey_trigger_to_evdev_key(
+                self.runtime
+                    .config_snapshot()?
+                    .manual_correction_hotkey
+                    .trigger,
+            ),
+            self.manual_current_word_flow_seen_real_next_step(),
+            key,
+            value,
+            origin,
+        ) {
+            ManualCurrentWordPhysicalEventAction::ProcessImmediately => {}
+            ManualCurrentWordPhysicalEventAction::Swallow => return Ok(()),
+            ManualCurrentWordPhysicalEventAction::RequestRetryAfterDrain => {
+                self.request_manual_current_word_retry_after_drain(key);
+                return Ok(());
+            }
+            ManualCurrentWordPhysicalEventAction::Enqueue {
+                marks_real_next_step,
+            } => {
+                self.enqueue_deferred_physical_input_event(
+                    key,
+                    value,
+                    event_timestamp,
+                    marks_real_next_step,
+                )?;
+                return Ok(());
+            }
         }
 
         let config = self.runtime.config_snapshot()?;
@@ -2131,6 +2215,15 @@ impl DaemonService {
     }
 
     fn drop_active_input_backend(&mut self) {
+        match self.runtime.reset_layout_switch_capture_input_epoch() {
+            Ok(state_change) => {
+                self.observe_layout_switch_capture_state_change(state_change);
+            }
+            Err(error) => {
+                log_input_debug("capture-input-epoch-reset-error", &format!("error={error}"));
+            }
+        }
+
         // Drop selected-text transport clones before stopping the writer so the
         // virtual keyboard shutdown is not held open by an idle helper worker.
         self.selected_text_runner = None;
@@ -2334,6 +2427,106 @@ mod tests {
             desktop_environment: DesktopEnvironment::Unknown,
             distro: DistroKind::Unknown,
         })
+    }
+
+    #[test]
+    fn capture_routing_suppress_has_no_modifier_or_forward_side_effect() {
+        let mut modifiers = ModifierState::default();
+        let shared_modifiers = SharedModifierState::default();
+        let mut forwarded = Vec::new();
+
+        let control = apply_capture_routing_disposition(
+            crate::daemon::capture::CaptureEventDisposition::Suppress,
+            &mut modifiers,
+            &shared_modifiers,
+            Key::KEY_LEFTSHIFT,
+            1,
+            |key, value| {
+                forwarded.push((key, value));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(control, CaptureRoutingControl::Return);
+        assert!(!modifiers.is_shift_pressed());
+        assert!(!shared_modifiers.snapshot().is_shift_pressed());
+        assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn capture_routing_forward_direct_updates_both_modifiers_and_forwards_once() {
+        let mut modifiers = ModifierState::default();
+        let shared_modifiers = SharedModifierState::default();
+        let mut forwarded = Vec::new();
+
+        let control = apply_capture_routing_disposition(
+            crate::daemon::capture::CaptureEventDisposition::ForwardDirect,
+            &mut modifiers,
+            &shared_modifiers,
+            Key::KEY_LEFTSHIFT,
+            1,
+            |key, value| {
+                forwarded.push((key, value));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(control, CaptureRoutingControl::Return);
+        assert!(modifiers.is_shift_pressed());
+        assert!(shared_modifiers.snapshot().is_shift_pressed());
+        assert_eq!(forwarded, vec![(Key::KEY_LEFTSHIFT, 1)]);
+    }
+
+    #[test]
+    fn capture_routing_pass_through_has_no_early_side_effect() {
+        let mut modifiers = ModifierState::default();
+        let shared_modifiers = SharedModifierState::default();
+        let mut forwarded = Vec::new();
+
+        let control = apply_capture_routing_disposition(
+            crate::daemon::capture::CaptureEventDisposition::PassThrough,
+            &mut modifiers,
+            &shared_modifiers,
+            Key::KEY_LEFTSHIFT,
+            1,
+            |key, value| {
+                forwarded.push((key, value));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(control, CaptureRoutingControl::Continue);
+        assert!(!modifiers.is_shift_pressed());
+        assert!(!shared_modifiers.snapshot().is_shift_pressed());
+        assert!(forwarded.is_empty());
+    }
+
+    #[test]
+    fn capture_routing_precedes_manual_flow_only_for_physical_input() {
+        assert!(should_route_capture_before_manual_current_word(
+            InputOrigin::Physical
+        ));
+        assert!(!should_route_capture_before_manual_current_word(
+            InputOrigin::DeferredReplay
+        ));
+        assert!(!should_route_capture_before_manual_current_word(
+            InputOrigin::DeferredRetry
+        ));
+    }
+
+    #[test]
+    fn capture_expiry_poll_timeout_is_never_over_one_hundred_milliseconds() {
+        assert_eq!(
+            bounded_capture_poll_timeout(Duration::from_secs(1)),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            bounded_capture_poll_timeout(Duration::from_millis(10)),
+            Duration::from_millis(10)
+        );
     }
 
     // Startup layout resync

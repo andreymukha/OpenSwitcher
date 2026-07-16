@@ -15,7 +15,7 @@ use crate::daemon::switch_logic::{
     should_switch, CorrectionPlan, Keystroke,
 };
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
-use crate::error::SwitcherError;
+use crate::error::{CaptureError, SwitcherError};
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
 use crate::model::{HotkeyModifiers, HotkeySpec, LayoutSwitchCaptureState, SessionType};
 use evdev::InputEventKind;
@@ -123,6 +123,25 @@ fn should_route_capture_before_manual_current_word(origin: InputOrigin) -> bool 
 
 fn bounded_capture_poll_timeout(timeout: Duration) -> Duration {
     timeout.min(INPUT_EVENT_WAIT_TIMEOUT)
+}
+
+fn reset_capture_epoch_then_shutdown_backend<F>(
+    reset_result: Result<Option<LayoutSwitchCaptureState>, CaptureError>,
+    shutdown_backend: F,
+) -> Option<LayoutSwitchCaptureState>
+where
+    F: FnOnce(),
+{
+    let state_change = match reset_result {
+        Ok(state_change) => state_change,
+        Err(error) => {
+            log_input_debug("capture-input-epoch-reset-error", &format!("error={error}"));
+            None
+        }
+    };
+
+    shutdown_backend();
+    state_change
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2215,22 +2234,17 @@ impl DaemonService {
     }
 
     fn drop_active_input_backend(&mut self) {
-        match self.runtime.reset_layout_switch_capture_input_epoch() {
-            Ok(state_change) => {
-                self.observe_layout_switch_capture_state_change(state_change);
-            }
-            Err(error) => {
-                log_input_debug("capture-input-epoch-reset-error", &format!("error={error}"));
-            }
-        }
+        let reset_result = self.runtime.reset_layout_switch_capture_input_epoch();
+        let state_change = reset_capture_epoch_then_shutdown_backend(reset_result, || {
+            // Drop selected-text transport clones before stopping the writer so the
+            // virtual keyboard shutdown is not held open by an idle helper worker.
+            self.selected_text_runner = None;
 
-        // Drop selected-text transport clones before stopping the writer so the
-        // virtual keyboard shutdown is not held open by an idle helper worker.
-        self.selected_text_runner = None;
-
-        if let Some(mut keyboard) = self.keyboard.take() {
-            keyboard.shutdown();
-        }
+            if let Some(mut keyboard) = self.keyboard.take() {
+                keyboard.shutdown();
+            }
+        });
+        self.observe_layout_switch_capture_state_change(state_change);
     }
 
     // Transient input state reset / invalidation
@@ -2427,6 +2441,33 @@ mod tests {
             desktop_environment: DesktopEnvironment::Unknown,
             distro: DistroKind::Unknown,
         })
+    }
+
+    #[test]
+    fn capture_reset_backend_shutdown_runs_once_when_reset_lock_is_poisoned() {
+        let mut shutdown_count = 0;
+
+        let state_change = reset_capture_epoch_then_shutdown_backend(
+            Err(crate::error::CaptureError::LockPoisoned),
+            || shutdown_count += 1,
+        );
+
+        assert_eq!(shutdown_count, 1);
+        assert_eq!(state_change, None);
+    }
+
+    #[test]
+    fn capture_reset_backend_shutdown_preserves_terminal_transition() {
+        let mut shutdown_count = 0;
+        let cancelled = LayoutSwitchCaptureState::cancelled();
+
+        let state_change =
+            reset_capture_epoch_then_shutdown_backend(Ok(Some(cancelled.clone())), || {
+                shutdown_count += 1
+            });
+
+        assert_eq!(shutdown_count, 1);
+        assert_eq!(state_change, Some(cancelled));
     }
 
     #[test]

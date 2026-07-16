@@ -1,13 +1,39 @@
+use crate::error::CaptureError;
 use crate::model::{LayoutSwitchCaptureState, LayoutSwitchCombo};
 use evdev::Key;
 use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 const UNSUPPORTED_MESSAGE: &str = "Эта комбинация сейчас не поддерживается OpenSwitcher.";
 const CAPTURE_DEBUG_ENV: &str = "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG";
 const CAPTURE_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG_FILE";
+pub const CAPTURE_SOFT_LEASE: Duration = Duration::from_secs(10);
+pub const CAPTURE_ABSOLUTE_LEASE: Duration = Duration::from_secs(65);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureOwner(String);
+
+impl From<&str> for CaptureOwner {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for CaptureOwner {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CaptureLease {
+    owner: CaptureOwner,
+    soft_deadline: Instant,
+    absolute_deadline: Instant,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum PhysicalCaptureKey {
@@ -185,6 +211,7 @@ impl EvaluatedCapture {
 pub struct LayoutSwitchCaptureSession {
     progress: CaptureProgress,
     state: LayoutSwitchCaptureState,
+    lease: Option<CaptureLease>,
 }
 
 impl LayoutSwitchCaptureSession {
@@ -197,6 +224,7 @@ impl LayoutSwitchCaptureSession {
     }
 
     pub fn start(&mut self) -> LayoutSwitchCaptureState {
+        self.lease = None;
         self.progress.clear();
         self.state = LayoutSwitchCaptureState::waiting();
         log_capture_debug("start", None, None, &self.progress, None, "session-started");
@@ -204,6 +232,7 @@ impl LayoutSwitchCaptureSession {
     }
 
     pub fn cancel(&mut self) -> LayoutSwitchCaptureState {
+        self.lease = None;
         self.progress.clear();
         self.state = LayoutSwitchCaptureState::cancelled();
         log_capture_debug(
@@ -218,6 +247,7 @@ impl LayoutSwitchCaptureSession {
     }
 
     pub fn finish(&mut self) -> LayoutSwitchCaptureState {
+        self.lease = None;
         self.progress.clear();
         self.state = LayoutSwitchCaptureState::finished();
         log_capture_debug(
@@ -229,6 +259,107 @@ impl LayoutSwitchCaptureSession {
             "session-finished",
         );
         self.current_state()
+    }
+
+    pub fn start_owned(
+        &mut self,
+        owner: CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        self.expire_at(now);
+
+        if let Some(lease) = self.lease.as_mut() {
+            if lease.owner != owner {
+                return Err(CaptureError::Busy);
+            }
+
+            lease.soft_deadline = (now + CAPTURE_SOFT_LEASE).min(lease.absolute_deadline);
+            return Ok(self.current_state());
+        }
+
+        self.progress.clear();
+        self.state = LayoutSwitchCaptureState::waiting();
+        self.lease = Some(CaptureLease {
+            owner,
+            soft_deadline: now + CAPTURE_SOFT_LEASE,
+            absolute_deadline: now + CAPTURE_ABSOLUTE_LEASE,
+        });
+        log_capture_debug(
+            "start",
+            None,
+            None,
+            &self.progress,
+            None,
+            "owned-session-started",
+        );
+        Ok(self.current_state())
+    }
+
+    pub fn renew_owned(
+        &mut self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        self.expire_at(now);
+        let lease = self.lease.as_mut().ok_or(CaptureError::NotActive)?;
+        if lease.owner != *owner {
+            return Err(CaptureError::NotOwner);
+        }
+
+        lease.soft_deadline = (now + CAPTURE_SOFT_LEASE).min(lease.absolute_deadline);
+        Ok(self.current_state())
+    }
+
+    pub fn cancel_owned(
+        &mut self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        self.expire_at(now);
+        self.ensure_owner(owner)?;
+        Ok(self.cancel())
+    }
+
+    pub fn finish_owned(
+        &mut self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Result<LayoutSwitchCaptureState, CaptureError> {
+        self.expire_at(now);
+        self.ensure_owner(owner)?;
+        Ok(self.finish())
+    }
+
+    pub fn owner_disappeared(
+        &mut self,
+        owner: &CaptureOwner,
+        now: Instant,
+    ) -> Option<LayoutSwitchCaptureState> {
+        if let Some(expired) = self.expire_at(now) {
+            return Some(expired);
+        }
+
+        let is_owner = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.owner == *owner);
+        is_owner.then(|| self.cancel())
+    }
+
+    pub fn expire_at(&mut self, now: Instant) -> Option<LayoutSwitchCaptureState> {
+        let expired = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| now >= lease.soft_deadline || now >= lease.absolute_deadline);
+        expired.then(|| self.cancel())
+    }
+
+    fn ensure_owner(&self, owner: &CaptureOwner) -> Result<(), CaptureError> {
+        let lease = self.lease.as_ref().ok_or(CaptureError::NotActive)?;
+        if lease.owner != *owner {
+            return Err(CaptureError::NotOwner);
+        }
+        Ok(())
     }
 
     pub fn handle_key_event(&mut self, key: Key, value: i32) -> Option<LayoutSwitchCaptureState> {
@@ -321,6 +452,9 @@ impl LayoutSwitchCaptureSession {
             return None;
         }
 
+        if !next.is_active() {
+            self.lease = None;
+        }
         self.state = next;
         Some(self.current_state())
     }
@@ -384,6 +518,161 @@ fn physical_capture_key_from_evdev(key: Key) -> Option<PhysicalCaptureKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CaptureError;
+    use std::time::{Duration, Instant};
+
+    fn owner(name: &str) -> CaptureOwner {
+        CaptureOwner::from(name)
+    }
+
+    #[test]
+    fn different_owner_cannot_replace_live_capture() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert!(matches!(
+            session.start_owned(owner(":1.11"), now),
+            Err(CaptureError::Busy)
+        ));
+        assert_eq!(session.current_state(), LayoutSwitchCaptureState::waiting());
+    }
+
+    #[test]
+    fn same_owner_start_renews_without_clearing_candidate_or_progress() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(capture_owner.clone(), now).unwrap();
+        session.handle_key_event(Key::KEY_LEFTCTRL, 1);
+        session.handle_key_event(Key::KEY_LEFTSHIFT, 1);
+        let candidate = session.current_state();
+        let progress = session.progress.clone();
+
+        let renewed = session
+            .start_owned(capture_owner, now + Duration::from_secs(4))
+            .unwrap();
+
+        assert_eq!(renewed, candidate);
+        assert_eq!(session.progress, progress);
+        let lease = session
+            .lease
+            .as_ref()
+            .expect("owner lease must remain active");
+        assert_eq!(lease.soft_deadline, now + Duration::from_secs(14));
+        assert_eq!(lease.absolute_deadline, now + CAPTURE_ABSOLUTE_LEASE);
+    }
+
+    #[test]
+    fn non_owner_cannot_renew_cancel_or_finish() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let other_owner = owner(":1.11");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(capture_owner, now).unwrap();
+        session.handle_key_event(Key::KEY_LEFTCTRL, 1);
+        let state = session.current_state();
+
+        assert!(matches!(
+            session.renew_owned(&other_owner, now),
+            Err(CaptureError::NotOwner)
+        ));
+        assert!(matches!(
+            session.cancel_owned(&other_owner, now),
+            Err(CaptureError::NotOwner)
+        ));
+        assert!(matches!(
+            session.finish_owned(&other_owner, now),
+            Err(CaptureError::NotOwner)
+        ));
+        assert_eq!(session.current_state(), state);
+    }
+
+    #[test]
+    fn owned_commands_reject_an_inactive_session() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let mut session = LayoutSwitchCaptureSession::default();
+
+        assert!(matches!(
+            session.renew_owned(&capture_owner, now),
+            Err(CaptureError::NotActive)
+        ));
+        assert!(matches!(
+            session.cancel_owned(&capture_owner, now),
+            Err(CaptureError::NotActive)
+        ));
+        assert!(matches!(
+            session.finish_owned(&capture_owner, now),
+            Err(CaptureError::NotActive)
+        ));
+    }
+
+    #[test]
+    fn lease_expires_exactly_at_soft_deadline() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session.expire_at(now + CAPTURE_SOFT_LEASE - Duration::from_nanos(1)),
+            None
+        );
+        assert_eq!(
+            session.expire_at(now + CAPTURE_SOFT_LEASE),
+            Some(LayoutSwitchCaptureState::cancelled())
+        );
+        assert!(!session.is_active());
+        assert!(session.lease.is_none());
+    }
+
+    #[test]
+    fn absolute_deadline_is_not_extended_by_renew() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(capture_owner.clone(), now).unwrap();
+
+        for seconds in [9, 18, 27, 36, 45, 54, 63, 64] {
+            session
+                .renew_owned(&capture_owner, now + Duration::from_secs(seconds))
+                .unwrap();
+        }
+
+        let lease = session
+            .lease
+            .as_ref()
+            .expect("owner lease must remain active");
+        assert_eq!(lease.soft_deadline, now + CAPTURE_ABSOLUTE_LEASE);
+        assert_eq!(lease.absolute_deadline, now + CAPTURE_ABSOLUTE_LEASE);
+        assert_eq!(
+            session.expire_at(now + CAPTURE_ABSOLUTE_LEASE - Duration::from_nanos(1)),
+            None
+        );
+        assert_eq!(
+            session.expire_at(now + CAPTURE_ABSOLUTE_LEASE),
+            Some(LayoutSwitchCaptureState::cancelled())
+        );
+    }
+
+    #[test]
+    fn owner_loss_cancels_only_matching_owner() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let other_owner = owner(":1.11");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(capture_owner.clone(), now).unwrap();
+
+        assert_eq!(session.owner_disappeared(&other_owner, now), None);
+        assert!(session.is_active());
+        assert_eq!(
+            session.owner_disappeared(&capture_owner, now),
+            Some(LayoutSwitchCaptureState::cancelled())
+        );
+        assert!(!session.is_active());
+        assert!(session.lease.is_none());
+    }
 
     #[test]
     fn builds_side_specific_combos_on_press() {

@@ -47,10 +47,16 @@ pub enum SettingsError {
     LockPoisoned,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CaptureError {
     #[error("Capture session lock is poisoned")]
     LockPoisoned,
+    #[error("A layout switch capture session is already owned by another caller")]
+    Busy,
+    #[error("The caller does not own the active layout switch capture session")]
+    NotOwner,
+    #[error("No owned layout switch capture session is active")]
+    NotActive,
 }
 
 #[derive(Debug, Error)]

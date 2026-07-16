@@ -18,6 +18,21 @@ assert_contains() {
     fi
 }
 
+assert_equals() {
+    local expected="$1"
+    local actual="$2"
+    local description="$3"
+
+    if [[ "$actual" != "$expected" ]]; then
+        echo "unexpected $description" >&2
+        echo "--- expected ---" >&2
+        printf '%s\n' "$expected" >&2
+        echo "--- actual ---" >&2
+        printf '%s\n' "$actual" >&2
+        exit 1
+    fi
+}
+
 create_fake_input_fixture() {
     local root="$1"
 
@@ -53,6 +68,97 @@ I: Bus=0018 Vendor=04f3 Product=000e Version=0000
 N: Name="Elan TrackPoint"
 H: Handlers=mouse1 event9
 EOF
+}
+
+create_fake_linux_input_commands() {
+    local fixture="$1"
+    local fake_bin="$fixture/fake-bin"
+
+    mkdir -p "$fake_bin"
+
+    cat >"$fake_bin/udevadm" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${OPEN_SWITCHER_TEST_FIXTURE_ROOT:?}"
+: "${OPEN_SWITCHER_TEST_UDEVADM_LOG:?}"
+
+case "$OPEN_SWITCHER_TEST_UDEVADM_LOG" in
+    "$OPEN_SWITCHER_TEST_FIXTURE_ROOT"/*) ;;
+    *)
+        echo "refusing to write udevadm log outside test fixture" >&2
+        exit 1
+        ;;
+esac
+
+printf '%s\n' "$*" >>"$OPEN_SWITCHER_TEST_UDEVADM_LOG"
+EOF
+
+    cat >"$fake_bin/setfacl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${OPEN_SWITCHER_TEST_FIXTURE_ROOT:?}"
+: "${OPEN_SWITCHER_TEST_SETFACL_LOG:?}"
+
+case "$OPEN_SWITCHER_TEST_SETFACL_LOG" in
+    "$OPEN_SWITCHER_TEST_FIXTURE_ROOT"/*) ;;
+    *)
+        echo "refusing to write setfacl log outside test fixture" >&2
+        exit 1
+        ;;
+esac
+
+printf '%s\n' "$*" >>"$OPEN_SWITCHER_TEST_SETFACL_LOG"
+EOF
+
+    cat >"$fake_bin/install" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${OPEN_SWITCHER_TEST_FIXTURE_ROOT:?}"
+: "${OPEN_SWITCHER_TEST_INSTALL_LOG:?}"
+: "${OPEN_SWITCHER_TEST_RULE_SOURCE:?}"
+: "${OPEN_SWITCHER_TEST_RULE_TARGET:?}"
+
+case "$OPEN_SWITCHER_TEST_INSTALL_LOG" in
+    "$OPEN_SWITCHER_TEST_FIXTURE_ROOT"/*) ;;
+    *)
+        echo "refusing to write install log outside test fixture" >&2
+        exit 1
+        ;;
+esac
+
+printf '%s\n' "$*" >>"$OPEN_SWITCHER_TEST_INSTALL_LOG"
+
+if [[ "$#" -ne 4 ]] || [[ "$1" != "-m" ]] || [[ "$2" != "0644" ]]; then
+    echo "unexpected install arguments" >&2
+    exit 1
+fi
+
+source_path="$3"
+target_path="$4"
+if [[ "$source_path" != "$OPEN_SWITCHER_TEST_RULE_SOURCE" ]] ||
+    [[ "$target_path" != "$OPEN_SWITCHER_TEST_RULE_TARGET" ]]; then
+    echo "refusing unexpected install source or target" >&2
+    exit 1
+fi
+
+case "$target_path" in
+    "$OPEN_SWITCHER_TEST_FIXTURE_ROOT"/*) ;;
+    *)
+        echo "refusing to install outside test fixture" >&2
+        exit 1
+        ;;
+esac
+
+umask 022
+while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$line"
+done <"$source_path" >"$target_path"
+EOF
+
+    chmod +x "$fake_bin/udevadm" "$fake_bin/setfacl" "$fake_bin/install"
 }
 
 test_doctor_reports_mixed_setup_problem() {
@@ -139,32 +245,65 @@ test_bootstrap_installs_rule_and_applies_acl_bridge() {
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' RETURN
     create_fake_input_fixture "$fixture"
+    create_fake_linux_input_commands "$fixture"
 
     local rules_dir="$fixture/etc/udev/rules.d"
-    mkdir -p "$rules_dir"
+    local fake_bin="$fixture/fake-bin"
+    local install_log="$fixture/install.log"
+    local udevadm_log="$fixture/udevadm.log"
+    local setfacl_log="$fixture/setfacl.log"
+    local rule_source="$REPO_ROOT/dist/udev/80-openswitcher-input.rules"
+    local rule_target="$rules_dir/80-openswitcher-input.rules"
+    local target_user
+    target_user="$(id -un)"
 
+    mkdir -p "$rules_dir"
+    : >"$install_log"
+    : >"$udevadm_log"
+    : >"$setfacl_log"
+
+    PATH="$fake_bin:$PATH" \
+    OPEN_SWITCHER_TEST_FIXTURE_ROOT="$fixture" \
+    OPEN_SWITCHER_TEST_INSTALL_LOG="$install_log" \
+    OPEN_SWITCHER_TEST_UDEVADM_LOG="$udevadm_log" \
+    OPEN_SWITCHER_TEST_SETFACL_LOG="$setfacl_log" \
+    OPEN_SWITCHER_TEST_RULE_SOURCE="$rule_source" \
+    OPEN_SWITCHER_TEST_RULE_TARGET="$rule_target" \
     OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
     OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES="$fixture/proc/bus/input/devices" \
     OPEN_SWITCHER_LINUX_INPUT_RULES_DIR="$rules_dir" \
-        openswitcher_linux_input_bootstrap_root "$REPO_ROOT" "$(id -un)" >/dev/null
+        openswitcher_linux_input_bootstrap_root "$REPO_ROOT" "$target_user" >/dev/null
 
-    if [[ ! -f "$rules_dir/80-openswitcher-input.rules" ]]; then
+    if [[ ! -f "$rule_target" ]]; then
         echo "udev rule was not installed into temp rules dir" >&2
         exit 1
     fi
 
-    if command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1; then
-        local acl_dump
-        acl_dump="$(
-            getfacl -p \
-                "$fixture/dev/input/event4" \
-                "$fixture/dev/input/event8" \
-                "$fixture/dev/input/event9" \
-                "$fixture/dev/uinput" 2>/dev/null
-        )"
-
-        assert_contains "$acl_dump" "user:$(id -un):rw-"
+    if ! cmp -s "$rule_source" "$rule_target"; then
+        echo "installed udev rule does not match source asset" >&2
+        exit 1
     fi
+
+    assert_equals \
+        "-m 0644 $rule_source $rule_target" \
+        "$(<"$install_log")" \
+        "install calls"
+
+    assert_equals \
+        $'control --reload-rules\ntrigger --subsystem-match=input --action=change\ntrigger --subsystem-match=misc --sysname-match=uinput --action=change' \
+        "$(<"$udevadm_log")" \
+        "udevadm calls"
+
+    local expected_setfacl_calls
+    expected_setfacl_calls="$(printf '%s\n' \
+        "-m u:${target_user}:rw $fixture/dev/input/event4" \
+        "-m u:${target_user}:rw $fixture/dev/input/event8" \
+        "-m u:${target_user}:rw $fixture/dev/input/event9" \
+        "-m u:${target_user}:rw $fixture/dev/uinput")"
+    assert_equals \
+        "$expected_setfacl_calls" \
+        "$(<"$setfacl_log")" \
+        "setfacl calls"
 }
 
 test_doctor_reports_mixed_setup_problem

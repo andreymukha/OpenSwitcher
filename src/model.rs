@@ -861,9 +861,7 @@ impl LayoutSwitchCaptureState {
     pub fn is_active(&self) -> bool {
         matches!(
             self.phase,
-            LayoutSwitchCapturePhase::Waiting
-                | LayoutSwitchCapturePhase::Candidate
-                | LayoutSwitchCapturePhase::Unsupported
+            LayoutSwitchCapturePhase::Waiting | LayoutSwitchCapturePhase::Candidate
         )
     }
 }
@@ -1607,7 +1605,7 @@ mod tests {
         assert_eq!(unsupported.candidate, LayoutSwitchCombo::default());
         assert!(!unsupported.has_candidate);
         assert_eq!(unsupported.message, "not supported");
-        assert!(unsupported.is_active());
+        assert!(!unsupported.is_active());
 
         let cancelled = LayoutSwitchCaptureState::cancelled();
         assert_eq!(cancelled.phase, LayoutSwitchCapturePhase::Cancelled);
@@ -1622,5 +1620,10 @@ mod tests {
         assert!(!finished.has_candidate);
         assert!(finished.message.is_empty());
         assert!(!finished.is_active());
+    }
+
+    #[test]
+    fn unsupported_capture_state_is_terminal() {
+        assert!(!LayoutSwitchCaptureState::unsupported("not supported").is_active());
     }
 }

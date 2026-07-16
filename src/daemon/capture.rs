@@ -212,6 +212,20 @@ pub struct LayoutSwitchCaptureSession {
     progress: CaptureProgress,
     state: LayoutSwitchCaptureState,
     lease: Option<CaptureLease>,
+    suppressed_keys: BTreeSet<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureEventDisposition {
+    PassThrough,
+    ForwardDirect,
+    Suppress,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureEventOutcome {
+    pub disposition: CaptureEventDisposition,
+    pub state_change: Option<LayoutSwitchCaptureState>,
 }
 
 impl LayoutSwitchCaptureSession {
@@ -362,12 +376,40 @@ impl LayoutSwitchCaptureSession {
         Ok(())
     }
 
-    pub fn handle_key_event(&mut self, key: Key, value: i32) -> Option<LayoutSwitchCaptureState> {
-        if !self.is_active() {
-            return None;
+    pub fn route_event_at(&mut self, now: Instant, key: Key, value: i32) -> CaptureEventOutcome {
+        let expiry_change = self.expire_at(now);
+        let key_code = key.code();
+
+        if self.suppressed_keys.contains(&key_code) {
+            if value == 0 {
+                self.suppressed_keys.remove(&key_code);
+                if let Some(capture_key) = physical_capture_key_from_evdev(key) {
+                    self.progress.release_key(capture_key);
+                }
+            }
+
+            return CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: expiry_change,
+            };
         }
 
-        if value == 1 && key == Key::KEY_ESC {
+        if !self.is_active() {
+            return CaptureEventOutcome {
+                disposition: CaptureEventDisposition::PassThrough,
+                state_change: expiry_change,
+            };
+        }
+
+        if value != 1 {
+            return CaptureEventOutcome {
+                disposition: CaptureEventDisposition::ForwardDirect,
+                state_change: expiry_change,
+            };
+        }
+
+        if key == Key::KEY_ESC {
+            self.suppressed_keys.insert(key_code);
             log_capture_debug(
                 "event",
                 Some(key),
@@ -376,72 +418,79 @@ impl LayoutSwitchCaptureSession {
                 None,
                 "escape-cancel",
             );
-            return Some(self.cancel());
+            return CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: Some(self.cancel()),
+            };
         }
 
         let Some(capture_key) = physical_capture_key_from_evdev(key) else {
-            if value == 1 {
-                self.progress.clear();
-                log_capture_debug(
-                    "event",
-                    Some(key),
-                    None,
-                    &self.progress,
-                    None,
-                    "unresolved-evdev-key",
-                );
-                return self
-                    .replace_state(LayoutSwitchCaptureState::unsupported(UNSUPPORTED_MESSAGE));
-            }
-
-            return None;
+            self.progress.clear();
+            log_capture_debug(
+                "event",
+                Some(key),
+                None,
+                &self.progress,
+                None,
+                "unresolved-evdev-key",
+            );
+            return CaptureEventOutcome {
+                disposition: CaptureEventDisposition::ForwardDirect,
+                state_change: self
+                    .replace_state(LayoutSwitchCaptureState::unsupported(UNSUPPORTED_MESSAGE)),
+            };
         };
 
-        match value {
-            1 | 2 => {
-                if self.progress.is_empty() {
-                    self.state = LayoutSwitchCaptureState::waiting();
+        if self.progress.is_empty() {
+            self.state = LayoutSwitchCaptureState::waiting();
+        }
+        self.progress.press_key(capture_key);
+        let evaluated = self.progress.evaluate();
+        log_capture_debug(
+            "event",
+            Some(key),
+            Some(capture_key),
+            &self.progress,
+            Some(evaluated),
+            "after-press",
+        );
+
+        match evaluated.evaluation {
+            CaptureEvaluation::Waiting => {
+                self.suppressed_keys.insert(key_code);
+                CaptureEventOutcome {
+                    disposition: CaptureEventDisposition::Suppress,
+                    state_change: self.replace_state(LayoutSwitchCaptureState::waiting()),
                 }
-                self.progress.press_key(capture_key);
-                let evaluated = self.progress.evaluate();
-                log_capture_debug(
-                    "event",
-                    Some(key),
-                    Some(capture_key),
-                    &self.progress,
-                    Some(evaluated),
-                    if value == 2 {
-                        "after-repeat"
-                    } else {
-                        "after-press"
-                    },
-                );
-                match evaluated.evaluation {
-                    CaptureEvaluation::Waiting => {
-                        self.replace_state(LayoutSwitchCaptureState::waiting())
-                    }
-                    CaptureEvaluation::Candidate(combo) => {
-                        self.replace_state(LayoutSwitchCaptureState::candidate(combo))
-                    }
-                    CaptureEvaluation::Unsupported => self
+            }
+            CaptureEvaluation::Candidate(combo) => {
+                self.suppressed_keys.insert(key_code);
+                CaptureEventOutcome {
+                    disposition: CaptureEventDisposition::Suppress,
+                    state_change: self.replace_state(LayoutSwitchCaptureState::candidate(combo)),
+                }
+            }
+            CaptureEvaluation::Unsupported => {
+                self.progress.clear();
+                CaptureEventOutcome {
+                    disposition: CaptureEventDisposition::ForwardDirect,
+                    state_change: self
                         .replace_state(LayoutSwitchCaptureState::unsupported(UNSUPPORTED_MESSAGE)),
                 }
             }
-            0 => {
-                self.progress.release_key(capture_key);
-                let evaluated = self.progress.evaluate();
-                log_capture_debug(
-                    "event",
-                    Some(key),
-                    Some(capture_key),
-                    &self.progress,
-                    Some(evaluated),
-                    "after-release",
-                );
-                None
-            }
-            _ => None,
         }
+    }
+
+    pub fn reset_input_epoch(&mut self) -> Option<LayoutSwitchCaptureState> {
+        let state_change = self.is_active().then(|| self.cancel());
+        self.lease = None;
+        self.progress.clear();
+        self.suppressed_keys.clear();
+        state_change
+    }
+
+    pub fn handle_key_event(&mut self, key: Key, value: i32) -> Option<LayoutSwitchCaptureState> {
+        self.route_event_at(Instant::now(), key, value).state_change
     }
 
     fn replace_state(
@@ -797,5 +846,352 @@ mod tests {
             Some(LayoutSwitchCaptureState::cancelled())
         );
         assert!(!session.is_active());
+    }
+
+    #[test]
+    fn preheld_release_and_repeat_forward_direct_without_entering_recognizer() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_A, 2),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::ForwardDirect,
+                state_change: None,
+            }
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_LEFTCTRL, 0),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::ForwardDirect,
+                state_change: None,
+            }
+        );
+        assert!(session.progress.is_empty());
+        assert_eq!(session.current_state(), LayoutSwitchCaptureState::waiting());
+    }
+
+    #[test]
+    fn captured_press_repeat_and_release_are_suppressed_and_release_updates_progress() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_LEFTCTRL, 1),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: None,
+            }
+        );
+        assert!(session
+            .progress
+            .pressed_keys
+            .contains(&PhysicalCaptureKey::LeftCtrl));
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_LEFTCTRL, 2),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: None,
+            }
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_LEFTCTRL, 0),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: None,
+            }
+        );
+        assert!(session.progress.is_empty());
+        assert_eq!(session.current_state(), LayoutSwitchCaptureState::waiting());
+    }
+
+    #[test]
+    fn supported_presses_are_suppressed_and_evaluate_a_candidate() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_LEFTCTRL, 1)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_LEFTSHIFT, 1),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: Some(LayoutSwitchCaptureState::candidate(
+                    LayoutSwitchCombo::left_ctrl_left_shift(),
+                )),
+            }
+        );
+    }
+
+    #[test]
+    fn known_unsupported_trigger_is_forwarded_without_adding_its_debt() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_RIGHTALT, 1)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_LEFTCTRL, 1),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::ForwardDirect,
+                state_change: Some(LayoutSwitchCaptureState::unsupported(UNSUPPORTED_MESSAGE,)),
+            }
+        );
+        assert!(!session.is_active());
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_LEFTCTRL, 0)
+                .disposition,
+            CaptureEventDisposition::PassThrough
+        );
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_RIGHTALT, 2)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_RIGHTALT, 0)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+    }
+
+    #[test]
+    fn unknown_press_is_forwarded_and_terminates_without_debt() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_A, 1),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::ForwardDirect,
+                state_change: Some(LayoutSwitchCaptureState::unsupported(UNSUPPORTED_MESSAGE,)),
+            }
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_A, 2).disposition,
+            CaptureEventDisposition::PassThrough
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_A, 0).disposition,
+            CaptureEventDisposition::PassThrough
+        );
+    }
+
+    #[test]
+    fn escape_press_repeat_and_release_stay_suppressed() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_ESC, 1),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: Some(LayoutSwitchCaptureState::cancelled()),
+            }
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_ESC, 2).disposition,
+            CaptureEventDisposition::Suppress
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_ESC, 0).disposition,
+            CaptureEventDisposition::Suppress
+        );
+        assert_eq!(
+            session.route_event_at(now, Key::KEY_ESC, 0).disposition,
+            CaptureEventDisposition::PassThrough
+        );
+    }
+
+    #[test]
+    fn debt_survives_cancel_finish_and_owner_loss() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+
+        let mut cancelled = LayoutSwitchCaptureSession::default();
+        cancelled.start_owned(capture_owner.clone(), now).unwrap();
+        cancelled.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+        cancelled.cancel_owned(&capture_owner, now).unwrap();
+        assert_eq!(
+            cancelled
+                .route_event_at(now, Key::KEY_LEFTCTRL, 0)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+
+        let mut finished = LayoutSwitchCaptureSession::default();
+        finished.start_owned(capture_owner.clone(), now).unwrap();
+        finished.route_event_at(now, Key::KEY_LEFTALT, 1);
+        finished.finish_owned(&capture_owner, now).unwrap();
+        assert_eq!(
+            finished
+                .route_event_at(now, Key::KEY_LEFTALT, 0)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+
+        let mut lost = LayoutSwitchCaptureSession::default();
+        lost.start_owned(capture_owner.clone(), now).unwrap();
+        lost.route_event_at(now, Key::KEY_LEFTSHIFT, 1);
+        lost.owner_disappeared(&capture_owner, now);
+        assert_eq!(
+            lost.route_event_at(now, Key::KEY_LEFTSHIFT, 0).disposition,
+            CaptureEventDisposition::Suppress
+        );
+    }
+
+    #[test]
+    fn debt_survives_soft_and_absolute_expiry() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+
+        let mut soft = LayoutSwitchCaptureSession::default();
+        soft.start_owned(capture_owner.clone(), now).unwrap();
+        soft.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+        assert_eq!(
+            soft.expire_at(now + CAPTURE_SOFT_LEASE),
+            Some(LayoutSwitchCaptureState::cancelled())
+        );
+        assert_eq!(
+            soft.route_event_at(now + CAPTURE_SOFT_LEASE, Key::KEY_LEFTCTRL, 0)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+
+        let mut absolute = LayoutSwitchCaptureSession::default();
+        absolute.start_owned(capture_owner.clone(), now).unwrap();
+        absolute.route_event_at(now, Key::KEY_LEFTALT, 1);
+        for seconds in [9, 18, 27, 36, 45, 54, 63, 64] {
+            absolute
+                .renew_owned(&capture_owner, now + Duration::from_secs(seconds))
+                .unwrap();
+        }
+        assert_eq!(
+            absolute.expire_at(now + CAPTURE_ABSOLUTE_LEASE),
+            Some(LayoutSwitchCaptureState::cancelled())
+        );
+        assert_eq!(
+            absolute
+                .route_event_at(now + CAPTURE_ABSOLUTE_LEASE, Key::KEY_LEFTALT, 0)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+    }
+
+    #[test]
+    fn routing_checks_expiry_before_suppression_debt() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+        session.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+
+        assert_eq!(
+            session.route_event_at(now + CAPTURE_SOFT_LEASE, Key::KEY_LEFTCTRL, 0),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: Some(LayoutSwitchCaptureState::cancelled()),
+            }
+        );
+    }
+
+    #[test]
+    fn debt_survives_a_new_owner_start() {
+        let now = Instant::now();
+        let first_owner = owner(":1.10");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(first_owner.clone(), now).unwrap();
+        session.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+        session.cancel_owned(&first_owner, now).unwrap();
+        session
+            .start_owned(owner(":1.11"), now + Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(
+            session.route_event_at(now + Duration::from_secs(1), Key::KEY_LEFTCTRL, 0,),
+            CaptureEventOutcome {
+                disposition: CaptureEventDisposition::Suppress,
+                state_change: None,
+            }
+        );
+        assert!(session.is_active());
+        assert!(session.progress.is_empty());
+    }
+
+    #[test]
+    fn inactive_unrelated_events_pass_through_while_debt_remains() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(capture_owner.clone(), now).unwrap();
+        session.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+        session.cancel_owned(&capture_owner, now).unwrap();
+
+        for value in [1, 2, 0] {
+            assert_eq!(
+                session.route_event_at(now, Key::KEY_A, value).disposition,
+                CaptureEventDisposition::PassThrough
+            );
+        }
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_LEFTCTRL, 0)
+                .disposition,
+            CaptureEventDisposition::Suppress
+        );
+    }
+
+    #[test]
+    fn reset_input_epoch_clears_debt_progress_and_active_session() {
+        let now = Instant::now();
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(owner(":1.10"), now).unwrap();
+        session.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+
+        assert_eq!(
+            session.reset_input_epoch(),
+            Some(LayoutSwitchCaptureState::cancelled())
+        );
+        assert!(session.progress.is_empty());
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_LEFTCTRL, 0)
+                .disposition,
+            CaptureEventDisposition::PassThrough
+        );
+    }
+
+    #[test]
+    fn reset_input_epoch_clears_terminal_debt_without_a_transition() {
+        let now = Instant::now();
+        let capture_owner = owner(":1.10");
+        let mut session = LayoutSwitchCaptureSession::default();
+        session.start_owned(capture_owner.clone(), now).unwrap();
+        session.route_event_at(now, Key::KEY_LEFTCTRL, 1);
+        session.cancel_owned(&capture_owner, now).unwrap();
+
+        assert_eq!(session.reset_input_epoch(), None);
+        assert_eq!(
+            session
+                .route_event_at(now, Key::KEY_LEFTCTRL, 0)
+                .disposition,
+            CaptureEventDisposition::PassThrough
+        );
     }
 }

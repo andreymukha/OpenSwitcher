@@ -76,6 +76,28 @@ create_fake_linux_input_commands() {
 
     mkdir -p "$fake_bin"
 
+    cat >"$fake_bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${OPEN_SWITCHER_TEST_FIXTURE_ROOT:?}"
+: "${OPEN_SWITCHER_TEST_SUDO_LOG:?}"
+
+case "$OPEN_SWITCHER_TEST_SUDO_LOG" in
+    "$OPEN_SWITCHER_TEST_FIXTURE_ROOT"/*) ;;
+    *)
+        echo "refusing to write sudo log outside test fixture" >&2
+        exit 1
+        ;;
+esac
+
+printf '%s\n' "$*" >>"$OPEN_SWITCHER_TEST_SUDO_LOG"
+
+# Never execute privileged argv in tests. A non-zero status also keeps manage.sh
+# from continuing into its post-bootstrap doctor when the boundary is crossed.
+exit 97
+EOF
+
     cat >"$fake_bin/udevadm" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -158,7 +180,170 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 done <"$source_path" >"$target_path"
 EOF
 
-    chmod +x "$fake_bin/udevadm" "$fake_bin/setfacl" "$fake_bin/install"
+    chmod +x \
+        "$fake_bin/sudo" \
+        "$fake_bin/udevadm" \
+        "$fake_bin/setfacl" \
+        "$fake_bin/install"
+}
+
+test_production_bootstrap_rejects_override_case() (
+    set -euo pipefail
+
+    local override_name="$1"
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT
+
+    create_fake_input_fixture "$fixture"
+    create_fake_linux_input_commands "$fixture"
+
+    local protected_target="$fixture/protected-target"
+    local protected_snapshot="$fixture/protected-target.before"
+    printf 'protected target must remain byte-identical\n' >"$protected_target"
+    cp "$protected_target" "$protected_snapshot"
+    rm -f "$fixture/dev/uinput"
+    ln -s "$protected_target" "$fixture/dev/uinput"
+
+    local rules_dir="$fixture/etc/udev/rules.d"
+    local fake_bin="$fixture/fake-bin"
+    local sudo_log="$fixture/sudo.log"
+    local install_log="$fixture/install.log"
+    local udevadm_log="$fixture/udevadm.log"
+    local setfacl_log="$fixture/setfacl.log"
+    local rule_source="$REPO_ROOT/dist/udev/80-openswitcher-input.rules"
+    local rule_target="$rules_dir/80-openswitcher-input.rules"
+    local override_value=""
+
+    case "$override_name" in
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT)
+            override_value="$fixture/dev"
+            ;;
+        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES)
+            override_value="$fixture/proc/bus/input/devices"
+            ;;
+        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR)
+            override_value="$rules_dir"
+            ;;
+        *)
+            echo "unexpected override case: $override_name" >&2
+            return 1
+            ;;
+    esac
+
+    mkdir -p "$rules_dir" "$fixture/home"
+    : >"$sudo_log"
+    : >"$install_log"
+    : >"$udevadm_log"
+    : >"$setfacl_log"
+
+    local output
+    local status
+    set +e
+    output="$(
+        cd "$REPO_ROOT"
+        unset \
+            OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT \
+            OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES \
+            OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
+        printf -v "$override_name" '%s' "$override_value"
+        export "$override_name"
+
+        PATH="$fake_bin:/usr/bin:/bin" \
+        HOME="$fixture/home" \
+        OPEN_SWITCHER_TEST_FIXTURE_ROOT="$fixture" \
+        OPEN_SWITCHER_TEST_SUDO_LOG="$sudo_log" \
+        OPEN_SWITCHER_TEST_INSTALL_LOG="$install_log" \
+        OPEN_SWITCHER_TEST_UDEVADM_LOG="$udevadm_log" \
+        OPEN_SWITCHER_TEST_SETFACL_LOG="$setfacl_log" \
+        OPEN_SWITCHER_TEST_RULE_SOURCE="$rule_source" \
+        OPEN_SWITCHER_TEST_RULE_TARGET="$rule_target" \
+            ./manage.sh bootstrap linux-input 2>&1
+    )"
+    status=$?
+    set -e
+
+    local failures=0
+
+    if [[ "$status" -eq 0 ]]; then
+        echo "$override_name: production bootstrap unexpectedly succeeded" >&2
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$output" != *"$override_name"* ]]; then
+        echo "$override_name: rejection output does not name the override" >&2
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$output" != *"test-only"* ]] ||
+        [[ "$output" != *"not allowed for production bootstrap"* ]]; then
+        echo "$override_name: rejection output lacks the stable test-only production-boundary message" >&2
+        failures=$((failures + 1))
+    fi
+
+    local command_name=""
+    local command_log=""
+    for command_name in sudo install setfacl udevadm; do
+        command_log="$fixture/$command_name.log"
+        if [[ -s "$command_log" ]]; then
+            echo "$override_name: fake $command_name was invoked" >&2
+            sed 's/^/  argv: /' "$command_log" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    if ! cmp -s "$protected_snapshot" "$protected_target"; then
+        echo "$override_name: protected target was modified" >&2
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$output" == *"Повторная проверка Linux input setup..."* ]]; then
+        echo "$override_name: production bootstrap reached the post-bootstrap doctor" >&2
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$failures" -ne 0 ]]; then
+        echo "--- production output for $override_name (status $status) ---" >&2
+        if [[ -n "$output" ]]; then
+            printf '%s\n' "$output" >&2
+        else
+            echo "<empty>" >&2
+        fi
+        return 1
+    fi
+)
+
+test_production_bootstrap_rejects_test_only_path_overrides() {
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "SKIP: production bootstrap override boundary requires a non-root EUID" >&2
+        return 0
+    fi
+
+    local failures=0
+    local override_name=""
+    local case_output=""
+    local -a override_names=(
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT
+        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES
+        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
+    )
+
+    for override_name in "${override_names[@]}"; do
+        if case_output="$(
+            test_production_bootstrap_rejects_override_case "$override_name" 2>&1
+        )"; then
+            continue
+        fi
+
+        echo "production bootstrap override case failed: $override_name" >&2
+        printf '%s\n' "$case_output" >&2
+        failures=$((failures + 1))
+    done
+
+    if [[ "$failures" -ne 0 ]]; then
+        echo "production bootstrap override cases failed: $failures/${#override_names[@]}" >&2
+        return 1
+    fi
 }
 
 test_doctor_reports_mixed_setup_problem() {
@@ -310,5 +495,6 @@ test_doctor_reports_mixed_setup_problem
 test_doctor_reports_ready_state
 test_doctor_reports_keyboard_not_found
 test_bootstrap_installs_rule_and_applies_acl_bridge
+test_production_bootstrap_rejects_test_only_path_overrides
 
 echo "linux_input_setup_test.sh: ok"

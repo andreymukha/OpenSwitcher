@@ -320,7 +320,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     ui.open_layout_switch_dialog();
                     ui.arm_capture_timeout(presenter.clone());
                 }
-                Err(error) => ui.show_client_error(error, false),
+                Err(error) => ui.handle_capture_failed(error),
             }
         });
     }
@@ -348,7 +348,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     ui.reset_capture_dialog();
                     ui.close_layout_switch_dialog();
                 }
-                Err(error) => ui.show_client_error(error, false),
+                Err(error) => ui.handle_capture_failed(error),
             }
         });
     }
@@ -425,7 +425,7 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                         let presenter = ui.presenter.borrow().as_ref().cloned();
                         if let Some(presenter) = presenter {
                             if presenter.apply_capture_renew_failure(generation) {
-                                ui.handle_capture_renew_failed(error);
+                                ui.handle_capture_failed(error);
                             }
                         }
                     }
@@ -1156,11 +1156,11 @@ impl SettingsWindow {
         }
     }
 
-    fn handle_capture_renew_failed(&self, error: SettingsClientError) {
+    fn handle_capture_failed(&self, error: SettingsClientError) {
         self.disarm_capture_timeout();
         {
             let mut dialog = self.capture_dialog_state.borrow_mut();
-            apply_capture_renew_failure_state(&mut dialog);
+            apply_capture_failure_state(&mut dialog);
         }
         self.update_capture_dialog_widgets();
         self.close_layout_switch_dialog();
@@ -1803,7 +1803,7 @@ fn apply_unsupported_capture_state(
     false
 }
 
-fn apply_capture_renew_failure_state(dialog: &mut CaptureDialogState) -> bool {
+fn apply_capture_failure_state(dialog: &mut CaptureDialogState) -> bool {
     dialog.clear();
     false
 }
@@ -2156,7 +2156,7 @@ mod tests {
             error: Some("old error".to_string()),
         };
 
-        let capture_active = apply_capture_renew_failure_state(&mut dialog);
+        let capture_active = apply_capture_failure_state(&mut dialog);
 
         assert!(!capture_active);
         assert_eq!(dialog, CaptureDialogState::default());

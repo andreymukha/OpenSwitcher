@@ -331,7 +331,16 @@ where
         combo: LayoutSwitchCombo,
     ) -> Result<(), SettingsClientError> {
         self.stop_capture_heartbeat();
-        let state = self.inner.client.finish_layout_switch_capture()?;
+        let state = match self.inner.client.finish_layout_switch_capture() {
+            Ok(state) => state,
+            Err(error) => {
+                let changed = self.with_state(DomainState::cancel_layout_switch_capture);
+                if changed {
+                    let _ = self.emit_view_state();
+                }
+                return Err(error);
+            }
+        };
         let changed = self.with_state(|current| current.apply_captured_layout_switch(combo));
         if changed {
             let _ = self.emit_view_state();
@@ -617,6 +626,7 @@ mod tests {
         renew_delay: Duration,
         get_state_results: VecDeque<FakeRenewResult>,
         get_state_delay: Duration,
+        finish_should_fail: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -666,6 +676,10 @@ mod tests {
 
         fn set_get_state_delay(&self, delay: Duration) {
             self.state.lock().unwrap().get_state_delay = delay;
+        }
+
+        fn fail_finish(&self) {
+            self.state.lock().unwrap().finish_should_fail = true;
         }
     }
 
@@ -729,7 +743,11 @@ mod tests {
         fn finish_layout_switch_capture(
             &self,
         ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-            Ok(LayoutSwitchCaptureState::finished())
+            if self.state.lock().unwrap().finish_should_fail {
+                Err(capture_test_error())
+            } else {
+                Ok(LayoutSwitchCaptureState::finished())
+            }
         }
 
         fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
@@ -966,6 +984,29 @@ mod tests {
         let stopped_at = finish_client.renew_calls();
         thread::sleep(Duration::from_millis(35));
         assert_eq!(finish_client.renew_calls(), stopped_at);
+    }
+
+    #[test]
+    fn capture_finish_failure_is_terminal_locally_and_stops_heartbeat() {
+        let client = CountingCaptureClient::default();
+        let (presenter, _event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(1);
+        client.base.fail_finish();
+
+        assert!(presenter
+            .confirm_captured_layout_switch(LayoutSwitchCombo::alt_shift())
+            .is_err());
+        let stopped_at = client.renew_calls();
+        thread::sleep(Duration::from_millis(35));
+
+        assert_eq!(client.renew_calls(), stopped_at);
+        assert!(
+            !presenter
+                .with_state(|state| state.view_state())
+                .layout_switch
+                .capture_active
+        );
     }
 
     #[test]

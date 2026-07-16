@@ -1,21 +1,190 @@
 use crate::daemon::capture::CaptureOwner;
 use crate::daemon::runtime::log_layout_debug;
 use crate::daemon::runtime::RuntimeState;
-use crate::error::{DbusError, SettingsError};
+use crate::error::{DbusError, SettingsError, SwitcherError};
 use crate::model::{LayoutSwitchCaptureState, Settings, SettingsDto, UpdateSettingsResult};
+use futures_util::{
+    future::{select, Either},
+    pin_mut, StreamExt,
+};
 use std::sync::{
     mpsc::{self, SyncSender},
     Arc,
 };
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 use zbus::blocking::Connection;
-use zbus::{dbus_interface, dbus_proxy, fdo, MessageHeader, SignalContext};
+use zbus::{dbus_interface, dbus_proxy, fdo, AsyncDrop, MessageHeader, SignalContext};
 
 pub const SERVICE_NAME: &str = "org.oswitch.core";
 pub const OBJECT_PATH: &str = "/org/oswitch/core";
 pub const INTERFACE_NAME: &str = "org.oswitch.core";
 pub(crate) const DBUS_SIGNAL_QUEUE_CAPACITY: usize = 16;
+
+pub(crate) struct CaptureOwnerMonitor {
+    stop_sender: async_channel::Sender<()>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl CaptureOwnerMonitor {
+    pub(crate) fn start(
+        connection: &Connection,
+        runtime: Arc<RuntimeState>,
+    ) -> Result<Self, SwitcherError> {
+        let connection = connection.inner().clone();
+        Self::spawn_worker(move |stop_receiver, ready_sender| {
+            async_io::block_on(run_capture_owner_monitor(
+                connection,
+                runtime,
+                stop_receiver,
+                ready_sender,
+            ));
+        })
+    }
+
+    fn spawn_worker<F>(worker_main: F) -> Result<Self, SwitcherError>
+    where
+        F: FnOnce(async_channel::Receiver<()>, mpsc::SyncSender<zbus::Result<()>>) + Send + 'static,
+    {
+        let (stop_sender, stop_receiver) = async_channel::bounded(1);
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("openswitcher-capture-owner".to_owned())
+            .spawn(move || worker_main(stop_receiver, ready_sender))?;
+
+        match ready_receiver.recv() {
+            Ok(Ok(())) => Ok(Self {
+                stop_sender,
+                worker: Some(worker),
+            }),
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                Err(error.into())
+            }
+            Err(error) => {
+                let _ = worker.join();
+                Err(std::io::Error::other(format!(
+                    "capture owner monitor failed before subscription was ready: {error}"
+                ))
+                .into())
+            }
+        }
+    }
+
+    pub(crate) fn stop(&mut self) -> thread::Result<()> {
+        self.stop_and_join()
+    }
+
+    fn stop_and_join(&mut self) -> thread::Result<()> {
+        let _ = self.stop_sender.try_send(());
+        match self.worker.take() {
+            Some(worker) => worker.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for CaptureOwnerMonitor {
+    fn drop(&mut self) {
+        if self.stop_and_join().is_err() {
+            log_layout_debug(
+                "dbus-capture-owner-monitor-stop-error",
+                "worker_panicked=true",
+            );
+            eprintln!("[dbus] Capture owner monitor worker panicked");
+        }
+    }
+}
+
+async fn run_capture_owner_monitor(
+    connection: zbus::Connection,
+    runtime: Arc<RuntimeState>,
+    stop_receiver: async_channel::Receiver<()>,
+    ready_sender: mpsc::SyncSender<zbus::Result<()>>,
+) {
+    let proxy = match zbus::fdo::DBusProxy::new(&connection).await {
+        Ok(proxy) => proxy,
+        Err(error) => {
+            let _ = ready_sender.send(Err(error));
+            return;
+        }
+    };
+    let mut owner_changes = match proxy.receive_name_owner_changed().await {
+        Ok(owner_changes) => owner_changes,
+        Err(error) => {
+            let _ = ready_sender.send(Err(error));
+            return;
+        }
+    };
+    if ready_sender.send(Ok(())).is_err() {
+        return;
+    }
+
+    loop {
+        let stop = stop_receiver.recv();
+        let owner_change = owner_changes.next();
+        pin_mut!(stop, owner_change);
+        match select(stop, owner_change).await {
+            Either::Left((_stop, _pending_owner_change)) => break,
+            Either::Right((signal, _pending_stop)) => {
+                let Some(signal) = signal else {
+                    log_layout_debug(
+                        "dbus-capture-owner-monitor-ended",
+                        "soft_lease_fallback=true",
+                    );
+                    eprintln!(
+                        "[dbus] Capture owner monitor ended; the bounded lease remains active"
+                    );
+                    break;
+                };
+                let args = match signal.args() {
+                    Ok(args) => args,
+                    Err(error) => {
+                        log_layout_debug(
+                            "dbus-capture-owner-monitor-signal-error",
+                            &format!("error={error}"),
+                        );
+                        eprintln!("[dbus] Failed to read NameOwnerChanged signal: {error}");
+                        continue;
+                    }
+                };
+                if args.new_owner().as_ref().is_some() {
+                    continue;
+                }
+                let owner = CaptureOwner::from(args.name().as_str());
+                drop(args);
+
+                match runtime.layout_switch_capture_owner_disappeared_at(&owner, Instant::now()) {
+                    Ok(Some(state)) => {
+                        emit_capture_state_changed_async_best_effort(&connection, &state).await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        log_layout_debug(
+                            "dbus-capture-owner-monitor-runtime-error",
+                            &format!("error={error} soft_lease_fallback=true"),
+                        );
+                        eprintln!("[dbus] Failed to cancel capture for a vanished owner: {error}");
+                    }
+                }
+            }
+        }
+    }
+    owner_changes.async_drop().await;
+}
+
+async fn emit_capture_state_changed_async_best_effort(
+    connection: &zbus::Connection,
+    state: &LayoutSwitchCaptureState,
+) {
+    let result = match SignalContext::new(connection, OBJECT_PATH) {
+        Ok(context) => {
+            OpenSwitcherDbusApi::layout_switch_capture_state_changed(&context, state.clone()).await
+        }
+        Err(error) => Err(error),
+    };
+    capture_signal_best_effort(result);
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DbusSignalEvent {
@@ -370,7 +539,14 @@ pub fn emit_layout_switch_capture_state_changed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::runtime::ConfigService;
+    use crate::model::LayoutSwitchCapturePhase;
+    use std::error::Error;
+    use std::path::Path;
     use std::sync::mpsc;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+    use zbus::blocking::{ConnectionBuilder, Proxy};
 
     #[test]
     fn status_signal_best_effort_treats_success_as_ok() {
@@ -450,5 +626,152 @@ mod tests {
             enabled: true,
             layout: true,
         }));
+    }
+
+    #[test]
+    fn capture_owner_monitor_cancels_when_starting_connection_disappears(
+    ) -> Result<(), Box<dyn Error>> {
+        let temp_dir = TempDir::new()?;
+        let runtime = test_runtime(temp_dir.path())?;
+        let service_name = unique_test_service_name("owner_loss");
+        let service = ConnectionBuilder::session()?
+            .name(service_name.as_str())?
+            .build()?;
+        let mut monitor = CaptureOwnerMonitor::start(&service, runtime.clone())?;
+        service
+            .object_server()
+            .at(OBJECT_PATH, OpenSwitcherDbusApi::new(runtime.clone()))?;
+
+        {
+            let owner_connection = Connection::session()?;
+            let owner_proxy = Proxy::new(
+                &owner_connection,
+                service_name.as_str(),
+                OBJECT_PATH,
+                INTERFACE_NAME,
+            )?;
+            let started: LayoutSwitchCaptureState =
+                owner_proxy.call("StartLayoutSwitchCapture", &())?;
+            assert_eq!(started.phase, LayoutSwitchCapturePhase::Waiting);
+        }
+
+        wait_for_capture_phase(&runtime, LayoutSwitchCapturePhase::Cancelled)?;
+        assert!(monitor.stop().is_ok(), "monitor worker must join cleanly");
+
+        Ok(())
+    }
+
+    #[test]
+    fn capture_owner_monitor_ignores_an_unrelated_connection_disappearing(
+    ) -> Result<(), Box<dyn Error>> {
+        let temp_dir = TempDir::new()?;
+        let runtime = test_runtime(temp_dir.path())?;
+        let service_name = unique_test_service_name("unrelated_owner_loss");
+        let service = ConnectionBuilder::session()?
+            .name(service_name.as_str())?
+            .build()?;
+        let mut monitor = CaptureOwnerMonitor::start(&service, runtime.clone())?;
+        service
+            .object_server()
+            .at(OBJECT_PATH, OpenSwitcherDbusApi::new(runtime.clone()))?;
+        let owner_connection = Connection::session()?;
+        let owner_proxy = Proxy::new(
+            &owner_connection,
+            service_name.as_str(),
+            OBJECT_PATH,
+            INTERFACE_NAME,
+        )?;
+        let started: LayoutSwitchCaptureState =
+            owner_proxy.call("StartLayoutSwitchCapture", &())?;
+        assert_eq!(started.phase, LayoutSwitchCapturePhase::Waiting);
+
+        let unrelated_connection = Connection::session()?;
+        assert_ne!(
+            owner_connection.unique_name(),
+            unrelated_connection.unique_name()
+        );
+        drop(unrelated_connection);
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(
+            runtime.layout_switch_capture_state()?.phase,
+            LayoutSwitchCapturePhase::Waiting
+        );
+        let cancelled: LayoutSwitchCaptureState =
+            owner_proxy.call("CancelLayoutSwitchCapture", &())?;
+        assert_eq!(cancelled.phase, LayoutSwitchCapturePhase::Cancelled);
+        assert!(monitor.stop().is_ok(), "monitor worker must join cleanly");
+
+        Ok(())
+    }
+
+    #[test]
+    fn capture_owner_monitor_stop_is_idempotent_and_joins_cleanly() -> Result<(), Box<dyn Error>> {
+        let temp_dir = TempDir::new()?;
+        let runtime = test_runtime(temp_dir.path())?;
+        let connection = Connection::session()?;
+        let mut monitor = CaptureOwnerMonitor::start(&connection, runtime)?;
+
+        assert!(monitor.stop().is_ok());
+        assert!(monitor.stop().is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn capture_owner_monitor_propagates_subscription_startup_failure() {
+        let result = CaptureOwnerMonitor::spawn_worker(|_stop_receiver, ready_sender| {
+            ready_sender
+                .send(Err(zbus::Error::Failure(
+                    "injected subscription failure".to_owned(),
+                )))
+                .expect("startup result receiver must still be present");
+        });
+
+        match result {
+            Err(SwitcherError::Dbus(zbus::Error::Failure(message))) => {
+                assert_eq!(message, "injected subscription failure");
+            }
+            Err(error) => panic!("unexpected startup error: {error}"),
+            Ok(_) => panic!("subscription failure must prevent monitor startup"),
+        }
+    }
+
+    fn test_runtime(temp_dir: &Path) -> Result<Arc<RuntimeState>, Box<dyn Error>> {
+        Ok(Arc::new(RuntimeState::new(ConfigService::load(
+            temp_dir.join("config.toml"),
+        )?)))
+    }
+
+    fn unique_test_service_name(suffix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        format!(
+            "org.oswitch.core.monitor_test.{suffix}.p{}.n{nanos}",
+            std::process::id()
+        )
+    }
+
+    fn wait_for_capture_phase(
+        runtime: &RuntimeState,
+        expected: LayoutSwitchCapturePhase,
+    ) -> Result<(), Box<dyn Error>> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = runtime.layout_switch_capture_state()?;
+            if state.phase == expected {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out waiting for capture phase {expected:?}; current={:?}",
+                    state.phase
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }

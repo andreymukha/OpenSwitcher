@@ -1567,6 +1567,7 @@ dependencies = [
  "async-io 1.13.0",
  "dirs",
  "evdev",
+ "futures-util",
  "gtk4",
  "ksni",
  "libadwaita",

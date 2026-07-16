@@ -8,7 +8,7 @@ pub mod service;
 pub mod switch_logic;
 
 use crate::config::default_config_path;
-use crate::dbus::{OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
+use crate::dbus::{CaptureOwnerMonitor, OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
 use crate::system::is_dev_runtime_mode;
 use keyboard::log_input_debug;
@@ -73,15 +73,11 @@ pub fn run() -> Result<(), SwitcherError> {
             "enabled=false reason=dev-runtime-mode",
         );
     }
-    let dbus_api = OpenSwitcherDbusApi::new(runtime.clone());
-
-    let connection = ConnectionBuilder::session()?
-        .name(SERVICE_NAME)?
-        .serve_at(OBJECT_PATH, dbus_api)?
-        .build()?;
+    let (connection, mut capture_owner_monitor) =
+        start_dbus_endpoint(runtime.clone(), SERVICE_NAME)?;
 
     let mut service = DaemonService::new(runtime, connection)?;
-    match panic::catch_unwind(AssertUnwindSafe(|| service.run())) {
+    let result = match panic::catch_unwind(AssertUnwindSafe(|| service.run())) {
         Ok(result) => result,
         Err(payload) => {
             let reason = if let Some(text) = payload.downcast_ref::<&str>() {
@@ -96,5 +92,65 @@ pub fn run() -> Result<(), SwitcherError> {
             service.shutdown();
             Err(SwitcherError::DaemonPanicked)
         }
+    };
+    if capture_owner_monitor.stop().is_err() {
+        log_layout_debug(
+            "dbus-capture-owner-monitor-stop-error",
+            "worker_panicked=true",
+        );
+        eprintln!("[dbus] Capture owner monitor worker panicked during shutdown");
+    }
+    result
+}
+
+fn start_dbus_endpoint(
+    runtime: Arc<RuntimeState>,
+    service_name: &str,
+) -> Result<(Connection, CaptureOwnerMonitor), SwitcherError> {
+    let connection = ConnectionBuilder::session()?.name(service_name)?.build()?;
+    let monitor = CaptureOwnerMonitor::start(&connection, runtime.clone())?;
+    connection
+        .object_server()
+        .at(OBJECT_PATH, OpenSwitcherDbusApi::new(runtime))?;
+    Ok((connection, monitor))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dbus::INTERFACE_NAME;
+    use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState};
+    use std::error::Error;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
+    use zbus::blocking::Proxy;
+
+    #[test]
+    fn dbus_endpoint_registers_capture_api_after_monitor_is_ready() -> Result<(), Box<dyn Error>> {
+        let temp_dir = TempDir::new()?;
+        let runtime = Arc::new(RuntimeState::new(ConfigService::load(
+            temp_dir.path().join("config.toml"),
+        )?));
+        let service_name = unique_service_name();
+
+        let (_service, mut monitor) = start_dbus_endpoint(runtime, service_name.as_str())?;
+        let client = Connection::session()?;
+        let proxy = Proxy::new(&client, service_name.as_str(), OBJECT_PATH, INTERFACE_NAME)?;
+        let state: LayoutSwitchCaptureState = proxy.call("GetLayoutSwitchCaptureState", &())?;
+
+        assert_eq!(state.phase, LayoutSwitchCapturePhase::Idle);
+        assert!(monitor.stop().is_ok());
+        Ok(())
+    }
+
+    fn unique_service_name() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        format!(
+            "org.oswitch.core.endpoint_test.p{}.n{nanos}",
+            std::process::id()
+        )
     }
 }

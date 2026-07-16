@@ -225,6 +225,8 @@ run_doctor_command() {
 }
 
 bootstrap_linux_input() {
+    openswitcher_linux_input_reject_production_overrides || return 1
+
     local target_user
     target_user="$(id -un)"
 
@@ -237,14 +239,20 @@ bootstrap_linux_input() {
             exit 1
         fi
 
-        sudo env \
-            OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="${OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT:-}" \
-            OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES="${OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES:-}" \
-            OPEN_SWITCHER_LINUX_INPUT_RULES_DIR="${OPEN_SWITCHER_LINUX_INPUT_RULES_DIR:-}" \
-            bash -lc '
-                source "$0"
-                openswitcher_linux_input_bootstrap_root "$1" "$2"
-            ' "$LINUX_INPUT_HELPER" "$SCRIPT_DIR" "$target_user"
+        sudo -- /usr/bin/env -i \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            /bin/bash --noprofile --norc -c '
+                set -euo pipefail
+                unset \
+                    OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT \
+                    OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES \
+                    OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
+                source "$1"
+                openswitcher_linux_input_bootstrap_root "$2" "$3"
+            ' openswitcher-linux-input-bootstrap \
+            "$LINUX_INPUT_HELPER" \
+            "$SCRIPT_DIR" \
+            "$target_user"
     fi
 
     echo

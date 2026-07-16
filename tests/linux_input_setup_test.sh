@@ -346,6 +346,220 @@ test_production_bootstrap_rejects_test_only_path_overrides() {
     fi
 }
 
+test_production_bootstrap_uses_sanitized_sudo_boundary() (
+    set -euo pipefail
+
+    if [[ "$EUID" -eq 0 ]]; then
+        echo "SKIP: sanitized sudo boundary requires a non-root EUID" >&2
+        return 0
+    fi
+
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT
+    create_fake_linux_input_commands "$fixture"
+
+    local fake_bin="$fixture/fake-bin"
+    local sudo_log="$fixture/sudo.log"
+    : >"$sudo_log"
+    mkdir -p "$fixture/home"
+
+    local output
+    local status
+    set +e
+    output="$(
+        cd "$REPO_ROOT"
+        PATH="$fake_bin:/usr/bin:/bin" \
+        HOME="$fixture/home" \
+        OPEN_SWITCHER_TEST_FIXTURE_ROOT="$fixture" \
+        OPEN_SWITCHER_TEST_SUDO_LOG="$sudo_log" \
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT='' \
+        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES='' \
+        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR='' \
+            ./manage.sh bootstrap linux-input 2>&1
+    )"
+    status=$?
+    set -e
+
+    if [[ "$status" -ne 97 ]]; then
+        echo "sanitized sudo boundary did not reach the inert fake sudo (status $status)" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+
+    local sudo_argv
+    sudo_argv="$(<"$sudo_log")"
+    assert_contains "$sudo_argv" "-- /usr/bin/env -i"
+    assert_contains "$sudo_argv" "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+    assert_contains "$sudo_argv" "/bin/bash --noprofile --norc -c"
+
+    if [[ "$sudo_argv" == *"bash -lc"* ]]; then
+        echo "production bootstrap still uses bash -lc across sudo" >&2
+        printf '%s\n' "$sudo_argv" >&2
+        return 1
+    fi
+
+    local override_name=""
+    for override_name in \
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT \
+        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES \
+        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR; do
+        if [[ "$sudo_argv" == *"${override_name}="* ]]; then
+            echo "production bootstrap still forwards $override_name through sudo" >&2
+            printf '%s\n' "$sudo_argv" >&2
+            return 1
+        fi
+    done
+)
+
+test_root_bootstrap_rejects_override_case() (
+    set -euo pipefail
+
+    local override_name="$1"
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT
+
+    create_fake_input_fixture "$fixture"
+    create_fake_linux_input_commands "$fixture"
+
+    local protected_target="$fixture/protected-target"
+    local protected_snapshot="$fixture/protected-target.before"
+    printf 'protected target must remain byte-identical\n' >"$protected_target"
+    cp "$protected_target" "$protected_snapshot"
+    rm -f "$fixture/dev/uinput"
+    ln -s "$protected_target" "$fixture/dev/uinput"
+
+    local rules_dir="$fixture/etc/udev/rules.d"
+    local fake_bin="$fixture/fake-bin"
+    local install_log="$fixture/install.log"
+    local udevadm_log="$fixture/udevadm.log"
+    local setfacl_log="$fixture/setfacl.log"
+    local rule_source="$REPO_ROOT/dist/udev/80-openswitcher-input.rules"
+    local rule_target="$rules_dir/80-openswitcher-input.rules"
+    local override_value=""
+
+    case "$override_name" in
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT)
+            override_value="$fixture/dev"
+            ;;
+        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES)
+            override_value="$fixture/proc/bus/input/devices"
+            ;;
+        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR)
+            override_value="$rules_dir"
+            ;;
+        *)
+            echo "unexpected direct root override case: $override_name" >&2
+            return 1
+            ;;
+    esac
+
+    mkdir -p "$rules_dir"
+    : >"$install_log"
+    : >"$udevadm_log"
+    : >"$setfacl_log"
+
+    local output
+    local status
+    set +e
+    output="$(
+        unset \
+            OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT \
+            OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES \
+            OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
+        printf -v "$override_name" '%s' "$override_value"
+        export "$override_name"
+
+        # Keep the vulnerable pre-fix implementation inside the fixture while
+        # this regression is RED. The selected override is first in validation
+        # order, so the fixed entrypoint must still name it.
+        if [[ "$override_name" != "OPEN_SWITCHER_LINUX_INPUT_RULES_DIR" ]]; then
+            export OPEN_SWITCHER_LINUX_INPUT_RULES_DIR="$rules_dir"
+        fi
+
+        PATH="$fake_bin:/usr/bin:/bin" \
+        OPEN_SWITCHER_TEST_FIXTURE_ROOT="$fixture" \
+        OPEN_SWITCHER_TEST_INSTALL_LOG="$install_log" \
+        OPEN_SWITCHER_TEST_UDEVADM_LOG="$udevadm_log" \
+        OPEN_SWITCHER_TEST_SETFACL_LOG="$setfacl_log" \
+        OPEN_SWITCHER_TEST_RULE_SOURCE="$rule_source" \
+        OPEN_SWITCHER_TEST_RULE_TARGET="$rule_target" \
+            openswitcher_linux_input_bootstrap_root "$REPO_ROOT" "$(id -un)" 2>&1
+    )"
+    status=$?
+    set -e
+
+    local failures=0
+    if [[ "$status" -eq 0 ]]; then
+        echo "$override_name: direct root bootstrap unexpectedly succeeded" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$output" != *"$override_name"* ]]; then
+        echo "$override_name: direct root rejection output does not name the override" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ "$output" != *"test-only"* ]] ||
+        [[ "$output" != *"not allowed for production bootstrap"* ]]; then
+        echo "$override_name: direct root rejection lacks the stable boundary message" >&2
+        failures=$((failures + 1))
+    fi
+
+    local command_name=""
+    local command_log=""
+    for command_name in install setfacl udevadm; do
+        command_log="$fixture/$command_name.log"
+        if [[ -s "$command_log" ]]; then
+            echo "$override_name: direct root bootstrap invoked fake $command_name" >&2
+            sed 's/^/  argv: /' "$command_log" >&2
+            failures=$((failures + 1))
+        fi
+    done
+
+    if ! cmp -s "$protected_snapshot" "$protected_target"; then
+        echo "$override_name: direct root bootstrap modified the protected target" >&2
+        failures=$((failures + 1))
+    fi
+
+    if [[ "$failures" -ne 0 ]]; then
+        echo "--- direct root output for $override_name (status $status) ---" >&2
+        if [[ -n "$output" ]]; then
+            printf '%s\n' "$output" >&2
+        else
+            echo "<empty>" >&2
+        fi
+        return 1
+    fi
+)
+
+test_root_bootstrap_rejects_test_only_path_overrides() {
+    local failures=0
+    local override_name=""
+    local case_output=""
+    local -a override_names=(
+        OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT
+        OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES
+        OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
+    )
+
+    for override_name in "${override_names[@]}"; do
+        if case_output="$(
+            test_root_bootstrap_rejects_override_case "$override_name" 2>&1
+        )"; then
+            continue
+        fi
+
+        echo "direct root bootstrap override case failed: $override_name" >&2
+        printf '%s\n' "$case_output" >&2
+        failures=$((failures + 1))
+    done
+
+    if [[ "$failures" -ne 0 ]]; then
+        echo "direct root override cases failed: $failures/${#override_names[@]}" >&2
+        return 1
+    fi
+}
+
 test_doctor_reports_mixed_setup_problem() {
     local fixture
     fixture="$(mktemp -d)"
@@ -454,10 +668,12 @@ test_bootstrap_installs_rule_and_applies_acl_bridge() {
     OPEN_SWITCHER_TEST_SETFACL_LOG="$setfacl_log" \
     OPEN_SWITCHER_TEST_RULE_SOURCE="$rule_source" \
     OPEN_SWITCHER_TEST_RULE_TARGET="$rule_target" \
-    OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT="$fixture/dev" \
-    OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES="$fixture/proc/bus/input/devices" \
-    OPEN_SWITCHER_LINUX_INPUT_RULES_DIR="$rules_dir" \
-        openswitcher_linux_input_bootstrap_root "$REPO_ROOT" "$target_user" >/dev/null
+        openswitcher_linux_input_bootstrap_test \
+        "$REPO_ROOT" \
+        "$target_user" \
+        "$fixture/dev" \
+        "$fixture/proc/bus/input/devices" \
+        "$rules_dir" >/dev/null
 
     if [[ ! -f "$rule_target" ]]; then
         echo "udev rule was not installed into temp rules dir" >&2
@@ -495,6 +711,8 @@ test_doctor_reports_mixed_setup_problem
 test_doctor_reports_ready_state
 test_doctor_reports_keyboard_not_found
 test_bootstrap_installs_rule_and_applies_acl_bridge
+test_root_bootstrap_rejects_test_only_path_overrides
 test_production_bootstrap_rejects_test_only_path_overrides
+test_production_bootstrap_uses_sanitized_sudo_boundary
 
 echo "linux_input_setup_test.sh: ok"

@@ -169,11 +169,25 @@ impl SwitcherError {
     pub fn linux_input_setup_hint(&self) -> Option<String> {
         match self {
             SwitcherError::KeyboardAccessDenied { path, .. } => Some(format!(
-                "Linux input setup is not ready.\nKeyboard access is denied for: {}\nBuild the canonical OpenSwitcher .deb package:\n  ./manage.sh package deb\nThen run the exact `sudo apt install <artifact>` command printed by the build.\nUse `--reinstall` only when the same package version is already installed.\nSign out and sign in again, then run `./manage.sh doctor`.",
+                concat!(
+                    "Linux input setup is not ready.\n",
+                    "Keyboard access is denied for: {}\n",
+                    "Install a trusted OpenSwitcher .deb with your package manager.\n",
+                    "If the same package version is already installed, use the package manager's ",
+                    "reinstall option.\n",
+                    "Sign out and sign in again."
+                ),
                 path.display()
             )),
             SwitcherError::UinputAccessDenied { path, .. } => Some(format!(
-                "Linux input setup is not ready.\nuinput access is denied for: {}\nBuild the canonical OpenSwitcher .deb package:\n  ./manage.sh package deb\nThen run the exact `sudo apt install <artifact>` command printed by the build.\nUse `--reinstall` only when the same package version is already installed.\nSign out and sign in again, then run `./manage.sh doctor`.",
+                concat!(
+                    "Linux input setup is not ready.\n",
+                    "uinput access is denied for: {}\n",
+                    "Install a trusted OpenSwitcher .deb with your package manager.\n",
+                    "If the same package version is already installed, use the package manager's ",
+                    "reinstall option.\n",
+                    "Sign out and sign in again."
+                ),
                 path.display()
             )),
             _ => None,
@@ -213,13 +227,16 @@ mod tests {
             .linux_input_setup_hint()
             .expect("setup hint must be present");
 
-        assert!(hint.contains("./manage.sh doctor"));
-        assert!(hint.contains("OpenSwitcher .deb"));
-        assert!(hint.contains("./manage.sh package deb"));
-        assert!(hint.contains("exact `sudo apt install <artifact>` command printed by the build"));
-        assert!(hint.contains("Use `--reinstall` only when the same package version is already installed."));
+        assert!(hint.contains("trusted OpenSwitcher .deb"));
+        assert!(hint.contains("package manager"));
+        assert!(hint.contains("same package version"));
+        assert!(hint.contains("reinstall option"));
         assert!(hint.contains("Sign out and sign in again"));
         assert!(!hint.contains("./manage.sh bootstrap linux-input"));
+        assert!(!hint.contains("./manage.sh"));
+        assert!(!hint.contains("./dist"));
+        assert!(!hint.contains("Build"));
+        assert!(!hint.contains("<artifact>"));
     }
 
     #[test]
@@ -233,12 +250,15 @@ mod tests {
             .linux_input_setup_hint()
             .expect("setup hint must be present");
 
-        assert!(hint.contains("./manage.sh doctor"));
-        assert!(hint.contains("OpenSwitcher .deb"));
-        assert!(hint.contains("./manage.sh package deb"));
-        assert!(hint.contains("exact `sudo apt install <artifact>` command printed by the build"));
-        assert!(hint.contains("Use `--reinstall` only when the same package version is already installed."));
+        assert!(hint.contains("trusted OpenSwitcher .deb"));
+        assert!(hint.contains("package manager"));
+        assert!(hint.contains("same package version"));
+        assert!(hint.contains("reinstall option"));
         assert!(hint.contains("Sign out and sign in again"));
         assert!(!hint.contains("./manage.sh bootstrap linux-input"));
+        assert!(!hint.contains("./manage.sh"));
+        assert!(!hint.contains("./dist"));
+        assert!(!hint.contains("Build"));
+        assert!(!hint.contains("<artifact>"));
     }
 }

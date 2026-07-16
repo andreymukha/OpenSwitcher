@@ -4,9 +4,9 @@ use open_switcher::dbus::{
     OpenSwitcherDbusApi, OpenSwitcherProxyBlocking, INTERFACE_NAME, OBJECT_PATH, SERVICE_NAME,
 };
 use open_switcher::model::{
-    AutoDetectedLayoutSwitch, LayoutSwitchCapturePhase, LayoutSwitchCaptureState,
-    HotkeyModifiers, HotkeySpec, HotkeyTrigger, LayoutSwitchCombo, LayoutSwitchSetting,
-    LayoutSwitchSource, SelectedTextHotkey, SettingsDto, UndoKey, UpdateSettingsResult,
+    AutoDetectedLayoutSwitch, HotkeyModifiers, HotkeySpec, HotkeyTrigger, LayoutSwitchCapturePhase,
+    LayoutSwitchCaptureState, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource,
+    SelectedTextHotkey, SettingsDto, UndoKey, UpdateSettingsResult,
 };
 use std::error::Error;
 use std::path::Path;
@@ -44,12 +44,18 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
         initial.auto_switch_enabled
     );
     assert_eq!(initial.layout_delay_ms, 30);
-    assert_eq!(initial.manual_correction_hotkey, HotkeySpec::from(UndoKey::Pause));
+    assert_eq!(
+        initial.manual_correction_hotkey,
+        HotkeySpec::from(UndoKey::Pause)
+    );
     assert_eq!(
         initial.selected_text_hotkey,
         HotkeySpec::from(SelectedTextHotkey::ShiftPause)
     );
-    assert_eq!(initial.layout_switch, initial_config.settings().layout_switch);
+    assert_eq!(
+        initial.layout_switch,
+        initial_config.settings().layout_switch
+    );
 
     let result: UpdateSettingsResult = proxy.call(
         "UpdateSettings",
@@ -72,7 +78,10 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
     let updated: SettingsDto = proxy.call("GetSettings", &())?;
     assert!(!updated.auto_switch_enabled);
     assert_eq!(updated.layout_delay_ms, 77);
-    assert_eq!(updated.manual_correction_hotkey, HotkeySpec::from(UndoKey::F12));
+    assert_eq!(
+        updated.manual_correction_hotkey,
+        HotkeySpec::from(UndoKey::F12)
+    );
     assert_eq!(
         updated.selected_text_hotkey,
         HotkeySpec::from(SelectedTextHotkey::AltF12)
@@ -330,25 +339,75 @@ fn tray_and_settings_reload_observe_same_auto_switch_value() -> Result<(), Box<d
 // Capture controls
 
 #[test]
-fn dbus_exposes_layout_switch_capture_session_controls() -> Result<(), Box<dyn Error>> {
+fn dbus_binds_layout_switch_capture_commands_to_the_starting_connection(
+) -> Result<(), Box<dyn Error>> {
     let temp_dir = TempDir::new()?;
     let config_path = temp_dir.path().join("config.toml");
-    let service_name = unique_service_name("capture");
+    let service_name = unique_service_name("capture_owner");
     let _service = spawn_service(&config_path, &service_name)?;
 
-    let client = Connection::session()?;
-    let proxy = settings_proxy(&client, &service_name)?;
+    let owner_client = Connection::session()?;
+    let owner_proxy = settings_proxy(&owner_client, &service_name)?;
+    let other_client = Connection::session()?;
+    let other_proxy = settings_proxy(&other_client, &service_name)?;
 
-    let initial: LayoutSwitchCaptureState = proxy.call("GetLayoutSwitchCaptureState", &())?;
+    assert_ne!(owner_client.unique_name(), other_client.unique_name());
+
+    let initial: LayoutSwitchCaptureState = other_proxy.call("GetLayoutSwitchCaptureState", &())?;
     assert_eq!(initial.phase, LayoutSwitchCapturePhase::Idle);
 
-    let started: LayoutSwitchCaptureState = proxy.call("StartLayoutSwitchCapture", &())?;
+    let started: LayoutSwitchCaptureState = owner_proxy.call("StartLayoutSwitchCapture", &())?;
     assert_eq!(started.phase, LayoutSwitchCapturePhase::Waiting);
 
-    let cancelled: LayoutSwitchCaptureState = proxy.call("CancelLayoutSwitchCapture", &())?;
+    let busy = other_proxy
+        .call_method("StartLayoutSwitchCapture", &())
+        .expect_err("a different D-Bus connection must not replace the capture session");
+    assert!(
+        busy.to_string().contains("already owned"),
+        "unexpected StartLayoutSwitchCapture error: {busy}"
+    );
+
+    for member in [
+        "RenewLayoutSwitchCapture",
+        "CancelLayoutSwitchCapture",
+        "FinishLayoutSwitchCapture",
+    ] {
+        let error = other_proxy
+            .call_method(member, &())
+            .expect_err("a different D-Bus connection must not control the capture session");
+        assert!(
+            error.to_string().contains("does not own"),
+            "unexpected {member} error: {error}"
+        );
+    }
+
+    let renewed: LayoutSwitchCaptureState = owner_proxy.call("RenewLayoutSwitchCapture", &())?;
+    assert_eq!(renewed.phase, LayoutSwitchCapturePhase::Waiting);
+
+    let public_state: LayoutSwitchCaptureState =
+        other_proxy.call("GetLayoutSwitchCaptureState", &())?;
+    assert_eq!(public_state.phase, LayoutSwitchCapturePhase::Waiting);
+
+    let cancelled: LayoutSwitchCaptureState = owner_proxy.call("CancelLayoutSwitchCapture", &())?;
     assert_eq!(cancelled.phase, LayoutSwitchCapturePhase::Cancelled);
 
-    let finished: LayoutSwitchCaptureState = proxy.call("FinishLayoutSwitchCapture", &())?;
+    Ok(())
+}
+
+#[test]
+fn dbus_owner_can_finish_an_active_layout_switch_capture() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("capture_finish");
+    let _service = spawn_service(&config_path, &service_name)?;
+
+    let owner_client = Connection::session()?;
+    let owner_proxy = settings_proxy(&owner_client, &service_name)?;
+
+    let started: LayoutSwitchCaptureState = owner_proxy.call("StartLayoutSwitchCapture", &())?;
+    assert_eq!(started.phase, LayoutSwitchCapturePhase::Waiting);
+
+    let finished: LayoutSwitchCaptureState = owner_proxy.call("FinishLayoutSwitchCapture", &())?;
     assert_eq!(finished.phase, LayoutSwitchCapturePhase::Finished);
 
     Ok(())
@@ -376,7 +435,9 @@ fn dbus_exposes_settings_hotkey_capture_inhibition() -> Result<(), Box<dyn Error
 // Test harness
 
 fn spawn_service(config_path: &Path, service_name: &str) -> Result<Connection, Box<dyn Error>> {
-    let runtime = Arc::new(RuntimeState::new(ConfigService::load(config_path.to_path_buf())?));
+    let runtime = Arc::new(RuntimeState::new(ConfigService::load(
+        config_path.to_path_buf(),
+    )?));
     let connection = ConnectionBuilder::session()?
         .name(service_name)?
         .serve_at(OBJECT_PATH, OpenSwitcherDbusApi::new(runtime))?

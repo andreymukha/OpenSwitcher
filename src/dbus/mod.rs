@@ -1,3 +1,4 @@
+use crate::daemon::capture::CaptureOwner;
 use crate::daemon::runtime::log_layout_debug;
 use crate::daemon::runtime::RuntimeState;
 use crate::error::{DbusError, SettingsError};
@@ -7,8 +8,9 @@ use std::sync::{
     Arc,
 };
 use std::thread;
+use std::time::Instant;
 use zbus::blocking::Connection;
-use zbus::{dbus_interface, dbus_proxy, fdo, SignalContext};
+use zbus::{dbus_interface, dbus_proxy, fdo, MessageHeader, SignalContext};
 
 pub const SERVICE_NAME: &str = "org.oswitch.core";
 pub const OBJECT_PATH: &str = "/org/oswitch/core";
@@ -42,9 +44,7 @@ impl DbusSignalPublisher {
                                 "dbus-publisher-status-error",
                                 &format!("error={error}"),
                             );
-                            eprintln!(
-                                "[dbus] Failed to emit queued StatusChanged signal: {error}"
-                            );
+                            eprintln!("[dbus] Failed to emit queued StatusChanged signal: {error}");
                         }
                     }
                     DbusSignalEvent::LayoutSwitchCaptureStateChanged(state) => {
@@ -88,6 +88,7 @@ pub trait OpenSwitcher {
     fn get_settings(&self) -> zbus::Result<SettingsDto>;
     fn update_settings(&self, settings: SettingsDto) -> zbus::Result<UpdateSettingsResult>;
     fn start_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
+    fn renew_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn cancel_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn finish_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn get_layout_switch_capture_state(&self) -> zbus::Result<LayoutSwitchCaptureState>;
@@ -166,48 +167,68 @@ impl OpenSwitcherDbusApi {
     pub fn start_layout_switch_capture(
         &self,
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
+        #[zbus(header)] header: MessageHeader<'_>,
     ) -> fdo::Result<LayoutSwitchCaptureState> {
+        let owner = capture_owner_from_header(&header)?;
         let state = self
             .runtime
-            .start_layout_switch_capture()
+            .start_layout_switch_capture_owned_at(owner, Instant::now())
             .map_err(DbusError::from)?;
-        zbus::block_on(Self::layout_switch_capture_state_changed(
+        capture_signal_best_effort(zbus::block_on(Self::layout_switch_capture_state_changed(
             &ctxt,
             state.clone(),
-        ))
-        .map_err(|err| fdo::Error::from(DbusError::Signal(err)))?;
+        )));
+        Ok(state)
+    }
+
+    pub fn renew_layout_switch_capture(
+        &self,
+        #[zbus(signal_context)] ctxt: SignalContext<'_>,
+        #[zbus(header)] header: MessageHeader<'_>,
+    ) -> fdo::Result<LayoutSwitchCaptureState> {
+        let owner = capture_owner_from_header(&header)?;
+        let state = self
+            .runtime
+            .renew_layout_switch_capture_owned_at(&owner, Instant::now())
+            .map_err(DbusError::from)?;
+        capture_signal_best_effort(zbus::block_on(Self::layout_switch_capture_state_changed(
+            &ctxt,
+            state.clone(),
+        )));
         Ok(state)
     }
 
     pub fn cancel_layout_switch_capture(
         &self,
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
+        #[zbus(header)] header: MessageHeader<'_>,
     ) -> fdo::Result<LayoutSwitchCaptureState> {
+        let owner = capture_owner_from_header(&header)?;
         let state = self
             .runtime
-            .cancel_layout_switch_capture()
+            .cancel_layout_switch_capture_owned_at(&owner, Instant::now())
             .map_err(DbusError::from)?;
-        zbus::block_on(Self::layout_switch_capture_state_changed(
+        capture_signal_best_effort(zbus::block_on(Self::layout_switch_capture_state_changed(
             &ctxt,
             state.clone(),
-        ))
-        .map_err(|err| fdo::Error::from(DbusError::Signal(err)))?;
+        )));
         Ok(state)
     }
 
     pub fn finish_layout_switch_capture(
         &self,
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
+        #[zbus(header)] header: MessageHeader<'_>,
     ) -> fdo::Result<LayoutSwitchCaptureState> {
+        let owner = capture_owner_from_header(&header)?;
         let state = self
             .runtime
-            .finish_layout_switch_capture()
+            .finish_layout_switch_capture_owned_at(&owner, Instant::now())
             .map_err(DbusError::from)?;
-        zbus::block_on(Self::layout_switch_capture_state_changed(
+        capture_signal_best_effort(zbus::block_on(Self::layout_switch_capture_state_changed(
             &ctxt,
             state.clone(),
-        ))
-        .map_err(|err| fdo::Error::from(DbusError::Signal(err)))?;
+        )));
         Ok(state)
     }
 
@@ -244,6 +265,21 @@ impl OpenSwitcherDbusApi {
         ctxt: &SignalContext<'_>,
         state: LayoutSwitchCaptureState,
     ) -> zbus::Result<()>;
+}
+
+fn capture_owner_from_header(header: &MessageHeader<'_>) -> fdo::Result<CaptureOwner> {
+    let sender = header
+        .sender()
+        .map_err(|_| fdo::Error::Failed("D-Bus caller identity is unavailable".to_owned()))?
+        .ok_or_else(|| fdo::Error::Failed("D-Bus caller identity is unavailable".to_owned()))?;
+    let sender = sender.as_str();
+    if sender.is_empty() {
+        return Err(fdo::Error::Failed(
+            "D-Bus caller identity is unavailable".to_owned(),
+        ));
+    }
+
+    Ok(CaptureOwner::from(sender))
 }
 
 fn emit_status_changed_from_context_best_effort(
@@ -308,6 +344,17 @@ fn status_signal_best_effort<E: std::fmt::Display>(context: &str, result: Result
     }
 }
 
+fn capture_signal_best_effort<E: std::fmt::Display>(result: Result<(), E>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            log_layout_debug("dbus-capture-signal-error", &format!("error={error}"));
+            eprintln!("[dbus] Failed to emit LayoutSwitchCaptureStateChanged signal: {error}");
+            false
+        }
+    }
+}
+
 pub fn emit_layout_switch_capture_state_changed(
     connection: &Connection,
     state: &LayoutSwitchCaptureState,
@@ -327,7 +374,10 @@ mod tests {
 
     #[test]
     fn status_signal_best_effort_treats_success_as_ok() {
-        assert!(status_signal_best_effort("test-success", Ok::<(), &str>(())));
+        assert!(status_signal_best_effort(
+            "test-success",
+            Ok::<(), &str>(())
+        ));
     }
 
     #[test]
@@ -336,6 +386,18 @@ mod tests {
             "test-failure",
             Err::<(), &str>("signal failed")
         ));
+    }
+
+    #[test]
+    fn capture_signal_best_effort_treats_success_as_ok() {
+        assert!(capture_signal_best_effort(Ok::<(), &str>(())))
+    }
+
+    #[test]
+    fn capture_signal_best_effort_treats_failure_as_non_fatal() {
+        assert!(!capture_signal_best_effort(Err::<(), &str>(
+            "signal failed"
+        )))
     }
 
     #[test]

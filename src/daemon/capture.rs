@@ -237,7 +237,8 @@ impl LayoutSwitchCaptureSession {
         self.state.is_active()
     }
 
-    pub fn start(&mut self) -> LayoutSwitchCaptureState {
+    #[cfg(test)]
+    fn start(&mut self) -> LayoutSwitchCaptureState {
         self.lease = None;
         self.progress.clear();
         self.state = LayoutSwitchCaptureState::waiting();
@@ -245,7 +246,7 @@ impl LayoutSwitchCaptureSession {
         self.current_state()
     }
 
-    pub fn cancel(&mut self) -> LayoutSwitchCaptureState {
+    fn cancel(&mut self) -> LayoutSwitchCaptureState {
         self.lease = None;
         self.progress.clear();
         self.state = LayoutSwitchCaptureState::cancelled();
@@ -260,7 +261,7 @@ impl LayoutSwitchCaptureSession {
         self.current_state()
     }
 
-    pub fn finish(&mut self) -> LayoutSwitchCaptureState {
+    fn finish(&mut self) -> LayoutSwitchCaptureState {
         self.lease = None;
         self.progress.clear();
         self.state = LayoutSwitchCaptureState::finished();

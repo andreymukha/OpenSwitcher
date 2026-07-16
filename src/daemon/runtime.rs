@@ -3073,30 +3073,6 @@ impl RuntimeState {
 
     // Capture delegation
 
-    pub fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
-        let mut session = self
-            .capture_session
-            .lock()
-            .map_err(|_| CaptureError::LockPoisoned)?;
-        Ok(session.start())
-    }
-
-    pub fn cancel_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
-        let mut session = self
-            .capture_session
-            .lock()
-            .map_err(|_| CaptureError::LockPoisoned)?;
-        Ok(session.cancel())
-    }
-
-    pub fn finish_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, CaptureError> {
-        let mut session = self
-            .capture_session
-            .lock()
-            .map_err(|_| CaptureError::LockPoisoned)?;
-        Ok(session.finish())
-    }
-
     pub fn start_layout_switch_capture_owned_at(
         &self,
         owner: CaptureOwner,

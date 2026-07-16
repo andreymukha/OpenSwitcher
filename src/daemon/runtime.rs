@@ -2,6 +2,7 @@ use crate::config::AppConfig;
 use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
 use crate::error::{
     CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
+    ValidationError,
 };
 use crate::layout_backend::{
     compatibility_from_setup, feature_availability_for, legacy_backend_factory,
@@ -14,9 +15,10 @@ use crate::layout_switch::{
     LayoutSwitchAutoDetector,
 };
 use crate::model::{
-    DesktopEnvironment, DetectionConfidence, DistroKind, HotkeySpec, LayoutSwitchCaptureState,
-    LayoutSwitchCombo, LayoutSwitchSetting, SessionType, Settings, SystemContext,
-    UpdateSettingsResult,
+    estimated_correction_schedule_ms, DesktopEnvironment, DetectionConfidence, DistroKind,
+    HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, LayoutSwitchSetting, SessionType,
+    Settings, SystemContext, UpdateSettingsResult, MAX_CORRECTION_EXTRA_BACKSPACES,
+    MAX_CORRECTION_KEYSTROKES, MAX_CORRECTION_SCHEDULE_MS,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::env;
@@ -67,6 +69,44 @@ impl From<&AppConfig> for RuntimeConfigSnapshot {
             manual_correction_hotkey: value.features.manual_correction_hotkey,
             selected_text_hotkey: value.features.selected_text_switch_hotkey,
         }
+    }
+}
+
+impl RuntimeConfigSnapshot {
+    pub(crate) fn estimated_correction_schedule(
+        &self,
+        strokes: usize,
+        extra_backspaces: usize,
+        switch_layout: bool,
+    ) -> Result<Duration, ValidationError> {
+        if strokes > MAX_CORRECTION_KEYSTROKES
+            || extra_backspaces > MAX_CORRECTION_EXTRA_BACKSPACES
+        {
+            return Err(ValidationError::InputCorrectionPlanTooLarge {
+                max_strokes: MAX_CORRECTION_KEYSTROKES,
+                max_extra_backspaces: MAX_CORRECTION_EXTRA_BACKSPACES,
+                strokes,
+                extra_backspaces,
+            });
+        }
+
+        let found_ms = estimated_correction_schedule_ms(
+            strokes,
+            extra_backspaces,
+            self.layout_delay_ms,
+            self.backspace_ms,
+            self.typing_ms,
+            switch_layout,
+        )
+        .unwrap_or(u64::MAX);
+        if found_ms > MAX_CORRECTION_SCHEDULE_MS {
+            return Err(ValidationError::InputCorrectionScheduleTooLong {
+                max_ms: MAX_CORRECTION_SCHEDULE_MS,
+                found_ms,
+            });
+        }
+
+        Ok(Duration::from_millis(found_ms))
     }
 }
 
@@ -248,14 +288,15 @@ fn apply_detected_layout_switch_if_changed(
 mod tests {
     use super::*;
     use crate::daemon::capture::{CaptureEventDisposition, CaptureOwner, CAPTURE_SOFT_LEASE};
-    use crate::error::LayoutAutoDetectError;
+    use crate::error::{LayoutAutoDetectError, ValidationError};
     use crate::layout_backend::{
         AppLayoutKind, BackendCapabilities, CurrentLayoutState, LayoutBackendError,
         LayoutBackendOperation, LayoutCode, LayoutStateSink, SystemLayout,
     };
     use crate::model::{
-        AutoDetectedLayoutSwitch, DesktopEnvironment, DetectionConfidence, DetectionStrategy,
-        DistroKind, LayoutSwitchSetting, LayoutSwitchSource, SessionType,
+        default_manual_correction_hotkey, default_selected_text_hotkey, AutoDetectedLayoutSwitch,
+        DesktopEnvironment, DetectionConfidence, DetectionStrategy, DistroKind,
+        LayoutSwitchSetting, LayoutSwitchSource, SessionType,
     };
     use std::io;
     use std::sync::{
@@ -263,6 +304,68 @@ mod tests {
         Arc,
     };
     use tempfile::TempDir;
+
+    #[test]
+    fn runtime_snapshot_estimates_exact_bounded_correction_schedule() {
+        let snapshot = RuntimeConfigSnapshot {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
+            layout_switch_combo: LayoutSwitchCombo::ctrl_shift(),
+            layout_delay_ms: 500,
+            backspace_ms: 4,
+            typing_ms: 5,
+            manual_correction_hotkey: default_manual_correction_hotkey(),
+            selected_text_hotkey: default_selected_text_hotkey(),
+        };
+
+        assert_eq!(
+            snapshot.estimated_correction_schedule(128, 1, true),
+            Ok(Duration::from_millis(2_818))
+        );
+    }
+
+    #[test]
+    fn runtime_snapshot_rejects_correction_plan_above_work_limits() {
+        let snapshot = RuntimeConfigSnapshot {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
+            layout_switch_combo: LayoutSwitchCombo::ctrl_shift(),
+            layout_delay_ms: 500,
+            backspace_ms: 4,
+            typing_ms: 5,
+            manual_correction_hotkey: default_manual_correction_hotkey(),
+            selected_text_hotkey: default_selected_text_hotkey(),
+        };
+
+        for (strokes, extra_backspaces) in [(129, 1), (128, 2)] {
+            assert!(matches!(
+                snapshot.estimated_correction_schedule(strokes, extra_backspaces, true),
+                Err(ValidationError::InputCorrectionPlanTooLarge { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn runtime_snapshot_rejects_schedule_above_wall_budget() {
+        let snapshot = RuntimeConfigSnapshot {
+            auto_switch_enabled: true,
+            fix_two_capitals: false,
+            fix_accidental_caps_lock: false,
+            layout_switch_combo: LayoutSwitchCombo::ctrl_shift(),
+            layout_delay_ms: 500,
+            backspace_ms: 10,
+            typing_ms: 10,
+            manual_correction_hotkey: default_manual_correction_hotkey(),
+            selected_text_hotkey: default_selected_text_hotkey(),
+        };
+
+        assert!(matches!(
+            snapshot.estimated_correction_schedule(128, 1, true),
+            Err(ValidationError::InputCorrectionScheduleTooLong { .. })
+        ));
+    }
 
     // Test helpers
 

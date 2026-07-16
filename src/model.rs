@@ -7,6 +7,43 @@ use zvariant::Type;
 
 pub const LAYOUT_DELAY_MIN_MS: u32 = 0;
 pub const LAYOUT_DELAY_MAX_MS: u32 = 500;
+pub const INPUT_KEY_DELAY_MAX_MS: u32 = 10;
+pub const MAX_CORRECTION_KEYSTROKES: usize = 128;
+pub const MAX_CORRECTION_EXTRA_BACKSPACES: usize = 1;
+pub const MAX_CORRECTION_SCHEDULE_MS: u64 = 4_000;
+
+const CORRECTION_MODIFIER_SYNC_MS: u64 = 20;
+const CORRECTION_KEY_TAP_MS: u64 = 2;
+const CORRECTION_SHIFT_SETTLE_MS: u64 = 1;
+
+pub fn estimated_correction_schedule_ms(
+    strokes: usize,
+    extra_backspaces: usize,
+    layout_delay_ms: u64,
+    backspace_ms: u64,
+    typing_ms: u64,
+    switch_layout: bool,
+) -> Option<u64> {
+    let strokes = u64::try_from(strokes).ok()?;
+    let backspaces = strokes.checked_add(u64::try_from(extra_backspaces).ok()?)?;
+    let backspace_work =
+        backspaces.checked_mul(CORRECTION_KEY_TAP_MS.checked_add(backspace_ms)?)?;
+    let typing_work = strokes.checked_mul(
+        CORRECTION_KEY_TAP_MS
+            .checked_add(CORRECTION_SHIFT_SETTLE_MS)?
+            .checked_add(typing_ms)?,
+    )?;
+    let layout_work = if switch_layout {
+        layout_delay_ms.checked_mul(2)?
+    } else {
+        0
+    };
+
+    CORRECTION_MODIFIER_SYNC_MS
+        .checked_add(backspace_work)?
+        .checked_add(typing_work)?
+        .checked_add(layout_work)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct HotkeyModifiers {
@@ -1011,6 +1048,14 @@ pub struct UpdateSettingsResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn correction_schedule_estimation_rejects_arithmetic_overflow() {
+        assert_eq!(
+            estimated_correction_schedule_ms(1, 0, u64::MAX, 0, 0, true),
+            None
+        );
+    }
 
     // Settings validation / DTO conversion
 

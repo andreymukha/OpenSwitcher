@@ -1,7 +1,10 @@
 use crate::error::ConfigError;
+use crate::error::ValidationError;
 use crate::model::{
-    default_manual_correction_hotkey, default_selected_text_hotkey, AutoDetectedLayoutSwitch,
-    HotkeySpec, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource, Settings,
+    default_manual_correction_hotkey, default_selected_text_hotkey,
+    estimated_correction_schedule_ms, AutoDetectedLayoutSwitch, HotkeySpec, LayoutSwitchCombo,
+    LayoutSwitchSetting, LayoutSwitchSource, Settings, INPUT_KEY_DELAY_MAX_MS,
+    MAX_CORRECTION_EXTRA_BACKSPACES, MAX_CORRECTION_KEYSTROKES, MAX_CORRECTION_SCHEDULE_MS,
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -84,12 +87,47 @@ impl AppConfig {
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<(), ConfigError> {
-        self.settings().validate()?;
+        self.validate()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let content = toml::to_string_pretty(&AppConfigFile::from(self))?;
         fs::write(path, content)?;
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        self.settings().validate()?;
+
+        for (field, found) in [
+            ("backspace_ms", self.delays.backspace_ms),
+            ("typing_ms", self.delays.typing_ms),
+        ] {
+            if found > INPUT_KEY_DELAY_MAX_MS {
+                return Err(ValidationError::InputDelayOutOfRange {
+                    field,
+                    max: INPUT_KEY_DELAY_MAX_MS,
+                    found,
+                });
+            }
+        }
+
+        let found_ms = estimated_correction_schedule_ms(
+            MAX_CORRECTION_KEYSTROKES,
+            MAX_CORRECTION_EXTRA_BACKSPACES,
+            u64::from(self.layout.delay_ms),
+            u64::from(self.delays.backspace_ms),
+            u64::from(self.delays.typing_ms),
+            true,
+        )
+        .unwrap_or(u64::MAX);
+        if found_ms > MAX_CORRECTION_SCHEDULE_MS {
+            return Err(ValidationError::InputCorrectionScheduleTooLong {
+                max_ms: MAX_CORRECTION_SCHEDULE_MS,
+                found_ms,
+            });
+        }
+
         Ok(())
     }
 
@@ -187,7 +225,7 @@ impl TryFrom<AppConfigFile> for AppConfig {
             delays: value.delays,
             features: value.features,
         };
-        config.settings().validate()?;
+        config.validate()?;
         Ok(config)
     }
 }
@@ -215,6 +253,7 @@ mod tests {
     use crate::model::{
         DetectionConfidence, DetectionStrategy, DesktopEnvironment, DistroKind, HotkeyModifiers,
         HotkeySpec, HotkeyTrigger, SelectedTextHotkey, SessionType, SystemContext, UndoKey,
+        INPUT_KEY_DELAY_MAX_MS, MAX_CORRECTION_SCHEDULE_MS,
     };
     use tempfile::TempDir;
 
@@ -431,6 +470,157 @@ selected_text_switch_hotkey = "ctrl+alt+f12"
             error,
             ConfigError::Validation(ValidationError::DuplicateHotkey { .. })
         ));
+    }
+
+    #[test]
+    fn maximum_individual_input_delays_within_total_budget_are_accepted() {
+        for (backspace_ms, typing_ms) in [(INPUT_KEY_DELAY_MAX_MS, 0), (0, INPUT_KEY_DELAY_MAX_MS)]
+        {
+            let mut config = non_default_config(LayoutSwitchSource::Manual);
+            config.layout.delay_ms = crate::model::LAYOUT_DELAY_MAX_MS;
+            config.delays = DelaysConfig {
+                backspace_ms,
+                typing_ms,
+            };
+
+            config.validate().expect(
+                "a maximum individual delay should remain valid when total work is bounded",
+            );
+        }
+    }
+
+    #[test]
+    fn input_delay_above_per_key_limit_is_rejected_before_runtime_snapshot() {
+        let mut config = non_default_config(LayoutSwitchSource::Manual);
+        config.delays.backspace_ms = INPUT_KEY_DELAY_MAX_MS + 1;
+
+        let error = config.validate().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ValidationError::InputDelayOutOfRange {
+                field: "backspace_ms",
+                max: INPUT_KEY_DELAY_MAX_MS,
+                found,
+            } if found == INPUT_KEY_DELAY_MAX_MS + 1
+        ));
+    }
+
+    #[test]
+    fn excessive_worst_case_correction_schedule_is_rejected() {
+        let mut config = non_default_config(LayoutSwitchSource::Manual);
+        config.layout.delay_ms = crate::model::LAYOUT_DELAY_MAX_MS;
+        config.delays = DelaysConfig {
+            backspace_ms: INPUT_KEY_DELAY_MAX_MS,
+            typing_ms: INPUT_KEY_DELAY_MAX_MS,
+        };
+
+        let error = config.validate().unwrap_err();
+
+        assert!(matches!(
+            error,
+            ValidationError::InputCorrectionScheduleTooLong {
+                max_ms: MAX_CORRECTION_SCHEDULE_MS,
+                found_ms,
+            } if found_ms > MAX_CORRECTION_SCHEDULE_MS
+        ));
+    }
+
+    #[test]
+    fn loading_toml_rejects_unbounded_input_delay_before_backend_startup() {
+        let parsed: AppConfigFile = toml::from_str(&format!(
+            r#"
+[layout]
+switch_combo = "CtrlShift"
+switch_source = "Manual"
+delay_ms = 30
+
+[delays]
+backspace_ms = {}
+typing_ms = 0
+
+[features]
+undo_key = "Pause"
+selected_text_switch_hotkey = "ShiftPause"
+"#,
+            INPUT_KEY_DELAY_MAX_MS + 1
+        ))
+        .unwrap();
+
+        let error = AppConfig::try_from(parsed).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::InputDelayOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn saving_public_config_fields_cannot_bypass_input_delay_validation() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        let mut config = non_default_config(LayoutSwitchSource::Manual);
+        config.delays.typing_ms = INPUT_KEY_DELAY_MAX_MS + 1;
+
+        let error = config.save_to_path(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::InputDelayOutOfRange {
+                field: "typing_ms",
+                ..
+            })
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn loading_toml_rejects_aggregate_correction_schedule_above_limit() {
+        let parsed: AppConfigFile = toml::from_str(
+            r#"
+[layout]
+switch_combo = "CtrlShift"
+switch_source = "Manual"
+delay_ms = 500
+
+[delays]
+backspace_ms = 10
+typing_ms = 10
+
+[features]
+undo_key = "Pause"
+selected_text_switch_hotkey = "ShiftPause"
+"#,
+        )
+        .unwrap();
+
+        let error = AppConfig::try_from(parsed).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::InputCorrectionScheduleTooLong { .. })
+        ));
+    }
+
+    #[test]
+    fn saving_config_rejects_aggregate_correction_schedule_before_writing() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nested").join("config.toml");
+        let mut config = non_default_config(LayoutSwitchSource::Manual);
+        config.layout.delay_ms = crate::model::LAYOUT_DELAY_MAX_MS;
+        config.delays = DelaysConfig {
+            backspace_ms: INPUT_KEY_DELAY_MAX_MS,
+            typing_ms: INPUT_KEY_DELAY_MAX_MS,
+        };
+
+        let error = config.save_to_path(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConfigError::Validation(ValidationError::InputCorrectionScheduleTooLong { .. })
+        ));
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
     }
 
     // Settings mapping

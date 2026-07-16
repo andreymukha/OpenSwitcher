@@ -31,6 +31,25 @@ pub enum LayoutSwitchComboParseError {
 pub enum ValidationError {
     #[error("Задержка переключения должна быть в диапазоне от {min} до {max} мс.")]
     LayoutDelayOutOfRange { min: u32, max: u32, found: u32 },
+    #[error("Задержка {field} должна быть не больше {max} мс (получено {found} мс).")]
+    InputDelayOutOfRange {
+        field: &'static str,
+        max: u32,
+        found: u32,
+    },
+    #[error(
+        "Максимальная расчётная длительность коррекции должна быть не больше {max_ms} мс (получено {found_ms} мс)."
+    )]
+    InputCorrectionScheduleTooLong { max_ms: u64, found_ms: u64 },
+    #[error(
+        "План коррекции превышает предел: максимум {max_strokes} клавиш и {max_extra_backspaces} дополнительное удаление (получено {strokes} и {extra_backspaces})."
+    )]
+    InputCorrectionPlanTooLarge {
+        max_strokes: usize,
+        max_extra_backspaces: usize,
+        strokes: usize,
+        extra_backspaces: usize,
+    },
     #[error("Горячие клавиши ручного исправления и выделенного текста совпадают: {hotkey}")]
     DuplicateHotkey { hotkey: String },
 }

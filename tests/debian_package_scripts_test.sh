@@ -87,6 +87,8 @@ test_privileged_input_setup_uses_package_owned_trust_anchors() {
     local postinst="$REPO_ROOT/debian/open-switcher.postinst"
     local prerm="$REPO_ROOT/debian/open-switcher.prerm"
     local postrm="$REPO_ROOT/debian/open-switcher.postrm"
+    local acl_bridge="$REPO_ROOT/debian/scripts/open-switcher-input-acl-bridge"
+    local udev_rule="$REPO_ROOT/debian/open-switcher.openswitcher-input.udev"
     local file=""
 
     assert_contains "$install_file" "debian/scripts/open-switcher-input-acl-bridge usr/lib/open-switcher/"
@@ -94,7 +96,14 @@ test_privileged_input_setup_uses_package_owned_trust_anchors() {
     assert_contains "$rules" "chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-acl-bridge"
     assert_contains "$postinst" "/usr/lib/open-switcher/open-switcher-input-acl-bridge"
 
-    for file in "$install_file" "$rules" "$postinst" "$prerm" "$postrm"; do
+    for file in \
+        "$install_file" \
+        "$rules" \
+        "$postinst" \
+        "$prerm" \
+        "$postrm" \
+        "$acl_bridge" \
+        "$udev_rule"; do
         assert_not_contains "$file" "scripts/linux_input_setup.sh"
         assert_not_contains "$file" "dist/udev"
         assert_not_contains "$file" "OPEN_SWITCHER_LINUX_INPUT_"

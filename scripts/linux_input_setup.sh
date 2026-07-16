@@ -330,8 +330,10 @@ openswitcher_linux_input_doctor() {
     if [[ "$keyboard_status" == "not-found" ]]; then
         echo "Connect the keyboard device before checking the setup again."
     fi
-    echo 'Install or reinstall the OpenSwitcher .deb package:'
-    echo '  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb'
+    echo 'Build the canonical OpenSwitcher .deb package:'
+    echo '  ./manage.sh package deb'
+    echo 'Then run the exact `sudo apt install <artifact>` command printed by the build.'
+    echo 'Use `--reinstall` only when the same package version is already installed.'
     echo 'Sign out and sign in again, then run:'
     echo '  ./manage.sh doctor'
 

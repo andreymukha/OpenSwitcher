@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+print_linux_input_bootstrap_migration() {
+    echo "Source-tree Linux input bootstrap is disabled." >&2
+    echo "Linux input setup helpers and assets were not executed or installed with elevated privileges." >&2
+    echo "Do not run ./manage.sh with sudo." >&2
+    echo "Build the canonical package:" >&2
+    echo "  ./manage.sh package deb" >&2
+    echo 'Then run the exact `sudo apt install <artifact>` command printed by the build.' >&2
+    echo 'Use `--reinstall` only when the same package version is already installed.' >&2
+    echo "Sign out and sign in again, then verify:" >&2
+    echo "  ./manage.sh doctor" >&2
+    echo "Privileged Linux input setup and system configuration were not changed." >&2
+}
+
+if [[ "${1:-}" == "bootstrap" ]] && [[ "${2:-}" == "linux-input" ]]; then
+    print_linux_input_bootstrap_migration
+    exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_DIR="$SCRIPT_DIR/.run"
 LOG_DIR="$RUN_DIR/logs"
@@ -197,7 +215,8 @@ start_component() {
                 echo "  ./manage.sh doctor" >&2
                 echo "Установи или переустанови собранный OpenSwitcher .deb:" >&2
                 echo "  ./manage.sh package deb" >&2
-                echo "  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb" >&2
+                echo "Выполни точную команду 'sudo apt install <artifact>', которую напечатает сборка." >&2
+                echo "Добавляй --reinstall, только если эта же версия пакета уже установлена." >&2
                 echo "Затем выйди из пользовательской сессии, войди снова и повтори doctor." >&2
             fi
         fi
@@ -227,16 +246,7 @@ run_doctor_command() {
 }
 
 bootstrap_linux_input() {
-    echo "Source-tree Linux input bootstrap is disabled." >&2
-    echo "Working-tree code was not run as root." >&2
-    echo "Do not run ./manage.sh with sudo." >&2
-    echo "Build the canonical package:" >&2
-    echo "  ./manage.sh package deb" >&2
-    echo "Install or reinstall it:" >&2
-    echo "  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb" >&2
-    echo "Sign out and sign in again, then verify:" >&2
-    echo "  ./manage.sh doctor" >&2
-    echo "System state was not changed." >&2
+    print_linux_input_bootstrap_migration
     return 1
 }
 

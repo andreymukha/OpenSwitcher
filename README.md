@@ -50,6 +50,8 @@ For normal use, download the Debian package from the GitHub Release and install 
 sudo apt install ./open-switcher_0.1.0-1_amd64.deb
 ```
 
+Add `--reinstall` only when reinstalling the same package version that is already installed.
+
 Then start OpenSwitcher from the desktop application menu. The settings window controls whether
 OpenSwitcher starts automatically after login/reboot; launching it manually from the application
 menu always starts it even when autostart is disabled.
@@ -66,7 +68,8 @@ local binaries:
 
 ```bash
 ./manage.sh package deb
-sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+# Run the exact `sudo apt install <artifact>` command printed by the build.
+# Add `--reinstall` only if that same package version is already installed.
 # Sign out and sign in once after installing the package.
 ./manage.sh dev build
 ./manage.sh doctor
@@ -179,7 +182,8 @@ Build and install (or reinstall) the package before running from the source tree
 
 ```bash
 ./manage.sh package deb
-sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+# Run the exact `sudo apt install <artifact>` command printed by the build.
+# Add `--reinstall` only if that same package version is already installed.
 ```
 
 Sign out and sign in again, then check the current session:
@@ -292,11 +296,8 @@ The command checks `rustup`, verifies that the required toolchain is available, 
 dist/packages/
 ```
 
-Install the locally built package with:
-
-```bash
-sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
-```
+The build prints the exact `sudo apt install <artifact>` command for its canonical output. Run that
+printed command. Add `--reinstall` only when the same package version is already installed.
 
 This package installation is also the required Linux input setup for source-tree development.
 

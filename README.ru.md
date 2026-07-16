@@ -51,6 +51,8 @@ diagnostics-first режим, пока не проверены и не покр�
 sudo apt install ./open-switcher_0.1.0-1_amd64.deb
 ```
 
+Добавляй `--reinstall`, только если переустанавливается уже установленная версия пакета.
+
 После этого запускай OpenSwitcher из меню приложений рабочего стола. Настройка автозапуска в
 окне настроек управляет запуском после login/reboot; ручной запуск из меню приложений всегда
 стартует программу, даже если автозапуск выключен.
@@ -67,7 +69,8 @@ rules и не меняют ACL устройств. Никогда не запу�
 
 ```bash
 ./manage.sh package deb
-sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+# Выполни точную команду `sudo apt install <artifact>`, которую напечатает сборка.
+# Добавляй `--reinstall`, только если эта же версия пакета уже установлена.
 # После установки пакета один раз выйди из сессии и войди снова.
 ./manage.sh dev build
 ./manage.sh doctor
@@ -180,7 +183,8 @@ working tree не запускается с правами root.
 
 ```bash
 ./manage.sh package deb
-sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
+# Выполни точную команду `sudo apt install <artifact>`, которую напечатает сборка.
+# Добавляй `--reinstall`, только если эта же версия пакета уже установлена.
 ```
 
 Выйди из пользовательской сессии, войди снова и проверь текущую сессию:
@@ -294,11 +298,8 @@ CI также запускает `settings-ui` feature tests, чтобы feature
 dist/packages/
 ```
 
-Установить локально собранный пакет можно так:
-
-```bash
-sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb
-```
+Сборка печатает точную команду `sudo apt install <artifact>` для canonical artifact. Выполни эту
+напечатанную команду. Добавляй `--reinstall`, только если эта же версия пакета уже установлена.
 
 Эта установка пакета также выполняет обязательную настройку Linux input для разработки из исходников.
 

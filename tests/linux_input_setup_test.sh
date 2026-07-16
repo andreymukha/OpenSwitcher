@@ -66,84 +66,43 @@ H: Handlers=mouse1 event9
 EOF
 }
 
-create_inert_privileged_commands() {
-    local fixture="$1"
-    local fake_bin="$fixture/fake-bin"
-    local command_name=""
-
-    mkdir -p "$fake_bin"
-
-    for command_name in sudo install udevadm setfacl; do
-        cat >"$fake_bin/$command_name" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "${OPEN_SWITCHER_TEST_FIXTURE_ROOT:?}"
-command_name="$(basename "$0")"
-log="$OPEN_SWITCHER_TEST_FIXTURE_ROOT/$command_name.log"
-printf '%s\n' "$*" >>"$log"
-exit 97
-EOF
-        chmod +x "$fake_bin/$command_name"
-    done
-
-    # The pre-fix root branch tries to create /etc/udev/rules.d before calling
-    # install. Permit only fixture and repository runtime directories so the
-    # RED test is safe even when the test runner itself has EUID 0.
-    cat >"$fake_bin/mkdir" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "${OPEN_SWITCHER_TEST_FIXTURE_ROOT:?}"
-: "${OPEN_SWITCHER_TEST_REPO_ROOT:?}"
-
-for path in "$@"; do
-    [[ "$path" == -* ]] && continue
-    case "$path" in
-        "$OPEN_SWITCHER_TEST_FIXTURE_ROOT"/*|\
-        "$OPEN_SWITCHER_TEST_REPO_ROOT/.run"|\
-        "$OPEN_SWITCHER_TEST_REPO_ROOT/.run"/*) ;;
-        *)
-            echo "inert test mkdir refused path outside fixtures: $path" >&2
-            exit 98
-            ;;
-    esac
-done
-
-exec /usr/bin/mkdir "$@"
-EOF
-    chmod +x "$fake_bin/mkdir"
-}
-
 run_disabled_bootstrap_case() (
     set -euo pipefail
 
     local case_name="$1"
     shift
-    local fixture="$1"
-    shift
-    local fake_bin="$fixture/fake-bin"
+    local test_root
+    test_root="$(mktemp -d)"
+    trap 'rm -rf "$test_root"' EXIT
+    local fixture="$test_root/source-copy"
+    local fake_bin="$test_root/inert-bin"
     local output=""
     local status=0
     local command_name=""
 
+    mkdir -p "$fixture" "$fake_bin"
+    cp "$REPO_ROOT/manage.sh" "$fixture/manage.sh"
+    chmod +x "$fixture/manage.sh"
+
     for command_name in sudo install udevadm setfacl; do
-        : >"$fixture/$command_name.log"
+        : >"$test_root/$command_name.log"
+        printf '%s\n' \
+            '#!/usr/bin/env bash' \
+            'set -euo pipefail' \
+            ': "${OPEN_SWITCHER_TEST_GUARD_ROOT:?}"' \
+            'command_name="$(basename "$0")"' \
+            'printf "%s\\n" "$*" >>"$OPEN_SWITCHER_TEST_GUARD_ROOT/$command_name.log"' \
+            'exit 97' >"$fake_bin/$command_name"
+        chmod +x "$fake_bin/$command_name"
     done
 
     set +e
     output="$(
-        cd "$REPO_ROOT"
-        unset \
-            OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT \
-            OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES \
-            OPEN_SWITCHER_LINUX_INPUT_RULES_DIR
-
+        cd "$fixture"
         env -i \
             PATH="$fake_bin:/usr/bin:/bin" \
             HOME="$fixture/home" \
-            OPEN_SWITCHER_TEST_FIXTURE_ROOT="$fixture" \
-            OPEN_SWITCHER_TEST_REPO_ROOT="$REPO_ROOT" \
+            OPEN_SWITCHER_TEST_GUARD_ROOT="$test_root" \
             "$@" \
             ./manage.sh bootstrap linux-input 2>&1
     )"
@@ -157,26 +116,32 @@ run_disabled_bootstrap_case() (
     fi
 
     assert_contains "$output" "Source-tree Linux input bootstrap is disabled." || failures=$((failures + 1))
-    assert_contains "$output" "Working-tree code was not run as root." || failures=$((failures + 1))
+    assert_contains "$output" "Linux input setup helpers and assets were not executed or installed with elevated privileges." || failures=$((failures + 1))
     assert_contains "$output" "./manage.sh package deb" || failures=$((failures + 1))
-    assert_contains "$output" "sudo apt install --reinstall" || failures=$((failures + 1))
+    assert_contains "$output" 'exact `sudo apt install <artifact>` command printed by the build' || failures=$((failures + 1))
+    assert_contains "$output" 'Use `--reinstall` only when the same package version is already installed.' || failures=$((failures + 1))
     assert_contains "$output" "Sign out and sign in again" || failures=$((failures + 1))
     assert_contains "$output" "./manage.sh doctor" || failures=$((failures + 1))
-    assert_contains "$output" "System state was not changed." || failures=$((failures + 1))
+    assert_contains "$output" "Privileged Linux input setup and system configuration were not changed." || failures=$((failures + 1))
+    assert_contains "$output" "Do not run ./manage.sh with sudo." || failures=$((failures + 1))
     assert_not_contains "$output" "Повторная проверка Linux input setup..." || failures=$((failures + 1))
 
+    if [[ -e "$fixture/.run" ]]; then
+        echo "$case_name: early migration gate created fixture .run" >&2
+        failures=$((failures + 1))
+    fi
+    if [[ -e "$fixture/scripts" ]]; then
+        echo "$case_name: source-copy unexpectedly gained a scripts directory" >&2
+        failures=$((failures + 1))
+    fi
+
     for command_name in sudo install udevadm setfacl; do
-        if [[ -s "$fixture/$command_name.log" ]]; then
+        if [[ -s "$test_root/$command_name.log" ]]; then
             echo "$case_name: fake $command_name was invoked" >&2
-            sed 's/^/  argv: /' "$fixture/$command_name.log" >&2
+            sed 's/^/  argv: /' "$test_root/$command_name.log" >&2
             failures=$((failures + 1))
         fi
     done
-
-    if ! cmp -s "$fixture/protected-target.before" "$fixture/protected-target"; then
-        echo "$case_name: protected fixture was modified" >&2
-        failures=$((failures + 1))
-    fi
 
     if [[ "$failures" -ne 0 ]]; then
         echo "--- source bootstrap output for $case_name (status $status) ---" >&2
@@ -190,32 +155,14 @@ run_disabled_bootstrap_case() (
 )
 
 test_source_tree_bootstrap_is_disabled_without_mutation() {
-    local fixture
-    fixture="$(mktemp -d)"
-    trap 'rm -rf "$fixture"' RETURN
-
-    create_fake_input_fixture "$fixture"
-    create_inert_privileged_commands "$fixture"
-    mkdir -p "$fixture/home" "$fixture/etc/udev/rules.d"
-
-    printf 'protected target must remain byte-identical\n' >"$fixture/protected-target"
-    cp "$fixture/protected-target" "$fixture/protected-target.before"
-    rm -f "$fixture/dev/uinput"
-    ln -s "$fixture/protected-target" "$fixture/dev/uinput"
-
-    local command_name=""
-    for command_name in sudo install udevadm setfacl; do
-        : >"$fixture/$command_name.log"
-    done
-
     local -a dev_override=(
-        "OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT=$fixture/dev"
+        "OPEN_SWITCHER_LINUX_INPUT_DEV_ROOT=/tmp/openswitcher-test-dev"
     )
     local -a proc_override=(
-        "OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES=$fixture/proc/bus/input/devices"
+        "OPEN_SWITCHER_LINUX_INPUT_PROC_INPUT_DEVICES=/tmp/openswitcher-test-proc-devices"
     )
     local -a rules_override=(
-        "OPEN_SWITCHER_LINUX_INPUT_RULES_DIR=$fixture/etc/udev/rules.d"
+        "OPEN_SWITCHER_LINUX_INPUT_RULES_DIR=/tmp/openswitcher-test-rules"
     )
     local -a all_overrides=(
         "${dev_override[@]}"
@@ -225,23 +172,23 @@ test_source_tree_bootstrap_is_disabled_without_mutation() {
 
     local failures=0
     local case_output=""
-    if ! case_output="$(run_disabled_bootstrap_case clean "$fixture" 2>&1)"; then
+    if ! case_output="$(run_disabled_bootstrap_case clean 2>&1)"; then
         printf '%s\n' "$case_output" >&2
         failures=$((failures + 1))
     fi
-    if ! case_output="$(run_disabled_bootstrap_case dev-root "$fixture" "${dev_override[@]}" 2>&1)"; then
+    if ! case_output="$(run_disabled_bootstrap_case dev-root "${dev_override[@]}" 2>&1)"; then
         printf '%s\n' "$case_output" >&2
         failures=$((failures + 1))
     fi
-    if ! case_output="$(run_disabled_bootstrap_case proc-devices "$fixture" "${proc_override[@]}" 2>&1)"; then
+    if ! case_output="$(run_disabled_bootstrap_case proc-devices "${proc_override[@]}" 2>&1)"; then
         printf '%s\n' "$case_output" >&2
         failures=$((failures + 1))
     fi
-    if ! case_output="$(run_disabled_bootstrap_case rules-dir "$fixture" "${rules_override[@]}" 2>&1)"; then
+    if ! case_output="$(run_disabled_bootstrap_case rules-dir "${rules_override[@]}" 2>&1)"; then
         printf '%s\n' "$case_output" >&2
         failures=$((failures + 1))
     fi
-    if ! case_output="$(run_disabled_bootstrap_case all-overrides "$fixture" "${all_overrides[@]}" 2>&1)"; then
+    if ! case_output="$(run_disabled_bootstrap_case all-overrides "${all_overrides[@]}" 2>&1)"; then
         printf '%s\n' "$case_output" >&2
         failures=$((failures + 1))
     fi
@@ -278,7 +225,9 @@ test_doctor_reports_mixed_setup_problem() {
     assert_contains "$output" "Keyboard access: denied"
     assert_contains "$output" "Pointer access: denied"
     assert_contains "$output" "uinput access: available"
-    assert_contains "$output" "sudo apt install --reinstall"
+    assert_contains "$output" "./manage.sh package deb"
+    assert_contains "$output" 'exact `sudo apt install <artifact>` command printed by the build'
+    assert_contains "$output" 'Use `--reinstall` only when the same package version is already installed.'
     assert_contains "$output" "Sign out and sign in again"
     assert_contains "$output" './manage.sh doctor'
     assert_not_contains "$output" './manage.sh bootstrap linux-input'
@@ -332,7 +281,9 @@ test_doctor_reports_keyboard_not_found() {
 
     assert_contains "$output" "Keyboard device: not found"
     assert_contains "$output" "Connect the keyboard device before checking the setup again."
-    assert_contains "$output" "sudo apt install --reinstall"
+    assert_contains "$output" "./manage.sh package deb"
+    assert_contains "$output" 'exact `sudo apt install <artifact>` command printed by the build'
+    assert_contains "$output" 'Use `--reinstall` only when the same package version is already installed.'
     assert_contains "$output" "Sign out and sign in again"
     assert_contains "$output" './manage.sh doctor'
     assert_not_contains "$output" './manage.sh bootstrap linux-input'

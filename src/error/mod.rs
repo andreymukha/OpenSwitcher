@@ -169,11 +169,11 @@ impl SwitcherError {
     pub fn linux_input_setup_hint(&self) -> Option<String> {
         match self {
             SwitcherError::KeyboardAccessDenied { path, .. } => Some(format!(
-                "Linux input setup is not ready.\nKeyboard access is denied for: {}\nInstall or reinstall the OpenSwitcher .deb package:\n  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb\nSign out and sign in again, then run `./manage.sh doctor`.",
+                "Linux input setup is not ready.\nKeyboard access is denied for: {}\nBuild the canonical OpenSwitcher .deb package:\n  ./manage.sh package deb\nThen run the exact `sudo apt install <artifact>` command printed by the build.\nUse `--reinstall` only when the same package version is already installed.\nSign out and sign in again, then run `./manage.sh doctor`.",
                 path.display()
             )),
             SwitcherError::UinputAccessDenied { path, .. } => Some(format!(
-                "Linux input setup is not ready.\nuinput access is denied for: {}\nInstall or reinstall the OpenSwitcher .deb package:\n  sudo apt install --reinstall ./dist/packages/open-switcher_*_amd64.deb\nSign out and sign in again, then run `./manage.sh doctor`.",
+                "Linux input setup is not ready.\nuinput access is denied for: {}\nBuild the canonical OpenSwitcher .deb package:\n  ./manage.sh package deb\nThen run the exact `sudo apt install <artifact>` command printed by the build.\nUse `--reinstall` only when the same package version is already installed.\nSign out and sign in again, then run `./manage.sh doctor`.",
                 path.display()
             )),
             _ => None,
@@ -215,7 +215,9 @@ mod tests {
 
         assert!(hint.contains("./manage.sh doctor"));
         assert!(hint.contains("OpenSwitcher .deb"));
-        assert!(hint.contains("sudo apt install --reinstall"));
+        assert!(hint.contains("./manage.sh package deb"));
+        assert!(hint.contains("exact `sudo apt install <artifact>` command printed by the build"));
+        assert!(hint.contains("Use `--reinstall` only when the same package version is already installed."));
         assert!(hint.contains("Sign out and sign in again"));
         assert!(!hint.contains("./manage.sh bootstrap linux-input"));
     }
@@ -233,7 +235,9 @@ mod tests {
 
         assert!(hint.contains("./manage.sh doctor"));
         assert!(hint.contains("OpenSwitcher .deb"));
-        assert!(hint.contains("sudo apt install --reinstall"));
+        assert!(hint.contains("./manage.sh package deb"));
+        assert!(hint.contains("exact `sudo apt install <artifact>` command printed by the build"));
+        assert!(hint.contains("Use `--reinstall` only when the same package version is already installed."));
         assert!(hint.contains("Sign out and sign in again"));
         assert!(!hint.contains("./manage.sh bootstrap linux-input"));
     }

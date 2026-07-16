@@ -6,17 +6,28 @@ use std::thread;
 use std::time::Duration;
 use zbus::blocking::Connection;
 
-#[derive(Clone, Debug, Default)]
-pub struct SettingsDbusClient;
+#[derive(Clone, Debug)]
+pub struct SettingsDbusClient {
+    connection: Connection,
+}
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
 impl SettingsDbusClient {
-    pub fn load_settings(&self) -> Result<Settings, SettingsClientError> {
+    pub fn connect() -> Result<Self, SettingsClientError> {
         let connection = Connection::session().map_err(SettingsClientError::Connection)?;
-        let proxy =
-            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
-        let settings = proxy.get_settings().map_err(SettingsClientError::Daemon)?;
+        Ok(Self { connection })
+    }
+
+    fn proxy(&self) -> Result<OpenSwitcherProxyBlocking<'_>, SettingsClientError> {
+        OpenSwitcherProxyBlocking::new(&self.connection).map_err(SettingsClientError::Proxy)
+    }
+
+    pub fn load_settings(&self) -> Result<Settings, SettingsClientError> {
+        let settings = self
+            .proxy()?
+            .get_settings()
+            .map_err(SettingsClientError::Daemon)?;
         Settings::try_from(settings).map_err(SettingsClientError::from)
     }
 
@@ -24,10 +35,7 @@ impl SettingsDbusClient {
         &self,
         settings: Settings,
     ) -> Result<UpdateSettingsResult, SettingsClientError> {
-        let connection = Connection::session().map_err(SettingsClientError::Connection)?;
-        let proxy =
-            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
-        proxy
+        self.proxy()?
             .update_settings(SettingsDto::from(settings))
             .map_err(SettingsClientError::Daemon)
     }
@@ -35,21 +43,23 @@ impl SettingsDbusClient {
     pub fn start_layout_switch_capture(
         &self,
     ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-        let connection = Connection::session().map_err(SettingsClientError::Connection)?;
-        let proxy =
-            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
-        proxy
+        self.proxy()?
             .start_layout_switch_capture()
+            .map_err(SettingsClientError::Daemon)
+    }
+
+    pub fn renew_layout_switch_capture(
+        &self,
+    ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+        self.proxy()?
+            .renew_layout_switch_capture()
             .map_err(SettingsClientError::Daemon)
     }
 
     pub fn cancel_layout_switch_capture(
         &self,
     ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-        let connection = Connection::session().map_err(SettingsClientError::Connection)?;
-        let proxy =
-            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
-        proxy
+        self.proxy()?
             .cancel_layout_switch_capture()
             .map_err(SettingsClientError::Daemon)
     }
@@ -57,22 +67,13 @@ impl SettingsDbusClient {
     pub fn finish_layout_switch_capture(
         &self,
     ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-        let connection = Connection::session().map_err(SettingsClientError::Connection)?;
-        let proxy =
-            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
-        proxy
+        self.proxy()?
             .finish_layout_switch_capture()
             .map_err(SettingsClientError::Daemon)
     }
 
-    pub fn set_hotkey_capture_inhibited(
-        &self,
-        inhibited: bool,
-    ) -> Result<(), SettingsClientError> {
-        let connection = Connection::session().map_err(SettingsClientError::Connection)?;
-        let proxy =
-            OpenSwitcherProxyBlocking::new(&connection).map_err(SettingsClientError::Proxy)?;
-        proxy
+    pub fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
+        self.proxy()?
             .set_hotkey_capture_inhibited(inhibited)
             .map_err(SettingsClientError::Daemon)
     }
@@ -131,5 +132,15 @@ impl SettingsDbusClient {
 
             thread::sleep(RECONNECT_DELAY);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_client_retains_connection_state() {
+        assert_ne!(std::mem::size_of::<SettingsDbusClient>(), 0);
     }
 }

@@ -1,14 +1,16 @@
 use super::dbus_client::SettingsDbusClient;
 use super::state::{DomainState, ViewState};
 use crate::error::{SettingsClientError, UiError};
-use crate::model::{
-    HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, UpdateSettingsResult,
-};
+use crate::model::{HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, UpdateSettingsResult};
 use crate::system::user_services::{CommandRunner, ProcessCommandRunner};
 use crate::system::UserServiceController;
 use async_channel::Sender;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+pub(crate) const CAPTURE_HEARTBEAT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 pub enum PresenterEvent {
@@ -17,6 +19,7 @@ pub enum PresenterEvent {
     SaveFailed(SettingsClientError),
     SaveSucceeded(UpdateSettingsResult),
     CaptureStateChanged(LayoutSwitchCaptureState),
+    CaptureRenewFailed(SettingsClientError),
     AutostartFailed(SettingsClientError),
 }
 
@@ -32,6 +35,7 @@ pub trait SettingsClientBackend: Clone + Send + Sync + 'static {
         settings: crate::model::Settings,
     ) -> Result<UpdateSettingsResult, SettingsClientError>;
     fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
+    fn renew_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn cancel_layout_switch_capture(&self)
         -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn finish_layout_switch_capture(&self)
@@ -54,6 +58,10 @@ impl SettingsClientBackend for SettingsDbusClient {
 
     fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
         SettingsDbusClient::start_layout_switch_capture(self)
+    }
+
+    fn renew_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+        SettingsDbusClient::renew_layout_switch_capture(self)
     }
 
     fn cancel_layout_switch_capture(
@@ -95,6 +103,14 @@ where
     services: UserServiceController<R>,
     state: Mutex<DomainState>,
     event_tx: Sender<PresenterEvent>,
+    capture_command: Arc<Mutex<()>>,
+    capture_generation: Arc<AtomicU64>,
+    capture_heartbeat: Mutex<Option<CaptureHeartbeat>>,
+    capture_heartbeat_interval: Duration,
+}
+
+struct CaptureHeartbeat {
+    stop_tx: mpsc::Sender<()>,
 }
 
 impl SettingsPresenter<SettingsDbusClient, ProcessCommandRunner> {
@@ -113,12 +129,25 @@ where
         services: UserServiceController<R>,
         event_tx: Sender<PresenterEvent>,
     ) -> Self {
+        Self::with_services_and_heartbeat_interval(client, services, event_tx, CAPTURE_HEARTBEAT)
+    }
+
+    fn with_services_and_heartbeat_interval(
+        client: C,
+        services: UserServiceController<R>,
+        event_tx: Sender<PresenterEvent>,
+        capture_heartbeat_interval: Duration,
+    ) -> Self {
         Self {
             inner: Arc::new(PresenterInner {
                 client,
                 services,
                 state: Mutex::new(DomainState::new()),
                 event_tx,
+                capture_command: Arc::new(Mutex::new(())),
+                capture_generation: Arc::new(AtomicU64::new(0)),
+                capture_heartbeat: Mutex::new(None),
+                capture_heartbeat_interval,
             }),
         }
     }
@@ -127,10 +156,14 @@ where
         let (capture_tx, capture_rx) = async_channel::unbounded();
         self.inner.client.spawn_capture_listener(capture_tx);
 
-        let presenter = self.clone();
+        let presenter = Arc::downgrade(&self.inner);
         thread::spawn(move || {
             while let Ok(state) = capture_rx.recv_blocking() {
-                let _ = presenter.send_event(PresenterEvent::CaptureStateChanged(state));
+                let Some(inner) = presenter.upgrade() else {
+                    break;
+                };
+                let presenter = SettingsPresenter { inner };
+                presenter.observe_layout_switch_capture_state(state);
             }
         });
 
@@ -229,13 +262,20 @@ where
     }
 
     pub fn start_layout_switch_capture(&self) -> Result<(), SettingsClientError> {
+        self.stop_capture_heartbeat();
         let changed = self.with_state(DomainState::start_layout_switch_capture);
         if changed {
             let _ = self.emit_view_state();
         }
 
-        match self.inner.client.start_layout_switch_capture() {
+        let result = self.with_capture_command(|client| client.start_layout_switch_capture());
+        match result {
             Ok(state) => {
+                if state.is_active()
+                    && self.with_state(|current| current.view_state().layout_switch.capture_active)
+                {
+                    self.start_capture_heartbeat();
+                }
                 let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
                 Ok(())
             }
@@ -248,12 +288,14 @@ where
     }
 
     pub fn cancel_layout_switch_capture(&self) -> Result<(), SettingsClientError> {
+        self.stop_capture_heartbeat();
         let changed = self.with_state(DomainState::cancel_layout_switch_capture);
         if changed {
             let _ = self.emit_view_state();
         }
 
-        match self.inner.client.cancel_layout_switch_capture() {
+        let result = self.with_capture_command(|client| client.cancel_layout_switch_capture());
+        match result {
             Ok(state) => {
                 let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
                 Ok(())
@@ -266,7 +308,8 @@ where
         &self,
         combo: LayoutSwitchCombo,
     ) -> Result<(), SettingsClientError> {
-        let state = self.inner.client.finish_layout_switch_capture()?;
+        self.stop_capture_heartbeat();
+        let state = self.with_capture_command(|client| client.finish_layout_switch_capture())?;
         let changed = self.with_state(|current| current.apply_captured_layout_switch(combo));
         if changed {
             let _ = self.emit_view_state();
@@ -276,6 +319,7 @@ where
     }
 
     pub fn discard_changes(&self) {
+        self.stop_capture_heartbeat();
         let changed = self.with_state(DomainState::discard_changes);
         if changed {
             let _ = self.emit_view_state();
@@ -283,16 +327,16 @@ where
     }
 
     pub fn sync_layout_switch_capture_active(&self, active: bool) {
+        if !active {
+            self.stop_capture_heartbeat();
+        }
         let changed = self.with_state(|state| state.set_layout_switch_capture_active(active));
         if changed {
             let _ = self.emit_view_state();
         }
     }
 
-    pub fn set_hotkey_capture_inhibited(
-        &self,
-        inhibited: bool,
-    ) -> Result<(), SettingsClientError> {
+    pub fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
         self.inner.client.set_hotkey_capture_inhibited(inhibited)
     }
 
@@ -377,14 +421,183 @@ where
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         f(&mut state)
     }
+
+    fn with_capture_command<T>(&self, f: impl FnOnce(&C) -> T) -> T {
+        let _guard = self
+            .inner
+            .capture_command
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&self.inner.client)
+    }
+
+    fn observe_layout_switch_capture_state(&self, state: LayoutSwitchCaptureState) {
+        if !state.is_active() {
+            self.stop_capture_heartbeat();
+            let changed =
+                self.with_state(|current| current.set_layout_switch_capture_active(false));
+            if changed {
+                let _ = self.emit_view_state();
+            }
+        }
+        let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+    }
+
+    fn start_capture_heartbeat(&self) {
+        self.stop_capture_heartbeat();
+
+        let generation = self
+            .inner
+            .capture_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        let interval = self.inner.capture_heartbeat_interval;
+        let client = self.inner.client.clone();
+        let command = Arc::clone(&self.inner.capture_command);
+        let capture_generation = Arc::clone(&self.inner.capture_generation);
+        let presenter = Arc::downgrade(&self.inner);
+        let (stop_tx, stop_rx) = mpsc::channel();
+
+        thread::spawn(move || loop {
+            match stop_rx.recv_timeout(interval) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+
+            if capture_generation.load(Ordering::SeqCst) != generation {
+                break;
+            }
+
+            let result = {
+                let _guard = command
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if capture_generation.load(Ordering::SeqCst) != generation {
+                    break;
+                }
+                client.renew_layout_switch_capture()
+            };
+
+            if capture_generation.load(Ordering::SeqCst) != generation {
+                break;
+            }
+
+            let Some(inner) = presenter.upgrade() else {
+                break;
+            };
+            let presenter = SettingsPresenter { inner };
+            if !presenter.handle_capture_renew_result(generation, result) {
+                break;
+            }
+        });
+
+        self.inner
+            .capture_heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(CaptureHeartbeat { stop_tx });
+    }
+
+    fn handle_capture_renew_result(
+        &self,
+        generation: u64,
+        result: Result<LayoutSwitchCaptureState, SettingsClientError>,
+    ) -> bool {
+        if self.inner.capture_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+
+        match result {
+            Ok(state) if state.is_active() => true,
+            Ok(state) => {
+                if self
+                    .inner
+                    .capture_generation
+                    .compare_exchange(
+                        generation,
+                        generation.wrapping_add(1),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                let changed =
+                    self.with_state(|current| current.set_layout_switch_capture_active(false));
+                if changed {
+                    let _ = self.emit_view_state();
+                }
+                let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+                false
+            }
+            Err(error) => {
+                if self
+                    .inner
+                    .capture_generation
+                    .compare_exchange(
+                        generation,
+                        generation.wrapping_add(1),
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                let changed =
+                    self.with_state(|current| current.set_layout_switch_capture_active(false));
+                if changed {
+                    let _ = self.emit_view_state();
+                }
+                let _ = self.send_event(PresenterEvent::CaptureRenewFailed(error));
+                false
+            }
+        }
+    }
+
+    fn stop_capture_heartbeat(&self) {
+        self.inner.capture_generation.fetch_add(1, Ordering::SeqCst);
+        let heartbeat = self
+            .inner
+            .capture_heartbeat
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(heartbeat) = heartbeat {
+            let _ = heartbeat.stop_tx.send(());
+        }
+    }
+}
+
+impl<C, R> Drop for PresenterInner<C, R>
+where
+    C: SettingsClientBackend,
+    R: CommandRunner,
+{
+    fn drop(&mut self) {
+        self.capture_generation.fetch_add(1, Ordering::SeqCst);
+        let heartbeat = self
+            .capture_heartbeat
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(heartbeat) = heartbeat {
+            let _ = heartbeat.stop_tx.send(());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::ServiceManagerError;
+    use crate::error::ValidationError;
+    use crate::model::LayoutSwitchCapturePhase;
     use crate::model::{LayoutSwitchSetting, LayoutSwitchSource, Settings};
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     // Test helpers
     #[derive(Clone, Default)]
@@ -397,6 +610,20 @@ mod tests {
         save_results: VecDeque<Result<UpdateSettingsResult, SettingsClientError>>,
         saved_settings: Vec<Settings>,
         hotkey_capture_inhibitions: Vec<bool>,
+        renew_results: VecDeque<FakeRenewResult>,
+        renew_delay: Duration,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FakeRenewResult {
+        State(LayoutSwitchCapturePhase),
+        Error,
+    }
+
+    impl Default for FakeRenewResult {
+        fn default() -> Self {
+            Self::State(LayoutSwitchCapturePhase::Waiting)
+        }
     }
 
     impl FakeSettingsClient {
@@ -414,6 +641,14 @@ mod tests {
                 .unwrap()
                 .hotkey_capture_inhibitions
                 .clone()
+        }
+
+        fn push_renew_result(&self, result: FakeRenewResult) {
+            self.state.lock().unwrap().renew_results.push_back(result);
+        }
+
+        fn set_renew_delay(&self, delay: Duration) {
+            self.state.lock().unwrap().renew_delay = delay;
         }
     }
 
@@ -437,19 +672,53 @@ mod tests {
         fn start_layout_switch_capture(
             &self,
         ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-            panic!("capture is not used in this test")
+            Ok(LayoutSwitchCaptureState::waiting())
+        }
+
+        fn renew_layout_switch_capture(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            let (delay, result) = {
+                let mut state = self.state.lock().unwrap();
+                (
+                    state.renew_delay,
+                    state.renew_results.pop_front().unwrap_or_default(),
+                )
+            };
+            thread::sleep(delay);
+            match result {
+                FakeRenewResult::State(LayoutSwitchCapturePhase::Idle) => {
+                    Ok(LayoutSwitchCaptureState::idle())
+                }
+                FakeRenewResult::State(LayoutSwitchCapturePhase::Waiting) => {
+                    Ok(LayoutSwitchCaptureState::waiting())
+                }
+                FakeRenewResult::State(LayoutSwitchCapturePhase::Candidate) => Ok(
+                    LayoutSwitchCaptureState::candidate(LayoutSwitchCombo::ctrl_shift()),
+                ),
+                FakeRenewResult::State(LayoutSwitchCapturePhase::Unsupported) => {
+                    Ok(LayoutSwitchCaptureState::unsupported("unsupported"))
+                }
+                FakeRenewResult::State(LayoutSwitchCapturePhase::Cancelled) => {
+                    Ok(LayoutSwitchCaptureState::cancelled())
+                }
+                FakeRenewResult::State(LayoutSwitchCapturePhase::Finished) => {
+                    Ok(LayoutSwitchCaptureState::finished())
+                }
+                FakeRenewResult::Error => Err(capture_test_error()),
+            }
         }
 
         fn cancel_layout_switch_capture(
             &self,
         ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-            panic!("capture is not used in this test")
+            Ok(LayoutSwitchCaptureState::cancelled())
         }
 
         fn finish_layout_switch_capture(
             &self,
         ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
-            panic!("capture is not used in this test")
+            Ok(LayoutSwitchCaptureState::finished())
         }
 
         fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
@@ -462,6 +731,260 @@ mod tests {
         }
 
         fn spawn_capture_listener(&self, _tx: Sender<LayoutSwitchCaptureState>) {}
+    }
+
+    #[derive(Clone, Default)]
+    struct CountingCaptureClient {
+        base: FakeSettingsClient,
+        renew_calls: Arc<AtomicUsize>,
+        active_renews: Arc<AtomicUsize>,
+        max_active_renews: Arc<AtomicUsize>,
+    }
+
+    impl CountingCaptureClient {
+        fn renew_calls(&self) -> usize {
+            self.renew_calls.load(Ordering::SeqCst)
+        }
+
+        fn max_active_renews(&self) -> usize {
+            self.max_active_renews.load(Ordering::SeqCst)
+        }
+
+        fn wait_for_renew_calls(&self, expected: usize) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while self.renew_calls() < expected && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                self.renew_calls() >= expected,
+                "heartbeat did not renew in time"
+            );
+        }
+    }
+
+    impl SettingsClientBackend for CountingCaptureClient {
+        fn load_settings(&self) -> Result<Settings, SettingsClientError> {
+            self.base.load_settings()
+        }
+
+        fn save_settings(
+            &self,
+            settings: Settings,
+        ) -> Result<UpdateSettingsResult, SettingsClientError> {
+            self.base.save_settings(settings)
+        }
+
+        fn start_layout_switch_capture(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            self.base.start_layout_switch_capture()
+        }
+
+        fn renew_layout_switch_capture(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            self.renew_calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active_renews.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active_renews.fetch_max(active, Ordering::SeqCst);
+            let result = self.base.renew_layout_switch_capture();
+            self.active_renews.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        fn cancel_layout_switch_capture(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            self.base.cancel_layout_switch_capture()
+        }
+
+        fn finish_layout_switch_capture(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            self.base.finish_layout_switch_capture()
+        }
+
+        fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
+            self.base.set_hotkey_capture_inhibited(inhibited)
+        }
+
+        fn spawn_capture_listener(&self, tx: Sender<LayoutSwitchCaptureState>) {
+            self.base.spawn_capture_listener(tx)
+        }
+    }
+
+    fn capture_test_error() -> SettingsClientError {
+        SettingsClientError::Validation(ValidationError::LayoutDelayOutOfRange {
+            min: 1,
+            max: 2,
+            found: 3,
+        })
+    }
+
+    fn capture_presenter(
+        client: CountingCaptureClient,
+        interval: Duration,
+    ) -> (
+        SettingsPresenter<CountingCaptureClient, FakeCommandRunner>,
+        async_channel::Receiver<PresenterEvent>,
+    ) {
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let presenter = SettingsPresenter::with_services_and_heartbeat_interval(
+            client,
+            UserServiceController::new(FakeCommandRunner::default()),
+            event_tx,
+            interval,
+        );
+        presenter.with_state(|state| state.apply_loaded(Settings::default()));
+        (presenter, event_rx)
+    }
+
+    fn drain_events(event_rx: &async_channel::Receiver<PresenterEvent>) -> Vec<PresenterEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    // Layout switch capture lease
+    #[test]
+    fn capture_heartbeat_renews_after_successful_start_without_overlap() {
+        let client = CountingCaptureClient::default();
+        client.base.set_renew_delay(Duration::from_millis(15));
+        let (presenter, _event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(3);
+        presenter.cancel_layout_switch_capture().unwrap();
+
+        assert_eq!(client.max_active_renews(), 1);
+    }
+
+    #[test]
+    fn capture_cancel_finish_and_terminal_state_stop_heartbeat() {
+        for stop in [
+            LayoutSwitchCapturePhase::Cancelled,
+            LayoutSwitchCapturePhase::Finished,
+            LayoutSwitchCapturePhase::Unsupported,
+            LayoutSwitchCapturePhase::Idle,
+        ] {
+            let client = CountingCaptureClient::default();
+            let (presenter, _event_rx) =
+                capture_presenter(client.clone(), Duration::from_millis(10));
+            presenter.start_layout_switch_capture().unwrap();
+            client.wait_for_renew_calls(1);
+
+            presenter.observe_layout_switch_capture_state(match stop {
+                LayoutSwitchCapturePhase::Cancelled => LayoutSwitchCaptureState::cancelled(),
+                LayoutSwitchCapturePhase::Finished => LayoutSwitchCaptureState::finished(),
+                LayoutSwitchCapturePhase::Unsupported => {
+                    LayoutSwitchCaptureState::unsupported("unsupported")
+                }
+                LayoutSwitchCapturePhase::Idle => LayoutSwitchCaptureState::idle(),
+                _ => unreachable!(),
+            });
+
+            let stopped_at = client.renew_calls();
+            thread::sleep(Duration::from_millis(35));
+            assert_eq!(client.renew_calls(), stopped_at, "terminal phase: {stop:?}");
+        }
+
+        let cancel_client = CountingCaptureClient::default();
+        let (cancel_presenter, _event_rx) =
+            capture_presenter(cancel_client.clone(), Duration::from_millis(10));
+        cancel_presenter.start_layout_switch_capture().unwrap();
+        cancel_client.wait_for_renew_calls(1);
+        cancel_presenter.cancel_layout_switch_capture().unwrap();
+        let stopped_at = cancel_client.renew_calls();
+        thread::sleep(Duration::from_millis(35));
+        assert_eq!(cancel_client.renew_calls(), stopped_at);
+
+        let finish_client = CountingCaptureClient::default();
+        let (finish_presenter, _event_rx) =
+            capture_presenter(finish_client.clone(), Duration::from_millis(10));
+        finish_presenter.start_layout_switch_capture().unwrap();
+        finish_client.wait_for_renew_calls(1);
+        finish_presenter
+            .confirm_captured_layout_switch(LayoutSwitchCombo::alt_shift())
+            .unwrap();
+        let stopped_at = finish_client.renew_calls();
+        thread::sleep(Duration::from_millis(35));
+        assert_eq!(finish_client.renew_calls(), stopped_at);
+    }
+
+    #[test]
+    fn capture_renew_failure_closes_local_state_and_emits_dedicated_error() {
+        let client = CountingCaptureClient::default();
+        client.base.push_renew_result(FakeRenewResult::Error);
+        let (presenter, event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(1);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut saw_error = false;
+        while Instant::now() < deadline {
+            if let Ok(event) = event_rx.try_recv() {
+                if matches!(event, PresenterEvent::CaptureRenewFailed(_)) {
+                    saw_error = true;
+                    break;
+                }
+            } else {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        assert!(saw_error);
+        assert!(
+            !presenter
+                .with_state(|state| state.view_state())
+                .layout_switch
+                .capture_active
+        );
+    }
+
+    #[test]
+    fn stale_renew_failure_is_ignored_after_cancel_and_new_start() {
+        let client = CountingCaptureClient::default();
+        client.base.set_renew_delay(Duration::from_millis(40));
+        client.base.push_renew_result(FakeRenewResult::Error);
+        let (presenter, event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(1);
+        presenter.cancel_layout_switch_capture().unwrap();
+        presenter.start_layout_switch_capture().unwrap();
+        thread::sleep(Duration::from_millis(60));
+
+        assert!(
+            presenter
+                .with_state(|state| state.view_state())
+                .layout_switch
+                .capture_active
+        );
+        assert!(!drain_events(&event_rx)
+            .iter()
+            .any(|event| matches!(event, PresenterEvent::CaptureRenewFailed(_))));
+        presenter.cancel_layout_switch_capture().unwrap();
+    }
+
+    #[test]
+    fn dropping_presenter_stops_heartbeat_without_retaining_presenter() {
+        let client = CountingCaptureClient::default();
+        let (presenter, _event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(1);
+
+        drop(presenter);
+        let stopped_at = client.renew_calls();
+        thread::sleep(Duration::from_millis(35));
+
+        assert_eq!(client.renew_calls(), stopped_at);
+    }
+
+    #[test]
+    fn production_capture_heartbeat_is_shorter_than_soft_lease() {
+        assert!(CAPTURE_HEARTBEAT < crate::daemon::capture::CAPTURE_SOFT_LEASE);
     }
 
     #[derive(Clone, Default)]

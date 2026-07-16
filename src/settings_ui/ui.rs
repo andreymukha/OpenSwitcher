@@ -164,7 +164,14 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     ui.install_form(form);
 
     let (event_tx, event_rx) = async_channel::unbounded();
-    let presenter = SettingsPresenter::new(SettingsDbusClient, event_tx);
+    let client = match SettingsDbusClient::connect() {
+        Ok(client) => client,
+        Err(error) => {
+            ui.show_client_error(error, true);
+            return;
+        }
+    };
+    let presenter = SettingsPresenter::new(client, event_tx);
     ui.set_presenter(presenter.clone());
 
     let delay_handler = {
@@ -393,10 +400,12 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
     }
 
     {
-        let ui = Rc::clone(&ui);
-        let presenter_for_events = presenter.clone();
+        let ui = Rc::downgrade(&ui);
         glib::MainContext::default().spawn_local(async move {
             while let Ok(event) = event_rx.recv().await {
+                let Some(ui) = ui.upgrade() else {
+                    break;
+                };
                 match event {
                     PresenterEvent::ViewStateChanged(view_state) => {
                         ui.apply_view_state(&view_state)
@@ -405,7 +414,13 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     PresenterEvent::SaveFailed(error) => ui.show_client_error(error, false),
                     PresenterEvent::SaveSucceeded(result) => ui.show_toast(&result.message),
                     PresenterEvent::CaptureStateChanged(state) => {
-                        ui.apply_capture_state(&presenter_for_events, state)
+                        let presenter = ui.presenter.borrow().as_ref().cloned();
+                        if let Some(presenter) = presenter {
+                            ui.apply_capture_state(&presenter, state);
+                        }
+                    }
+                    PresenterEvent::CaptureRenewFailed(error) => {
+                        ui.handle_capture_renew_failed(error)
                     }
                     PresenterEvent::AutostartFailed(error) => ui.show_client_error(error, false),
                 }
@@ -1063,6 +1078,14 @@ impl SettingsWindow {
                 window.hide();
                 glib::Propagation::Stop
             });
+        } else {
+            let ui_weak = Rc::downgrade(&ui);
+            ui.window.connect_close_request(move |_| {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.discard_pending_changes();
+                }
+                glib::Propagation::Proceed
+            });
         }
 
         {
@@ -1107,12 +1130,13 @@ impl SettingsWindow {
                 }
             }
             LayoutSwitchCapturePhase::Unsupported => {
-                let message = if state.message.is_empty() {
-                    "Эта комбинация сейчас не поддерживается OpenSwitcher.".to_string()
-                } else {
-                    state.message
+                self.disarm_capture_timeout();
+                let active = {
+                    let mut dialog = self.capture_dialog_state.borrow_mut();
+                    apply_unsupported_capture_state(&mut dialog, state)
                 };
-                self.set_capture_error(message);
+                presenter.sync_layout_switch_capture_active(active);
+                self.update_capture_dialog_widgets();
             }
             LayoutSwitchCapturePhase::Cancelled => {
                 self.disarm_capture_timeout();
@@ -1126,6 +1150,17 @@ impl SettingsWindow {
                 self.reset_capture_dialog();
             }
         }
+    }
+
+    fn handle_capture_renew_failed(&self, error: SettingsClientError) {
+        self.disarm_capture_timeout();
+        {
+            let mut dialog = self.capture_dialog_state.borrow_mut();
+            apply_capture_renew_failure_state(&mut dialog);
+        }
+        self.update_capture_dialog_widgets();
+        self.close_layout_switch_dialog();
+        self.show_client_error(error, false);
     }
 
     fn reload_from_daemon(&self) {
@@ -1256,14 +1291,6 @@ impl SettingsWindow {
         let mut state = self.capture_dialog_state.borrow_mut();
         state.candidate = Some(combo);
         state.error = None;
-        drop(state);
-        self.update_capture_dialog_widgets();
-    }
-
-    fn set_capture_error(&self, message: impl Into<String>) {
-        let mut state = self.capture_dialog_state.borrow_mut();
-        state.candidate = None;
-        state.error = Some(message.into());
         drop(state);
         self.update_capture_dialog_widgets();
     }
@@ -1579,7 +1606,8 @@ impl SettingsWindow {
             });
         }
 
-        self.selected_text_hotkey_dialog().add_controller(controller);
+        self.selected_text_hotkey_dialog()
+            .add_controller(controller);
     }
 
     // View state rendering
@@ -1643,7 +1671,8 @@ impl SettingsWindow {
                 .set_sensitive(state.form_enabled);
             form.manual_hotkey_row.set_sensitive(state.form_enabled);
             form.manual_hotkey_row.set_activatable(state.form_enabled);
-            form.manual_hotkey_value_icon.set_visible(state.form_enabled);
+            form.manual_hotkey_value_icon
+                .set_visible(state.form_enabled);
             form.manual_hotkey_value_label
                 .set_text(&state.manual_correction_hotkey.short_label());
             form.selected_text_hotkey_row
@@ -1754,6 +1783,25 @@ impl SettingsWindow {
     }
 }
 
+fn apply_unsupported_capture_state(
+    dialog: &mut CaptureDialogState,
+    state: LayoutSwitchCaptureState,
+) -> bool {
+    let message = if state.message.is_empty() {
+        "Эта комбинация сейчас не поддерживается OpenSwitcher.".to_string()
+    } else {
+        state.message
+    };
+    dialog.candidate = None;
+    dialog.error = Some(message);
+    false
+}
+
+fn apply_capture_renew_failure_state(dialog: &mut CaptureDialogState) -> bool {
+    dialog.clear();
+    false
+}
+
 // View state helpers
 fn initial_view_state() -> ViewState {
     let default_settings = crate::model::Settings::default();
@@ -1770,7 +1818,11 @@ fn initial_view_state() -> ViewState {
         runtime_context: SystemContext::default(),
         layout_switch: LayoutSwitchViewState {
             combo: default_settings.layout_switch.combo,
-            combo_label: default_settings.layout_switch.combo.short_label().to_string(),
+            combo_label: default_settings
+                .layout_switch
+                .combo
+                .short_label()
+                .to_string(),
             source: default_settings.layout_switch.source,
             editable: false,
             manual_override_active: false,
@@ -1797,9 +1849,7 @@ fn hotkey_modifier_from_key(key: gdk::Key) -> Option<HotkeyModifier> {
     match key {
         gdk::Key::Shift_L | gdk::Key::Shift_R => Some(HotkeyModifier::Shift),
         gdk::Key::Control_L | gdk::Key::Control_R => Some(HotkeyModifier::Ctrl),
-        gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::ISO_Level3_Shift => {
-            Some(HotkeyModifier::Alt)
-        }
+        gdk::Key::Alt_L | gdk::Key::Alt_R | gdk::Key::ISO_Level3_Shift => Some(HotkeyModifier::Alt),
         _ => None,
     }
 }
@@ -2041,10 +2091,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn capture_timeout_is_bounded_by_daemon_absolute_lease() {
+        assert!(CAPTURE_TIMEOUT < crate::daemon::capture::CAPTURE_ABSOLUTE_LEASE);
+    }
+
+    #[test]
+    fn unsupported_capture_is_terminal_and_preserves_the_error() {
+        let mut dialog = CaptureDialogState {
+            candidate: Some(LayoutSwitchCombo::ctrl_shift()),
+            error: None,
+        };
+
+        let capture_active = apply_unsupported_capture_state(
+            &mut dialog,
+            LayoutSwitchCaptureState::unsupported("unsupported combination"),
+        );
+
+        assert!(!capture_active);
+        assert_eq!(dialog.candidate, None);
+        assert_eq!(dialog.error.as_deref(), Some("unsupported combination"));
+    }
+
+    #[test]
+    fn renew_failure_closes_capture_and_clears_dialog_state() {
+        let mut dialog = CaptureDialogState {
+            candidate: Some(LayoutSwitchCombo::alt_shift()),
+            error: Some("old error".to_string()),
+        };
+
+        let capture_active = apply_capture_renew_failure_state(&mut dialog);
+
+        assert!(!capture_active);
+        assert_eq!(dialog, CaptureDialogState::default());
+    }
+
+    #[test]
     fn hotkey_supported_triggers_are_recognized() {
-        assert_eq!(hotkey_trigger_from_key(gdk::Key::F9), Some(HotkeyTrigger::F9));
-        assert_eq!(hotkey_trigger_from_key(gdk::Key::F10), Some(HotkeyTrigger::F10));
-        assert_eq!(hotkey_trigger_from_key(gdk::Key::F12), Some(HotkeyTrigger::F12));
+        assert_eq!(
+            hotkey_trigger_from_key(gdk::Key::F9),
+            Some(HotkeyTrigger::F9)
+        );
+        assert_eq!(
+            hotkey_trigger_from_key(gdk::Key::F10),
+            Some(HotkeyTrigger::F10)
+        );
+        assert_eq!(
+            hotkey_trigger_from_key(gdk::Key::F12),
+            Some(HotkeyTrigger::F12)
+        );
         assert_eq!(
             hotkey_trigger_from_key(gdk::Key::Pause),
             Some(HotkeyTrigger::Pause)
@@ -2057,7 +2151,10 @@ mod tests {
             hotkey_trigger_from_key(gdk::Key::Insert),
             Some(HotkeyTrigger::Insert)
         );
-        assert_eq!(hotkey_trigger_from_key(gdk::Key::Menu), Some(HotkeyTrigger::Menu));
+        assert_eq!(
+            hotkey_trigger_from_key(gdk::Key::Menu),
+            Some(HotkeyTrigger::Menu)
+        );
     }
 
     #[test]
@@ -2104,11 +2201,7 @@ mod tests {
         dialog_state.ctrl = true;
 
         assert_eq!(
-            hotkey_spec_from_key_event(
-                &dialog_state,
-                gdk::Key::F12,
-                gdk::ModifierType::ALT_MASK,
-            ),
+            hotkey_spec_from_key_event(&dialog_state, gdk::Key::F12, gdk::ModifierType::ALT_MASK,),
             Some(HotkeySpec::new(
                 HotkeyModifiers::shift_ctrl_alt(),
                 HotkeyTrigger::F12,
@@ -2203,7 +2296,10 @@ mod tests {
 
         assert_eq!(
             dialog_state.borrow().candidate,
-            Some(HotkeySpec::new(HotkeyModifiers::shift(), HotkeyTrigger::F12)),
+            Some(HotkeySpec::new(
+                HotkeyModifiers::shift(),
+                HotkeyTrigger::F12
+            )),
         );
     }
 
@@ -2276,7 +2372,10 @@ mod tests {
         let target = hotkey_dialog_target(&dialog_state);
         dialog_state.borrow_mut().set_target(target);
 
-        assert_eq!(dialog_state.borrow().target, HotkeyDialogTarget::ManualCorrection);
+        assert_eq!(
+            dialog_state.borrow().target,
+            HotkeyDialogTarget::ManualCorrection
+        );
     }
 
     #[test]

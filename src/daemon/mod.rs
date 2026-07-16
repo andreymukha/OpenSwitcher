@@ -89,11 +89,27 @@ pub fn run() -> Result<(), SwitcherError> {
             };
             log_input_debug("event-loop-panic", &format!("reason={reason}"));
             eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
-            service.shutdown();
             Err(SwitcherError::DaemonPanicked)
         }
     };
-    if capture_owner_monitor.stop().is_err() {
+    finalize_daemon_run(
+        result,
+        || service.shutdown(),
+        || capture_owner_monitor.stop(),
+    )
+}
+
+fn finalize_daemon_run<Shutdown, StopMonitor>(
+    result: Result<(), SwitcherError>,
+    shutdown: Shutdown,
+    stop_monitor: StopMonitor,
+) -> Result<(), SwitcherError>
+where
+    Shutdown: FnOnce(),
+    StopMonitor: FnOnce() -> std::thread::Result<()>,
+{
+    shutdown();
+    if stop_monitor().is_err() {
         log_layout_debug(
             "dbus-capture-owner-monitor-stop-error",
             "worker_panicked=true",
@@ -129,9 +145,46 @@ mod tests {
     use crate::dbus::INTERFACE_NAME;
     use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState};
     use std::error::Error;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use zbus::blocking::Proxy;
+
+    #[test]
+    fn daemon_error_releases_input_before_potentially_blocking_monitor_stop() {
+        let input_released = Arc::new(AtomicBool::new(false));
+        let observed_input_released = Arc::clone(&input_released);
+        let (monitor_entered_tx, monitor_entered_rx) = mpsc::channel();
+        let (allow_monitor_stop_tx, allow_monitor_stop_rx) = mpsc::channel();
+
+        let finalizer = std::thread::spawn(move || {
+            finalize_daemon_run(
+                Err(SwitcherError::KeyboardNotFound),
+                || input_released.store(true, Ordering::SeqCst),
+                || {
+                    monitor_entered_tx.send(()).unwrap();
+                    allow_monitor_stop_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+
+        monitor_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("monitor stop must be entered");
+        assert!(
+            observed_input_released.load(Ordering::SeqCst),
+            "input must be released before monitor stop can block"
+        );
+
+        allow_monitor_stop_tx.send(()).unwrap();
+        assert!(matches!(
+            finalizer.join().unwrap(),
+            Err(SwitcherError::KeyboardNotFound)
+        ));
+    }
 
     #[test]
     fn dbus_endpoint_is_published_only_after_monitor_and_api_are_ready(

@@ -413,14 +413,21 @@ fn initialize_window(ui: Rc<SettingsWindow>) {
                     PresenterEvent::LoadFailed(error) => ui.show_client_error(error, true),
                     PresenterEvent::SaveFailed(error) => ui.show_client_error(error, false),
                     PresenterEvent::SaveSucceeded(result) => ui.show_toast(&result.message),
-                    PresenterEvent::CaptureStateChanged(state) => {
+                    PresenterEvent::CaptureStateChanged { generation, state } => {
                         let presenter = ui.presenter.borrow().as_ref().cloned();
                         if let Some(presenter) = presenter {
-                            ui.apply_capture_state(&presenter, state);
+                            if presenter.apply_capture_state_event(generation, &state) {
+                                ui.apply_capture_state(state);
+                            }
                         }
                     }
-                    PresenterEvent::CaptureRenewFailed(error) => {
-                        ui.handle_capture_renew_failed(error)
+                    PresenterEvent::CaptureRenewFailed { generation, error } => {
+                        let presenter = ui.presenter.borrow().as_ref().cloned();
+                        if let Some(presenter) = presenter {
+                            if presenter.apply_capture_renew_failure(generation) {
+                                ui.handle_capture_renew_failed(error);
+                            }
+                        }
                     }
                     PresenterEvent::AutostartFailed(error) => ui.show_client_error(error, false),
                 }
@@ -1112,11 +1119,10 @@ impl SettingsWindow {
     }
 
     // Capture dialogs
-    fn apply_capture_state(&self, presenter: &SettingsPresenter, state: LayoutSwitchCaptureState) {
+    fn apply_capture_state(&self, state: LayoutSwitchCaptureState) {
         match state.phase {
             LayoutSwitchCapturePhase::Idle => {
                 self.disarm_capture_timeout();
-                presenter.sync_layout_switch_capture_active(false);
                 self.reset_capture_dialog();
             }
             LayoutSwitchCapturePhase::Waiting => {
@@ -1135,18 +1141,16 @@ impl SettingsWindow {
                     let mut dialog = self.capture_dialog_state.borrow_mut();
                     apply_unsupported_capture_state(&mut dialog, state)
                 };
-                presenter.sync_layout_switch_capture_active(active);
+                debug_assert!(!active);
                 self.update_capture_dialog_widgets();
             }
             LayoutSwitchCapturePhase::Cancelled => {
                 self.disarm_capture_timeout();
-                presenter.sync_layout_switch_capture_active(false);
                 self.reset_capture_dialog();
                 self.close_layout_switch_dialog();
             }
             LayoutSwitchCapturePhase::Finished => {
                 self.disarm_capture_timeout();
-                presenter.sync_layout_switch_capture_active(false);
                 self.reset_capture_dialog();
             }
         }
@@ -1245,9 +1249,11 @@ impl SettingsWindow {
         let source_id = glib::timeout_add_local_once(CAPTURE_TIMEOUT, move || {
             ui.capture_timeout.borrow_mut().take();
 
-            if ui.capture_timeout_generation.get() != generation
-                || !ui.current_view_state().layout_switch.capture_active
-            {
+            if !capture_timeout_should_cancel(
+                generation,
+                ui.capture_timeout_generation.get(),
+                ui.current_view_state().layout_switch.capture_active,
+            ) {
                 return;
             }
 
@@ -1259,12 +1265,12 @@ impl SettingsWindow {
 
     fn schedule_focus_loss_check(self: Rc<Self>, presenter: SettingsPresenter) {
         glib::timeout_add_local_once(CAPTURE_FOCUS_SETTLE_DELAY, move || {
-            if !self.current_view_state().layout_switch.capture_active {
-                return;
-            }
-
             let dialog = self.layout_switch_dialog();
-            if !self.window.is_active() && !dialog.is_active() {
+            if capture_focus_loss_should_cancel(
+                self.current_view_state().layout_switch.capture_active,
+                self.window.is_active(),
+                dialog.is_active(),
+            ) {
                 self.cancel_capture_safely(&presenter, None);
             }
         });
@@ -1802,6 +1808,22 @@ fn apply_capture_renew_failure_state(dialog: &mut CaptureDialogState) -> bool {
     false
 }
 
+fn capture_timeout_should_cancel(
+    expected_generation: u64,
+    current_generation: u64,
+    capture_active: bool,
+) -> bool {
+    capture_active && expected_generation == current_generation
+}
+
+fn capture_focus_loss_should_cancel(
+    capture_active: bool,
+    window_active: bool,
+    dialog_active: bool,
+) -> bool {
+    capture_active && !window_active && !dialog_active
+}
+
 // View state helpers
 fn initial_view_state() -> ViewState {
     let default_settings = crate::model::Settings::default();
@@ -2093,6 +2115,21 @@ mod tests {
     #[test]
     fn capture_timeout_is_bounded_by_daemon_absolute_lease() {
         assert!(CAPTURE_TIMEOUT < crate::daemon::capture::CAPTURE_ABSOLUTE_LEASE);
+    }
+
+    #[test]
+    fn capture_timeout_only_cancels_the_current_active_session() {
+        assert!(capture_timeout_should_cancel(7, 7, true));
+        assert!(!capture_timeout_should_cancel(7, 8, true));
+        assert!(!capture_timeout_should_cancel(7, 7, false));
+    }
+
+    #[test]
+    fn capture_focus_loss_cancels_only_when_both_windows_are_inactive() {
+        assert!(capture_focus_loss_should_cancel(true, false, false));
+        assert!(!capture_focus_loss_should_cancel(true, true, false));
+        assert!(!capture_focus_loss_should_cancel(true, false, true));
+        assert!(!capture_focus_loss_should_cancel(false, false, false));
     }
 
     #[test]

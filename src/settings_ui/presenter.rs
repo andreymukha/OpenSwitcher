@@ -18,8 +18,14 @@ pub enum PresenterEvent {
     LoadFailed(SettingsClientError),
     SaveFailed(SettingsClientError),
     SaveSucceeded(UpdateSettingsResult),
-    CaptureStateChanged(LayoutSwitchCaptureState),
-    CaptureRenewFailed(SettingsClientError),
+    CaptureStateChanged {
+        generation: u64,
+        state: LayoutSwitchCaptureState,
+    },
+    CaptureRenewFailed {
+        generation: u64,
+        error: SettingsClientError,
+    },
     AutostartFailed(SettingsClientError),
 }
 
@@ -36,6 +42,9 @@ pub trait SettingsClientBackend: Clone + Send + Sync + 'static {
     ) -> Result<UpdateSettingsResult, SettingsClientError>;
     fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn renew_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
+    fn get_layout_switch_capture_state(
+        &self,
+    ) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn cancel_layout_switch_capture(&self)
         -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn finish_layout_switch_capture(&self)
@@ -62,6 +71,12 @@ impl SettingsClientBackend for SettingsDbusClient {
 
     fn renew_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
         SettingsDbusClient::renew_layout_switch_capture(self)
+    }
+
+    fn get_layout_switch_capture_state(
+        &self,
+    ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+        SettingsDbusClient::get_layout_switch_capture_state(self)
     }
 
     fn cancel_layout_switch_capture(
@@ -103,7 +118,6 @@ where
     services: UserServiceController<R>,
     state: Mutex<DomainState>,
     event_tx: Sender<PresenterEvent>,
-    capture_command: Arc<Mutex<()>>,
     capture_generation: Arc<AtomicU64>,
     capture_heartbeat: Mutex<Option<CaptureHeartbeat>>,
     capture_heartbeat_interval: Duration,
@@ -144,7 +158,6 @@ where
                 services,
                 state: Mutex::new(DomainState::new()),
                 event_tx,
-                capture_command: Arc::new(Mutex::new(())),
                 capture_generation: Arc::new(AtomicU64::new(0)),
                 capture_heartbeat: Mutex::new(None),
                 capture_heartbeat_interval,
@@ -268,15 +281,25 @@ where
             let _ = self.emit_view_state();
         }
 
-        let result = self.with_capture_command(|client| client.start_layout_switch_capture());
+        let result = self.inner.client.start_layout_switch_capture();
         match result {
             Ok(state) => {
-                if state.is_active()
-                    && self.with_state(|current| current.view_state().layout_switch.capture_active)
-                {
-                    self.start_capture_heartbeat();
-                }
-                let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+                let generation = if state.is_active() {
+                    let changed =
+                        self.with_state(|current| current.set_layout_switch_capture_active(true));
+                    if changed {
+                        let _ = self.emit_view_state();
+                    }
+                    self.start_capture_heartbeat()
+                } else {
+                    let changed =
+                        self.with_state(|current| current.set_layout_switch_capture_active(false));
+                    if changed {
+                        let _ = self.emit_view_state();
+                    }
+                    self.current_capture_generation()
+                };
+                let _ = self.send_capture_state_event(generation, state);
                 Ok(())
             }
             Err(error) => {
@@ -294,10 +317,9 @@ where
             let _ = self.emit_view_state();
         }
 
-        let result = self.with_capture_command(|client| client.cancel_layout_switch_capture());
-        match result {
+        match self.inner.client.cancel_layout_switch_capture() {
             Ok(state) => {
-                let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+                let _ = self.send_capture_state_event(self.current_capture_generation(), state);
                 Ok(())
             }
             Err(error) => Err(error),
@@ -309,12 +331,12 @@ where
         combo: LayoutSwitchCombo,
     ) -> Result<(), SettingsClientError> {
         self.stop_capture_heartbeat();
-        let state = self.with_capture_command(|client| client.finish_layout_switch_capture())?;
+        let state = self.inner.client.finish_layout_switch_capture()?;
         let changed = self.with_state(|current| current.apply_captured_layout_switch(combo));
         if changed {
             let _ = self.emit_view_state();
         }
-        let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+        let _ = self.send_capture_state_event(self.current_capture_generation(), state);
         Ok(())
     }
 
@@ -326,14 +348,35 @@ where
         }
     }
 
-    pub fn sync_layout_switch_capture_active(&self, active: bool) {
-        if !active {
-            self.stop_capture_heartbeat();
+    pub(crate) fn apply_capture_state_event(
+        &self,
+        generation: u64,
+        state: &LayoutSwitchCaptureState,
+    ) -> bool {
+        if self.current_capture_generation() != generation {
+            return false;
         }
-        let changed = self.with_state(|state| state.set_layout_switch_capture_active(active));
+        if !state.is_active() {
+            self.stop_capture_heartbeat();
+            let changed =
+                self.with_state(|current| current.set_layout_switch_capture_active(false));
+            if changed {
+                let _ = self.emit_view_state();
+            }
+        }
+        true
+    }
+
+    pub(crate) fn apply_capture_renew_failure(&self, generation: u64) -> bool {
+        if self.current_capture_generation() != generation {
+            return false;
+        }
+        self.stop_capture_heartbeat();
+        let changed = self.with_state(|current| current.set_layout_switch_capture_active(false));
         if changed {
             let _ = self.emit_view_state();
         }
+        true
     }
 
     pub fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
@@ -422,28 +465,31 @@ where
         f(&mut state)
     }
 
-    fn with_capture_command<T>(&self, f: impl FnOnce(&C) -> T) -> T {
-        let _guard = self
-            .inner
-            .capture_command
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        f(&self.inner.client)
-    }
-
     fn observe_layout_switch_capture_state(&self, state: LayoutSwitchCaptureState) {
-        if !state.is_active() {
-            self.stop_capture_heartbeat();
-            let changed =
-                self.with_state(|current| current.set_layout_switch_capture_active(false));
-            if changed {
-                let _ = self.emit_view_state();
+        let generation = self.current_capture_generation();
+        let local_capture_active =
+            self.with_state(|current| current.view_state().layout_switch.capture_active);
+        let state = if local_capture_active {
+            match self.inner.client.get_layout_switch_capture_state() {
+                Ok(current) => current,
+                Err(error) => {
+                    eprintln!(
+                        "[settings] Failed to reconcile capture state signal; keeping the current lease: {error}"
+                    );
+                    return;
+                }
             }
+        } else {
+            state
+        };
+
+        if self.current_capture_generation() != generation {
+            return;
         }
-        let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
+        let _ = self.send_capture_state_event(generation, state);
     }
 
-    fn start_capture_heartbeat(&self) {
+    fn start_capture_heartbeat(&self) -> u64 {
         self.stop_capture_heartbeat();
 
         let generation = self
@@ -453,9 +499,8 @@ where
             .wrapping_add(1);
         let interval = self.inner.capture_heartbeat_interval;
         let client = self.inner.client.clone();
-        let command = Arc::clone(&self.inner.capture_command);
         let capture_generation = Arc::clone(&self.inner.capture_generation);
-        let presenter = Arc::downgrade(&self.inner);
+        let event_tx = self.inner.event_tx.clone();
         let (stop_tx, stop_rx) = mpsc::channel();
 
         thread::spawn(move || loop {
@@ -468,26 +513,24 @@ where
                 break;
             }
 
-            let result = {
-                let _guard = command
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if capture_generation.load(Ordering::SeqCst) != generation {
-                    break;
-                }
-                client.renew_layout_switch_capture()
-            };
+            let result = client.renew_layout_switch_capture();
 
             if capture_generation.load(Ordering::SeqCst) != generation {
                 break;
             }
 
-            let Some(inner) = presenter.upgrade() else {
-                break;
-            };
-            let presenter = SettingsPresenter { inner };
-            if !presenter.handle_capture_renew_result(generation, result) {
-                break;
+            match result {
+                Ok(state) if state.is_active() => {}
+                Ok(state) => {
+                    let _ = event_tx
+                        .send_blocking(PresenterEvent::CaptureStateChanged { generation, state });
+                    break;
+                }
+                Err(error) => {
+                    let _ = event_tx
+                        .send_blocking(PresenterEvent::CaptureRenewFailed { generation, error });
+                    break;
+                }
             }
         });
 
@@ -496,68 +539,15 @@ where
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .replace(CaptureHeartbeat { stop_tx });
+        generation
     }
 
-    fn handle_capture_renew_result(
-        &self,
-        generation: u64,
-        result: Result<LayoutSwitchCaptureState, SettingsClientError>,
-    ) -> bool {
-        if self.inner.capture_generation.load(Ordering::SeqCst) != generation {
-            return false;
-        }
-
-        match result {
-            Ok(state) if state.is_active() => true,
-            Ok(state) => {
-                if self
-                    .inner
-                    .capture_generation
-                    .compare_exchange(
-                        generation,
-                        generation.wrapping_add(1),
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                    .is_err()
-                {
-                    return false;
-                }
-                let changed =
-                    self.with_state(|current| current.set_layout_switch_capture_active(false));
-                if changed {
-                    let _ = self.emit_view_state();
-                }
-                let _ = self.send_event(PresenterEvent::CaptureStateChanged(state));
-                false
-            }
-            Err(error) => {
-                if self
-                    .inner
-                    .capture_generation
-                    .compare_exchange(
-                        generation,
-                        generation.wrapping_add(1),
-                        Ordering::SeqCst,
-                        Ordering::SeqCst,
-                    )
-                    .is_err()
-                {
-                    return false;
-                }
-                let changed =
-                    self.with_state(|current| current.set_layout_switch_capture_active(false));
-                if changed {
-                    let _ = self.emit_view_state();
-                }
-                let _ = self.send_event(PresenterEvent::CaptureRenewFailed(error));
-                false
-            }
-        }
-    }
-
-    fn stop_capture_heartbeat(&self) {
-        self.inner.capture_generation.fetch_add(1, Ordering::SeqCst);
+    fn stop_capture_heartbeat(&self) -> u64 {
+        let generation = self
+            .inner
+            .capture_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
         let heartbeat = self
             .inner
             .capture_heartbeat
@@ -567,6 +557,19 @@ where
         if let Some(heartbeat) = heartbeat {
             let _ = heartbeat.stop_tx.send(());
         }
+        generation
+    }
+
+    fn current_capture_generation(&self) -> u64 {
+        self.inner.capture_generation.load(Ordering::SeqCst)
+    }
+
+    fn send_capture_state_event(
+        &self,
+        generation: u64,
+        state: LayoutSwitchCaptureState,
+    ) -> Result<(), UiError> {
+        self.send_event(PresenterEvent::CaptureStateChanged { generation, state })
     }
 }
 
@@ -612,6 +615,8 @@ mod tests {
         hotkey_capture_inhibitions: Vec<bool>,
         renew_results: VecDeque<FakeRenewResult>,
         renew_delay: Duration,
+        get_state_results: VecDeque<FakeRenewResult>,
+        get_state_delay: Duration,
     }
 
     #[derive(Clone, Copy)]
@@ -650,6 +655,18 @@ mod tests {
         fn set_renew_delay(&self, delay: Duration) {
             self.state.lock().unwrap().renew_delay = delay;
         }
+
+        fn push_get_state_result(&self, result: FakeRenewResult) {
+            self.state
+                .lock()
+                .unwrap()
+                .get_state_results
+                .push_back(result);
+        }
+
+        fn set_get_state_delay(&self, delay: Duration) {
+            self.state.lock().unwrap().get_state_delay = delay;
+        }
     }
 
     impl SettingsClientBackend for FakeSettingsClient {
@@ -686,27 +703,21 @@ mod tests {
                 )
             };
             thread::sleep(delay);
-            match result {
-                FakeRenewResult::State(LayoutSwitchCapturePhase::Idle) => {
-                    Ok(LayoutSwitchCaptureState::idle())
-                }
-                FakeRenewResult::State(LayoutSwitchCapturePhase::Waiting) => {
-                    Ok(LayoutSwitchCaptureState::waiting())
-                }
-                FakeRenewResult::State(LayoutSwitchCapturePhase::Candidate) => Ok(
-                    LayoutSwitchCaptureState::candidate(LayoutSwitchCombo::ctrl_shift()),
-                ),
-                FakeRenewResult::State(LayoutSwitchCapturePhase::Unsupported) => {
-                    Ok(LayoutSwitchCaptureState::unsupported("unsupported"))
-                }
-                FakeRenewResult::State(LayoutSwitchCapturePhase::Cancelled) => {
-                    Ok(LayoutSwitchCaptureState::cancelled())
-                }
-                FakeRenewResult::State(LayoutSwitchCapturePhase::Finished) => {
-                    Ok(LayoutSwitchCaptureState::finished())
-                }
-                FakeRenewResult::Error => Err(capture_test_error()),
-            }
+            fake_capture_result(result)
+        }
+
+        fn get_layout_switch_capture_state(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            let (delay, result) = {
+                let mut state = self.state.lock().unwrap();
+                (
+                    state.get_state_delay,
+                    state.get_state_results.pop_front().unwrap_or_default(),
+                )
+            };
+            thread::sleep(delay);
+            fake_capture_result(result)
         }
 
         fn cancel_layout_switch_capture(
@@ -791,6 +802,12 @@ mod tests {
             result
         }
 
+        fn get_layout_switch_capture_state(
+            &self,
+        ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+            self.base.get_layout_switch_capture_state()
+        }
+
         fn cancel_layout_switch_capture(
             &self,
         ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
@@ -818,6 +835,32 @@ mod tests {
             max: 2,
             found: 3,
         })
+    }
+
+    fn fake_capture_result(
+        result: FakeRenewResult,
+    ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+        match result {
+            FakeRenewResult::State(LayoutSwitchCapturePhase::Idle) => {
+                Ok(LayoutSwitchCaptureState::idle())
+            }
+            FakeRenewResult::State(LayoutSwitchCapturePhase::Waiting) => {
+                Ok(LayoutSwitchCaptureState::waiting())
+            }
+            FakeRenewResult::State(LayoutSwitchCapturePhase::Candidate) => Ok(
+                LayoutSwitchCaptureState::candidate(LayoutSwitchCombo::ctrl_shift()),
+            ),
+            FakeRenewResult::State(LayoutSwitchCapturePhase::Unsupported) => {
+                Ok(LayoutSwitchCaptureState::unsupported("unsupported"))
+            }
+            FakeRenewResult::State(LayoutSwitchCapturePhase::Cancelled) => {
+                Ok(LayoutSwitchCaptureState::cancelled())
+            }
+            FakeRenewResult::State(LayoutSwitchCapturePhase::Finished) => {
+                Ok(LayoutSwitchCaptureState::finished())
+            }
+            FakeRenewResult::Error => Err(capture_test_error()),
+        }
     }
 
     fn capture_presenter(
@@ -869,10 +912,15 @@ mod tests {
             LayoutSwitchCapturePhase::Idle,
         ] {
             let client = CountingCaptureClient::default();
-            let (presenter, _event_rx) =
+            let (presenter, event_rx) =
                 capture_presenter(client.clone(), Duration::from_millis(10));
             presenter.start_layout_switch_capture().unwrap();
+            drain_events(&event_rx);
             client.wait_for_renew_calls(1);
+
+            client
+                .base
+                .push_get_state_result(FakeRenewResult::State(stop));
 
             presenter.observe_layout_switch_capture_state(match stop {
                 LayoutSwitchCapturePhase::Cancelled => LayoutSwitchCaptureState::cancelled(),
@@ -883,6 +931,14 @@ mod tests {
                 LayoutSwitchCapturePhase::Idle => LayoutSwitchCaptureState::idle(),
                 _ => unreachable!(),
             });
+
+            let event = event_rx.recv_blocking().unwrap();
+            match event {
+                PresenterEvent::CaptureStateChanged { generation, state } => {
+                    assert!(presenter.apply_capture_state_event(generation, &state));
+                }
+                other => panic!("unexpected capture event: {other:?}"),
+            }
 
             let stopped_at = client.renew_calls();
             thread::sleep(Duration::from_millis(35));
@@ -919,14 +975,15 @@ mod tests {
         let (presenter, event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
 
         presenter.start_layout_switch_capture().unwrap();
+        drain_events(&event_rx);
         client.wait_for_renew_calls(1);
 
         let deadline = Instant::now() + Duration::from_secs(1);
         let mut saw_error = false;
         while Instant::now() < deadline {
             if let Ok(event) = event_rx.try_recv() {
-                if matches!(event, PresenterEvent::CaptureRenewFailed(_)) {
-                    saw_error = true;
+                if let PresenterEvent::CaptureRenewFailed { generation, .. } = event {
+                    saw_error = presenter.apply_capture_renew_failure(generation);
                     break;
                 }
             } else {
@@ -964,7 +1021,132 @@ mod tests {
         );
         assert!(!drain_events(&event_rx)
             .iter()
-            .any(|event| matches!(event, PresenterEvent::CaptureRenewFailed(_))));
+            .any(|event| matches!(event, PresenterEvent::CaptureRenewFailed { .. })));
+        presenter.cancel_layout_switch_capture().unwrap();
+    }
+
+    #[test]
+    fn delayed_listener_reconciliation_cannot_stop_a_new_capture_generation() {
+        let client = CountingCaptureClient::default();
+        let (presenter, event_rx) = capture_presenter(client.clone(), Duration::from_millis(20));
+        presenter.start_layout_switch_capture().unwrap();
+        drain_events(&event_rx);
+
+        client.base.set_get_state_delay(Duration::from_millis(50));
+        client
+            .base
+            .push_get_state_result(FakeRenewResult::State(LayoutSwitchCapturePhase::Cancelled));
+        let observer = presenter.clone();
+        let observation = thread::spawn(move || {
+            observer.observe_layout_switch_capture_state(LayoutSwitchCaptureState::cancelled());
+        });
+
+        thread::sleep(Duration::from_millis(5));
+        presenter.cancel_layout_switch_capture().unwrap();
+        presenter.start_layout_switch_capture().unwrap();
+        observation.join().unwrap();
+
+        assert!(
+            presenter
+                .with_state(|state| state.view_state())
+                .layout_switch
+                .capture_active
+        );
+        for event in drain_events(&event_rx) {
+            if let PresenterEvent::CaptureStateChanged { generation, state } = event {
+                if state.phase == LayoutSwitchCapturePhase::Cancelled {
+                    assert!(!presenter.apply_capture_state_event(generation, &state));
+                }
+            }
+        }
+        assert!(
+            presenter
+                .with_state(|state| state.view_state())
+                .layout_switch
+                .capture_active
+        );
+        presenter.cancel_layout_switch_capture().unwrap();
+    }
+
+    #[test]
+    fn queued_terminal_capture_event_is_rejected_after_a_new_start() {
+        let client = CountingCaptureClient::default();
+        let (presenter, event_rx) = capture_presenter(client.clone(), Duration::from_millis(20));
+        presenter.start_layout_switch_capture().unwrap();
+        drain_events(&event_rx);
+        client
+            .base
+            .push_get_state_result(FakeRenewResult::State(LayoutSwitchCapturePhase::Cancelled));
+
+        presenter.observe_layout_switch_capture_state(LayoutSwitchCaptureState::cancelled());
+        let old_event = event_rx.recv_blocking().unwrap();
+        let PresenterEvent::CaptureStateChanged { generation, state } = old_event else {
+            panic!("expected a capture state event");
+        };
+
+        presenter.cancel_layout_switch_capture().unwrap();
+        presenter.start_layout_switch_capture().unwrap();
+
+        assert!(!presenter.apply_capture_state_event(generation, &state));
+        assert!(
+            presenter
+                .with_state(|current| current.view_state())
+                .layout_switch
+                .capture_active
+        );
+        presenter.cancel_layout_switch_capture().unwrap();
+    }
+
+    #[test]
+    fn cancel_does_not_wait_for_an_in_flight_heartbeat_call() {
+        let client = CountingCaptureClient::default();
+        client.base.set_renew_delay(Duration::from_millis(200));
+        let (presenter, _event_rx) = capture_presenter(client.clone(), Duration::from_millis(5));
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(1);
+
+        let started = Instant::now();
+        presenter.cancel_layout_switch_capture().unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "cancel waited behind an in-flight renew"
+        );
+    }
+
+    #[test]
+    fn capture_window_discard_stops_heartbeat() {
+        let client = CountingCaptureClient::default();
+        let (presenter, _event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+        presenter.start_layout_switch_capture().unwrap();
+        client.wait_for_renew_calls(1);
+
+        presenter.discard_changes();
+        let stopped_at = client.renew_calls();
+        thread::sleep(Duration::from_millis(35));
+
+        assert_eq!(client.renew_calls(), stopped_at);
+    }
+
+    #[test]
+    fn failed_listener_reconciliation_keeps_the_current_heartbeat() {
+        let client = CountingCaptureClient::default();
+        let (presenter, event_rx) = capture_presenter(client.clone(), Duration::from_millis(10));
+        presenter.start_layout_switch_capture().unwrap();
+        drain_events(&event_rx);
+        client.base.push_get_state_result(FakeRenewResult::Error);
+
+        presenter.observe_layout_switch_capture_state(LayoutSwitchCaptureState::cancelled());
+        let renews_before = client.renew_calls();
+        client.wait_for_renew_calls(renews_before + 1);
+
+        assert!(
+            presenter
+                .with_state(|state| state.view_state())
+                .layout_switch
+                .capture_active
+        );
+        assert!(event_rx.try_recv().is_err());
         presenter.cancel_layout_switch_capture().unwrap();
     }
 

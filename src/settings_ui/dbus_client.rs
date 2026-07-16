@@ -72,6 +72,14 @@ impl SettingsDbusClient {
             .map_err(SettingsClientError::Daemon)
     }
 
+    pub fn get_layout_switch_capture_state(
+        &self,
+    ) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
+        self.proxy()?
+            .get_layout_switch_capture_state()
+            .map_err(SettingsClientError::Daemon)
+    }
+
     pub fn set_hotkey_capture_inhibited(&self, inhibited: bool) -> Result<(), SettingsClientError> {
         self.proxy()?
             .set_hotkey_capture_inhibited(inhibited)
@@ -93,7 +101,9 @@ impl SettingsDbusClient {
                 Ok(proxy) => {
                     match proxy.get_layout_switch_capture_state() {
                         Ok(state) => {
-                            let _ = tx.send_blocking(state);
+                            if tx.send_blocking(state).is_err() {
+                                return;
+                            }
                         }
                         Err(error) => {
                             eprintln!(
@@ -107,7 +117,9 @@ impl SettingsDbusClient {
                             for signal in &mut stream {
                                 match signal.args() {
                                     Ok(args) => {
-                                        let _ = tx.send_blocking(args.state);
+                                        if tx.send_blocking(args.state).is_err() {
+                                            return;
+                                        }
                                     }
                                     Err(error) => {
                                         eprintln!(
@@ -140,7 +152,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_client_retains_connection_state() {
-        assert_ne!(std::mem::size_of::<SettingsDbusClient>(), 0);
+    fn cloned_client_retains_one_dbus_unique_owner() {
+        let Ok(client) = SettingsDbusClient::connect() else {
+            eprintln!("session D-Bus unavailable; retained-owner integration check skipped");
+            return;
+        };
+        let clone = client.clone();
+        let distinct = SettingsDbusClient::connect()
+            .expect("a second session D-Bus connection should be available");
+
+        assert_eq!(
+            client.connection.unique_name(),
+            clone.connection.unique_name()
+        );
+        assert_ne!(
+            client.connection.unique_name(),
+            distinct.connection.unique_name()
+        );
     }
 }

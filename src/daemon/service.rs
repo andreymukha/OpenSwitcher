@@ -3,13 +3,16 @@ use crate::daemon::input_backend::{
     ActiveInputBackend, InputBackendHandle, InputBackendLifecycle, KeyboardInputBackendOpener,
     OpenedInputBackend,
 };
+use crate::daemon::input_snapshot::{
+    InputLayoutStatus, InputRuntimeSnapshot, SnapshotAuthorization, SnapshotTryLoad,
+};
 use crate::daemon::keyboard::{
     hotkey_trigger_to_evdev_key, is_character, is_modifier, is_wayland_focus_switch_shortcut,
-    log_input_debug, CorrectionExecutionOutcome, CorrectionLayoutSwitchOutcome, KeyboardController,
+    log_input_debug, CorrectionLayoutSwitchOutcome, KeyboardController,
     ManualCurrentWordCompletion, ManualCurrentWordOutcome, ManualCurrentWordStartOutcome,
     ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
 };
-use crate::daemon::runtime::{log_layout_debug, BackendSyncResult, RuntimeState};
+use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
 use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
@@ -29,7 +32,6 @@ use zbus::blocking::Connection;
 
 const EVENT_LOOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_LOOP_HEARTBEAT_EVENTS: u64 = 500;
-const STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS: u8 = 3;
 const WRITER_HEALTH_POLL_QUANTUM: Duration = Duration::from_millis(5);
 const MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT: Duration = WRITER_HEALTH_POLL_QUANTUM;
 const MAX_DEFERRED_MANUAL_INPUT_EVENTS: usize = 256;
@@ -68,6 +70,7 @@ impl CorrectionPath {
 struct PendingWordCommit {
     separator_key: evdev::Key,
     action: PendingWordCommitAction,
+    authorization: SnapshotAuthorization,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -338,80 +341,69 @@ fn failed_manual_current_word_completion_error(request_id: u64, reason: String) 
     SwitcherError::VirtualKeyboardWriterTransactionFailed { request_id, reason }
 }
 
-// Startup layout resync state
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StartupLayoutResyncState {
-    Pending { attempts_remaining: u8 },
-    Completed,
-    Exhausted,
-}
-
-impl StartupLayoutResyncState {
-    fn pending() -> Self {
-        Self::Pending {
-            attempts_remaining: STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS,
-        }
-    }
-
-    fn is_pending(self) -> bool {
-        matches!(self, Self::Pending { .. })
-    }
-
-    fn complete(&mut self) {
-        *self = Self::Completed;
-    }
-
-    fn record_failure(&mut self) -> u8 {
-        match self {
-            Self::Pending { attempts_remaining } if *attempts_remaining > 1 => {
-                *attempts_remaining -= 1;
-                *attempts_remaining
-            }
-            Self::Pending { .. } => {
-                *self = Self::Exhausted;
-                0
-            }
-            Self::Completed | Self::Exhausted => 0,
-        }
-    }
-}
-
 // Layout/action decision helpers
 
-fn automatic_layout_actions_allowed(sync_result: &BackendSyncResult) -> bool {
-    !matches!(sync_result, BackendSyncResult::Skipped)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayoutCorrectionAvailability {
+    Available(AppLayoutKind),
+    Unavailable(InputLayoutStatus),
 }
 
-fn startup_autocorrection_allowed_after_resync(
-    sync_result: &BackendSyncResult,
-    cached_layout_kind: AppLayoutKind,
-) -> bool {
-    match sync_result {
-        BackendSyncResult::Updated { .. } | BackendSyncResult::Unchanged => true,
-        BackendSyncResult::Skipped => {
-            auto_layout_correction_supported_for_layout(cached_layout_kind)
-        }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WordBoundaryAction {
+    Evaluate {
+        layout_kind: AppLayoutKind,
+        authorization: SnapshotAuthorization,
+    },
+    ForwardUncorrected(evdev::Key),
+}
+
+fn layout_correction_decision(
+    snapshot: &InputRuntimeSnapshot,
+    now: Instant,
+    epoch: u64,
+) -> LayoutCorrectionAvailability {
+    match snapshot.layout_kind_for_decision_at(now, epoch) {
+        Some(kind) => LayoutCorrectionAvailability::Available(kind),
+        None => LayoutCorrectionAvailability::Unavailable(snapshot.layout_status_at(now, epoch)),
     }
 }
 
-fn next_layout_for_user_shortcut(
-    sync_result: &BackendSyncResult,
-    current_layout_kind: AppLayoutKind,
-    legacy_layout_is_english: bool,
-) -> Option<bool> {
-    match sync_result {
-        BackendSyncResult::Updated { .. } | BackendSyncResult::Unchanged => {
-            match current_layout_kind {
-                AppLayoutKind::English => Some(false),
-                AppLayoutKind::Russian => Some(true),
-                AppLayoutKind::Other | AppLayoutKind::Unknown => None,
-            }
-        }
-        BackendSyncResult::Skipped => match current_layout_kind {
-            AppLayoutKind::English | AppLayoutKind::Russian => Some(!legacy_layout_is_english),
-            AppLayoutKind::Other | AppLayoutKind::Unknown => None,
+fn same_layout_fixes_allowed(snapshot: &InputRuntimeSnapshot, now: Instant, epoch: u64) -> bool {
+    (snapshot.config.fix_two_capitals || snapshot.config.fix_accidental_caps_lock)
+        && matches!(
+            layout_correction_decision(snapshot, now, epoch),
+            LayoutCorrectionAvailability::Available(
+                AppLayoutKind::English | AppLayoutKind::Russian
+            )
+        )
+}
+
+fn manual_correction_allowed(snapshot: &InputRuntimeSnapshot, now: Instant, epoch: u64) -> bool {
+    snapshot.features.manual_word_fix
+        && matches!(
+            layout_correction_decision(snapshot, now, epoch),
+            LayoutCorrectionAvailability::Available(
+                AppLayoutKind::English | AppLayoutKind::Russian
+            )
+        )
+}
+
+fn word_boundary_action(
+    snapshot: &InputRuntimeSnapshot,
+    now: Instant,
+    epoch: u64,
+    key: evdev::Key,
+) -> WordBoundaryAction {
+    match (
+        snapshot.layout_kind_for_decision_at(now, epoch),
+        snapshot.authorization_at(now, epoch),
+    ) {
+        (Some(layout_kind), Some(authorization)) => WordBoundaryAction::Evaluate {
+            layout_kind,
+            authorization,
         },
+        _ => WordBoundaryAction::ForwardUncorrected(key),
     }
 }
 
@@ -421,20 +413,6 @@ fn should_publish_pending_status_change(has_pending_status_change: bool) -> bool
 
 fn auto_layout_correction_supported_for_layout(layout_kind: AppLayoutKind) -> bool {
     matches!(layout_kind, AppLayoutKind::English | AppLayoutKind::Russian)
-}
-
-fn correction_outcome_allows_optimistic_layout_update(outcome: CorrectionExecutionOutcome) -> bool {
-    outcome.layout_switch == CorrectionLayoutSwitchOutcome::AppliedUinput
-}
-
-// Logging format helpers
-
-fn format_legacy_layout(is_english: bool) -> &'static str {
-    if is_english {
-        "EN"
-    } else {
-        "RU"
-    }
 }
 
 // Pending word commit helpers
@@ -449,6 +427,23 @@ fn pending_word_commit_action_label(pending: Option<&PendingWordCommit>) -> &'st
 
 fn pending_word_commit_separator_key(pending: Option<&PendingWordCommit>) -> Option<evdev::Key> {
     pending.map(|pending| pending.separator_key)
+}
+
+fn cancel_pending_commit_with<E>(
+    separator_key: evdev::Key,
+    replay: impl FnOnce(evdev::Key) -> Result<(), E>,
+) -> Result<(), E> {
+    replay(separator_key)
+}
+
+fn pending_commit_authorized_after_adoption(
+    snapshot_adopted: bool,
+    snapshot: &InputRuntimeSnapshot,
+    authorization: SnapshotAuthorization,
+    now: Instant,
+    epoch: u64,
+) -> bool {
+    snapshot_adopted && snapshot.authorizes_at(authorization, now, epoch)
 }
 
 // Separator suppression helpers
@@ -837,6 +832,7 @@ fn apply_corrected_word_commit_state(
 
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
+    input_snapshot: InputRuntimeSnapshot,
     signal_publisher: DbusSignalPublisher,
     input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
     keyboard: Option<KeyboardController>,
@@ -855,16 +851,17 @@ pub struct DaemonService {
     layout_shortcut_latched: bool,
     pending_word_commit: Option<PendingWordCommit>,
     pending_selected_text_switch: bool,
-    startup_layout_resync: StartupLayoutResyncState,
     dbus_signal_drop_counters: DbusSignalDropCounters,
 }
 
 impl DaemonService {
     pub fn new(runtime: Arc<RuntimeState>, connection: Connection) -> Result<Self, SwitcherError> {
+        let input_snapshot = runtime.input_snapshot_before_grab();
         let shared_modifiers = SharedModifierState::default();
         let signal_publisher = DbusSignalPublisher::spawn(connection);
         let mut service = Self {
             runtime,
+            input_snapshot,
             signal_publisher,
             input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
             keyboard: None,
@@ -883,7 +880,6 @@ impl DaemonService {
             layout_shortcut_latched: false,
             pending_word_commit: None,
             pending_selected_text_switch: false,
-            startup_layout_resync: StartupLayoutResyncState::pending(),
             dbus_signal_drop_counters: DbusSignalDropCounters::default(),
         };
         log_input_debug("event-loop-start", "daemon input loop starting");
@@ -1045,6 +1041,20 @@ impl DaemonService {
         active_keyboard_fetch_timeout(timeout, self.keyboard.is_some())
     }
 
+    fn adopt_input_snapshot_nonblocking(&mut self) -> bool {
+        match self.runtime.try_input_snapshot() {
+            SnapshotTryLoad::Loaded(snapshot) => {
+                self.input_snapshot = snapshot;
+                true
+            }
+            SnapshotTryLoad::Contended => false,
+            SnapshotTryLoad::Poisoned => {
+                log_layout_debug("input-snapshot-read", "result=poisoned action=keep-local");
+                false
+            }
+        }
+    }
+
     fn ensure_writer_healthy(&mut self) -> Result<(), SwitcherError> {
         let error = self
             .keyboard
@@ -1192,6 +1202,8 @@ impl DaemonService {
                     finalize_manual_correction(&mut self.buffer, &mut self.word_context, &applied);
                 self.current_word_correction_state = CurrentWordCorrectionState::ManuallyCorrected;
                 self.manual_hotkey_latch = None;
+                self.runtime
+                    .invalidate_layout_and_request_refresh("manual-current-word-succeeded");
                 self.manual_current_word_flow =
                     ManualCurrentWordFlow::DrainingDeferredInput { session };
                 Ok(())
@@ -1207,6 +1219,9 @@ impl DaemonService {
                         session.seen_real_next_step,
                         session.retry_after_drain_requested,
                     ),
+                );
+                self.runtime.invalidate_layout_and_request_refresh(
+                    "manual-current-word-failed-after-mutation",
                 );
                 self.abort_manual_current_word_flow("manual-current-word-failed-after-mutation");
                 Err(failed_manual_current_word_completion_error(
@@ -1263,7 +1278,8 @@ impl DaemonService {
                 ) {
                     let undo_key = session.undo_key;
                     self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
-                    let config = self.runtime.config_snapshot()?;
+                    self.adopt_input_snapshot_nonblocking();
+                    let config = self.input_snapshot.config.clone();
                     if self.begin_deferred_manual_current_word_correction(
                         undo_key,
                         &config,
@@ -1349,6 +1365,8 @@ impl DaemonService {
         event_timestamp: SystemTime,
         origin: InputOrigin,
     ) -> Result<(), SwitcherError> {
+        self.adopt_input_snapshot_nonblocking();
+
         if self.suppressed_hotkey_key == Some(key) {
             if value == 0 {
                 self.suppressed_hotkey_key = None;
@@ -1434,7 +1452,8 @@ impl DaemonService {
                 )
                 .expect("suppressed separator release already matched");
                 if let Some(pending) = release_state.pending_to_finish {
-                    self.finish_pending_word_commit(pending, &self.runtime.config_snapshot()?)?;
+                    let config = self.input_snapshot.config.clone();
+                    self.finish_pending_word_commit(pending, &config)?;
                 }
                 log_input_debug(
                     "suppressed-separator-clear",
@@ -1461,10 +1480,7 @@ impl DaemonService {
         match manual_current_word_physical_event_action(
             self.has_active_manual_current_word_flow(),
             hotkey_trigger_to_evdev_key(
-                self.runtime
-                    .config_snapshot()?
-                    .manual_correction_hotkey
-                    .trigger,
+                self.input_snapshot.config.manual_correction_hotkey.trigger,
             ),
             self.manual_current_word_flow_seen_real_next_step(),
             key,
@@ -1490,12 +1506,12 @@ impl DaemonService {
             }
         }
 
-        let config = self.runtime.config_snapshot()?;
+        let config = self.input_snapshot.config.clone();
         self.modifiers.update(key, value);
         self.shared_modifiers.store(self.modifiers);
 
         if should_invalidate_for_wayland_focus_switch_shortcut(
-            self.runtime.as_ref(),
+            self.input_snapshot.session_type,
             self.modifiers,
             key,
             value,
@@ -1718,37 +1734,44 @@ impl DaemonService {
                     self.buffer.clear();
                     return self.keyboard_mut()?.forward_event(key, value);
                 }
-                let startup_sync_ready = self.refresh_startup_layout_before_autocorrect()?;
-                let features = self.runtime.feature_availability();
-                let cached_layout_state = self.runtime.current_layout_state();
-                let current_layout_kind = self.current_layout_kind();
-                let effective_layout_kind = self.runtime.auto_correction_layout_kind();
-                if effective_layout_kind != current_layout_kind {
-                    let cached_layout_trustworthy = matches!(
-                        cached_layout_state,
-                        CurrentLayoutState::Known {
-                            trustworthy: true,
-                            ..
+                let now = Instant::now();
+                let epoch = self.runtime.input_layout_epoch();
+                let (effective_layout_kind, authorization) =
+                    match word_boundary_action(&self.input_snapshot, now, epoch, key) {
+                        WordBoundaryAction::Evaluate {
+                            layout_kind,
+                            authorization,
+                        } => (layout_kind, authorization),
+                        WordBoundaryAction::ForwardUncorrected(_) => {
+                            let status = self.input_snapshot.layout_status_at(now, epoch);
+                            let request = self.runtime.request_layout_refresh();
+                            log_layout_debug(
+                                "space-correction-skip",
+                                &format!("status={status:?} request={request:?}"),
+                            );
+                            self.word_context.valid = !self.buffer.is_empty();
+                            self.word_context.word_before_cursor = self.buffer.clone();
+                            self.word_context.followed_by_separator = true;
+                            self.buffer.clear();
+                            self.word_buffer_overflowed = false;
+                            return self.keyboard_mut()?.forward_event(key, value);
                         }
-                    );
-                    log_layout_debug(
-                        "space-layout-cache",
-                        &format!(
-                            "cached_layout_kind={current_layout_kind:?} effective_layout_kind={effective_layout_kind:?} trustworthy={cached_layout_trustworthy} source=runtime-cache",
-                        ),
-                    );
-                }
+                    };
+                let same_layout_plan =
+                    if same_layout_fixes_allowed(&self.input_snapshot, now, epoch) {
+                        same_layout_case_correction_plan(
+                            &self.buffer,
+                            effective_layout_kind,
+                            config.fix_two_capitals,
+                            config.fix_accidental_caps_lock,
+                        )
+                    } else {
+                        None
+                    };
                 let should_switch_word = should_switch(&self.buffer, effective_layout_kind);
-                let same_layout_plan = same_layout_case_correction_plan(
-                    &self.buffer,
-                    effective_layout_kind,
-                    config.fix_two_capitals,
-                    config.fix_accidental_caps_lock,
-                );
-                let corrected = self.runtime.is_enabled()
+                let corrected = self.input_snapshot.enabled
                     && config.auto_switch_enabled
-                    && features.auto_switch
-                    && startup_sync_ready
+                    && self.input_snapshot.features.auto_switch
                     && auto_layout_correction_supported_for_layout(effective_layout_kind)
                     && should_switch_word;
 
@@ -1762,11 +1785,10 @@ impl DaemonService {
                 log_layout_debug(
                     "space-correction-decision",
                     &format!(
-                        "enabled={} auto_switch_enabled={} feature_auto_switch={} startup_sync_ready={} current_layout_kind={current_layout_kind:?} effective_layout_kind={effective_layout_kind:?} should_switch={} same_layout_case_fix={} selected_path={} buffer_len={}",
-                        self.runtime.is_enabled(),
+                        "enabled={} auto_switch_enabled={} feature_auto_switch={} effective_layout_kind={effective_layout_kind:?} should_switch={} same_layout_case_fix={} selected_path={} buffer_len={}",
+                        self.input_snapshot.enabled,
                         config.auto_switch_enabled,
-                        features.auto_switch,
-                        startup_sync_ready,
+                        self.input_snapshot.features.auto_switch,
                         should_switch_word,
                         same_layout_plan.is_some(),
                         selected_path,
@@ -1789,6 +1811,7 @@ impl DaemonService {
                     self.pending_word_commit = Some(PendingWordCommit {
                         separator_key: key,
                         action: PendingWordCommitAction::LayoutCorrection,
+                        authorization,
                     });
                     log_input_debug(
                         "pending-word-commit-set",
@@ -1821,6 +1844,7 @@ impl DaemonService {
                         action: PendingWordCommitAction::SameLayoutCaseCorrection {
                             corrected_buffer: plan.buffer,
                         },
+                        authorization,
                     });
                     log_input_debug(
                         "pending-word-commit-set",
@@ -1853,12 +1877,36 @@ impl DaemonService {
                     self.invalidate_word_context();
                     return self.keyboard_mut()?.forward_event(key, value);
                 }
-                if let Some(plan) = same_layout_case_correction_plan(
-                    &self.buffer,
-                    self.current_layout_kind(),
-                    config.fix_two_capitals,
-                    config.fix_accidental_caps_lock,
-                ) {
+                let now = Instant::now();
+                let epoch = self.runtime.input_layout_epoch();
+                let (layout_kind, authorization) =
+                    match word_boundary_action(&self.input_snapshot, now, epoch, key) {
+                        WordBoundaryAction::Evaluate {
+                            layout_kind,
+                            authorization,
+                        } => (layout_kind, authorization),
+                        WordBoundaryAction::ForwardUncorrected(_) => {
+                            let status = self.input_snapshot.layout_status_at(now, epoch);
+                            let request = self.runtime.request_layout_refresh();
+                            log_layout_debug(
+                                "boundary-case-correction-skip",
+                                &format!("key={key:?} status={status:?} request={request:?}"),
+                            );
+                            self.invalidate_word_context();
+                            return self.keyboard_mut()?.forward_event(key, value);
+                        }
+                    };
+                let same_layout_plan = same_layout_fixes_allowed(&self.input_snapshot, now, epoch)
+                    .then(|| {
+                        same_layout_case_correction_plan(
+                            &self.buffer,
+                            layout_kind,
+                            config.fix_two_capitals,
+                            config.fix_accidental_caps_lock,
+                        )
+                    })
+                    .flatten();
+                if let Some(plan) = same_layout_plan {
                     log_input_debug(
                         "suppressed-separator-set",
                         &format!(
@@ -1875,6 +1923,7 @@ impl DaemonService {
                         action: PendingWordCommitAction::SameLayoutCaseCorrection {
                             corrected_buffer: plan.buffer,
                         },
+                        authorization,
                     });
                     log_input_debug(
                         "pending-word-commit-set",
@@ -1982,47 +2031,27 @@ impl DaemonService {
         }
 
         self.layout_shortcut_latched = true;
-        let shortcut_sync = self.runtime.sync_with_backend();
         let current_layout_kind = self.current_layout_kind();
-        let legacy_layout_is_english = self.runtime.current_layout();
         log_layout_debug(
             "observed-layout-shortcut",
             &format!(
-                "combo={:?} key={key:?} value={value} shift={} ctrl={} alt={} layout_before={}",
+                "combo={:?} key={key:?} value={value} shift={} ctrl={} alt={} layout_before={current_layout_kind:?}",
                 config.layout_switch_combo,
                 self.modifiers.is_shift_pressed(),
                 self.modifiers.is_ctrl_pressed(),
                 self.modifiers.is_alt_pressed(),
-                if self.runtime.current_layout() {
-                    "EN"
-                } else {
-                    "RU"
-                }
             ),
         );
-        let Some(next_layout_is_english) = next_layout_for_user_shortcut(
-            &shortcut_sync,
-            current_layout_kind,
-            legacy_layout_is_english,
-        ) else {
-            log_layout_debug(
-                "layout-shortcut-skip",
-                &format!("sync={shortcut_sync:?} current_layout_kind={current_layout_kind:?}"),
-            );
-            return Ok(true);
-        };
         self.runtime
-            .set_layout_with_reason(next_layout_is_english, "user-layout-shortcut");
-        self.startup_layout_resync.complete();
-        self.publish_status_changed();
+            .invalidate_layout_and_request_refresh("physical-layout-shortcut");
         self.invalidate_word_context();
-        // Preserve the original branch behavior: a successful shortcut falls
-        // through to the later input handling instead of returning early.
+        // Preserve normal OS handling: the matched physical shortcut continues
+        // through the ordinary forwarding path while confirmation happens off-thread.
         Ok(false)
     }
 
     fn apply_selected_text_switch(&mut self) -> Result<(), SwitcherError> {
-        if !self.runtime.feature_availability().selected_text_switch {
+        if !self.input_snapshot.features.selected_text_switch {
             log_selected_text_debug(
                 "hotkey-skip",
                 "selected-text switching disabled by backend policy",
@@ -2078,6 +2107,19 @@ impl DaemonService {
         pending: PendingWordCommit,
         config: &crate::daemon::runtime::RuntimeConfigSnapshot,
     ) -> Result<(), SwitcherError> {
+        let snapshot_adopted = self.adopt_input_snapshot_nonblocking();
+        if !self.pending_commit_is_authorized_after_adoption(snapshot_adopted, &pending) {
+            log_layout_debug(
+                "pending-word-commit-cancel",
+                &format!(
+                    "separator_key={:?} authorization={:?} current_epoch={}",
+                    pending.separator_key,
+                    pending.authorization,
+                    self.runtime.input_layout_epoch(),
+                ),
+            );
+            return self.cancel_pending_word_commit(pending.separator_key);
+        }
         let action_label = pending_word_commit_action_label(Some(&pending));
         let separator_key = pending.separator_key;
         log_input_debug(
@@ -2114,6 +2156,30 @@ impl DaemonService {
             ),
         );
         Ok(())
+    }
+
+    fn pending_commit_is_authorized_after_adoption(
+        &self,
+        snapshot_adopted: bool,
+        pending: &PendingWordCommit,
+    ) -> bool {
+        pending_commit_authorized_after_adoption(
+            snapshot_adopted,
+            &self.input_snapshot,
+            pending.authorization,
+            Instant::now(),
+            self.runtime.input_layout_epoch(),
+        )
+    }
+
+    fn cancel_pending_word_commit(
+        &mut self,
+        separator_key: evdev::Key,
+    ) -> Result<(), SwitcherError> {
+        let raw_buffer = self.buffer.clone();
+        cancel_pending_commit_with(separator_key, |key| {
+            self.commit_corrected_word(key, raw_buffer)
+        })
     }
 
     fn commit_corrected_word(
@@ -2188,20 +2254,23 @@ impl DaemonService {
         let outcome = self
             .keyboard_mut()?
             .apply_correction(&prepared.plan, config, modifiers)?;
-        if correction_path == CorrectionPath::AutoWordCommit
-            && correction_outcome_allows_optimistic_layout_update(outcome)
-        {
-            let updated = self.runtime.optimistic_gnome_wayland_uinput_layout_switch();
+        if matches!(
+            outcome.layout_switch,
+            CorrectionLayoutSwitchOutcome::AppliedUinput
+                | CorrectionLayoutSwitchOutcome::AppliedX11
+                | CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest
+        ) {
+            self.runtime
+                .invalidate_layout_and_request_refresh("writer-layout-switch");
             log_layout_debug(
-                "gnome-wayland-optimistic-layout-switch",
+                "correction-layout-invalidation",
                 &format!(
-                    "path={} outcome={:?} updated={updated}",
+                    "path={} outcome={:?}",
                     correction_path.as_str(),
                     outcome.layout_switch
                 ),
             );
         }
-        self.finish_manual_correction_sync(config, correction_path)?;
         Ok(Some(AppliedManualCorrection {
             corrected_buffer: prepared.plan.buffer,
             used_current_buffer: prepared.used_current_buffer,
@@ -2215,41 +2284,32 @@ impl DaemonService {
         fallback_buffer: &[Keystroke],
         correction_path: CorrectionPath,
     ) -> Result<Option<PreparedManualCorrection>, SwitcherError> {
-        let features = self.runtime.feature_availability();
-        if !features.manual_word_fix {
+        let now = Instant::now();
+        let epoch = self.runtime.input_layout_epoch();
+        if !manual_correction_allowed(&self.input_snapshot, now, epoch) {
+            if self.input_snapshot.features.manual_word_fix {
+                let _ = self.layout_kind_for_current_decision("manual-correction");
+            }
             return Ok(None);
         }
 
-        let cached_layout_before = self.runtime.current_layout_state();
-        let legacy_layout_before = self.runtime.current_layout();
-        let current_layout_kind_before = self.current_layout_kind();
-        let pre_correction_sync = self.runtime.sync_with_backend();
+        let Some(current_layout_kind) = self.layout_kind_for_current_decision("manual-correction")
+        else {
+            return Ok(None);
+        };
         log_layout_debug(
             "correction-start",
             &format!(
-                "path={} combo={:?} pre_sync={pre_correction_sync:?} cached_layout_before={cached_layout_before:?} legacy_layout_before={} current_layout_kind_before={current_layout_kind_before:?} buffer_len={} fallback_buffer_len={} followed_by_separator={}",
+                "path={} combo={:?} current_layout_kind={current_layout_kind:?} buffer_len={} fallback_buffer_len={} followed_by_separator={}",
                 correction_path.as_str(),
                 config.layout_switch_combo,
-                format_legacy_layout(legacy_layout_before),
                 self.buffer.len(),
                 fallback_buffer.len(),
                 self.word_context.followed_by_separator,
             ),
         );
-        if !automatic_layout_actions_allowed(&pre_correction_sync) {
-            log_layout_debug(
-                "manual-correction-sync",
-                &format!(
-                    "path={} combo={:?} source=backend skipped=true phase=before-correction",
-                    correction_path.as_str(),
-                    config.layout_switch_combo,
-                ),
-            );
-            return Ok(None);
-        }
-
         if !matches!(
-            current_layout_kind_before,
+            current_layout_kind,
             AppLayoutKind::English | AppLayoutKind::Russian
         ) {
             return Ok(None);
@@ -2260,7 +2320,7 @@ impl DaemonService {
             &self.buffer,
             fallback_buffer,
             self.word_context.followed_by_separator,
-            current_layout_kind_before,
+            current_layout_kind,
         ) else {
             return Ok(None);
         };
@@ -2297,66 +2357,6 @@ impl DaemonService {
             plan,
             used_current_buffer,
         }))
-    }
-
-    fn finish_manual_correction_sync(
-        &mut self,
-        config: &crate::daemon::runtime::RuntimeConfigSnapshot,
-        correction_path: CorrectionPath,
-    ) -> Result<(), SwitcherError> {
-        let cached_layout_before = self.runtime.current_layout_state();
-        self.runtime.refresh_current_layout_observation();
-        let post_correction_sync = self.runtime.sync_with_backend();
-        let cached_layout_after = self.runtime.current_layout_state();
-        let legacy_layout_after = self.runtime.current_layout();
-        let current_layout_kind_after = self.current_layout_kind();
-        log_layout_debug(
-            "correction-finish",
-            &format!(
-                "path={} combo={:?} post_sync={post_correction_sync:?} cached_layout_after={cached_layout_after:?} legacy_layout_after={} current_layout_kind_after={current_layout_kind_after:?} cached_layout_changed={}",
-                correction_path.as_str(),
-                config.layout_switch_combo,
-                format_legacy_layout(legacy_layout_after),
-                cached_layout_before != cached_layout_after,
-            ),
-        );
-        match post_correction_sync {
-            BackendSyncResult::Updated { current, .. } => {
-                log_layout_debug(
-                    "manual-correction-sync",
-                    &format!(
-                        "path={} combo={:?} source=backend updated=true current={current:?}",
-                        correction_path.as_str(),
-                        config.layout_switch_combo,
-                    ),
-                );
-                self.startup_layout_resync.complete();
-                self.publish_status_changed();
-            }
-            BackendSyncResult::Unchanged => {
-                log_layout_debug(
-                    "manual-correction-sync",
-                    &format!(
-                        "path={} combo={:?} source=backend updated=false current=unchanged",
-                        correction_path.as_str(),
-                        config.layout_switch_combo,
-                    ),
-                );
-                self.startup_layout_resync.complete();
-                self.publish_status_changed();
-            }
-            BackendSyncResult::Skipped => {
-                log_layout_debug(
-                    "manual-correction-sync",
-                    &format!(
-                        "path={} combo={:?} source=backend skipped=true phase=after-correction fallback=disabled",
-                        correction_path.as_str(),
-                        config.layout_switch_combo,
-                    ),
-                );
-            }
-        }
-        Ok(())
     }
 
     fn begin_deferred_manual_current_word_correction(
@@ -2580,54 +2580,23 @@ impl DaemonService {
             && !self.word_context.word_before_cursor.is_empty()
     }
 
-    fn refresh_startup_layout_before_autocorrect(&mut self) -> Result<bool, SwitcherError> {
-        if !self.startup_layout_resync.is_pending() {
-            return Ok(true);
+    fn layout_kind_for_current_decision(&self, reason: &str) -> Option<AppLayoutKind> {
+        let now = Instant::now();
+        let epoch = self.runtime.input_layout_epoch();
+        let kind = self.input_snapshot.layout_kind_for_decision_at(now, epoch);
+        if kind.is_none() {
+            let status = self.input_snapshot.layout_status_at(now, epoch);
+            let request = self.runtime.request_layout_refresh();
+            log_layout_debug(
+                "layout-dependent-action-skip",
+                &format!("reason={reason} status={status:?} request={request:?}"),
+            );
         }
-
-        let layout_before = self.runtime.current_layout();
-
-        match self.runtime.periodic_sync_tick() {
-            BackendSyncResult::Updated { current, .. } => {
-                self.startup_layout_resync.complete();
-                log_layout_debug(
-                    "startup-resync",
-                    &format!("source=periodic updated=true current={current:?}"),
-                );
-                if self.runtime.current_layout() != layout_before {
-                    self.publish_status_changed();
-                }
-                Ok(true)
-            }
-            BackendSyncResult::Unchanged => {
-                self.startup_layout_resync.complete();
-                log_layout_debug(
-                    "startup-resync",
-                    "source=periodic updated=false current=unchanged",
-                );
-                Ok(true)
-            }
-            BackendSyncResult::Skipped => {
-                let attempts_remaining = self.startup_layout_resync.record_failure();
-                let cached_layout_kind = self.current_layout_kind();
-                let fallback_allowed = startup_autocorrection_allowed_after_resync(
-                    &BackendSyncResult::Skipped,
-                    cached_layout_kind,
-                );
-                log_layout_debug(
-                    "startup-resync",
-                    &format!(
-                        "source=periodic skipped=true attempts_remaining={attempts_remaining} \
-                         cached_layout_kind={cached_layout_kind:?} fallback_allowed={fallback_allowed}"
-                    ),
-                );
-                Ok(fallback_allowed)
-            }
-        }
+        kind
     }
 
     fn current_layout_kind(&self) -> AppLayoutKind {
-        match self.runtime.current_layout_state() {
+        match &self.input_snapshot.layout_state {
             CurrentLayoutState::Known { layout, .. } => layout.kind,
             CurrentLayoutState::Unknown { .. } => AppLayoutKind::Unknown,
         }
@@ -2689,21 +2658,18 @@ fn hotkey_modifiers_from_state(modifiers: ModifierState) -> HotkeyModifiers {
 }
 
 pub(crate) fn should_invalidate_for_wayland_focus_switch_shortcut(
-    runtime: &RuntimeState,
+    session_type: SessionType,
     modifiers: ModifierState,
     key: evdev::Key,
     value: i32,
 ) -> bool {
-    runtime.session_type() == SessionType::Wayland
-        && is_wayland_focus_switch_shortcut(modifiers, key, value)
+    session_type == SessionType::Wayland && is_wayland_focus_switch_shortcut(modifiers, key, value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        DesktopEnvironment, DistroKind, SelectedTextHotkey, SessionType, SystemContext, UndoKey,
-    };
+    use crate::model::{SelectedTextHotkey, SessionType, UndoKey};
     use evdev::Key;
 
     // Test helpers
@@ -2713,6 +2679,22 @@ mod tests {
             key,
             shift: false,
             caps_lock: false,
+        }
+    }
+
+    fn test_snapshot_authorization() -> SnapshotAuthorization {
+        SnapshotAuthorization {
+            config_generation: 1,
+            layout_generation: 1,
+            layout_epoch: 1,
+        }
+    }
+
+    fn test_pending_word_commit(separator_key: Key) -> PendingWordCommit {
+        PendingWordCommit {
+            separator_key,
+            action: PendingWordCommitAction::LayoutCorrection,
+            authorization: test_snapshot_authorization(),
         }
     }
 
@@ -2837,14 +2819,6 @@ mod tests {
             modifiers.update(*key, 1);
         }
         modifiers
-    }
-
-    fn runtime_with_session_type(session_type: SessionType) -> RuntimeState {
-        RuntimeState::test_with_system_context(SystemContext {
-            session_type,
-            desktop_environment: DesktopEnvironment::Unknown,
-            distro: DistroKind::Unknown,
-        })
     }
 
     #[test]
@@ -3280,137 +3254,6 @@ mod tests {
         ));
     }
 
-    // Startup layout resync
-
-    #[test]
-    fn startup_layout_resync_starts_pending() {
-        let state = StartupLayoutResyncState::pending();
-
-        assert_eq!(
-            state,
-            StartupLayoutResyncState::Pending {
-                attempts_remaining: STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS,
-            }
-        );
-        assert!(state.is_pending());
-    }
-
-    #[test]
-    fn startup_layout_resync_failures_decrement_until_exhausted() {
-        let mut state = StartupLayoutResyncState::pending();
-
-        assert_eq!(
-            state.record_failure(),
-            STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS - 1
-        );
-        assert_eq!(
-            state,
-            StartupLayoutResyncState::Pending {
-                attempts_remaining: STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS - 1,
-            }
-        );
-
-        assert_eq!(state.record_failure(), 1);
-        assert_eq!(
-            state,
-            StartupLayoutResyncState::Pending {
-                attempts_remaining: 1,
-            }
-        );
-
-        assert_eq!(state.record_failure(), 0);
-        assert_eq!(state, StartupLayoutResyncState::Exhausted);
-        assert!(!state.is_pending());
-    }
-
-    #[test]
-    fn startup_layout_resync_completion_stops_future_retries() {
-        let mut state = StartupLayoutResyncState::pending();
-
-        state.complete();
-
-        assert_eq!(state, StartupLayoutResyncState::Completed);
-        assert!(!state.is_pending());
-        assert_eq!(state.record_failure(), 0);
-        assert_eq!(state, StartupLayoutResyncState::Completed);
-    }
-
-    #[test]
-    fn startup_autocorrection_allows_known_cached_layout_when_resync_is_skipped() {
-        assert!(startup_autocorrection_allowed_after_resync(
-            &BackendSyncResult::Skipped,
-            AppLayoutKind::English,
-        ));
-        assert!(startup_autocorrection_allowed_after_resync(
-            &BackendSyncResult::Skipped,
-            AppLayoutKind::Russian,
-        ));
-    }
-
-    #[test]
-    fn startup_autocorrection_does_not_guess_unknown_cached_layout_when_resync_is_skipped() {
-        assert!(!startup_autocorrection_allowed_after_resync(
-            &BackendSyncResult::Skipped,
-            AppLayoutKind::Unknown,
-        ));
-        assert!(!startup_autocorrection_allowed_after_resync(
-            &BackendSyncResult::Skipped,
-            AppLayoutKind::Other,
-        ));
-    }
-
-    // Layout shortcut decisions
-
-    #[test]
-    fn automatic_layout_actions_are_blocked_when_backend_sync_is_skipped() {
-        assert!(!automatic_layout_actions_allowed(
-            &BackendSyncResult::Skipped
-        ));
-        assert!(automatic_layout_actions_allowed(
-            &BackendSyncResult::Unchanged
-        ));
-    }
-
-    #[test]
-    fn shortcut_fallback_is_allowed_only_for_known_en_ru_layouts() {
-        assert_eq!(
-            next_layout_for_user_shortcut(
-                &BackendSyncResult::Skipped,
-                AppLayoutKind::English,
-                true,
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            next_layout_for_user_shortcut(
-                &BackendSyncResult::Skipped,
-                AppLayoutKind::Russian,
-                false,
-            ),
-            Some(true)
-        );
-        assert_eq!(
-            next_layout_for_user_shortcut(
-                &BackendSyncResult::Skipped,
-                AppLayoutKind::Unknown,
-                true,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn shortcut_does_not_guess_layout_for_other_when_sync_succeeds() {
-        assert_eq!(
-            next_layout_for_user_shortcut(
-                &BackendSyncResult::Unchanged,
-                AppLayoutKind::Other,
-                true,
-            ),
-            None
-        );
-    }
-
     // Pending status / status publishing helpers
 
     #[test]
@@ -3671,27 +3514,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn optimistic_layout_update_is_allowed_only_after_applied_uinput() {
-        use crate::daemon::keyboard::{CorrectionExecutionOutcome, CorrectionLayoutSwitchOutcome};
-
-        assert!(correction_outcome_allows_optimistic_layout_update(
-            CorrectionExecutionOutcome {
-                layout_switch: CorrectionLayoutSwitchOutcome::AppliedUinput,
-            }
-        ));
-        assert!(!correction_outcome_allows_optimistic_layout_update(
-            CorrectionExecutionOutcome {
-                layout_switch: CorrectionLayoutSwitchOutcome::AppliedX11,
-            }
-        ));
-        assert!(!correction_outcome_allows_optimistic_layout_update(
-            CorrectionExecutionOutcome {
-                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
-            }
-        ));
-    }
-
     // Manual correction finalization
 
     #[test]
@@ -3937,10 +3759,7 @@ mod tests {
     #[test]
     fn suppressed_separator_release_state_takes_matching_pending_once() {
         let mut suppressed_separator_key = Some(Key::KEY_SPACE);
-        let mut pending_word_commit = Some(PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        });
+        let mut pending_word_commit = Some(test_pending_word_commit(Key::KEY_SPACE));
 
         let release_state = take_suppressed_separator_release_state(
             suppressed_separator_key,
@@ -3959,10 +3778,7 @@ mod tests {
 
         assert_eq!(
             release_state.pending_to_finish,
-            Some(PendingWordCommit {
-                separator_key: Key::KEY_SPACE,
-                action: PendingWordCommitAction::LayoutCorrection,
-            })
+            Some(test_pending_word_commit(Key::KEY_SPACE))
         );
         assert_eq!(pending_word_commit, None);
         assert_eq!(repeated_release, None);
@@ -3970,10 +3786,7 @@ mod tests {
 
     #[test]
     fn suppressed_separator_release_state_ignores_non_matching_key() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
         let mut pending_word_commit = Some(pending.clone());
 
         let release_state = take_suppressed_separator_release_state(
@@ -3989,10 +3802,7 @@ mod tests {
 
     #[test]
     fn suppressed_separator_release_state_ignores_key_press() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
         let mut pending_word_commit = Some(pending.clone());
 
         let release_state = take_suppressed_separator_release_state(
@@ -4008,10 +3818,7 @@ mod tests {
 
     #[test]
     fn suppressed_separator_release_state_preserves_mismatched_pending() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_ENTER,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_ENTER);
         let mut pending_word_commit = Some(pending.clone());
 
         let release_state = take_suppressed_separator_release_state(
@@ -4028,10 +3835,7 @@ mod tests {
 
     #[test]
     fn early_finish_does_not_preserve_separator_when_next_event_is_release_or_modifier() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
 
         assert_eq!(
             preserved_separator_after_early_finish(Some(&pending), Key::KEY_A, 1),
@@ -4049,10 +3853,7 @@ mod tests {
 
     #[test]
     fn early_finish_preserves_one_swallowed_release_for_original_separator() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
 
         assert_eq!(
             preserved_separator_after_early_finish(Some(&pending), Key::KEY_A, 1),
@@ -4070,10 +3871,7 @@ mod tests {
 
     #[test]
     fn early_finish_state_takes_pending_on_non_modifier_press() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
         let mut pending_word_commit = Some(pending.clone());
 
         let early_finish =
@@ -4095,10 +3893,7 @@ mod tests {
 
     #[test]
     fn early_finish_state_ignores_key_release_and_preserves_pending() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
         let mut pending_word_commit = Some(pending.clone());
 
         let early_finish =
@@ -4110,10 +3905,7 @@ mod tests {
 
     #[test]
     fn early_finish_state_ignores_modifier_press_and_preserves_pending() {
-        let pending = PendingWordCommit {
-            separator_key: Key::KEY_SPACE,
-            action: PendingWordCommitAction::LayoutCorrection,
-        };
+        let pending = test_pending_word_commit(Key::KEY_SPACE);
         let mut pending_word_commit = Some(pending.clone());
 
         let early_finish = take_pending_word_commit_for_early_finish(
@@ -4554,24 +4346,21 @@ mod tests {
     #[test]
     fn wayland_focus_switch_policy_enables_shortcut_only_on_wayland() {
         let modifiers = modifiers_with(&[Key::KEY_LEFTALT]);
-        let wayland_runtime = runtime_with_session_type(SessionType::Wayland);
-        let x11_runtime = runtime_with_session_type(SessionType::X11);
-        let unknown_runtime = runtime_with_session_type(SessionType::Unknown);
 
         assert!(should_invalidate_for_wayland_focus_switch_shortcut(
-            &wayland_runtime,
+            SessionType::Wayland,
             modifiers,
             Key::KEY_TAB,
             1,
         ));
         assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
-            &x11_runtime,
+            SessionType::X11,
             modifiers,
             Key::KEY_TAB,
             1,
         ));
         assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
-            &unknown_runtime,
+            SessionType::Unknown,
             modifiers,
             Key::KEY_TAB,
             1,
@@ -4580,19 +4369,229 @@ mod tests {
 
     #[test]
     fn wayland_focus_switch_policy_rejects_ctrl_modified_tab() {
-        let runtime = runtime_with_session_type(SessionType::Wayland);
-
         assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
-            &runtime,
+            SessionType::Wayland,
             modifiers_with(&[Key::KEY_LEFTCTRL, Key::KEY_LEFTALT]),
             Key::KEY_TAB,
             1,
         ));
         assert!(!should_invalidate_for_wayland_focus_switch_shortcut(
-            &runtime,
+            SessionType::Wayland,
             modifiers_with(&[Key::KEY_LEFTCTRL, Key::KEY_LEFTMETA]),
             Key::KEY_TAB,
             1,
         ));
+    }
+}
+
+#[cfg(test)]
+fn fresh_service_snapshot(
+    layout_kind: AppLayoutKind,
+    confirmed_at: Instant,
+) -> InputRuntimeSnapshot {
+    use crate::config::AppConfig;
+    use crate::daemon::runtime::RuntimeConfigSnapshot;
+    use crate::layout_backend::{FeatureAvailability, LayoutCode, SystemLayout};
+
+    let normalized_code = match layout_kind {
+        AppLayoutKind::English => LayoutCode::Us,
+        AppLayoutKind::Russian => LayoutCode::Ru,
+        AppLayoutKind::Other | AppLayoutKind::Unknown => LayoutCode::Unknown,
+    };
+    InputRuntimeSnapshot {
+        config: RuntimeConfigSnapshot::from(&AppConfig::default()),
+        enabled: true,
+        features: FeatureAvailability {
+            auto_switch: true,
+            manual_word_fix: true,
+            selected_text_switch: true,
+            reason: None,
+        },
+        session_type: SessionType::X11,
+        layout_state: CurrentLayoutState::Known {
+            layout: SystemLayout {
+                backend_key: "test".to_string(),
+                normalized_code,
+                display_name: "Test".to_string(),
+                kind: layout_kind,
+                index: Some(0),
+            },
+            trustworthy: true,
+        },
+        config_generation: 1,
+        layout_generation: 1,
+        confirmed_layout_epoch: 1,
+        confirmed_at: Some(confirmed_at),
+    }
+}
+
+#[cfg(test)]
+mod service_snapshot_fresh_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_snapshot_keeps_layout_auto_correction_enabled() {
+        let now = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, now);
+
+        assert_eq!(
+            layout_correction_decision(&snapshot, now, snapshot.confirmed_layout_epoch),
+            LayoutCorrectionAvailability::Available(AppLayoutKind::English)
+        );
+    }
+
+    #[test]
+    fn fresh_snapshot_keeps_caps_and_two_capitals_fixes_enabled() {
+        let now = Instant::now();
+        let mut snapshot = fresh_service_snapshot(AppLayoutKind::Russian, now);
+        snapshot.config.fix_two_capitals = true;
+        snapshot.config.fix_accidental_caps_lock = true;
+
+        assert!(same_layout_fixes_allowed(
+            &snapshot,
+            now,
+            snapshot.confirmed_layout_epoch
+        ));
+    }
+
+    #[test]
+    fn fresh_snapshot_keeps_manual_correction_enabled() {
+        let now = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, now);
+
+        assert!(manual_correction_allowed(
+            &snapshot,
+            now,
+            snapshot.confirmed_layout_epoch
+        ));
+    }
+
+    #[test]
+    fn daemon_service_has_no_synchronous_runtime_refresh_calls() {
+        let source = include_str!("service.rs");
+        for forbidden in [
+            ["sync_", "with_backend"].concat(),
+            ["periodic_", "sync_tick"].concat(),
+            ["refresh_current_layout_", "observation"].concat(),
+            ["optimistic_gnome_wayland_", "uinput_layout_switch"].concat(),
+            ["config_", "snapshot()?"].concat(),
+        ] {
+            assert!(
+                !source.contains(&forbidden),
+                "forbidden input-path call: {forbidden}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod service_snapshot_stale_tests {
+    use super::*;
+    use crate::daemon::input_snapshot::INPUT_LAYOUT_FRESHNESS;
+
+    #[test]
+    fn stale_layout_disables_all_layout_dependent_corrections() {
+        let confirmed_at = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, confirmed_at);
+        let stale_at = confirmed_at + INPUT_LAYOUT_FRESHNESS + Duration::from_millis(1);
+
+        assert_eq!(
+            layout_correction_decision(&snapshot, stale_at, snapshot.confirmed_layout_epoch),
+            LayoutCorrectionAvailability::Unavailable(InputLayoutStatus::Stale)
+        );
+        assert!(!same_layout_fixes_allowed(
+            &snapshot,
+            stale_at,
+            snapshot.confirmed_layout_epoch
+        ));
+        assert!(!manual_correction_allowed(
+            &snapshot,
+            stale_at,
+            snapshot.confirmed_layout_epoch
+        ));
+    }
+
+    #[test]
+    fn stale_separator_path_forwards_instead_of_suppressing() {
+        let confirmed_at = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, confirmed_at);
+        let stale_at = confirmed_at + INPUT_LAYOUT_FRESHNESS;
+        let outcome = word_boundary_action(
+            &snapshot,
+            stale_at,
+            snapshot.confirmed_layout_epoch,
+            evdev::Key::KEY_SPACE,
+        );
+
+        assert_eq!(
+            outcome,
+            WordBoundaryAction::ForwardUncorrected(evdev::Key::KEY_SPACE)
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_snapshot_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn pending_commit_carries_snapshot_authorization() {
+        let now = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, now);
+        let authorization = snapshot.authorization_at(now, 1).unwrap();
+        let pending = PendingWordCommit {
+            separator_key: evdev::Key::KEY_SPACE,
+            action: PendingWordCommitAction::LayoutCorrection,
+            authorization,
+        };
+
+        assert_eq!(pending.authorization, authorization);
+    }
+
+    #[test]
+    fn pending_commit_is_cancelled_after_layout_generation_change() {
+        let now = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, now);
+        let authorization = snapshot.authorization_at(now, 1).unwrap();
+        let changed = InputRuntimeSnapshot {
+            layout_generation: snapshot.layout_generation + 1,
+            ..snapshot
+        };
+
+        assert!(!changed.authorizes_at(authorization, now, 1));
+    }
+
+    #[test]
+    fn pending_commit_requires_successful_snapshot_adoption() {
+        let now = Instant::now();
+        let snapshot = fresh_service_snapshot(AppLayoutKind::English, now);
+        let authorization = snapshot.authorization_at(now, 1).unwrap();
+
+        assert!(!pending_commit_authorized_after_adoption(
+            false,
+            &snapshot,
+            authorization,
+            now,
+            1,
+        ));
+        assert!(pending_commit_authorized_after_adoption(
+            true,
+            &snapshot,
+            authorization,
+            now,
+            1,
+        ));
+    }
+
+    #[test]
+    fn cancelled_pending_commit_replays_separator_once() {
+        let mut ledger = Vec::new();
+        cancel_pending_commit_with(evdev::Key::KEY_SPACE, |key| {
+            ledger.push(key);
+            Ok::<(), ()>(())
+        })
+        .unwrap();
+
+        assert_eq!(ledger, vec![evdev::Key::KEY_SPACE]);
     }
 }

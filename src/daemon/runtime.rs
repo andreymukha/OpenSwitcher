@@ -2164,7 +2164,7 @@ undo_key = "Pause"
 
         assert!(
             !crate::daemon::service::should_invalidate_for_wayland_focus_switch_shortcut(
-                &runtime,
+                runtime.session_type(),
                 modifiers,
                 evdev::Key::KEY_TAB,
                 1,
@@ -2175,7 +2175,7 @@ undo_key = "Pause"
 
         assert!(
             crate::daemon::service::should_invalidate_for_wayland_focus_switch_shortcut(
-                &runtime,
+                runtime.session_type(),
                 modifiers,
                 evdev::Key::KEY_TAB,
                 1,
@@ -3012,57 +3012,6 @@ impl RuntimeState {
         runtime
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_with_system_context(system_context: SystemContext) -> Self {
-        let config_service = ConfigService {
-            config_path: PathBuf::from("test-config.toml"),
-            inner: RwLock::new(AppConfig::default()),
-        };
-        let enabled = config_service.auto_switch_enabled().unwrap_or(true);
-        let layout_state = CurrentLayoutState::Unknown {
-            reason: "test".to_string(),
-        };
-        let feature_availability = FeatureAvailability {
-            auto_switch: false,
-            manual_word_fix: false,
-            selected_text_switch: true,
-            reason: Some("test".to_string()),
-        };
-        let initial_input_snapshot = initial_input_snapshot(
-            &config_service,
-            enabled,
-            feature_availability.clone(),
-            system_context.session_type,
-            layout_state.clone(),
-        );
-        let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
-
-        Self {
-            enabled: AtomicBool::new(enabled),
-            should_exit: AtomicBool::new(false),
-            hotkey_capture_inhibition_started_at: Instant::now(),
-            settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
-            layout_state: RwLock::new(layout_state),
-            backend: Mutex::new(None),
-            layout_setup: RwLock::new(LayoutSetup::Unsupported {
-                reason: "test".to_string(),
-            }),
-            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(feature_availability),
-            system_context: RwLock::new(system_context),
-            current_layout_observation: RwLock::new(None),
-            config_service,
-            settings_update_gate: Mutex::new(()),
-            input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
-            layout_invalidation_epoch: AtomicU64::new(0),
-            layout_refresh_requests,
-            layout_refresh_receiver: Mutex::new(Some(layout_refresh_receiver)),
-            capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
-            background_sync_started: AtomicBool::new(false),
-            pending_status_change: AtomicBool::new(false),
-        }
-    }
-
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
     }
@@ -3300,12 +3249,7 @@ impl RuntimeState {
         );
     }
 
-    pub(crate) fn optimistic_gnome_wayland_uinput_layout_switch(&self) -> bool {
-        self.optimistic_gnome_wayland_uinput_layout_switch_with_reader(
-            &CommandDesktopSettingsReader,
-        )
-    }
-
+    #[cfg(test)]
     fn optimistic_gnome_wayland_uinput_layout_switch_with_reader<R: DesktopSettingsReader>(
         &self,
         reader: &R,
@@ -4235,6 +4179,7 @@ fn gnome_wayland_current_layout_state<R: DesktopSettingsReader>(
     ))
 }
 
+#[cfg(test)]
 fn trusted_gnome_layout_pair_from_reader<R: DesktopSettingsReader>(
     reader: &R,
 ) -> Option<TrustedGnomeLayoutPair> {

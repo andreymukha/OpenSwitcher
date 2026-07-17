@@ -1,4 +1,5 @@
 pub mod capture;
+pub(crate) mod debug_log;
 pub mod input_backend;
 pub mod keyboard;
 pub mod layout_switcher;

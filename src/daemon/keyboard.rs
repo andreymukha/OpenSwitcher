@@ -14,8 +14,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -38,11 +38,35 @@ const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const WRITER_QUEUE_CAPACITY: usize = 1024;
 const FAST_PATH_SATURATION_RETRY_WINDOW: Duration = Duration::from_millis(2);
 const TRANSACTION_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
+const TRANSACTION_BACKEND_GRACE: Duration = Duration::from_secs(1);
+const MAX_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
+const SHORTCUT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1);
+const TRANSACTION_SLEEP_QUANTUM: Duration = Duration::from_millis(5);
 const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const SHUTDOWN_JOIN_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
 const CINNAMON_DBUS_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
 const CINNAMON_DBUS_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
+static NEXT_WRITER_TRANSACTION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_writer_transaction_request_id() -> u64 {
+    loop {
+        let request_id = NEXT_WRITER_TRANSACTION_REQUEST_ID.fetch_add(1, Ordering::SeqCst);
+        if request_id != 0 {
+            return request_id;
+        }
+    }
+}
+
+fn take_next_nonzero_request_id(next_request_id: &mut u64) -> u64 {
+    loop {
+        let request_id = *next_request_id;
+        *next_request_id = next_request_id.wrapping_add(1);
+        if request_id != 0 {
+            return request_id;
+        }
+    }
+}
 
 // Backend readiness state
 
@@ -65,6 +89,21 @@ impl InputBackendReadiness {
 
 // Keyboard controller
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyboardShutdownPhase {
+    RequestWriterStop,
+    ReleaseGrab,
+    FinishWriterStop,
+    StopWatchers,
+}
+
+fn run_keyboard_shutdown_sequence(mut run_phase: impl FnMut(KeyboardShutdownPhase)) {
+    run_phase(KeyboardShutdownPhase::RequestWriterStop);
+    run_phase(KeyboardShutdownPhase::ReleaseGrab);
+    run_phase(KeyboardShutdownPhase::FinishWriterStop);
+    run_phase(KeyboardShutdownPhase::StopWatchers);
+}
+
 pub struct KeyboardController {
     real_device: GrabbedKeyboardDevice,
     pointer_watcher: PointerWatcher,
@@ -85,6 +124,9 @@ pub struct SelectionKeyboardTransport {
 struct VirtualKeyboardHandle {
     command_tx: mpsc::SyncSender<WriterCommand>,
     alive: Arc<AtomicBool>,
+    stop_requested: Arc<AtomicBool>,
+    transaction_failure_request_id: Arc<AtomicU64>,
+    transaction_terminal_gate: Arc<Mutex<()>>,
 }
 
 struct VirtualKeyboardWriter {
@@ -92,6 +134,12 @@ struct VirtualKeyboardWriter {
     join_handle: Option<JoinHandle<()>>,
     completion_rx: mpsc::Receiver<ManualCurrentWordCompletion>,
     next_request_id: u64,
+    pending_manual_current_word: Option<PendingManualCurrentWordTransaction>,
+}
+
+struct PendingManualCurrentWordTransaction {
+    control: WriterTransactionControl,
+    completion: Option<ManualCurrentWordCompletion>,
 }
 
 enum WriterCommand {
@@ -99,7 +147,7 @@ enum WriterCommand {
     Fast(WriterFastCommand),
     Transaction(WriterTransaction),
     DeferredManualCurrentWordCorrection {
-        request_id: u64,
+        control: WriterTransactionControl,
         plan: CorrectionPlan,
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
@@ -133,9 +181,331 @@ enum WriterTransactionKind {
 
 enum WriterTransaction {
     Execute {
+        control: WriterTransactionControl,
         kind: WriterTransactionKind,
         reply: mpsc::Sender<Result<CorrectionExecutionOutcome, SwitcherError>>,
     },
+}
+
+#[derive(Clone)]
+struct WriterTransactionControl {
+    request_id: u64,
+    deadline: Instant,
+    state: Arc<AtomicU8>,
+    failure_request_id: Arc<AtomicU64>,
+    stop_requested: Arc<AtomicBool>,
+    terminal_gate: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum WriterTransactionState {
+    Pending = 0,
+    Completed = 1,
+    TimedOut = 2,
+}
+
+impl WriterTransactionState {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            value if value == Self::Completed as u8 => Self::Completed,
+            value if value == Self::TimedOut as u8 => Self::TimedOut,
+            _ => Self::Pending,
+        }
+    }
+}
+
+impl WriterTransactionControl {
+    #[cfg(test)]
+    fn new(request_id: u64, timeout: Duration, failure_request_id: Arc<AtomicU64>) -> Self {
+        Self::new_with_terminal_gate(
+            request_id,
+            timeout,
+            failure_request_id,
+            Arc::new(Mutex::new(())),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_terminal_gate(
+        request_id: u64,
+        timeout: Duration,
+        failure_request_id: Arc<AtomicU64>,
+        terminal_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        Self::new_with_writer_state(
+            request_id,
+            timeout,
+            failure_request_id,
+            Arc::new(AtomicBool::new(false)),
+            terminal_gate,
+        )
+    }
+
+    fn new_with_writer_state(
+        request_id: u64,
+        timeout: Duration,
+        failure_request_id: Arc<AtomicU64>,
+        stop_requested: Arc<AtomicBool>,
+        terminal_gate: Arc<Mutex<()>>,
+    ) -> Self {
+        Self {
+            request_id,
+            deadline: Instant::now()
+                .checked_add(timeout)
+                .unwrap_or_else(Instant::now),
+            state: Arc::new(AtomicU8::new(WriterTransactionState::Pending as u8)),
+            failure_request_id,
+            stop_requested,
+            terminal_gate,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout_for_test(request_id: u64, timeout: Duration) -> Self {
+        Self::new(request_id, timeout, Arc::new(AtomicU64::new(0)))
+    }
+
+    fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    fn state(&self) -> WriterTransactionState {
+        WriterTransactionState::from_raw(self.state.load(Ordering::SeqCst))
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.state() == WriterTransactionState::TimedOut
+            || self.stop_requested.load(Ordering::SeqCst)
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+    }
+
+    fn timed_out_error(&self) -> SwitcherError {
+        let failed_request_id = match self.failure_request_id.load(Ordering::SeqCst) {
+            0 => self.request_id(),
+            request_id => request_id,
+        };
+        SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+            request_id: failed_request_id,
+        }
+    }
+
+    fn cancellation_error(&self) -> SwitcherError {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        } else {
+            self.timed_out_error()
+        }
+    }
+
+    fn try_mark_timed_out(&self) -> bool {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.try_mark_timed_out_while_terminal_gate_is_held()
+    }
+
+    fn try_mark_timed_out_while_terminal_gate_is_held(&self) -> bool {
+        if self
+            .state
+            .compare_exchange(
+                WriterTransactionState::Pending as u8,
+                WriterTransactionState::TimedOut as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return false;
+        }
+
+        let _ = self.failure_request_id.compare_exchange(
+            0,
+            self.request_id,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        true
+    }
+
+    fn mark_timed_out(&self) -> SwitcherError {
+        let _ = self.try_mark_timed_out();
+        self.timed_out_error()
+    }
+
+    fn publish_completed(&self) -> bool {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return false;
+        }
+        if self.failure_request_id.load(Ordering::SeqCst) != 0 || Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                WriterTransactionState::Pending as u8,
+                WriterTransactionState::Completed as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    fn ensure_active_while_terminal_gate_is_held(&self) -> Result<(), SwitcherError> {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+        }
+        if self.failure_request_id.load(Ordering::SeqCst) != 0 {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return Err(self.timed_out_error());
+        }
+        match self.state() {
+            WriterTransactionState::Pending => {}
+            WriterTransactionState::TimedOut => return Err(self.timed_out_error()),
+            WriterTransactionState::Completed => {
+                return Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: self.request_id(),
+                    reason: "transaction is already completed".to_string(),
+                });
+            }
+        }
+        if Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return Err(self.timed_out_error());
+        }
+        Ok(())
+    }
+
+    fn ensure_active(&self) -> Result<(), SwitcherError> {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_active_while_terminal_gate_is_held()
+    }
+
+    fn authorize_mutation_start(&self) -> Result<(), SwitcherError> {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.ensure_active_while_terminal_gate_is_held()
+    }
+
+    fn wait_for_reply(
+        &self,
+        reply_rx: mpsc::Receiver<Result<CorrectionExecutionOutcome, SwitcherError>>,
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+        let mut received_reply = None;
+
+        loop {
+            match self.state() {
+                WriterTransactionState::Completed => {
+                    let reply = match received_reply {
+                        Some(reply) => reply,
+                        None => reply_rx
+                            .try_recv()
+                            .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?,
+                    };
+                    return reply;
+                }
+                WriterTransactionState::TimedOut => return Err(self.timed_out_error()),
+                WriterTransactionState::Pending => {}
+            }
+
+            if self.stop_requested.load(Ordering::SeqCst) {
+                return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+            }
+
+            if self.failure_request_id.load(Ordering::SeqCst) != 0
+                || Instant::now() >= self.deadline
+            {
+                if self.try_mark_timed_out() {
+                    return Err(self.timed_out_error());
+                }
+                continue;
+            }
+
+            let wait = self
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .min(TRANSACTION_SLEEP_QUANTUM);
+            match reply_rx.recv_timeout(wait) {
+                Ok(reply) => received_reply = Some(reply),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if self.state() == WriterTransactionState::Pending
+                        && self.failure_request_id.load(Ordering::SeqCst) == 0
+                    {
+                        return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+                    }
+                }
+            }
+        }
+    }
+
+    fn sleep_interruptibly(&self, duration: Duration) -> Result<(), SwitcherError> {
+        let sleep_deadline = Instant::now()
+            .checked_add(duration)
+            .unwrap_or(self.deadline);
+        loop {
+            self.ensure_active()?;
+            let now = Instant::now();
+            if now >= sleep_deadline {
+                return Ok(());
+            }
+
+            let until_sleep_done = sleep_deadline.saturating_duration_since(now);
+            let until_transaction_deadline = self.deadline.saturating_duration_since(now);
+            let step = until_sleep_done
+                .min(until_transaction_deadline)
+                .min(TRANSACTION_SLEEP_QUANTUM);
+            if step.is_zero() {
+                return Err(self.mark_timed_out());
+            }
+            thread::sleep(step);
+        }
+    }
+}
+
+impl WriterTransactionKind {
+    fn execution_timeout(&self) -> Result<Duration, SwitcherError> {
+        match self {
+            WriterTransactionKind::ApplyCorrection { plan, config, .. } => {
+                correction_transaction_timeout(plan, config, true)
+            }
+            WriterTransactionKind::ApplySameLayoutCorrection { plan, config, .. } => {
+                correction_transaction_timeout(plan, config, false)
+            }
+            WriterTransactionKind::CopyShortcut { .. }
+            | WriterTransactionKind::PasteShortcut { .. } => Ok(SHORTCUT_TRANSACTION_TIMEOUT),
+        }
+    }
+}
+
+impl WriterTransaction {
+    fn control(&self) -> &WriterTransactionControl {
+        match self {
+            Self::Execute { control, .. } => control,
+        }
+    }
+}
+
+fn correction_transaction_timeout(
+    plan: &CorrectionPlan,
+    config: &RuntimeConfigSnapshot,
+    switch_layout: bool,
+) -> Result<Duration, SwitcherError> {
+    let timeout = config
+        .estimated_correction_schedule(plan.buffer.len(), plan.extra_backspaces, switch_layout)?
+        .saturating_add(TRANSACTION_BACKEND_GRACE);
+    debug_assert!(timeout <= MAX_TRANSACTION_TIMEOUT);
+    Ok(timeout)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,10 +827,15 @@ impl KeyboardController {
     }
 
     pub fn shutdown(&mut self) {
-        self.release_grab_best_effort();
-        self.virtual_device.stop();
-        self.pointer_watcher.stop();
-        self.input_target_watcher.stop();
+        run_keyboard_shutdown_sequence(|phase| match phase {
+            KeyboardShutdownPhase::RequestWriterStop => self.virtual_device.request_stop(),
+            KeyboardShutdownPhase::ReleaseGrab => self.release_grab_best_effort(),
+            KeyboardShutdownPhase::FinishWriterStop => self.virtual_device.finish_stop(),
+            KeyboardShutdownPhase::StopWatchers => {
+                self.pointer_watcher.stop();
+                self.input_target_watcher.stop();
+            }
+        });
     }
 
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
@@ -529,6 +904,10 @@ impl KeyboardController {
         self.virtual_device.handle().is_alive()
     }
 
+    pub fn writer_health_error(&self) -> Option<SwitcherError> {
+        self.virtual_device.health_error()
+    }
+
     pub fn caps_lock_active(&self) -> bool {
         self.real_device.caps_lock_active().unwrap_or(false)
     }
@@ -545,6 +924,12 @@ impl KeyboardController {
             watchers_ready,
             event_processing_ready: keyboard_open && writer_ready && watchers_ready,
         }
+    }
+}
+
+impl Drop for KeyboardController {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -955,13 +1340,27 @@ impl VirtualKeyboardWriter {
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::channel();
         let alive = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let transaction_failure_request_id = Arc::new(AtomicU64::new(0));
+        let transaction_terminal_gate = Arc::new(Mutex::new(()));
         let worker_alive = Arc::clone(&alive);
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let worker_transaction_failure_request_id = Arc::clone(&transaction_failure_request_id);
+        let worker_transaction_terminal_gate = Arc::clone(&transaction_terminal_gate);
 
         let join_handle = thread::spawn(move || {
             log_input_debug("writer-start", "virtual keyboard writer thread started");
             let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_virtual_keyboard_writer_loop(device, command_rx, completion_tx)
+                run_virtual_keyboard_writer_loop(
+                    device,
+                    command_rx,
+                    completion_tx,
+                    worker_transaction_failure_request_id,
+                    worker_stop_requested,
+                    worker_transaction_terminal_gate,
+                )
             }));
+            worker_alive.store(false, Ordering::SeqCst);
 
             match loop_result {
                 Ok(Ok(())) => {
@@ -985,15 +1384,20 @@ impl VirtualKeyboardWriter {
                     );
                 }
             }
-
-            worker_alive.store(false, Ordering::SeqCst);
         });
 
         Ok(Self {
-            handle: VirtualKeyboardHandle { command_tx, alive },
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive,
+                stop_requested,
+                transaction_failure_request_id,
+                transaction_terminal_gate,
+            },
             join_handle: Some(join_handle),
             completion_rx,
             next_request_id: 1,
+            pending_manual_current_word: None,
         })
     }
 
@@ -1001,12 +1405,26 @@ impl VirtualKeyboardWriter {
         self.handle.clone()
     }
 
-    fn stop(&mut self) {
-        if self.handle.alive.swap(false, Ordering::SeqCst) {
+    fn request_stop(&self) {
+        let _terminal_guard = self
+            .handle
+            .transaction_terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.handle.stop_requested.store(true, Ordering::SeqCst);
+        self.handle.alive.store(false, Ordering::SeqCst);
+    }
+
+    fn finish_stop(&mut self) {
+        if self.join_handle.is_some() {
             self.send_shutdown_command();
         }
-
         self.join_writer_thread_best_effort();
+    }
+
+    fn stop(&mut self) {
+        self.request_stop();
+        self.finish_stop();
     }
 
     fn send_shutdown_command(&self) {
@@ -1094,20 +1512,48 @@ impl VirtualKeyboardWriter {
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
     ) -> Result<ManualCurrentWordStartOutcome, SwitcherError> {
+        let timeout = correction_transaction_timeout(&plan, &config, true)?;
+        self.begin_manual_current_word_correction_with_timeout(plan, config, modifiers, timeout)
+    }
+
+    fn begin_manual_current_word_correction_with_timeout(
+        &mut self,
+        plan: CorrectionPlan,
+        config: RuntimeConfigSnapshot,
+        modifiers: ModifierState,
+        timeout: Duration,
+    ) -> Result<ManualCurrentWordStartOutcome, SwitcherError> {
         self.handle.ensure_alive()?;
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
+        if self.pending_manual_current_word.is_some() {
+            return Ok(ManualCurrentWordStartOutcome::RejectedBeforeMutation(
+                "manual-current-word-already-in-progress".to_string(),
+            ));
+        }
+        let request_id = take_next_nonzero_request_id(&mut self.next_request_id);
+        let control = WriterTransactionControl::new_with_writer_state(
+            request_id,
+            timeout.min(MAX_TRANSACTION_TIMEOUT),
+            Arc::clone(&self.handle.transaction_failure_request_id),
+            Arc::clone(&self.handle.stop_requested),
+            Arc::clone(&self.handle.transaction_terminal_gate),
+        );
 
         match self
             .handle
             .command_tx
             .try_send(WriterCommand::DeferredManualCurrentWordCorrection {
-                request_id,
+                control: control.clone(),
                 plan,
                 config,
                 modifiers,
             }) {
-            Ok(()) => Ok(ManualCurrentWordStartOutcome::Started(request_id)),
+            Ok(()) => {
+                self.pending_manual_current_word = Some(PendingManualCurrentWordTransaction {
+                    control,
+                    completion: None,
+                });
+                Ok(ManualCurrentWordStartOutcome::Started(request_id))
+            }
             Err(mpsc::TrySendError::Disconnected(_)) => {
                 Err(SwitcherError::VirtualKeyboardWriterDisconnected)
             }
@@ -1122,17 +1568,79 @@ impl VirtualKeyboardWriter {
     fn poll_manual_current_word_completion(
         &mut self,
     ) -> Result<Option<ManualCurrentWordCompletion>, SwitcherError> {
-        match self.completion_rx.try_recv() {
-            Ok(completion) => Ok(Some(completion)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                if self.handle.is_alive() {
-                    Err(SwitcherError::VirtualKeyboardWriterDisconnected)
-                } else {
-                    Ok(None)
+        let (received, completion_channel_disconnected) = match self.completion_rx.try_recv() {
+            Ok(completion) => (Some(completion), false),
+            Err(mpsc::TryRecvError::Empty) => (None, false),
+            Err(mpsc::TryRecvError::Disconnected) => (None, true),
+        };
+
+        let Some(pending) = self.pending_manual_current_word.as_mut() else {
+            if received.is_some() {
+                return Ok(received);
+            }
+            if completion_channel_disconnected {
+                return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+            }
+            self.handle.ensure_alive()?;
+            return Ok(None);
+        };
+        if let Some(completion) = received {
+            if completion.request_id != pending.control.request_id() {
+                return Err(SwitcherError::Io(io::Error::other(format!(
+                    "deferred completion request mismatch: pending={} received={}",
+                    pending.control.request_id(),
+                    completion.request_id,
+                ))));
+            }
+            pending.completion = Some(completion);
+        }
+
+        match pending.control.state() {
+            WriterTransactionState::Pending => {
+                pending.control.ensure_active()?;
+                if completion_channel_disconnected {
+                    return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+                }
+                self.handle.ensure_alive()?;
+                Ok(None)
+            }
+            WriterTransactionState::TimedOut => Err(pending.control.timed_out_error()),
+            WriterTransactionState::Completed => {
+                let completion = match pending.completion.take() {
+                    Some(completion) => completion,
+                    None => self
+                        .completion_rx
+                        .try_recv()
+                        .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?,
+                };
+                if completion.request_id != pending.control.request_id() {
+                    return Err(SwitcherError::Io(io::Error::other(format!(
+                        "deferred completion request mismatch: pending={} received={}",
+                        pending.control.request_id(),
+                        completion.request_id,
+                    ))));
+                }
+                self.pending_manual_current_word = None;
+                Ok(Some(completion))
+            }
+        }
+    }
+
+    fn health_error(&self) -> Option<SwitcherError> {
+        if let Some(pending) = self.pending_manual_current_word.as_ref() {
+            match pending.control.state() {
+                WriterTransactionState::Completed => return None,
+                WriterTransactionState::TimedOut => {
+                    return Some(pending.control.timed_out_error());
+                }
+                WriterTransactionState::Pending => {
+                    if let Err(error) = pending.control.ensure_active() {
+                        return Some(error);
+                    }
                 }
             }
         }
+        self.handle.health_error()
     }
 }
 
@@ -1144,15 +1652,31 @@ impl Drop for VirtualKeyboardWriter {
 
 impl VirtualKeyboardHandle {
     fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::SeqCst)
+        self.alive.load(Ordering::SeqCst) && self.transaction_failure_request_id().is_none()
+    }
+
+    fn transaction_failure_request_id(&self) -> Option<u64> {
+        match self.transaction_failure_request_id.load(Ordering::SeqCst) {
+            0 => None,
+            request_id => Some(request_id),
+        }
     }
 
     fn ensure_alive(&self) -> Result<(), SwitcherError> {
-        if self.is_alive() {
-            Ok(())
-        } else {
-            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        if let Some(error) = self.health_error() {
+            return Err(error);
         }
+        Ok(())
+    }
+
+    fn health_error(&self) -> Option<SwitcherError> {
+        if let Some(request_id) = self.transaction_failure_request_id() {
+            return Some(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id });
+        }
+        if !self.alive.load(Ordering::SeqCst) {
+            return Some(SwitcherError::VirtualKeyboardWriterDisconnected);
+        }
+        None
     }
 
     fn forward_event(&self, key: Key, value: i32) -> Result<(), SwitcherError> {
@@ -1207,26 +1731,62 @@ impl VirtualKeyboardHandle {
         &self,
         kind: WriterTransactionKind,
     ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+        let timeout = kind.execution_timeout()?;
+        self.run_transaction_with_timeout(kind, timeout)
+    }
+
+    fn run_transaction_with_timeout(
+        &self,
+        kind: WriterTransactionKind,
+        timeout: Duration,
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
         self.ensure_alive()?;
+        let request_id = next_writer_transaction_request_id();
+        let control = WriterTransactionControl::new_with_writer_state(
+            request_id,
+            timeout,
+            Arc::clone(&self.transaction_failure_request_id),
+            Arc::clone(&self.stop_requested),
+            Arc::clone(&self.transaction_terminal_gate),
+        );
         let (reply_tx, reply_rx) = mpsc::channel();
         self.send_transaction_command(WriterTransaction::Execute {
+            control: control.clone(),
             kind,
             reply: reply_tx,
         })?;
-        reply_rx
-            .recv()
-            .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?
+        control.wait_for_reply(reply_rx)
     }
 
     fn send_transaction_command(
         &self,
         transaction: WriterTransaction,
     ) -> Result<(), SwitcherError> {
+        let control = transaction.control().clone();
         let started = Instant::now();
+        let retry_deadline = started
+            .checked_add(TRANSACTION_SEND_RETRY_WINDOW)
+            .unwrap_or(control.deadline)
+            .min(control.deadline);
         let mut yielded = false;
         let mut command = WriterCommand::Transaction(transaction);
 
         loop {
+            control.ensure_active()?;
+            self.ensure_alive()?;
+            if yielded && Instant::now() >= retry_deadline {
+                control.ensure_active()?;
+                log_input_debug(
+                    "writer-transaction-backpressure-failed",
+                    &format!(
+                        "elapsed_us={} retry_window_us={}",
+                        started.elapsed().as_micros(),
+                        TRANSACTION_SEND_RETRY_WINDOW.as_micros()
+                    ),
+                );
+                return Err(SwitcherError::VirtualKeyboardWriterSaturated);
+            }
+
             match self.command_tx.try_send(command) {
                 Ok(()) => {
                     if yielded {
@@ -1241,18 +1801,6 @@ impl VirtualKeyboardHandle {
                     return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
                 }
                 Err(mpsc::TrySendError::Full(returned_command)) => {
-                    if started.elapsed() >= TRANSACTION_SEND_RETRY_WINDOW {
-                        log_input_debug(
-                            "writer-transaction-backpressure-failed",
-                            &format!(
-                                "elapsed_us={} retry_window_us={}",
-                                started.elapsed().as_micros(),
-                                TRANSACTION_SEND_RETRY_WINDOW.as_micros()
-                            ),
-                        );
-                        return Err(SwitcherError::VirtualKeyboardWriterSaturated);
-                    }
-
                     if !yielded {
                         log_input_debug(
                             "writer-transaction-backpressure",
@@ -1271,6 +1819,7 @@ impl VirtualKeyboardHandle {
     }
 
     fn send_fast_command(&self, command: WriterFastCommand) -> Result<(), SwitcherError> {
+        self.ensure_alive()?;
         let started = Instant::now();
         let mut yielded = false;
 
@@ -1292,6 +1841,7 @@ impl VirtualKeyboardHandle {
                     return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
                 }
                 Err(mpsc::TrySendError::Full(_)) => {
+                    self.ensure_alive()?;
                     if started.elapsed() >= FAST_PATH_SATURATION_RETRY_WINDOW {
                         log_input_debug(
                             "writer-backpressure-failed",
@@ -1782,42 +2332,6 @@ fn format_x11_window(window: Option<u32>) -> String {
     }
 }
 
-// Modifier replay helpers
-
-impl ModifierState {
-    fn for_each_pressed(
-        self,
-        mut f: impl FnMut(uinput::event::keyboard::Key) -> Result<(), uinput::Error>,
-    ) -> Result<(), SwitcherError> {
-        if self.left_shift {
-            f(uinput::event::keyboard::Key::LeftShift)?;
-        }
-        if self.right_shift {
-            f(uinput::event::keyboard::Key::RightShift)?;
-        }
-        if self.left_ctrl {
-            f(uinput::event::keyboard::Key::LeftControl)?;
-        }
-        if self.right_ctrl {
-            f(uinput::event::keyboard::Key::RightControl)?;
-        }
-        if self.left_alt {
-            f(uinput::event::keyboard::Key::LeftAlt)?;
-        }
-        if self.right_alt {
-            f(uinput::event::keyboard::Key::RightAlt)?;
-        }
-        if self.left_meta {
-            f(uinput::event::keyboard::Key::LeftMeta)?;
-        }
-        if self.right_meta {
-            f(uinput::event::keyboard::Key::RightMeta)?;
-        }
-
-        Ok(())
-    }
-}
-
 // Selection keyboard transport
 
 impl SelectionKeyboardTransport {
@@ -1836,23 +2350,145 @@ impl SelectionKeyboardTransport {
 
 // Correction replay
 
+fn ensure_transaction_active(
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    match control {
+        Some(control) => control.ensure_active(),
+        None => Ok(()),
+    }
+}
+
+fn authorize_transaction_mutation(
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    match control {
+        Some(control) => control.authorize_mutation_start(),
+        None => Ok(()),
+    }
+}
+
+fn sleep_for_transaction(
+    control: Option<&WriterTransactionControl>,
+    duration: Duration,
+) -> Result<(), SwitcherError> {
+    match control {
+        Some(control) => control.sleep_interruptibly(duration),
+        None => {
+            thread::sleep(duration);
+            Ok(())
+        }
+    }
+}
+
 fn release_modifiers(
     device: &mut uinput::Device,
     modifiers: ModifierState,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
-    modifiers.for_each_pressed(|key| device.release(&key))?;
-    device.synchronize()?;
-    thread::sleep(Duration::from_millis(MODIFIER_SYNC_DELAY_MS));
+    authorize_transaction_mutation(control)?;
+    release_uinput_modifiers_exhaustively(device, modifiers)?;
+    sleep_for_transaction(control, Duration::from_millis(MODIFIER_SYNC_DELAY_MS))?;
     Ok(())
 }
 
 fn restore_modifiers(
     device: &mut uinput::Device,
     modifiers: ModifierState,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
-    modifiers.for_each_pressed(|key| device.press(&key))?;
-    device.synchronize()?;
+    let mut restored = Vec::new();
+    for key in pressed_uinput_modifier_keys(modifiers) {
+        if let Err(error) = authorize_transaction_mutation(control) {
+            release_uinput_keys_best_effort(device, &restored);
+            return Err(error);
+        }
+        if let Err(error) = device.press(&key) {
+            release_uinput_keys_best_effort(device, &restored);
+            return Err(error.into());
+        }
+        restored.push(key);
+    }
+    if let Err(error) = device.synchronize() {
+        release_uinput_keys_best_effort(device, &restored);
+        return Err(error.into());
+    }
+    if let Err(error) = ensure_transaction_active(control) {
+        release_uinput_keys_best_effort(device, &restored);
+        return Err(error);
+    }
     Ok(())
+}
+
+fn pressed_uinput_modifier_keys(modifiers: ModifierState) -> Vec<uinput::event::keyboard::Key> {
+    use uinput::event::keyboard::Key;
+
+    let mut keys = Vec::new();
+    if modifiers.left_shift {
+        keys.push(Key::LeftShift);
+    }
+    if modifiers.right_shift {
+        keys.push(Key::RightShift);
+    }
+    if modifiers.left_ctrl {
+        keys.push(Key::LeftControl);
+    }
+    if modifiers.right_ctrl {
+        keys.push(Key::RightControl);
+    }
+    if modifiers.left_alt {
+        keys.push(Key::LeftAlt);
+    }
+    if modifiers.right_alt {
+        keys.push(Key::RightAlt);
+    }
+    if modifiers.left_meta {
+        keys.push(Key::LeftMeta);
+    }
+    if modifiers.right_meta {
+        keys.push(Key::RightMeta);
+    }
+    keys
+}
+
+fn release_uinput_keys_best_effort(
+    device: &mut uinput::Device,
+    keys: &[uinput::event::keyboard::Key],
+) {
+    for key in keys.iter().rev() {
+        let _ = device.release(key);
+    }
+    let _ = device.synchronize();
+}
+
+trait UinputShortcutSink {
+    fn release_shortcut_key(
+        &mut self,
+        key: &uinput::event::keyboard::Key,
+    ) -> Result<(), SwitcherError>;
+    fn synchronize_shortcut_keys(&mut self) -> Result<(), SwitcherError>;
+}
+
+impl UinputShortcutSink for uinput::Device {
+    fn release_shortcut_key(
+        &mut self,
+        key: &uinput::event::keyboard::Key,
+    ) -> Result<(), SwitcherError> {
+        self.release(key).map_err(Into::into)
+    }
+
+    fn synchronize_shortcut_keys(&mut self) -> Result<(), SwitcherError> {
+        self.synchronize().map_err(Into::into)
+    }
+}
+
+fn release_uinput_modifiers_exhaustively(
+    device: &mut dyn UinputShortcutSink,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    let pressed = pressed_uinput_modifier_keys(modifiers);
+    let pressed = pressed.iter().collect::<Vec<_>>();
+    release_shortcut_keys(device, None, &pressed)
 }
 
 fn run_shortcut(
@@ -1860,35 +2496,89 @@ fn run_shortcut(
     modifiers: ModifierState,
     shortcut_modifiers: &[uinput::event::keyboard::Key],
     trigger_key: Option<&uinput::event::keyboard::Key>,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
-    release_modifiers(device, modifiers)?;
+    release_modifiers(device, modifiers, control)?;
 
+    let mut pressed_shortcut_modifiers = Vec::new();
     for modifier in shortcut_modifiers {
-        device.press(modifier)?;
+        if let Err(error) = authorize_transaction_mutation(control) {
+            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
+            return Err(error);
+        }
+        if let Err(error) = device.press(modifier) {
+            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
+            return Err(error.into());
+        }
+        pressed_shortcut_modifiers.push(modifier);
     }
 
+    let mut trigger_pressed = None;
     if let Some(key) = trigger_key {
-        device.press(key)?;
+        if let Err(error) = authorize_transaction_mutation(control) {
+            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
+            return Err(error);
+        }
+        if let Err(error) = device.press(key) {
+            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
+            return Err(error.into());
+        }
+        trigger_pressed = Some(key);
     }
 
-    device.synchronize()?;
-    thread::sleep(Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
-
-    if let Some(key) = trigger_key {
-        device.release(key)?;
+    if let Err(error) = device.synchronize() {
+        release_shortcut_keys_best_effort(device, trigger_pressed, &pressed_shortcut_modifiers);
+        return Err(error.into());
     }
-
-    for modifier in shortcut_modifiers.iter().rev() {
-        device.release(modifier)?;
-    }
-
-    device.synchronize()?;
-    restore_modifiers(device, modifiers)?;
+    let wait_result = sleep_for_transaction(control, Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
+    let cleanup_result =
+        release_shortcut_keys(device, trigger_pressed, &pressed_shortcut_modifiers);
+    wait_result?;
+    cleanup_result?;
+    restore_modifiers(device, modifiers, control)?;
     Ok(())
 }
 
+fn release_shortcut_keys(
+    device: &mut dyn UinputShortcutSink,
+    trigger_pressed: Option<&uinput::event::keyboard::Key>,
+    pressed_shortcut_modifiers: &[&uinput::event::keyboard::Key],
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
+    if let Some(key) = trigger_pressed {
+        if let Err(error) = device.release_shortcut_key(key) {
+            first_error = Some(error);
+        }
+    }
+    for modifier in pressed_shortcut_modifiers.iter().rev() {
+        if let Err(error) = device.release_shortcut_key(modifier) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Err(error) = device.synchronize_shortcut_keys() {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn release_shortcut_keys_best_effort(
+    device: &mut dyn UinputShortcutSink,
+    trigger_pressed: Option<&uinput::event::keyboard::Key>,
+    pressed_shortcut_modifiers: &[&uinput::event::keyboard::Key],
+) {
+    let _ = release_shortcut_keys(device, trigger_pressed, pressed_shortcut_modifiers);
+}
+
 use crate::daemon::layout_switcher::{
-    LayoutSwitchStrategy, LayoutSwitcher, UinputLayoutSwitcher, X11LayoutSwitcher,
+    LayoutSwitchHooks, LayoutSwitchStrategy, LayoutSwitcher, UinputLayoutSwitcher,
+    X11LayoutSwitcher,
 };
 
 fn replay_shift_for_stroke(
@@ -1942,9 +2632,16 @@ fn is_case_sensitive_letter_key(key: Key) -> bool {
 }
 
 trait CinnamonX11XtestReplay {
-    fn prepare_for_layout_correction(&mut self, plan: &CorrectionPlan)
-        -> Result<(), SwitcherError>;
-    fn key_down(&mut self, key: Key) -> Result<(), SwitcherError>;
+    fn prepare_for_layout_correction(
+        &mut self,
+        plan: &CorrectionPlan,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<(), SwitcherError>;
+    fn key_down(
+        &mut self,
+        key: Key,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<(), SwitcherError>;
     fn key_up(&mut self, key: Key) -> Result<(), SwitcherError>;
 }
 
@@ -1975,6 +2672,45 @@ struct CinnamonX11XtestReplayer {
     dbus: zbus::blocking::Connection,
 }
 
+fn validate_cinnamon_plan_keycodes_with(
+    plan: &CorrectionPlan,
+    control: Option<&WriterTransactionControl>,
+    mut validate: impl FnMut(Key) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    let required_keys = [Key::KEY_BACKSPACE, Key::KEY_LEFTSHIFT, Key::KEY_SPACE];
+    for key in required_keys
+        .into_iter()
+        .chain(plan.buffer.iter().map(|stroke| stroke.key))
+    {
+        ensure_transaction_active(control)?;
+        let result = validate(key);
+        ensure_transaction_active(control)?;
+        result?;
+    }
+    Ok(())
+}
+
+fn run_checked_external_call<T>(
+    control: Option<&WriterTransactionControl>,
+    call: impl FnOnce() -> Result<T, SwitcherError>,
+) -> Result<T, SwitcherError> {
+    ensure_transaction_active(control)?;
+    let result = call();
+    ensure_transaction_active(control)?;
+    result
+}
+
+fn read_cinnamon_source_state_with(
+    control: Option<&WriterTransactionControl>,
+    read_active_source: impl FnOnce() -> Result<Option<i32>, SwitcherError>,
+    read_xkb_group: impl FnOnce() -> Result<u8, SwitcherError>,
+) -> Result<(Option<i32>, u8), SwitcherError> {
+    let active_source = run_checked_external_call(control, read_active_source)?;
+    ensure_transaction_active(control)?;
+    let xkb_group = run_checked_external_call(control, read_xkb_group)?;
+    Ok((active_source, xkb_group))
+}
+
 impl CinnamonX11XtestReplayer {
     fn new() -> Result<Self, SwitcherError> {
         let (x11, screen_num) = x11rb::connect(None)
@@ -2003,22 +2739,33 @@ impl CinnamonX11XtestReplayer {
             .map_err(SwitcherError::from)
     }
 
-    fn input_sources(&self) -> Result<Vec<CinnamonInputSource>, SwitcherError> {
-        self.proxy()?
-            .call("GetInputSources", &())
-            .map_err(Into::into)
+    fn input_sources(
+        &self,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<Vec<CinnamonInputSource>, SwitcherError> {
+        run_checked_external_call(control, || {
+            self.proxy()?
+                .call("GetInputSources", &())
+                .map_err(Into::into)
+        })
     }
 
-    fn active_source_index(&self) -> Result<Option<i32>, SwitcherError> {
+    fn active_source_index(
+        &self,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<Option<i32>, SwitcherError> {
         Ok(self
-            .input_sources()?
+            .input_sources(control)?
             .into_iter()
             .find(|source| source.11)
             .map(|source| source.2))
     }
 
-    fn target_source_index(&self) -> Result<i32, SwitcherError> {
-        let sources = self.input_sources()?;
+    fn target_source_index(
+        &self,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<i32, SwitcherError> {
+        let sources = self.input_sources(control)?;
         let Some(active) = sources.iter().find(|source| source.11) else {
             return Err(SwitcherError::Io(io::Error::other(
                 "cinnamon-dbus-xtest-before-mutation: no active input source",
@@ -2051,50 +2798,73 @@ impl CinnamonX11XtestReplayer {
         })
     }
 
-    fn activate_and_verify_source(&self, target_index: i32) -> Result<(), SwitcherError> {
-        let proxy = self.proxy()?;
-        let _: () = proxy.call("ActivateInputSourceIndex", &(target_index,))?;
+    fn activate_and_verify_source(
+        &self,
+        target_index: i32,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<(), SwitcherError> {
+        let proxy = run_checked_external_call(control, || self.proxy())?;
+        authorize_transaction_mutation(control)?;
+        let activation_result: Result<(), SwitcherError> = proxy
+            .call("ActivateInputSourceIndex", &(target_index,))
+            .map_err(Into::into);
+        ensure_transaction_active(control)?;
+        activation_result?;
         let started = Instant::now();
+        let mut last_active_index = None;
+        let mut last_xkb_group = None;
 
         while started.elapsed() < CINNAMON_DBUS_SWITCH_TIMEOUT {
-            let active_index = self.active_source_index()?;
-            let xkb_group = self.xkb_group()?;
+            ensure_transaction_active(control)?;
+            let (active_index, xkb_group) = read_cinnamon_source_state_with(
+                control,
+                || self.active_source_index(control),
+                || self.xkb_group(control),
+            )?;
+            ensure_transaction_active(control)?;
+            last_active_index = active_index;
+            last_xkb_group = Some(xkb_group);
             if active_index == Some(target_index) && i32::from(xkb_group) == target_index {
                 return Ok(());
             }
-            thread::sleep(CINNAMON_DBUS_SWITCH_POLL_INTERVAL);
+            sleep_for_transaction(control, CINNAMON_DBUS_SWITCH_POLL_INTERVAL)?;
         }
 
         Err(SwitcherError::Io(io::Error::other(format!(
             "cinnamon-dbus-xtest-before-mutation: activation did not settle target={target_index} active={:?} xkb_group={:?}",
-            self.active_source_index().ok().flatten(),
-            self.xkb_group().ok(),
+            last_active_index,
+            last_xkb_group,
         ))))
     }
 
-    fn xkb_group(&self) -> Result<u8, SwitcherError> {
+    fn xkb_group(&self, control: Option<&WriterTransactionControl>) -> Result<u8, SwitcherError> {
         use x11rb::protocol::xkb::{self, ConnectionExt as _};
-        let state = self
-            .x11
-            .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
-            .reply()
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+        let state = run_checked_external_call(control, || {
+            self.x11
+                .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
+                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+                .reply()
+                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
+        })?;
 
         Ok(u8::from(state.group))
     }
 
-    fn validate_plan_keycodes(&self, plan: &CorrectionPlan) -> Result<(), SwitcherError> {
-        self.validate_keycode(Key::KEY_BACKSPACE)?;
-        self.validate_keycode(Key::KEY_LEFTSHIFT)?;
-        self.validate_keycode(Key::KEY_SPACE)?;
-        for stroke in &plan.buffer {
-            self.validate_keycode(stroke.key)?;
-        }
-        Ok(())
+    fn validate_plan_keycodes(
+        &self,
+        plan: &CorrectionPlan,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<(), SwitcherError> {
+        validate_cinnamon_plan_keycodes_with(plan, control, |key| {
+            self.validate_keycode(key, control).map(|_| ())
+        })
     }
 
-    fn validate_keycode(&self, key: Key) -> Result<u8, SwitcherError> {
+    fn validate_keycode(
+        &self,
+        key: Key,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<u8, SwitcherError> {
         let keycode = evdev_key_to_x11_keycode(key)?;
         use x11rb::connection::Connection as _;
         let setup = self.x11.setup();
@@ -2106,12 +2876,13 @@ impl CinnamonX11XtestReplayer {
         }
 
         use x11rb::protocol::xproto::ConnectionExt as _;
-        let mapping = self
-            .x11
-            .get_keyboard_mapping(keycode, 1)
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
-            .reply()
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
+        let mapping = run_checked_external_call(control, || {
+            self.x11
+                .get_keyboard_mapping(keycode, 1)
+                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+                .reply()
+                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
+        })?;
         if mapping.keysyms.iter().all(|keysym| *keysym == 0) {
             return Err(SwitcherError::Io(io::Error::other(format!(
                 "cinnamon-dbus-xtest-before-mutation: keycode has empty mapping key={key:?} keycode={keycode}",
@@ -2121,8 +2892,7 @@ impl CinnamonX11XtestReplayer {
         Ok(keycode)
     }
 
-    fn fake_key(&self, key: Key, pressed: bool) -> Result<(), SwitcherError> {
-        let keycode = self.validate_keycode(key)?;
+    fn emit_fake_key(&self, keycode: u8, pressed: bool) -> Result<(), SwitcherError> {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::xproto;
         use x11rb::protocol::xtest::ConnectionExt as _;
@@ -2149,29 +2919,104 @@ impl CinnamonX11XtestReplayer {
         Ok(())
     }
 
-    fn type_key(&mut self, key: Key) -> Result<(), SwitcherError> {
-        self.key_down(key)?;
-        thread::sleep(Duration::from_millis(2));
-        self.key_up(key)
+    fn fake_key(
+        &self,
+        key: Key,
+        pressed: bool,
+        control: Option<&WriterTransactionControl>,
+        failure_request_id: Option<&AtomicU64>,
+        stop_requested: Option<&AtomicBool>,
+        terminal_gate: Option<&Mutex<()>>,
+    ) -> Result<(), SwitcherError> {
+        validate_and_emit_xtest_key(
+            key,
+            control,
+            failure_request_id,
+            stop_requested,
+            terminal_gate,
+            |key| self.validate_keycode(key, control),
+            |keycode| self.emit_fake_key(keycode, pressed),
+        )
     }
+
+    fn type_key(
+        &mut self,
+        key: Key,
+        failure_request_id: &AtomicU64,
+        stop_requested: &AtomicBool,
+        terminal_gate: &Mutex<()>,
+    ) -> Result<(), SwitcherError> {
+        let key_down_result = self.fake_key(
+            key,
+            true,
+            None,
+            Some(failure_request_id),
+            Some(stop_requested),
+            Some(terminal_gate),
+        );
+        finish_fast_xtest_tap_attempt(key_down_result, || self.key_up(key))
+    }
+}
+
+fn validate_and_emit_xtest_key(
+    key: Key,
+    control: Option<&WriterTransactionControl>,
+    failure_request_id: Option<&AtomicU64>,
+    stop_requested: Option<&AtomicBool>,
+    terminal_gate: Option<&Mutex<()>>,
+    validate: impl FnOnce(Key) -> Result<u8, SwitcherError>,
+    emit: impl FnOnce(u8) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    ensure_transaction_active(control)?;
+    if let Some(failure_request_id) = failure_request_id {
+        ensure_writer_not_failed(failure_request_id)?;
+    }
+    let keycode = validate(key);
+    ensure_transaction_active(control)?;
+    if let Some(failure_request_id) = failure_request_id {
+        ensure_writer_not_failed(failure_request_id)?;
+    }
+    let keycode = keycode?;
+    match (control, failure_request_id, stop_requested, terminal_gate) {
+        (Some(control), _, _, _) => control.authorize_mutation_start()?,
+        (None, Some(failure_request_id), Some(stop_requested), Some(terminal_gate)) => {
+            authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)?;
+        }
+        (None, Some(failure_request_id), _, None) => {
+            ensure_writer_not_failed(failure_request_id)?;
+        }
+        (None, None, _, _) => {}
+        (None, Some(_), None, Some(_)) => {
+            return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+        }
+    }
+    emit(keycode)
 }
 
 impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
     fn prepare_for_layout_correction(
         &mut self,
         plan: &CorrectionPlan,
+        control: Option<&WriterTransactionControl>,
     ) -> Result<(), SwitcherError> {
-        self.validate_plan_keycodes(plan)?;
-        let target_index = self.target_source_index()?;
-        self.activate_and_verify_source(target_index)
+        ensure_transaction_active(control)?;
+        self.validate_plan_keycodes(plan, control)?;
+        ensure_transaction_active(control)?;
+        let target_index = self.target_source_index(control)?;
+        ensure_transaction_active(control)?;
+        self.activate_and_verify_source(target_index, control)
     }
 
-    fn key_down(&mut self, key: Key) -> Result<(), SwitcherError> {
-        self.fake_key(key, true)
+    fn key_down(
+        &mut self,
+        key: Key,
+        control: Option<&WriterTransactionControl>,
+    ) -> Result<(), SwitcherError> {
+        self.fake_key(key, true, control, None, None, None)
     }
 
     fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
-        self.fake_key(key, false)
+        self.fake_key(key, false, None, None, None, None)
     }
 }
 
@@ -2217,21 +3062,75 @@ fn select_correction_replay_strategy(
 fn release_modifiers_xtest(
     replay: &mut dyn CinnamonX11XtestReplay,
     modifiers: ModifierState,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
+    authorize_transaction_mutation(control)?;
+    let cleanup_result = release_xtest_modifiers_exhaustively(replay, modifiers);
+    let active_result = ensure_transaction_active(control);
+    cleanup_result?;
+    active_result
+}
+
+fn release_xtest_modifiers_exhaustively(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    modifiers: ModifierState,
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
     for key in pressed_modifier_keys(modifiers) {
-        replay.key_up(key)?;
+        if let Err(error) = replay.key_up(key) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn restore_modifiers_xtest(
     replay: &mut dyn CinnamonX11XtestReplay,
     modifiers: ModifierState,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
+    let mut restored = Vec::new();
     for key in pressed_modifier_keys(modifiers) {
-        replay.key_down(key)?;
+        if let Err(error) = ensure_transaction_active(control) {
+            release_xtest_keys_best_effort(replay, &restored);
+            return Err(error);
+        }
+        if let Err(error) = xtest_key_down_exception_safe(replay, key, control) {
+            release_xtest_keys_best_effort(replay, &restored);
+            return Err(error);
+        }
+        restored.push(key);
+    }
+    if let Err(error) = ensure_transaction_active(control) {
+        release_xtest_keys_best_effort(replay, &restored);
+        return Err(error);
     }
     Ok(())
+}
+
+fn xtest_key_down_exception_safe(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    key: Key,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    match replay.key_down(key, control) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = replay.key_up(key);
+            Err(error)
+        }
+    }
+}
+
+fn release_xtest_keys_best_effort(replay: &mut dyn CinnamonX11XtestReplay, keys: &[Key]) {
+    for key in keys.iter().rev() {
+        let _ = replay.key_up(*key);
+    }
 }
 
 fn pressed_modifier_keys(modifiers: ModifierState) -> Vec<Key> {
@@ -2267,12 +3166,68 @@ fn xtest_key_tap(
     replay: &mut dyn CinnamonX11XtestReplay,
     key: Key,
     delay: Duration,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
-    replay.key_down(key)?;
-    thread::sleep(Duration::from_millis(2));
-    replay.key_up(key)?;
-    thread::sleep(delay);
-    Ok(())
+    ensure_transaction_active(control)?;
+    let key_down_result = replay.key_down(key, control);
+    complete_xtest_tap_attempt(
+        key_down_result,
+        || sleep_for_transaction(control, Duration::from_millis(2)),
+        || replay.key_up(key),
+        || sleep_for_transaction(control, delay),
+    )
+}
+
+fn complete_xtest_tap_attempt(
+    key_down_result: Result<(), SwitcherError>,
+    transition_wait: impl FnOnce() -> Result<(), SwitcherError>,
+    key_up: impl FnOnce() -> Result<(), SwitcherError>,
+    final_wait: impl FnOnce() -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    let transition_result = transition_wait();
+    let key_up_result = key_up();
+    key_down_result?;
+    transition_result?;
+    key_up_result?;
+    final_wait()
+}
+
+fn finish_fast_xtest_tap_attempt(
+    key_down_result: Result<(), SwitcherError>,
+    key_up: impl FnOnce() -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    complete_xtest_tap_attempt(
+        key_down_result,
+        || {
+            thread::sleep(Duration::from_millis(2));
+            Ok(())
+        },
+        key_up,
+        || Ok(()),
+    )
+}
+
+fn replay_xtest_stroke(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    key: Key,
+    effective_shift: bool,
+    typing_delay: Duration,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    if !effective_shift {
+        return xtest_key_tap(replay, key, typing_delay, control);
+    }
+
+    ensure_transaction_active(control)?;
+    xtest_key_down_exception_safe(replay, Key::KEY_LEFTSHIFT, control)?;
+    if let Err(error) = sleep_for_transaction(control, Duration::from_millis(1)) {
+        let _ = replay.key_up(Key::KEY_LEFTSHIFT);
+        return Err(error);
+    }
+    let tap_result = xtest_key_tap(replay, key, typing_delay, control);
+    let shift_release_result = replay.key_up(Key::KEY_LEFTSHIFT);
+    tap_result?;
+    shift_release_result
 }
 
 fn run_cinnamon_x11_xtest_correction(
@@ -2280,31 +3235,34 @@ fn run_cinnamon_x11_xtest_correction(
     plan: &CorrectionPlan,
     config: &RuntimeConfigSnapshot,
     modifiers: ModifierState,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
-    replay.prepare_for_layout_correction(plan)?;
-    release_modifiers_xtest(replay, modifiers)?;
+    ensure_transaction_active(control)?;
+    replay.prepare_for_layout_correction(plan, control)?;
+    ensure_transaction_active(control)?;
+    release_modifiers_xtest(replay, modifiers, control)?;
 
     for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
         xtest_key_tap(
             replay,
             Key::KEY_BACKSPACE,
             Duration::from_millis(config.backspace_ms),
+            control,
         )?;
     }
 
     for stroke in &plan.buffer {
         let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
-        if effective_shift {
-            replay.key_down(Key::KEY_LEFTSHIFT)?;
-            thread::sleep(Duration::from_millis(1));
-        }
-        xtest_key_tap(replay, stroke.key, Duration::from_millis(config.typing_ms))?;
-        if effective_shift {
-            replay.key_up(Key::KEY_LEFTSHIFT)?;
-        }
+        replay_xtest_stroke(
+            replay,
+            stroke.key,
+            effective_shift,
+            Duration::from_millis(config.typing_ms),
+            control,
+        )?;
     }
 
-    restore_modifiers_xtest(replay, modifiers)?;
+    restore_modifiers_xtest(replay, modifiers, control)?;
     Ok(CorrectionExecutionOutcome {
         layout_switch: CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest,
     })
@@ -2345,6 +3303,101 @@ fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11X
     }
 }
 
+trait UinputStrokeSink {
+    fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError>;
+    fn synchronize_keys(&mut self) -> Result<(), SwitcherError>;
+}
+
+impl UinputStrokeSink for uinput::Device {
+    fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
+        self.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)
+            .map_err(Into::into)
+    }
+
+    fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
+        self.synchronize().map_err(Into::into)
+    }
+}
+
+fn release_uinput_stroke_keys(
+    sink: &mut dyn UinputStrokeSink,
+    pressed: &[Key],
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
+    for key in pressed.iter().rev() {
+        if let Err(error) = sink.write_key(*key, 0) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Err(error) = sink.synchronize_keys() {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn replay_uinput_stroke(
+    sink: &mut dyn UinputStrokeSink,
+    key: Key,
+    effective_shift: bool,
+    typing_delay: Duration,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    let mut pressed = Vec::with_capacity(2);
+
+    if effective_shift {
+        authorize_transaction_mutation(control)?;
+        sink.write_key(Key::KEY_LEFTSHIFT, 1)?;
+        pressed.push(Key::KEY_LEFTSHIFT);
+        if let Err(error) = sink.synchronize_keys() {
+            let _ = release_uinput_stroke_keys(sink, &pressed);
+            return Err(error);
+        }
+        if let Err(error) = sleep_for_transaction(control, Duration::from_millis(1)) {
+            let _ = release_uinput_stroke_keys(sink, &pressed);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = authorize_transaction_mutation(control) {
+        let _ = release_uinput_stroke_keys(sink, &pressed);
+        return Err(error);
+    }
+    if let Err(error) = sink.write_key(key, 1) {
+        let _ = release_uinput_stroke_keys(sink, &pressed);
+        return Err(error);
+    }
+    pressed.push(key);
+    if let Err(error) = sink.synchronize_keys() {
+        let _ = release_uinput_stroke_keys(sink, &pressed);
+        return Err(error);
+    }
+
+    let transition_wait = sleep_for_transaction(control, Duration::from_millis(2));
+    let release_result = release_uinput_stroke_keys(sink, &pressed);
+    transition_wait?;
+    release_result?;
+    sleep_for_transaction(control, typing_delay)
+}
+
+fn replay_uinput_backspaces(
+    sink: &mut dyn UinputStrokeSink,
+    count: usize,
+    backspace_delay: Duration,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    for _ in 0..count {
+        replay_uinput_stroke(sink, Key::KEY_BACKSPACE, false, backspace_delay, control)?;
+    }
+    Ok(())
+}
+
 fn run_correction(
     device: &mut uinput::Device,
     plan: &CorrectionPlan,
@@ -2353,6 +3406,7 @@ fn run_correction(
     x11_switcher: &mut Option<X11LayoutSwitcher>,
     cinnamon_x11_xtest: &mut CinnamonX11XtestRuntime,
     switch_layout: bool,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
     log_input_debug(
         "correction-transaction",
@@ -2368,6 +3422,8 @@ fn run_correction(
         ),
     );
 
+    ensure_transaction_active(control)?;
+
     if switch_layout {
         match cinnamon_x11_xtest {
             CinnamonX11XtestRuntime::Available(replay) => {
@@ -2375,8 +3431,13 @@ fn run_correction(
                     "correction-layout-switch",
                     "strategy=cinnamon-dbus-xtest phase=prepare",
                 );
-                let outcome =
-                    run_cinnamon_x11_xtest_correction(replay.as_mut(), plan, config, modifiers)?;
+                let outcome = run_cinnamon_x11_xtest_correction(
+                    replay.as_mut(),
+                    plan,
+                    config,
+                    modifiers,
+                    control,
+                )?;
                 log_input_debug(
                     "correction-layout-switch",
                     "strategy=cinnamon-dbus-xtest result=ok",
@@ -2396,15 +3457,13 @@ fn run_correction(
         }
     }
 
-    release_modifiers(device, modifiers)?;
-    for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
-        device.press(&uinput::event::keyboard::Key::BackSpace)?;
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(2));
-        device.release(&uinput::event::keyboard::Key::BackSpace)?;
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(config.backspace_ms));
-    }
+    release_modifiers(device, modifiers, control)?;
+    replay_uinput_backspaces(
+        device,
+        plan.buffer.len() + plan.extra_backspaces,
+        Duration::from_millis(config.backspace_ms),
+        control,
+    )?;
 
     let layout_switch = if switch_layout {
         if x11_switcher.is_some() {
@@ -2425,12 +3484,26 @@ fn run_correction(
             );
         }
 
-        let mut uinput_switcher = UinputLayoutSwitcher::new(device, config.layout_delay_ms);
+        let layout_waiter = |duration: Duration| {
+            if duration.is_zero() {
+                authorize_transaction_mutation(control)
+            } else {
+                sleep_for_transaction(control, duration)
+            }
+        };
+        let mut uinput_switcher =
+            UinputLayoutSwitcher::new_with_waiter(device, config.layout_delay_ms, &layout_waiter);
         let x11 = x11_switcher
             .as_mut()
             .map(|switcher| switcher as &mut dyn LayoutSwitcher);
-        let outcome =
-            switch_layout_with_fallback(x11, &mut uinput_switcher, config.layout_switch_combo)?;
+        ensure_transaction_active(control)?;
+        let outcome = switch_layout_with_fallback(
+            x11,
+            &mut uinput_switcher,
+            config.layout_switch_combo,
+            control,
+        )?;
+        ensure_transaction_active(control)?;
         match outcome {
             CorrectionLayoutSwitchOutcome::AppliedX11 => log_input_debug(
                 "correction-layout-switch",
@@ -2452,7 +3525,7 @@ fn run_correction(
             ),
             CorrectionLayoutSwitchOutcome::NotNeeded => {}
         }
-        thread::sleep(Duration::from_millis(config.layout_delay_ms));
+        sleep_for_transaction(control, Duration::from_millis(config.layout_delay_ms))?;
         outcome
     } else {
         CorrectionLayoutSwitchOutcome::NotNeeded
@@ -2460,23 +3533,16 @@ fn run_correction(
 
     for stroke in &plan.buffer {
         let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
-        if effective_shift {
-            device.press(&uinput::event::keyboard::Key::LeftShift)?;
-            device.synchronize()?;
-            thread::sleep(Duration::from_millis(1));
-        }
-        device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 1)?;
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(2));
-        device.write(INPUT_EVENT_KEYBOARD, stroke.key.code() as i32, 0)?;
-        if effective_shift {
-            device.release(&uinput::event::keyboard::Key::LeftShift)?;
-        }
-        device.synchronize()?;
-        thread::sleep(Duration::from_millis(config.typing_ms));
+        replay_uinput_stroke(
+            device,
+            stroke.key,
+            effective_shift,
+            Duration::from_millis(config.typing_ms),
+            control,
+        )?;
     }
 
-    restore_modifiers(device, modifiers)?;
+    restore_modifiers(device, modifiers, control)?;
     Ok(CorrectionExecutionOutcome { layout_switch })
 }
 
@@ -2484,9 +3550,14 @@ fn switch_layout_with_fallback(
     x11_switcher: Option<&mut dyn LayoutSwitcher>,
     uinput_switcher: &mut dyn LayoutSwitcher,
     combo: LayoutSwitchCombo,
+    control: Option<&WriterTransactionControl>,
 ) -> Result<CorrectionLayoutSwitchOutcome, SwitcherError> {
+    ensure_transaction_active(control)?;
+    let checkpoint = || ensure_transaction_active(control);
+    let authorize_mutation = || authorize_transaction_mutation(control);
+    let hooks = LayoutSwitchHooks::new(&checkpoint, &authorize_mutation);
     if let Some(switcher) = x11_switcher {
-        if let Err(e) = switcher.switch_layout(combo) {
+        if let Err(e) = switcher.switch_layout_with_hooks(combo, &hooks) {
             log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
             log_input_debug(
                 "correction-layout-switch",
@@ -2495,23 +3566,153 @@ fn switch_layout_with_fallback(
                     combo
                 ),
             );
-            uinput_switcher.switch_layout(combo)?;
+            ensure_transaction_active(control)?;
+            uinput_switcher.switch_layout_with_hooks(combo, &hooks)?;
             return Ok(CorrectionLayoutSwitchOutcome::AppliedUinput);
         }
 
         return Ok(CorrectionLayoutSwitchOutcome::AppliedX11);
     }
 
-    uinput_switcher.switch_layout(combo)?;
+    ensure_transaction_active(control)?;
+    uinput_switcher.switch_layout_with_hooks(combo, &hooks)?;
     Ok(CorrectionLayoutSwitchOutcome::AppliedUinput)
 }
 
 // Virtual keyboard writer loop
 
+fn ensure_writer_not_failed(failure_request_id: &AtomicU64) -> Result<(), SwitcherError> {
+    let request_id = failure_request_id.load(Ordering::SeqCst);
+    if request_id == 0 {
+        Ok(())
+    } else {
+        Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id })
+    }
+}
+
+fn authorize_writer_mutation_start(
+    failure_request_id: &AtomicU64,
+    stop_requested: &AtomicBool,
+    terminal_gate: &Mutex<()>,
+) -> Result<(), SwitcherError> {
+    ensure_writer_running(failure_request_id, stop_requested, terminal_gate)
+}
+
+fn ensure_writer_running(
+    failure_request_id: &AtomicU64,
+    stop_requested: &AtomicBool,
+    terminal_gate: &Mutex<()>,
+) -> Result<(), SwitcherError> {
+    let _terminal_guard = terminal_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if stop_requested.load(Ordering::SeqCst) {
+        return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+    }
+    ensure_writer_not_failed(failure_request_id)
+}
+
+fn publish_writer_transaction_result(
+    control: &WriterTransactionControl,
+    reply: mpsc::Sender<Result<CorrectionExecutionOutcome, SwitcherError>>,
+    result: Result<CorrectionExecutionOutcome, SwitcherError>,
+) -> Result<(), SwitcherError> {
+    let failure_reason = result.as_ref().err().map(ToString::to_string);
+    if reply.send(result).is_err() {
+        return if control.is_cancelled() {
+            Err(control.cancellation_error())
+        } else {
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        };
+    }
+    if control.publish_completed() {
+        match failure_reason {
+            Some(reason) => Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: control.request_id(),
+                reason,
+            }),
+            None => Ok(()),
+        }
+    } else {
+        Err(control.cancellation_error())
+    }
+}
+
+fn publish_deferred_manual_completion(
+    control: &WriterTransactionControl,
+    completion_tx: &mpsc::Sender<ManualCurrentWordCompletion>,
+    completion: ManualCurrentWordCompletion,
+    failure_reason: Option<String>,
+) -> Result<(), SwitcherError> {
+    if completion_tx.send(completion).is_err() {
+        return if control.is_cancelled() {
+            Err(control.cancellation_error())
+        } else {
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        };
+    }
+    if !control.publish_completed() {
+        return Err(control.cancellation_error());
+    }
+    match failure_reason {
+        Some(reason) => Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+            request_id: control.request_id(),
+            reason,
+        }),
+        None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+fn run_writer_command_loop_with(
+    command_rx: mpsc::Receiver<WriterCommand>,
+    failure_request_id: &AtomicU64,
+    mut dispatch: impl FnMut(WriterCommand) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    for command in command_rx {
+        if matches!(&command, WriterCommand::Shutdown) {
+            break;
+        }
+        ensure_writer_not_failed(failure_request_id)?;
+        dispatch(command)?;
+    }
+    Ok(())
+}
+
+fn run_writer_command_loop_with_stop(
+    command_rx: mpsc::Receiver<WriterCommand>,
+    failure_request_id: &AtomicU64,
+    stop_requested: &AtomicBool,
+    terminal_gate: &Mutex<()>,
+    mut dispatch: impl FnMut(WriterCommand) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    for command in command_rx {
+        if matches!(&command, WriterCommand::Shutdown) {
+            break;
+        }
+        ensure_writer_running(failure_request_id, stop_requested, terminal_gate)?;
+        dispatch(command)?;
+    }
+    Ok(())
+}
+
+fn finish_fast_separator_replay(
+    xtest_attempt: Option<Result<(), SwitcherError>>,
+    uinput_fallback: impl FnOnce() -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    match xtest_attempt {
+        Some(result) => result,
+        None => uinput_fallback(),
+    }
+}
+
 fn run_virtual_keyboard_writer_loop(
     mut device: uinput::Device,
     command_rx: mpsc::Receiver<WriterCommand>,
     completion_tx: mpsc::Sender<ManualCurrentWordCompletion>,
+    failure_request_id: Arc<AtomicU64>,
+    stop_requested: Arc<AtomicBool>,
+    terminal_gate: Arc<Mutex<()>>,
 ) -> Result<(), SwitcherError> {
     let context = detect_current_system_context();
     let session_type = context.session_type;
@@ -2519,98 +3720,85 @@ fn run_virtual_keyboard_writer_loop(
         initialize_x11_switcher_for_session(session_type, X11LayoutSwitcher::new);
     let mut cinnamon_x11_xtest = initialize_cinnamon_x11_xtest_runtime(context);
 
-    for command in command_rx {
-        match command {
-            WriterCommand::Shutdown => break,
-            WriterCommand::Fast(command) => match command {
-                WriterFastCommand::ForwardEvent { key, value } => {
-                    device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
-                    device.synchronize()?;
-                }
-                WriterFastCommand::TypeSeparator { key } => {
-                    log_input_debug("type-separator-execute", &format!("key={key:?}"));
-                    let typed_with_xtest = match &mut cinnamon_x11_xtest {
-                        CinnamonX11XtestRuntime::Available(replay) => match replay.type_key(key) {
-                            Ok(()) => {
-                                log_input_debug(
-                                    "type-separator-execute",
-                                    &format!("key={key:?} strategy=cinnamon-dbus-xtest result=ok"),
+    run_writer_command_loop_with_stop(
+        command_rx,
+        &failure_request_id,
+        &stop_requested,
+        &terminal_gate,
+        |command| {
+            match command {
+                WriterCommand::Shutdown => unreachable!("shutdown handled before circuit breaker"),
+                WriterCommand::Fast(command) => match command {
+                    WriterFastCommand::ForwardEvent { key, value } => {
+                        authorize_writer_mutation_start(
+                            &failure_request_id,
+                            &stop_requested,
+                            &terminal_gate,
+                        )?;
+                        device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
+                        device.synchronize()?;
+                    }
+                    WriterFastCommand::TypeSeparator { key } => {
+                        log_input_debug("type-separator-execute", &format!("key={key:?}"));
+                        let xtest_attempt = match &mut cinnamon_x11_xtest {
+                            CinnamonX11XtestRuntime::Available(replay) => {
+                                let result = replay.type_key(
+                                    key,
+                                    &failure_request_id,
+                                    &stop_requested,
+                                    &terminal_gate,
                                 );
-                                true
-                            }
-                            Err(error) => {
-                                log_input_debug(
+                                match &result {
+                                    Ok(()) => {
+                                        log_input_debug(
+                                            "type-separator-execute",
+                                            &format!(
+                                            "key={key:?} strategy=cinnamon-dbus-xtest result=ok"
+                                        ),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        log_input_debug(
                                     "type-separator-execute",
                                     &format!(
-                                        "key={key:?} strategy=cinnamon-dbus-xtest result=error fallback=uinput error={error}"
+                                        "key={key:?} strategy=cinnamon-dbus-xtest result=error action=fail-stop error={error}"
                                     ),
                                 );
-                                false
+                                    }
+                                }
+                                Some(result)
                             }
-                        },
-                        CinnamonX11XtestRuntime::Unavailable(reason) => {
-                            log_input_debug(
+                            CinnamonX11XtestRuntime::Unavailable(reason) => {
+                                log_input_debug(
                                 "type-separator-execute",
                                 &format!(
                                     "key={key:?} strategy=cinnamon-dbus-xtest result=unavailable fallback=uinput reason={reason}"
-                                ),
-                            );
-                            false
-                        }
-                        CinnamonX11XtestRuntime::NotSelected => false,
-                    };
-                    if !typed_with_xtest {
-                        device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 1)?;
-                        device.synchronize()?;
-                        thread::sleep(Duration::from_millis(2));
-                        device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, 0)?;
-                        device.synchronize()?;
+                                    ),
+                                );
+                                None
+                            }
+                            CinnamonX11XtestRuntime::NotSelected => None,
+                        };
+                        finish_fast_separator_replay(xtest_attempt, || {
+                            authorize_writer_mutation_start(
+                                &failure_request_id,
+                                &stop_requested,
+                                &terminal_gate,
+                            )?;
+                            replay_uinput_stroke(&mut device, key, false, Duration::ZERO, None)
+                        })?;
                     }
-                }
-            },
-            WriterCommand::DeferredManualCurrentWordCorrection {
-                request_id,
-                plan,
-                config,
-                modifiers,
-            } => {
-                let started = Instant::now();
-                let result = run_correction(
-                    &mut device,
-                    &plan,
-                    &config,
+                },
+                WriterCommand::DeferredManualCurrentWordCorrection {
+                    control,
+                    plan,
+                    config,
                     modifiers,
-                    &mut x11_switcher,
-                    &mut cinnamon_x11_xtest,
-                    true,
-                );
-                let outcome = match result {
-                    Ok(_) => ManualCurrentWordOutcome::Succeeded(plan),
-                    Err(error) => {
-                        log_input_debug(
-                            "manual-current-word-writer-error",
-                            &format!(
-                                "request_id={} elapsed_ms={} error={error}",
-                                request_id,
-                                started.elapsed().as_millis(),
-                            ),
-                        );
-                        ManualCurrentWordOutcome::FailedAfterMutation(error.to_string())
-                    }
-                };
-                let _ = completion_tx.send(ManualCurrentWordCompletion {
-                    request_id,
-                    outcome,
-                });
-            }
-            WriterCommand::Transaction(transaction) => match transaction {
-                WriterTransaction::Execute { kind, reply } => {
-                    let result = match kind {
-                        WriterTransactionKind::ApplyCorrection {
-                            plan,
-                            config,
-                            modifiers,
-                        } => run_correction(
+                } => {
+                    let started = Instant::now();
+                    let request_id = control.request_id();
+                    let result = control.ensure_active().and_then(|_| {
+                        run_correction(
                             &mut device,
                             &plan,
                             &config,
@@ -2618,46 +3806,105 @@ fn run_virtual_keyboard_writer_loop(
                             &mut x11_switcher,
                             &mut cinnamon_x11_xtest,
                             true,
-                        ),
-                        WriterTransactionKind::ApplySameLayoutCorrection {
-                            plan,
-                            config,
-                            modifiers,
-                        } => run_correction(
-                            &mut device,
-                            &plan,
-                            &config,
-                            modifiers,
-                            &mut x11_switcher,
-                            &mut cinnamon_x11_xtest,
-                            false,
-                        ),
-                        WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
-                            &mut device,
-                            modifiers,
-                            &[uinput::event::keyboard::Key::LeftControl],
-                            Some(&uinput::event::keyboard::Key::C),
+                            Some(&control),
                         )
-                        .map(|_| CorrectionExecutionOutcome {
-                            layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
-                        }),
-                        WriterTransactionKind::PasteShortcut { modifiers } => run_shortcut(
-                            &mut device,
-                            modifiers,
-                            &[uinput::event::keyboard::Key::LeftControl],
-                            Some(&uinput::event::keyboard::Key::V),
-                        )
-                        .map(|_| CorrectionExecutionOutcome {
-                            layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
-                        }),
+                    });
+                    let result = match result {
+                        Ok(outcome) => control.ensure_active().map(|_| outcome),
+                        Err(error) => Err(error),
                     };
-                    let _ = reply.send(result);
+                    let failure_reason = result.as_ref().err().map(ToString::to_string);
+                    let outcome = match result {
+                        Ok(_) => ManualCurrentWordOutcome::Succeeded(plan),
+                        Err(error) => {
+                            log_input_debug(
+                                "manual-current-word-writer-error",
+                                &format!(
+                                    "request_id={} elapsed_ms={} error={error}",
+                                    request_id,
+                                    started.elapsed().as_millis(),
+                                ),
+                            );
+                            ManualCurrentWordOutcome::FailedAfterMutation(error.to_string())
+                        }
+                    };
+                    publish_deferred_manual_completion(
+                        &control,
+                        &completion_tx,
+                        ManualCurrentWordCompletion {
+                            request_id,
+                            outcome,
+                        },
+                        failure_reason,
+                    )?;
                 }
-            },
-        }
-    }
-
-    Ok(())
+                WriterCommand::Transaction(transaction) => match transaction {
+                    WriterTransaction::Execute {
+                        control,
+                        kind,
+                        reply,
+                    } => {
+                        let result = control.ensure_active().and_then(|_| match kind {
+                            WriterTransactionKind::ApplyCorrection {
+                                plan,
+                                config,
+                                modifiers,
+                            } => run_correction(
+                                &mut device,
+                                &plan,
+                                &config,
+                                modifiers,
+                                &mut x11_switcher,
+                                &mut cinnamon_x11_xtest,
+                                true,
+                                Some(&control),
+                            ),
+                            WriterTransactionKind::ApplySameLayoutCorrection {
+                                plan,
+                                config,
+                                modifiers,
+                            } => run_correction(
+                                &mut device,
+                                &plan,
+                                &config,
+                                modifiers,
+                                &mut x11_switcher,
+                                &mut cinnamon_x11_xtest,
+                                false,
+                                Some(&control),
+                            ),
+                            WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
+                                &mut device,
+                                modifiers,
+                                &[uinput::event::keyboard::Key::LeftControl],
+                                Some(&uinput::event::keyboard::Key::C),
+                                Some(&control),
+                            )
+                            .map(|_| CorrectionExecutionOutcome {
+                                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                            }),
+                            WriterTransactionKind::PasteShortcut { modifiers } => run_shortcut(
+                                &mut device,
+                                modifiers,
+                                &[uinput::event::keyboard::Key::LeftControl],
+                                Some(&uinput::event::keyboard::Key::V),
+                                Some(&control),
+                            )
+                            .map(|_| CorrectionExecutionOutcome {
+                                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                            }),
+                        });
+                        let result = match result {
+                            Ok(outcome) => control.ensure_active().map(|_| outcome),
+                            Err(error) => Err(error),
+                        };
+                        publish_writer_transaction_result(&control, reply, result)?;
+                    }
+                },
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn log_input_debug(stage: &str, details: &str) {
@@ -2739,6 +3986,9 @@ mod tests {
             VirtualKeyboardHandle {
                 command_tx,
                 alive: Arc::new(AtomicBool::new(alive)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             command_rx,
         )
@@ -2748,6 +3998,68 @@ mod tests {
         WriterTransactionKind::CopyShortcut {
             modifiers: ModifierState::default(),
         }
+    }
+
+    fn oversized_correction_transaction() -> WriterTransactionKind {
+        WriterTransactionKind::ApplyCorrection {
+            plan: CorrectionPlan {
+                buffer: vec![
+                    crate::daemon::switch_logic::Keystroke {
+                        key: Key::KEY_A,
+                        shift: false,
+                        caps_lock: false,
+                    };
+                    crate::model::MAX_CORRECTION_KEYSTROKES + 1
+                ],
+                extra_backspaces: 0,
+            },
+            config: test_runtime_config_snapshot(),
+            modifiers: ModifierState::default(),
+        }
+    }
+
+    #[test]
+    fn correction_transaction_timeout_is_estimated_work_plus_bounded_backend_grace() {
+        let mut config = test_runtime_config_snapshot();
+        config.layout_delay_ms = 500;
+        config.backspace_ms = 4;
+        config.typing_ms = 5;
+        let transaction = WriterTransactionKind::ApplyCorrection {
+            plan: CorrectionPlan {
+                buffer: vec![
+                    crate::daemon::switch_logic::Keystroke {
+                        key: Key::KEY_A,
+                        shift: false,
+                        caps_lock: false,
+                    };
+                    crate::model::MAX_CORRECTION_KEYSTROKES
+                ],
+                extra_backspaces: crate::model::MAX_CORRECTION_EXTRA_BACKSPACES,
+            },
+            config,
+            modifiers: ModifierState::default(),
+        };
+
+        assert_eq!(
+            transaction.execution_timeout().unwrap(),
+            Duration::from_millis(3_818)
+        );
+        assert!(transaction.execution_timeout().unwrap() <= Duration::from_secs(5));
+        assert!(
+            Duration::from_millis(crate::model::MAX_CORRECTION_SCHEDULE_MS)
+                .saturating_add(TRANSACTION_BACKEND_GRACE)
+                <= MAX_TRANSACTION_TIMEOUT
+        );
+        assert!(TRANSACTION_SLEEP_QUANTUM <= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn deferred_request_id_wrap_skips_zero_sentinel() {
+        let mut next = u64::MAX;
+
+        assert_eq!(take_next_nonzero_request_id(&mut next), u64::MAX);
+        assert_eq!(take_next_nonzero_request_id(&mut next), 1);
+        assert_eq!(next, 2);
     }
 
     // Modifier state / layout shortcuts
@@ -2950,11 +4262,69 @@ mod tests {
     struct FakeLayoutSwitcher {
         calls: usize,
         fail: bool,
+        cancel_on_switch: Option<WriterTransactionControl>,
+    }
+
+    #[derive(Default)]
+    struct FakeUinputStrokeSink {
+        events: Vec<String>,
+        cancel_on_sync: Option<WriterTransactionControl>,
+        fail_sync_on_call: Option<usize>,
+        sync_calls: usize,
+    }
+
+    impl UinputStrokeSink for FakeUinputStrokeSink {
+        fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
+            self.events.push(format!("key:{key:?}:{value}"));
+            Ok(())
+        }
+
+        fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
+            self.sync_calls += 1;
+            self.events.push("sync".to_string());
+            if let Some(control) = self.cancel_on_sync.take() {
+                let _ = control.mark_timed_out();
+            }
+            if self.fail_sync_on_call == Some(self.sync_calls) {
+                return Err(SwitcherError::Io(io::Error::other("stroke sync failed")));
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeUinputShortcutSink {
+        events: Vec<String>,
+        release_calls: usize,
+        fail_first_release: bool,
+    }
+
+    impl UinputShortcutSink for FakeUinputShortcutSink {
+        fn release_shortcut_key(
+            &mut self,
+            key: &uinput::event::keyboard::Key,
+        ) -> Result<(), SwitcherError> {
+            self.release_calls += 1;
+            self.events.push(format!("up:{key:?}"));
+            if self.fail_first_release && self.release_calls == 1 {
+                Err(SwitcherError::Io(io::Error::other("first release failed")))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn synchronize_shortcut_keys(&mut self) -> Result<(), SwitcherError> {
+            self.events.push("sync".to_string());
+            Ok(())
+        }
     }
 
     impl LayoutSwitcher for FakeLayoutSwitcher {
         fn switch_layout(&mut self, _combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
             self.calls += 1;
+            if let Some(control) = &self.cancel_on_switch {
+                let _ = control.mark_timed_out();
+            }
             if self.fail {
                 Err(SwitcherError::Io(io::Error::other("switch failed")))
             } else {
@@ -2967,28 +4337,60 @@ mod tests {
     struct FakeCinnamonX11XtestReplay {
         prepare_error: Option<&'static str>,
         calls: Vec<String>,
+        cancel_on_call: Option<usize>,
+        control: Option<WriterTransactionControl>,
+        key_down_calls: usize,
+        fail_key_down_on_call: Option<usize>,
+        key_up_calls: usize,
+        fail_key_up_on_call: Option<usize>,
+    }
+
+    impl FakeCinnamonX11XtestReplay {
+        fn record_call(&mut self, call: String) {
+            self.calls.push(call);
+            if self.cancel_on_call == Some(self.calls.len()) {
+                if let Some(control) = &self.control {
+                    let _ = control.mark_timed_out();
+                }
+            }
+        }
     }
 
     impl CinnamonX11XtestReplay for FakeCinnamonX11XtestReplay {
         fn prepare_for_layout_correction(
             &mut self,
             _plan: &CorrectionPlan,
+            _control: Option<&WriterTransactionControl>,
         ) -> Result<(), SwitcherError> {
-            self.calls.push("prepare".to_string());
+            self.record_call("prepare".to_string());
             if let Some(error) = self.prepare_error.take() {
                 return Err(SwitcherError::Io(io::Error::other(error)));
             }
             Ok(())
         }
 
-        fn key_down(&mut self, key: Key) -> Result<(), SwitcherError> {
-            self.calls.push(format!("down:{key:?}"));
-            Ok(())
+        fn key_down(
+            &mut self,
+            key: Key,
+            _control: Option<&WriterTransactionControl>,
+        ) -> Result<(), SwitcherError> {
+            self.key_down_calls += 1;
+            self.record_call(format!("down:{key:?}"));
+            if self.fail_key_down_on_call == Some(self.key_down_calls) {
+                Err(SwitcherError::Io(io::Error::other("key down failed")))
+            } else {
+                Ok(())
+            }
         }
 
         fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
-            self.calls.push(format!("up:{key:?}"));
-            Ok(())
+            self.key_up_calls += 1;
+            self.record_call(format!("up:{key:?}"));
+            if self.fail_key_up_on_call == Some(self.key_up_calls) {
+                Err(SwitcherError::Io(io::Error::other("key up failed")))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -3041,6 +4443,7 @@ mod tests {
         let mut replay = FakeCinnamonX11XtestReplay {
             prepare_error: Some("dbus unavailable"),
             calls: Vec::new(),
+            ..Default::default()
         };
 
         let result = run_cinnamon_x11_xtest_correction(
@@ -3055,6 +4458,7 @@ mod tests {
             },
             &test_runtime_config_snapshot(),
             ModifierState::default(),
+            None,
         );
 
         assert!(result.is_err());
@@ -3067,6 +4471,7 @@ mod tests {
         let mut replay = FakeCinnamonX11XtestReplay {
             prepare_error: Some("keycode unavailable"),
             calls: Vec::new(),
+            ..Default::default()
         };
 
         let result = run_cinnamon_x11_xtest_correction(
@@ -3081,6 +4486,7 @@ mod tests {
             },
             &test_runtime_config_snapshot(),
             ModifierState::default(),
+            None,
         );
 
         assert!(result.is_err());
@@ -3089,20 +4495,473 @@ mod tests {
     }
 
     #[test]
+    fn writer_transaction_cancellation_balances_current_tap_and_starts_no_new_key_down() {
+        let control = WriterTransactionControl::with_timeout_for_test(88, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            cancel_on_call: Some(2),
+            control: Some(control.clone()),
+            ..Default::default()
+        };
+        let plan = CorrectionPlan {
+            buffer: vec![
+                crate::daemon::switch_logic::Keystroke {
+                    key: Key::KEY_A,
+                    shift: false,
+                    caps_lock: false,
+                },
+                crate::daemon::switch_logic::Keystroke {
+                    key: Key::KEY_B,
+                    shift: false,
+                    caps_lock: false,
+                },
+            ],
+            extra_backspaces: 0,
+        };
+
+        let error = run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &plan,
+            &test_runtime_config_snapshot(),
+            ModifierState::default(),
+            Some(&control),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 88 }
+        ));
+        assert_eq!(
+            replay.calls,
+            vec![
+                "prepare".to_string(),
+                "down:KEY_BACKSPACE".to_string(),
+                "up:KEY_BACKSPACE".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn transactional_xtest_tap_releases_after_ambiguous_key_down_error_and_keeps_primary_error() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_down_on_call: Some(1),
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = xtest_key_tap(&mut replay, Key::KEY_SPACE, Duration::ZERO, None).unwrap_err();
+
+        assert!(error.to_string().contains("key down failed"));
+        assert_eq!(replay.calls, vec!["down:KEY_SPACE", "up:KEY_SPACE"]);
+    }
+
+    #[test]
+    fn transactional_xtest_tap_returns_key_up_error_when_no_primary_error_exists() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = xtest_key_tap(&mut replay, Key::KEY_SPACE, Duration::ZERO, None).unwrap_err();
+
+        assert!(error.to_string().contains("key up failed"));
+        assert_eq!(replay.calls, vec!["down:KEY_SPACE", "up:KEY_SPACE"]);
+    }
+
+    #[test]
+    fn shifted_replay_releases_ambiguous_shift_down_and_preserves_primary_error() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_down_on_call: Some(2),
+            fail_key_up_on_call: Some(2),
+            ..Default::default()
+        };
+        let plan = CorrectionPlan {
+            buffer: vec![crate::daemon::switch_logic::Keystroke {
+                key: Key::KEY_A,
+                shift: true,
+                caps_lock: false,
+            }],
+            extra_backspaces: 0,
+        };
+
+        let error = run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &plan,
+            &test_runtime_config_snapshot(),
+            ModifierState::default(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("key down failed"));
+        assert_eq!(
+            replay.calls,
+            vec![
+                "prepare",
+                "down:KEY_BACKSPACE",
+                "up:KEY_BACKSPACE",
+                "down:KEY_LEFTSHIFT",
+                "up:KEY_LEFTSHIFT"
+            ]
+        );
+    }
+
+    #[test]
+    fn shifted_replay_preserves_tap_error_over_shift_release_error() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_down_on_call: Some(3),
+            fail_key_up_on_call: Some(3),
+            ..Default::default()
+        };
+        let plan = CorrectionPlan {
+            buffer: vec![crate::daemon::switch_logic::Keystroke {
+                key: Key::KEY_A,
+                shift: true,
+                caps_lock: false,
+            }],
+            extra_backspaces: 0,
+        };
+
+        let error = run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &plan,
+            &test_runtime_config_snapshot(),
+            ModifierState::default(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("key down failed"));
+        assert_eq!(
+            replay.calls,
+            vec![
+                "prepare",
+                "down:KEY_BACKSPACE",
+                "up:KEY_BACKSPACE",
+                "down:KEY_LEFTSHIFT",
+                "down:KEY_A",
+                "up:KEY_A",
+                "up:KEY_LEFTSHIFT"
+            ]
+        );
+    }
+
+    #[test]
+    fn fast_xtest_tap_releases_after_ambiguous_key_down_error_and_keeps_primary_error() {
+        let key_up_called = Cell::new(false);
+
+        let error = finish_fast_xtest_tap_attempt(
+            Err(SwitcherError::Io(io::Error::other("fast key down failed"))),
+            || {
+                key_up_called.set(true);
+                Err(SwitcherError::Io(io::Error::other("fast key up failed")))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fast key down failed"));
+        assert!(key_up_called.get());
+    }
+
+    #[test]
+    fn fast_xtest_tap_returns_key_up_error_when_key_down_succeeds() {
+        let error = finish_fast_xtest_tap_attempt(Ok(()), || {
+            Err(SwitcherError::Io(io::Error::other("fast key up failed")))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fast key up failed"));
+    }
+
+    #[test]
+    fn modifier_release_finishes_all_key_ups_after_cancellation() {
+        let control = WriterTransactionControl::with_timeout_for_test(92, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            cancel_on_call: Some(1),
+            control: Some(control.clone()),
+            ..Default::default()
+        };
+        let modifiers = ModifierState {
+            left_ctrl: true,
+            right_ctrl: true,
+            ..Default::default()
+        };
+
+        let error = release_modifiers_xtest(&mut replay, modifiers, Some(&control)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 92 }
+        ));
+        assert_eq!(replay.calls, vec!["up:KEY_LEFTCTRL", "up:KEY_RIGHTCTRL"]);
+    }
+
+    #[test]
+    fn modifier_cleanup_attempts_every_xtest_release_after_first_error() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+        let modifiers = ModifierState {
+            left_ctrl: true,
+            right_ctrl: true,
+            left_shift: true,
+            ..Default::default()
+        };
+
+        let error = release_modifiers_xtest(&mut replay, modifiers, None).unwrap_err();
+
+        assert!(error.to_string().contains("key up failed"));
+        assert_eq!(
+            replay.calls,
+            vec!["up:KEY_LEFTCTRL", "up:KEY_RIGHTCTRL", "up:KEY_LEFTSHIFT"]
+        );
+    }
+
+    #[test]
+    fn restore_modifiers_releases_ambiguous_current_down_and_previously_restored_keys() {
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_down_on_call: Some(2),
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+        let modifiers = ModifierState {
+            left_ctrl: true,
+            right_ctrl: true,
+            ..Default::default()
+        };
+
+        let error = restore_modifiers_xtest(&mut replay, modifiers, None).unwrap_err();
+
+        assert!(error.to_string().contains("key down failed"));
+        assert_eq!(
+            replay.calls,
+            vec![
+                "down:KEY_LEFTCTRL",
+                "down:KEY_RIGHTCTRL",
+                "up:KEY_RIGHTCTRL",
+                "up:KEY_LEFTCTRL"
+            ]
+        );
+    }
+
+    #[test]
+    fn shortcut_cleanup_attempts_every_release_and_sync_after_first_error() {
+        use uinput::event::keyboard::Key as UinputKey;
+
+        let mut sink = FakeUinputShortcutSink {
+            fail_first_release: true,
+            ..Default::default()
+        };
+        let trigger = UinputKey::C;
+        let modifiers = [UinputKey::LeftControl, UinputKey::LeftShift];
+
+        let error =
+            release_shortcut_keys(&mut sink, Some(&trigger), &[&modifiers[0], &modifiers[1]])
+                .unwrap_err();
+
+        assert!(error.to_string().contains("first release failed"));
+        assert_eq!(
+            sink.events,
+            vec!["up:C", "up:LeftShift", "up:LeftControl", "sync"]
+        );
+    }
+
+    #[test]
+    fn modifier_cleanup_attempts_every_uinput_release_and_final_sync_after_first_error() {
+        let mut sink = FakeUinputShortcutSink {
+            fail_first_release: true,
+            ..Default::default()
+        };
+        let modifiers = ModifierState {
+            left_shift: true,
+            left_ctrl: true,
+            right_ctrl: true,
+            ..Default::default()
+        };
+
+        let error = release_uinput_modifiers_exhaustively(&mut sink, modifiers).unwrap_err();
+
+        assert!(error.to_string().contains("first release failed"));
+        assert_eq!(
+            sink.events,
+            vec!["up:RightControl", "up:LeftControl", "up:LeftShift", "sync"]
+        );
+    }
+
+    #[test]
+    fn generic_shifted_typing_cancellation_releases_shift_before_returning() {
+        let control = WriterTransactionControl::with_timeout_for_test(90, Duration::from_secs(1));
+        let mut sink = FakeUinputStrokeSink {
+            cancel_on_sync: Some(control.clone()),
+            ..Default::default()
+        };
+
+        let error =
+            replay_uinput_stroke(&mut sink, Key::KEY_A, true, Duration::ZERO, Some(&control))
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 90 }
+        ));
+        assert_eq!(
+            sink.events,
+            vec!["key:KEY_LEFTSHIFT:1", "sync", "key:KEY_LEFTSHIFT:0", "sync",]
+        );
+    }
+
+    #[test]
+    fn generic_backspace_sync_failure_releases_issued_key_and_syncs_cleanup() {
+        let mut sink = FakeUinputStrokeSink {
+            fail_sync_on_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = replay_uinput_backspaces(&mut sink, 1, Duration::ZERO, None).unwrap_err();
+
+        assert!(error.to_string().contains("stroke sync failed"));
+        assert_eq!(
+            sink.events,
+            vec!["key:KEY_BACKSPACE:1", "sync", "key:KEY_BACKSPACE:0", "sync",]
+        );
+    }
+
+    #[test]
+    fn xtest_cancellation_after_keycode_validation_prevents_fake_key_down() {
+        let control = WriterTransactionControl::with_timeout_for_test(89, Duration::from_secs(1));
+        let emitted = Cell::new(false);
+
+        let error = validate_and_emit_xtest_key(
+            Key::KEY_A,
+            Some(&control),
+            None,
+            None,
+            None,
+            |_| {
+                let _ = control.mark_timed_out();
+                Ok(38)
+            },
+            |_| {
+                emitted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 89 }
+        ));
+        assert!(!emitted.get());
+    }
+
+    #[test]
+    fn cinnamon_mapping_cancellation_stops_before_next_mapping() {
+        let control = WriterTransactionControl::with_timeout_for_test(93, Duration::from_secs(1));
+        let plan = CorrectionPlan {
+            buffer: vec![crate::daemon::switch_logic::Keystroke {
+                key: Key::KEY_A,
+                shift: false,
+                caps_lock: false,
+            }],
+            extra_backspaces: 0,
+        };
+        let mapping_calls = Cell::new(0usize);
+
+        let error = validate_cinnamon_plan_keycodes_with(&plan, Some(&control), |_key| {
+            mapping_calls.set(mapping_calls.get() + 1);
+            if mapping_calls.get() == 1 {
+                let _ = control.mark_timed_out();
+            }
+            Ok(())
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 93 }
+        ));
+        assert_eq!(mapping_calls.get(), 1);
+    }
+
+    #[test]
+    fn cinnamon_active_source_cancellation_stops_before_group_read() {
+        let control = WriterTransactionControl::with_timeout_for_test(94, Duration::from_secs(1));
+        let active_reads = Cell::new(0usize);
+        let group_reads = Cell::new(0usize);
+
+        let error = read_cinnamon_source_state_with(
+            Some(&control),
+            || {
+                active_reads.set(active_reads.get() + 1);
+                let _ = control.mark_timed_out();
+                Ok(Some(1))
+            },
+            || {
+                group_reads.set(group_reads.get() + 1);
+                Ok(1)
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 94 }
+        ));
+        assert_eq!(active_reads.get(), 1);
+        assert_eq!(group_reads.get(), 0);
+    }
+
+    #[test]
+    fn xtest_fast_path_shared_failure_after_validation_prevents_fake_key_down() {
+        let failure = AtomicU64::new(0);
+        let stop_requested = AtomicBool::new(false);
+        let terminal_gate = Mutex::new(());
+        let emitted = Cell::new(false);
+
+        let error = validate_and_emit_xtest_key(
+            Key::KEY_A,
+            None,
+            Some(&failure),
+            Some(&stop_requested),
+            Some(&terminal_gate),
+            |_| {
+                failure.store(91, Ordering::SeqCst);
+                Ok(38)
+            },
+            |_| {
+                emitted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 91 }
+        ));
+        assert!(!emitted.get());
+    }
+
+    #[test]
     fn layout_switch_outcome_reports_applied_x11_when_x11_succeeds() {
         let mut x11 = FakeLayoutSwitcher {
             calls: 0,
             fail: false,
+            cancel_on_switch: None,
         };
         let mut uinput = FakeLayoutSwitcher {
             calls: 0,
             fail: false,
+            cancel_on_switch: None,
         };
 
         let outcome = switch_layout_with_fallback(
             Some(&mut x11),
             &mut uinput,
             LayoutSwitchCombo::super_space(),
+            None,
         )
         .unwrap();
 
@@ -3116,10 +4975,11 @@ mod tests {
         let mut uinput = FakeLayoutSwitcher {
             calls: 0,
             fail: false,
+            cancel_on_switch: None,
         };
 
         let outcome =
-            switch_layout_with_fallback(None, &mut uinput, LayoutSwitchCombo::super_space())
+            switch_layout_with_fallback(None, &mut uinput, LayoutSwitchCombo::super_space(), None)
                 .unwrap();
 
         assert_eq!(outcome, CorrectionLayoutSwitchOutcome::AppliedUinput);
@@ -3131,22 +4991,55 @@ mod tests {
         let mut x11 = FakeLayoutSwitcher {
             calls: 0,
             fail: true,
+            cancel_on_switch: None,
         };
         let mut uinput = FakeLayoutSwitcher {
             calls: 0,
             fail: false,
+            cancel_on_switch: None,
         };
 
         let outcome = switch_layout_with_fallback(
             Some(&mut x11),
             &mut uinput,
             LayoutSwitchCombo::super_space(),
+            None,
         )
         .unwrap();
 
         assert_eq!(outcome, CorrectionLayoutSwitchOutcome::AppliedUinput);
         assert_eq!(x11.calls, 1);
         assert_eq!(uinput.calls, 1);
+    }
+
+    #[test]
+    fn layout_fallback_starts_no_uinput_mutation_after_transaction_timeout() {
+        let control = WriterTransactionControl::with_timeout_for_test(99, Duration::from_secs(1));
+        let mut x11 = FakeLayoutSwitcher {
+            calls: 0,
+            fail: true,
+            cancel_on_switch: Some(control.clone()),
+        };
+        let mut uinput = FakeLayoutSwitcher {
+            calls: 0,
+            fail: false,
+            cancel_on_switch: None,
+        };
+
+        let error = switch_layout_with_fallback(
+            Some(&mut x11),
+            &mut uinput,
+            LayoutSwitchCombo::super_space(),
+            Some(&control),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 99 }
+        ));
+        assert_eq!(x11.calls, 1);
+        assert_eq!(uinput.calls, 0);
     }
 
     // Device discovery
@@ -3248,6 +5141,23 @@ mod tests {
     // Writer lifecycle / queue behavior
 
     #[test]
+    fn keyboard_shutdown_sequence_stops_writer_before_grab_release() {
+        let mut phases = Vec::new();
+
+        run_keyboard_shutdown_sequence(|phase| phases.push(phase));
+
+        assert_eq!(
+            phases,
+            vec![
+                KeyboardShutdownPhase::RequestWriterStop,
+                KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::FinishWriterStop,
+                KeyboardShutdownPhase::StopWatchers,
+            ]
+        );
+    }
+
+    #[test]
     fn writer_stop_marks_alive_false_before_shutdown_completes() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -3258,10 +5168,14 @@ mod tests {
             .expect("queue should accept initial command");
 
         let alive = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
         let writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: alive.clone(),
+                stop_requested: Arc::clone(&stop_requested),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -3269,6 +5183,7 @@ mod tests {
             })),
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
 
         let stopper = thread::spawn(move || {
@@ -3284,9 +5199,57 @@ mod tests {
             !alive.load(Ordering::SeqCst),
             "writer must stop advertising itself as alive immediately on teardown"
         );
+        assert!(
+            stop_requested.load(Ordering::SeqCst),
+            "writer must publish cancellation before waiting for shutdown completion"
+        );
 
         drop(release_tx);
         stopper.join().expect("stop thread should finish");
+    }
+
+    #[test]
+    fn writer_stop_request_denies_transaction_and_fast_mutation_permits() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(AtomicU64::new(0));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::clone(&alive),
+                stop_requested: Arc::clone(&stop_requested),
+                transaction_failure_request_id: Arc::clone(&failure),
+                transaction_terminal_gate: Arc::clone(&terminal_gate),
+            },
+            join_handle: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let control = WriterTransactionControl::new_with_writer_state(
+            109,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+        control.authorize_mutation_start().unwrap();
+        authorize_writer_mutation_start(&failure, &stop_requested, &terminal_gate).unwrap();
+
+        writer.request_stop();
+
+        assert!(!alive.load(Ordering::SeqCst));
+        assert!(stop_requested.load(Ordering::SeqCst));
+        assert!(matches!(
+            control.authorize_mutation_start(),
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert!(matches!(
+            authorize_writer_mutation_start(&failure, &stop_requested, &terminal_gate),
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
     }
 
     #[test]
@@ -3303,10 +5266,14 @@ mod tests {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: alive.clone(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: Some(thread::spawn(|| {})),
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
         let (done_tx, done_rx) = mpsc::channel();
 
@@ -3342,10 +5309,14 @@ mod tests {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: alive.clone(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
 
         writer.stop();
@@ -3365,6 +5336,9 @@ mod tests {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: alive.clone(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -3372,6 +5346,7 @@ mod tests {
             })),
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
         let (done_tx, done_rx) = mpsc::channel();
 
@@ -3440,6 +5415,405 @@ mod tests {
     }
 
     #[test]
+    fn writer_transaction_timeout_returns_and_cancels_an_accepted_command() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let caller_handle = handle.clone();
+        let started = Instant::now();
+        let caller = thread::spawn(move || {
+            caller_handle.run_transaction_with_timeout(
+                copy_shortcut_transaction(),
+                Duration::from_millis(30),
+            )
+        });
+
+        let command = command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("transaction should be accepted before its deadline");
+        let (request_id, control, _held_reply_sender) = match command {
+            WriterCommand::Transaction(WriterTransaction::Execute { control, reply, .. }) => {
+                (control.request_id(), control, reply)
+            }
+            _ => panic!("expected transaction command"),
+        };
+
+        let error = caller.join().expect("caller should return").unwrap_err();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "accepted transaction must never leave the caller waiting forever"
+        );
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                request_id: timed_out
+            } if timed_out == request_id
+        ));
+        assert!(control.is_cancelled());
+        assert_eq!(handle.transaction_failure_request_id(), Some(request_id));
+        assert!(!handle.is_alive());
+        assert!(matches!(
+            handle.type_separator(Key::KEY_SPACE),
+            Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                request_id: blocked
+            }) if blocked == request_id
+        ));
+    }
+
+    #[test]
+    fn writer_transaction_late_reply_cannot_replace_timeout_outcome() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let caller_handle = handle.clone();
+        let caller = thread::spawn(move || {
+            caller_handle.run_transaction_with_timeout(
+                copy_shortcut_transaction(),
+                Duration::from_millis(25),
+            )
+        });
+
+        let command = command_rx.recv().expect("transaction should be accepted");
+        let (request_id, control, reply) = match command {
+            WriterCommand::Transaction(WriterTransaction::Execute { control, reply, .. }) => {
+                (control.request_id(), control, reply)
+            }
+            _ => panic!("expected transaction command"),
+        };
+        thread::sleep(Duration::from_millis(50));
+        let late_publish = publish_writer_transaction_result(
+            &control,
+            reply,
+            Ok(CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+            }),
+        );
+
+        let error = caller.join().expect("caller should return").unwrap_err();
+
+        assert!(
+            matches!(
+                late_publish,
+                Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                    request_id: late_request_id
+                }) if late_request_id == request_id
+            ),
+            "late worker publication must observe the timeout winner"
+        );
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                request_id: timed_out
+            } if timed_out == request_id
+        ));
+    }
+
+    #[test]
+    fn writer_timeout_wakes_another_waiting_clone_within_one_quantum() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let first_handle = handle.clone();
+        let first = thread::spawn(move || {
+            first_handle
+                .run_transaction_with_timeout(copy_shortcut_transaction(), Duration::from_secs(1))
+        });
+        let first_command = command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("first transaction should queue");
+        let (first_request_id, first_control, _first_reply) = match first_command {
+            WriterCommand::Transaction(WriterTransaction::Execute { control, reply, .. }) => {
+                (control.request_id(), control, reply)
+            }
+            _ => panic!("expected first transaction"),
+        };
+
+        let second_handle = handle.clone();
+        let second = thread::spawn(move || {
+            second_handle
+                .run_transaction_with_timeout(copy_shortcut_transaction(), Duration::from_secs(1))
+        });
+        let second_command = command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("second transaction should queue");
+        let (second_control, _second_reply) = match second_command {
+            WriterCommand::Transaction(WriterTransaction::Execute { control, reply, .. }) => {
+                (control, reply)
+            }
+            _ => panic!("expected second transaction"),
+        };
+
+        let second_started = Instant::now();
+        let _ = first_control.mark_timed_out();
+        let first_error = first
+            .join()
+            .expect("first caller should return")
+            .unwrap_err();
+        let second_error = second
+            .join()
+            .expect("second caller should wake on shared failure")
+            .unwrap_err();
+
+        assert!(second_started.elapsed() < Duration::from_millis(200));
+        assert!(matches!(
+            first_error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id }
+                if request_id == first_request_id
+        ));
+        assert!(matches!(
+            second_error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id }
+                if request_id == first_request_id
+        ));
+        assert_eq!(first_control.state(), WriterTransactionState::TimedOut);
+        assert_eq!(second_control.state(), WriterTransactionState::TimedOut);
+    }
+
+    #[test]
+    fn writer_transaction_rejects_oversized_plan_before_enqueue() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+
+        let error = handle
+            .run_transaction(oversized_correction_transaction())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkValidation(
+                crate::error::ValidationError::InputCorrectionPlanTooLarge { .. }
+            )
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn writer_transaction_control_interrupts_long_sleep_at_deadline() {
+        let control =
+            WriterTransactionControl::with_timeout_for_test(77, Duration::from_millis(25));
+        let started = Instant::now();
+
+        let error = control
+            .sleep_interruptibly(Duration::from_secs(1))
+            .unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 77 }
+        ));
+        assert!(control.is_cancelled());
+    }
+
+    #[test]
+    fn writer_transaction_timeout_cancels_other_controls_sharing_the_writer() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let first = WriterTransactionControl::new_with_terminal_gate(
+            101,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            Arc::clone(&terminal_gate),
+        );
+        let second = WriterTransactionControl::new_with_terminal_gate(
+            102,
+            Duration::from_secs(1),
+            failure,
+            terminal_gate,
+        );
+
+        let timeout = second.mark_timed_out();
+        let first_error = first.ensure_active().unwrap_err();
+
+        assert!(matches!(
+            timeout,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 102 }
+        ));
+        assert!(matches!(
+            first_error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 102 }
+        ));
+        assert!(first.is_cancelled());
+    }
+
+    #[test]
+    fn writer_transaction_completion_published_before_timeout_cas_wins() {
+        let control = WriterTransactionControl::with_timeout_for_test(103, Duration::from_secs(1));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let expected = CorrectionExecutionOutcome {
+            layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+        };
+
+        reply_tx
+            .send(Ok(expected))
+            .expect("reply must be published before completion state");
+        assert!(control.publish_completed());
+
+        let outcome = control.wait_for_reply(reply_rx).unwrap();
+
+        assert_eq!(outcome, expected);
+        assert_eq!(control.state(), WriterTransactionState::Completed);
+        assert_eq!(control.failure_request_id.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn completed_transaction_cannot_authorize_new_mutation() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let control =
+            WriterTransactionControl::new(106, Duration::from_secs(1), Arc::clone(&failure));
+        assert!(control.publish_completed());
+        let mutation_started = Cell::new(false);
+
+        let error = control
+            .authorize_mutation_start()
+            .and_then(|_| {
+                mutation_started.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 106,
+                ..
+            }
+        ));
+        assert!(!mutation_started.get());
+        assert_eq!(control.state(), WriterTransactionState::Completed);
+        assert_eq!(failure.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn writer_transaction_completion_after_wall_deadline_publishes_timeout() {
+        let control = WriterTransactionControl::with_timeout_for_test(104, Duration::ZERO);
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        reply_tx
+            .send(Ok(CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+            }))
+            .expect("reply publication should remain ordered before the terminal state");
+
+        assert!(!control.publish_completed());
+        let error = control.wait_for_reply(reply_rx).unwrap_err();
+
+        assert_eq!(control.state(), WriterTransactionState::TimedOut);
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 104 }
+        ));
+        assert_eq!(control.failure_request_id.load(Ordering::SeqCst), 104);
+    }
+
+    #[test]
+    fn writer_stop_interrupts_reply_wait_before_transaction_deadline() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_writer_state(
+            107,
+            Duration::from_millis(200),
+            failure,
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+        let (_reply_tx, reply_rx) = mpsc::channel();
+        {
+            let _terminal_guard = terminal_gate.lock().unwrap();
+            stop_requested.store(true, Ordering::SeqCst);
+        }
+        let started = Instant::now();
+
+        let error = control.wait_for_reply(reply_rx).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "stop must interrupt the waiter instead of consuming its full deadline"
+        );
+    }
+
+    #[test]
+    fn writer_stop_wins_terminal_race_against_late_completion() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_writer_state(
+            108,
+            Duration::from_secs(1),
+            failure,
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+        {
+            let _terminal_guard = terminal_gate.lock().unwrap();
+            stop_requested.store(true, Ordering::SeqCst);
+        }
+
+        assert!(!control.publish_completed());
+        assert_eq!(control.state(), WriterTransactionState::Pending);
+    }
+
+    #[test]
+    fn writer_failure_circuit_breaker_stops_next_mutation_after_timeout() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let timed_out =
+            WriterTransactionControl::new(104, Duration::from_secs(1), Arc::clone(&failure));
+        let _ = timed_out.mark_timed_out();
+        let mutation_started = Cell::new(false);
+
+        let error = ensure_writer_not_failed(&failure)
+            .and_then(|_| {
+                mutation_started.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 104 }
+        ));
+        assert!(!mutation_started.get());
+    }
+
+    #[test]
+    fn writer_transaction_timeout_before_mutation_permit_prevents_emitter() {
+        let control = WriterTransactionControl::with_timeout_for_test(105, Duration::from_secs(1));
+        let timeout_control = control.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let timeout_barrier = Arc::clone(&barrier);
+        let (timeout_done_tx, timeout_done_rx) = mpsc::channel();
+        let timeout = thread::spawn(move || {
+            timeout_barrier.wait();
+            let error = timeout_control.mark_timed_out();
+            timeout_done_tx.send(error).unwrap();
+        });
+        barrier.wait();
+        let timeout_error = timeout_done_rx.recv().unwrap();
+        timeout.join().unwrap();
+        let mutation_started = Cell::new(false);
+
+        let permit_error = control
+            .authorize_mutation_start()
+            .and_then(|_| {
+                mutation_started.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            timeout_error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 105 }
+        ));
+        assert!(matches!(
+            permit_error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 105 }
+        ));
+        assert!(!mutation_started.get());
+    }
+
+    #[test]
     fn transaction_returns_worker_reply_result() {
         fn not_needed_outcome() -> CorrectionExecutionOutcome {
             CorrectionExecutionOutcome {
@@ -3451,13 +5825,20 @@ mod tests {
             reply_result: Result<CorrectionExecutionOutcome, SwitcherError>,
         ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
             let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+            let should_fail_worker = reply_result.is_err();
             let worker = thread::spawn(move || {
                 let command = command_rx
                     .recv()
                     .expect("transaction command should be sent");
                 match command {
-                    WriterCommand::Transaction(WriterTransaction::Execute { reply, .. }) => {
-                        reply.send(reply_result).expect("caller should await reply");
+                    WriterCommand::Transaction(WriterTransaction::Execute {
+                        control,
+                        reply,
+                        ..
+                    }) => {
+                        let publication =
+                            publish_writer_transaction_result(&control, reply, reply_result);
+                        assert_eq!(publication.is_err(), should_fail_worker);
                     }
                     _ => panic!("expected transaction command"),
                 }
@@ -3481,6 +5862,146 @@ mod tests {
     }
 
     #[test]
+    fn transaction_error_is_published_then_loop_stops_before_next_command() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let first_control = WriterTransactionControl::new_with_terminal_gate(
+            501,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            Arc::clone(&terminal_gate),
+        );
+        let second_control = WriterTransactionControl::new_with_terminal_gate(
+            502,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            terminal_gate,
+        );
+        let (first_reply_tx, first_reply_rx) = mpsc::channel();
+        let (second_reply_tx, second_reply_rx) = mpsc::channel();
+        let (command_tx, command_rx) = mpsc::channel();
+        command_tx
+            .send(WriterCommand::Transaction(WriterTransaction::Execute {
+                control: first_control.clone(),
+                kind: copy_shortcut_transaction(),
+                reply: first_reply_tx,
+            }))
+            .unwrap();
+        command_tx
+            .send(WriterCommand::Transaction(WriterTransaction::Execute {
+                control: second_control.clone(),
+                kind: copy_shortcut_transaction(),
+                reply: second_reply_tx,
+            }))
+            .unwrap();
+        drop(command_tx);
+        let dispatched = Cell::new(0usize);
+
+        let worker_error = run_writer_command_loop_with(command_rx, &failure, |command| {
+            dispatched.set(dispatched.get() + 1);
+            match command {
+                WriterCommand::Transaction(WriterTransaction::Execute {
+                    control, reply, ..
+                }) => publish_writer_transaction_result(
+                    &control,
+                    reply,
+                    Err(SwitcherError::Io(io::Error::other("post-mutation failure"))),
+                ),
+                _ => panic!("expected transaction command"),
+            }
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            worker_error,
+            SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 501,
+                ..
+            }
+        ));
+        assert_eq!(dispatched.get(), 1);
+        assert_eq!(first_control.state(), WriterTransactionState::Completed);
+        assert!(matches!(
+            first_reply_rx.recv().unwrap(),
+            Err(SwitcherError::Io(error)) if error.to_string() == "post-mutation failure"
+        ));
+        assert!(matches!(second_reply_rx.recv(), Err(mpsc::RecvError)));
+        assert_eq!(second_control.state(), WriterTransactionState::Pending);
+    }
+
+    #[test]
+    fn available_xtest_separator_runtime_error_does_not_fallback_or_dispatch_next_command() {
+        let failure = AtomicU64::new(0);
+        let (command_tx, command_rx) = mpsc::channel();
+        for key in [Key::KEY_SPACE, Key::KEY_ENTER] {
+            command_tx
+                .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
+                    key,
+                }))
+                .unwrap();
+        }
+        drop(command_tx);
+        let dispatched = Cell::new(0usize);
+        let uinput_fallback_called = Cell::new(false);
+
+        let error = run_writer_command_loop_with(command_rx, &failure, |_command| {
+            dispatched.set(dispatched.get() + 1);
+            finish_fast_separator_replay(
+                Some(Err(SwitcherError::Io(io::Error::other(
+                    "available xtest runtime failure",
+                )))),
+                || {
+                    uinput_fallback_called.set(true);
+                    Ok(())
+                },
+            )
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::Io(error) if error.to_string() == "available xtest runtime failure"
+        ));
+        assert_eq!(dispatched.get(), 1);
+        assert!(!uinput_fallback_called.get());
+    }
+
+    #[test]
+    fn queued_writer_backlog_after_stop_executes_no_dispatch() {
+        let failure = AtomicU64::new(0);
+        let stop_requested = AtomicBool::new(true);
+        let terminal_gate = Mutex::new(());
+        let (command_tx, command_rx) = mpsc::channel();
+        for key in [Key::KEY_SPACE, Key::KEY_ENTER] {
+            command_tx
+                .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
+                    key,
+                }))
+                .unwrap();
+        }
+        drop(command_tx);
+        let dispatched = Cell::new(0usize);
+
+        let error = run_writer_command_loop_with_stop(
+            command_rx,
+            &failure,
+            &stop_requested,
+            &terminal_gate,
+            |_command| {
+                dispatched.set(dispatched.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+        assert_eq!(dispatched.get(), 0);
+    }
+
+    #[test]
     fn transaction_send_times_out_when_queue_stays_full() {
         let (handle, command_rx) = test_writer_handle(1, true);
         handle
@@ -3496,6 +6017,58 @@ mod tests {
         assert!(matches!(
             error,
             SwitcherError::VirtualKeyboardWriterSaturated
+        ));
+    }
+
+    #[test]
+    fn transaction_enqueue_uses_own_deadline_before_saturation_window() {
+        let (handle, command_rx) = test_writer_handle(1, true);
+        handle
+            .command_tx
+            .send(WriterCommand::Shutdown)
+            .expect("pre-fill should succeed");
+        let started = Instant::now();
+
+        let error = handle
+            .run_transaction_with_timeout(copy_shortcut_transaction(), Duration::from_millis(5))
+            .unwrap_err();
+        drop(command_rx);
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id }
+                if handle.transaction_failure_request_id() == Some(request_id)
+        ));
+        assert!(
+            started.elapsed() < TRANSACTION_SEND_RETRY_WINDOW,
+            "the request deadline must win before the fixed saturation window"
+        );
+    }
+
+    #[test]
+    fn transaction_enqueue_retry_observes_another_clone_failure() {
+        let (handle, command_rx) = test_writer_handle(1, true);
+        handle
+            .command_tx
+            .send(WriterCommand::Shutdown)
+            .expect("pre-fill should succeed");
+        let failure = Arc::clone(&handle.transaction_failure_request_id);
+        let caller_handle = handle.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            caller_handle.run_transaction(copy_shortcut_transaction())
+        });
+        started_rx.recv().unwrap();
+        thread::sleep(Duration::from_millis(5));
+        failure.store(401, Ordering::SeqCst);
+
+        let error = caller.join().unwrap().unwrap_err();
+        drop(command_rx);
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 401 }
         ));
     }
 
@@ -3622,6 +6195,312 @@ mod tests {
     // Deferred manual current-word writer
 
     #[test]
+    fn deferred_manual_correction_without_completion_times_out_and_fails_writer() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let started = Instant::now();
+
+        let outcome = writer
+            .begin_manual_current_word_correction_with_timeout(
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+                Duration::from_millis(30),
+            )
+            .expect("accepted deferred command should return immediately");
+        let request_id = match outcome {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            other => panic!("expected accepted deferred command, got {other:?}"),
+        };
+        let control = match command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("deferred command should be enqueued")
+        {
+            WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => control,
+            _ => panic!("expected deferred correction command"),
+        };
+
+        let error = loop {
+            match writer.poll_manual_current_word_completion() {
+                Ok(None) if started.elapsed() < Duration::from_millis(250) => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => break error,
+                other => panic!("deferred timeout should fail writer, got {other:?}"),
+            }
+        };
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                request_id: failed_request_id
+            } if failed_request_id == request_id
+        ));
+        assert_eq!(control.state(), WriterTransactionState::TimedOut);
+        assert_eq!(
+            writer.handle.transaction_failure_request_id(),
+            Some(request_id)
+        );
+    }
+
+    #[test]
+    fn deferred_manual_correction_rejects_oversized_plan_before_enqueue() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let plan = match oversized_correction_transaction() {
+            WriterTransactionKind::ApplyCorrection { plan, .. } => plan,
+            _ => unreachable!(),
+        };
+
+        let error = writer
+            .begin_manual_current_word_correction(
+                plan,
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkValidation(
+                crate::error::ValidationError::InputCorrectionPlanTooLarge { .. }
+            )
+        ));
+        assert!(matches!(
+            command_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(writer.pending_manual_current_word.is_none());
+    }
+
+    #[test]
+    fn completed_deferred_success_is_consumed_without_false_health_error() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let plan = CorrectionPlan {
+            buffer: Vec::new(),
+            extra_backspaces: 0,
+        };
+        let request_id = match writer
+            .begin_manual_current_word_correction(
+                plan.clone(),
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .unwrap()
+        {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            other => panic!("expected deferred command, got {other:?}"),
+        };
+        let control = match command_rx.recv().unwrap() {
+            WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => control,
+            _ => panic!("expected deferred correction command"),
+        };
+
+        completion_tx
+            .send(ManualCurrentWordCompletion {
+                request_id,
+                outcome: ManualCurrentWordOutcome::Succeeded(plan),
+            })
+            .unwrap();
+        assert!(control.publish_completed());
+        assert!(
+            writer.health_error().is_none(),
+            "published success must remain pollable instead of becoming a generic health error"
+        );
+
+        let completion = writer
+            .poll_manual_current_word_completion()
+            .unwrap()
+            .expect("published completion should be visible");
+        assert_eq!(completion.request_id, request_id);
+        assert!(writer.pending_manual_current_word.is_none());
+    }
+
+    #[test]
+    fn deferred_failure_completion_precedes_worker_dead_health() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::clone(&alive),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let request_id = match writer
+            .begin_manual_current_word_correction(
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .unwrap()
+        {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            other => panic!("expected deferred command, got {other:?}"),
+        };
+        let control = match command_rx.recv().unwrap() {
+            WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => control,
+            _ => panic!("expected deferred correction command"),
+        };
+        completion_tx
+            .send(ManualCurrentWordCompletion {
+                request_id,
+                outcome: ManualCurrentWordOutcome::FailedAfterMutation(
+                    "post-mutation failure".to_string(),
+                ),
+            })
+            .unwrap();
+        assert!(control.publish_completed());
+        alive.store(false, Ordering::SeqCst);
+
+        let completion = writer
+            .poll_manual_current_word_completion()
+            .unwrap()
+            .expect("terminal deferred completion must win over dead health once");
+
+        assert_eq!(completion.request_id, request_id);
+        assert_eq!(
+            completion.outcome,
+            ManualCurrentWordOutcome::FailedAfterMutation("post-mutation failure".to_string())
+        );
+        assert!(writer.pending_manual_current_word.is_none());
+        assert!(matches!(
+            writer.health_error(),
+            Some(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+    }
+
+    #[test]
+    fn deferred_error_is_published_then_loop_stops_before_next_command() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let first_control = WriterTransactionControl::new_with_terminal_gate(
+            601,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            Arc::clone(&terminal_gate),
+        );
+        let second_control = WriterTransactionControl::new_with_terminal_gate(
+            602,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            terminal_gate,
+        );
+        let (command_tx, command_rx) = mpsc::channel();
+        for control in [first_control.clone(), second_control.clone()] {
+            command_tx
+                .send(WriterCommand::DeferredManualCurrentWordCorrection {
+                    control,
+                    plan: CorrectionPlan {
+                        buffer: Vec::new(),
+                        extra_backspaces: 0,
+                    },
+                    config: test_runtime_config_snapshot(),
+                    modifiers: ModifierState::default(),
+                })
+                .unwrap();
+        }
+        drop(command_tx);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let dispatched = Cell::new(0usize);
+
+        let worker_error = run_writer_command_loop_with(command_rx, &failure, |command| {
+            dispatched.set(dispatched.get() + 1);
+            match command {
+                WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => {
+                    publish_deferred_manual_completion(
+                        &control,
+                        &completion_tx,
+                        ManualCurrentWordCompletion {
+                            request_id: control.request_id(),
+                            outcome: ManualCurrentWordOutcome::FailedAfterMutation(
+                                "post-mutation failure".to_string(),
+                            ),
+                        },
+                        Some("post-mutation failure".to_string()),
+                    )
+                }
+                _ => panic!("expected deferred command"),
+            }
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            worker_error,
+            SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 601,
+                ..
+            }
+        ));
+        assert_eq!(dispatched.get(), 1);
+        assert_eq!(first_control.state(), WriterTransactionState::Completed);
+        assert_eq!(second_control.state(), WriterTransactionState::Pending);
+        assert_eq!(
+            completion_rx.recv().unwrap(),
+            ManualCurrentWordCompletion {
+                request_id: 601,
+                outcome: ManualCurrentWordOutcome::FailedAfterMutation(
+                    "post-mutation failure".to_string()
+                ),
+            }
+        );
+    }
+
+    #[test]
     fn begin_manual_current_word_correction_returns_request_id_immediately() {
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (_completion_tx, completion_rx) = mpsc::channel();
@@ -3629,12 +6508,16 @@ mod tests {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: Some(thread::spawn(move || {
                 let _ = command_rx.recv();
             })),
             completion_rx,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
 
         let outcome = writer
@@ -3664,6 +6547,9 @@ mod tests {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: Some(thread::spawn(move || {
                 while worker_alive.load(Ordering::SeqCst) {
@@ -3673,6 +6559,7 @@ mod tests {
             })),
             completion_rx,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
 
         let outcome = writer
@@ -3705,10 +6592,14 @@ mod tests {
             handle: VirtualKeyboardHandle {
                 command_tx: _command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
             completion_rx,
             next_request_id: 1,
+            pending_manual_current_word: None,
         };
 
         let completion = writer
@@ -3719,38 +6610,65 @@ mod tests {
     }
 
     #[test]
-    fn poll_manual_current_word_completion_returns_success_for_matching_request() {
-        let (command_tx, _command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+    fn poll_manual_current_word_completion_waits_for_completed_publication() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
             completion_rx,
-            next_request_id: 2,
+            next_request_id: 7,
+            pending_manual_current_word: None,
+        };
+        let plan = CorrectionPlan {
+            buffer: Vec::new(),
+            extra_backspaces: 0,
+        };
+        let request_id = match writer
+            .begin_manual_current_word_correction(
+                plan.clone(),
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .unwrap()
+        {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            other => panic!("expected deferred command, got {other:?}"),
+        };
+        let control = match command_rx.recv().unwrap() {
+            WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => control,
+            _ => panic!("expected deferred correction command"),
         };
 
         completion_tx
             .send(ManualCurrentWordCompletion {
-                request_id: 7,
-                outcome: ManualCurrentWordOutcome::Succeeded(CorrectionPlan {
-                    buffer: Vec::new(),
-                    extra_backspaces: 0,
-                }),
+                request_id,
+                outcome: ManualCurrentWordOutcome::Succeeded(plan),
             })
             .expect("completion send should succeed");
 
+        assert!(writer
+            .poll_manual_current_word_completion()
+            .expect("poll should succeed")
+            .is_none());
+        assert!(control.publish_completed());
         let completion = writer
             .poll_manual_current_word_completion()
             .expect("poll should succeed")
-            .expect("completion should be ready");
+            .expect("completed reply should be ready");
 
-        assert_eq!(completion.request_id, 7);
+        assert_eq!(completion.request_id, request_id);
         assert!(matches!(
             completion.outcome,
             ManualCurrentWordOutcome::Succeeded(_)
         ));
+        assert!(writer.pending_manual_current_word.is_none());
+        assert_eq!(writer.handle.transaction_failure_request_id(), None);
     }
 }

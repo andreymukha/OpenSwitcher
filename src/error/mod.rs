@@ -112,6 +112,12 @@ pub enum SwitcherError {
     VirtualKeyboardWriterDisconnected,
     #[error("Virtual keyboard writer queue is saturated")]
     VirtualKeyboardWriterSaturated,
+    #[error("Virtual keyboard writer transaction {request_id} exceeded its deadline")]
+    VirtualKeyboardWriterTransactionTimedOut { request_id: u64 },
+    #[error("Virtual keyboard writer transaction {request_id} failed after mutation: {reason}")]
+    VirtualKeyboardWriterTransactionFailed { request_id: u64, reason: String },
+    #[error(transparent)]
+    InputWorkValidation(#[from] ValidationError),
     #[error(transparent)]
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]

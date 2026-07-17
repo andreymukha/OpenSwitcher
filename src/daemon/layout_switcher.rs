@@ -1,5 +1,6 @@
 use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, SessionType};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayoutSwitchStrategy {
@@ -25,16 +26,89 @@ impl LayoutSwitchStrategy {
 
 pub trait LayoutSwitcher {
     fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError>;
+
+    fn switch_layout_with_hooks(
+        &mut self,
+        combo: LayoutSwitchCombo,
+        hooks: &LayoutSwitchHooks<'_>,
+    ) -> Result<(), SwitcherError> {
+        hooks.checkpoint()?;
+        let result = self.switch_layout(combo);
+        hooks.checkpoint()?;
+        result
+    }
+}
+
+pub struct LayoutSwitchHooks<'a> {
+    checkpoint: &'a dyn Fn() -> Result<(), SwitcherError>,
+    authorize_mutation: &'a dyn Fn() -> Result<(), SwitcherError>,
+}
+
+impl<'a> LayoutSwitchHooks<'a> {
+    pub fn new(
+        checkpoint: &'a dyn Fn() -> Result<(), SwitcherError>,
+        authorize_mutation: &'a dyn Fn() -> Result<(), SwitcherError>,
+    ) -> Self {
+        Self {
+            checkpoint,
+            authorize_mutation,
+        }
+    }
+
+    fn checkpoint(&self) -> Result<(), SwitcherError> {
+        (self.checkpoint)()
+    }
+
+    fn authorize_mutation(&self) -> Result<(), SwitcherError> {
+        (self.authorize_mutation)()
+    }
+}
+
+trait UinputLayoutSink {
+    fn press_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError>;
+    fn release_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError>;
+    fn synchronize_keys(&mut self) -> Result<(), SwitcherError>;
+}
+
+impl UinputLayoutSink for uinput::Device {
+    fn press_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError> {
+        self.press(key).map_err(Into::into)
+    }
+
+    fn release_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError> {
+        self.release(key).map_err(Into::into)
+    }
+
+    fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
+        self.synchronize().map_err(Into::into)
+    }
 }
 
 pub struct UinputLayoutSwitcher<'a> {
     device: &'a mut uinput::Device,
     delay_ms: u64,
+    delay_waiter: Option<&'a dyn Fn(Duration) -> Result<(), SwitcherError>>,
 }
 
 impl<'a> UinputLayoutSwitcher<'a> {
     pub fn new(device: &'a mut uinput::Device, delay_ms: u64) -> Self {
-        Self { device, delay_ms }
+        Self {
+            device,
+            delay_ms,
+            delay_waiter: None,
+        }
+    }
+
+    pub fn new_with_waiter(
+        device: &'a mut uinput::Device,
+        delay_ms: u64,
+        delay_waiter: &'a dyn Fn(Duration) -> Result<(), SwitcherError>,
+    ) -> Self {
+        Self {
+            device,
+            delay_ms,
+            delay_waiter: Some(delay_waiter),
+        }
     }
 
     fn layout_switch_combo_sequence(
@@ -69,32 +143,105 @@ impl<'a> UinputLayoutSwitcher<'a> {
     }
 }
 
+fn release_uinput_layout_keys(
+    sink: &mut dyn UinputLayoutSink,
+    pressed: &[&uinput::event::keyboard::Key],
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
+    for key in pressed.iter().rev() {
+        if let Err(error) = sink.release_key(key) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    if let Err(error) = sink.synchronize_keys() {
+        if first_error.is_none() {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn execute_uinput_layout_switch_sequence(
+    sink: &mut dyn UinputLayoutSink,
+    combo: LayoutSwitchCombo,
+    delay: Duration,
+    ensure_active: &dyn Fn() -> Result<(), SwitcherError>,
+    wait: &dyn Fn(Duration) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    let (modifiers, trigger_key) = UinputLayoutSwitcher::layout_switch_combo_sequence(combo);
+    let mut pressed = Vec::new();
+
+    for key in modifiers.iter().chain(trigger_key) {
+        if let Err(error) = ensure_active() {
+            let _ = release_uinput_layout_keys(sink, &pressed);
+            return Err(error);
+        }
+        if let Err(error) = sink.press_key(key) {
+            let _ = release_uinput_layout_keys(sink, &pressed);
+            return Err(error);
+        }
+        pressed.push(key);
+    }
+
+    if let Err(error) = sink.synchronize_keys() {
+        let _ = release_uinput_layout_keys(sink, &pressed);
+        return Err(error);
+    }
+    let wait_result = wait(delay);
+    let release_result = release_uinput_layout_keys(sink, &pressed);
+    wait_result?;
+    release_result
+}
+
 impl<'a> LayoutSwitcher for UinputLayoutSwitcher<'a> {
     fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
-        let (modifiers, trigger_key) = Self::layout_switch_combo_sequence(combo);
-
-        for modifier in modifiers {
-            self.device.press(modifier)?;
-        }
-
-        if let Some(key) = trigger_key {
-            self.device.press(key)?;
-        }
-
-        self.device.synchronize()?;
-        std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
-
-        if let Some(key) = trigger_key {
-            self.device.release(key)?;
-        }
-
-        for modifier in modifiers.iter().rev() {
-            self.device.release(modifier)?;
-        }
-
-        self.device.synchronize()?;
-        Ok(())
+        let delay = Duration::from_millis(self.delay_ms);
+        let delay_waiter = self.delay_waiter;
+        let ensure_active = || match delay_waiter {
+            Some(waiter) => waiter(Duration::ZERO),
+            None => Ok(()),
+        };
+        let wait = |duration| match delay_waiter {
+            Some(waiter) => waiter(duration),
+            None => {
+                std::thread::sleep(duration);
+                Ok(())
+            }
+        };
+        execute_uinput_layout_switch_sequence(self.device, combo, delay, &ensure_active, &wait)
     }
+}
+
+fn execute_x11_layout_switch(
+    hooks: &LayoutSwitchHooks<'_>,
+    mut read_num_groups: impl FnMut() -> Result<u8, SwitcherError>,
+    mut read_current_group: impl FnMut() -> Result<u8, SwitcherError>,
+    mut latch_group: impl FnMut(u8) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    hooks.checkpoint()?;
+    let num_groups = read_num_groups();
+    hooks.checkpoint()?;
+    let num_groups = num_groups?;
+
+    hooks.checkpoint()?;
+    let current_group = read_current_group();
+    hooks.checkpoint()?;
+    let current_group = current_group?;
+
+    if num_groups <= 1 {
+        return Ok(());
+    }
+
+    let next_group = (current_group + 1) % num_groups;
+    hooks.authorize_mutation()?;
+    let result = latch_group(next_group);
+    hooks.checkpoint()?;
+    result
 }
 
 pub struct X11LayoutSwitcher {
@@ -117,71 +264,175 @@ impl X11LayoutSwitcher {
 }
 
 impl LayoutSwitcher for X11LayoutSwitcher {
-    fn switch_layout(&mut self, _combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+    fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+        let checkpoint = || Ok(());
+        let hooks = LayoutSwitchHooks::new(&checkpoint, &checkpoint);
+        self.switch_layout_with_hooks(combo, &hooks)
+    }
+
+    fn switch_layout_with_hooks(
+        &mut self,
+        _combo: LayoutSwitchCombo,
+        hooks: &LayoutSwitchHooks<'_>,
+    ) -> Result<(), SwitcherError> {
         use x11rb::protocol::xkb::{self, ConnectionExt as _};
+        let conn = &self.conn;
+        execute_x11_layout_switch(
+            hooks,
+            || {
+                conn.xkb_get_controls(xkb::ID::USE_CORE_KBD.into())
+                    .map_err(|e| {
+                        SwitcherError::Io(std::io::Error::other(format!(
+                            "XKB controls failed: {e}"
+                        )))
+                    })?
+                    .reply()
+                    .map(|controls| controls.num_groups)
+                    .map_err(|e| {
+                        SwitcherError::Io(std::io::Error::other(format!(
+                            "XKB controls reply failed: {e}"
+                        )))
+                    })
+            },
+            || {
+                conn.xkb_get_state(xkb::ID::USE_CORE_KBD.into())
+                    .map_err(|e| {
+                        SwitcherError::Io(std::io::Error::other(format!("XKB state failed: {e}")))
+                    })?
+                    .reply()
+                    .map(|state| u8::from(state.group))
+                    .map_err(|e| {
+                        SwitcherError::Io(std::io::Error::other(format!(
+                            "XKB state reply failed: {e}"
+                        )))
+                    })
+            },
+            |next_group| {
+                conn.xkb_latch_lock_state(
+                    xkb::ID::USE_CORE_KBD.into(),
+                    0u8.into(),
+                    0u8.into(),
+                    true,
+                    next_group.into(),
+                    0u8.into(),
+                    false,
+                    0,
+                )
+                .map_err(|e| {
+                    SwitcherError::Io(std::io::Error::other(format!(
+                        "XKB latch state failed: {e}"
+                    )))
+                })?;
 
-        let controls = self
-            .conn
-            .xkb_get_controls(xkb::ID::USE_CORE_KBD.into())
-            .map_err(|e| {
-                SwitcherError::Io(std::io::Error::other(format!("XKB controls failed: {e}")))
-            })?
-            .reply()
-            .map_err(|e| {
-                SwitcherError::Io(std::io::Error::other(format!(
-                    "XKB controls reply failed: {e}"
-                )))
-            })?;
-
-        let state = self
-            .conn
-            .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
-            .map_err(|e| {
-                SwitcherError::Io(std::io::Error::other(format!("XKB state failed: {e}")))
-            })?
-            .reply()
-            .map_err(|e| {
-                SwitcherError::Io(std::io::Error::other(format!(
-                    "XKB state reply failed: {e}"
-                )))
-            })?;
-
-        if controls.num_groups <= 1 {
-            return Ok(());
-        }
-
-        let current_group = u8::from(state.group);
-        let next_group = (current_group + 1) % controls.num_groups;
-
-        self.conn
-            .xkb_latch_lock_state(
-                xkb::ID::USE_CORE_KBD.into(),
-                0u8.into(),
-                0u8.into(),
-                true,
-                next_group.into(),
-                0u8.into(),
-                false,
-                0,
-            )
-            .map_err(|e| {
-                SwitcherError::Io(std::io::Error::other(format!(
-                    "XKB latch state failed: {e}"
-                )))
-            })?;
-
-        use x11rb::connection::Connection as _;
-        self.conn.flush().map_err(|e| {
-            SwitcherError::Io(std::io::Error::other(format!("XKB flush failed: {e}")))
-        })?;
-
-        Ok(())
+                use x11rb::connection::Connection as _;
+                conn.flush().map_err(|e| {
+                    SwitcherError::Io(std::io::Error::other(format!("XKB flush failed: {e}")))
+                })
+            },
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeUinputLayoutSink {
+        events: Vec<String>,
+    }
+
+    impl UinputLayoutSink for FakeUinputLayoutSink {
+        fn press_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError> {
+            self.events.push(format!("down:{key:?}"));
+            Ok(())
+        }
+
+        fn release_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError> {
+            self.events.push(format!("up:{key:?}"));
+            Ok(())
+        }
+
+        fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
+            self.events.push("sync".to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn uinput_combo_cancellation_between_presses_starts_no_new_key_down() {
+        let mut sink = FakeUinputLayoutSink::default();
+        let checks = std::cell::Cell::new(0usize);
+        let ensure_active = || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            if next == 2 {
+                Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 201 })
+            } else {
+                Ok(())
+            }
+        };
+
+        let error = execute_uinput_layout_switch_sequence(
+            &mut sink,
+            LayoutSwitchCombo::CtrlShift,
+            Duration::ZERO,
+            &ensure_active,
+            &|_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 201 }
+        ));
+        assert_eq!(
+            sink.events,
+            vec!["down:LeftControl", "up:LeftControl", "sync"]
+        );
+    }
+
+    #[test]
+    fn x11_cancellation_after_blocking_read_starts_no_latch_mutation() {
+        let cancelled = std::cell::Cell::new(false);
+        let controls_reads = std::cell::Cell::new(0usize);
+        let state_reads = std::cell::Cell::new(0usize);
+        let latch_mutations = std::cell::Cell::new(0usize);
+        let checkpoint = || {
+            if cancelled.get() {
+                Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 202 })
+            } else {
+                Ok(())
+            }
+        };
+        let hooks = LayoutSwitchHooks::new(&checkpoint, &checkpoint);
+
+        let error = execute_x11_layout_switch(
+            &hooks,
+            || {
+                controls_reads.set(controls_reads.get() + 1);
+                cancelled.set(true);
+                Ok(2)
+            },
+            || {
+                state_reads.set(state_reads.get() + 1);
+                Ok(0)
+            },
+            |_| {
+                latch_mutations.set(latch_mutations.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 202 }
+        ));
+        assert_eq!(controls_reads.get(), 1);
+        assert_eq!(state_reads.get(), 0);
+        assert_eq!(latch_mutations.get(), 0);
+    }
 
     #[test]
     fn prefers_x11_strategy_only_for_x11_sessions() {

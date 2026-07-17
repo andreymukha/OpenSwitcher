@@ -17,7 +17,9 @@ use crate::daemon::switch_logic::{
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::{CaptureError, SwitcherError};
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
-use crate::model::{HotkeyModifiers, HotkeySpec, LayoutSwitchCaptureState, SessionType};
+use crate::model::{
+    HotkeyModifiers, HotkeySpec, LayoutSwitchCaptureState, SessionType, MAX_CORRECTION_KEYSTROKES,
+};
 use evdev::InputEventKind;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -27,7 +29,8 @@ use zbus::blocking::Connection;
 const EVENT_LOOP_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 const EVENT_LOOP_HEARTBEAT_EVENTS: u64 = 500;
 const STARTUP_LAYOUT_RESYNC_MAX_ATTEMPTS: u8 = 3;
-const MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT: Duration = Duration::from_millis(10);
+const WRITER_HEALTH_POLL_QUANTUM: Duration = Duration::from_millis(5);
+const MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT: Duration = WRITER_HEALTH_POLL_QUANTUM;
 const MAX_DEFERRED_MANUAL_INPUT_EVENTS: usize = 256;
 
 // Word tracking / correction state
@@ -123,6 +126,82 @@ fn should_route_capture_before_manual_current_word(origin: InputOrigin) -> bool 
 
 fn bounded_capture_poll_timeout(timeout: Duration) -> Duration {
     timeout.min(INPUT_EVENT_WAIT_TIMEOUT)
+}
+
+fn active_keyboard_fetch_timeout(timeout: Duration, keyboard_attached: bool) -> Duration {
+    if keyboard_attached {
+        timeout.min(WRITER_HEALTH_POLL_QUANTUM)
+    } else {
+        timeout
+    }
+}
+
+fn writer_health_result(error: Option<SwitcherError>) -> Result<(), SwitcherError> {
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+enum WriterHealthyBatchError<E> {
+    Health(E),
+    Event(E),
+}
+
+enum WriterHealthyOperationError<E> {
+    Health(E),
+    Operation(E),
+}
+
+enum CompletionBeforeWriterHealthError<E> {
+    Completion(E),
+    Health(E),
+}
+
+fn poll_completion_before_writer_health<State, E, PollCompletion, EnsureHealth>(
+    state: &mut State,
+    poll_completion: PollCompletion,
+    ensure_health: EnsureHealth,
+) -> Result<(), CompletionBeforeWriterHealthError<E>>
+where
+    PollCompletion: FnOnce(&mut State) -> Result<(), E>,
+    EnsureHealth: FnOnce(&mut State) -> Result<(), E>,
+{
+    poll_completion(state).map_err(CompletionBeforeWriterHealthError::Completion)?;
+    ensure_health(state).map_err(CompletionBeforeWriterHealthError::Health)
+}
+
+fn run_writer_healthy_operation<State, Output, E, Health, Operation>(
+    state: &mut State,
+    mut ensure_healthy: Health,
+    operation: Operation,
+) -> Result<Output, WriterHealthyOperationError<E>>
+where
+    Health: FnMut(&mut State) -> Result<(), E>,
+    Operation: FnOnce(&mut State) -> Result<Output, E>,
+{
+    ensure_healthy(state).map_err(WriterHealthyOperationError::Health)?;
+    let operation_result = operation(state);
+    ensure_healthy(state).map_err(WriterHealthyOperationError::Health)?;
+    operation_result.map_err(WriterHealthyOperationError::Operation)
+}
+
+fn process_writer_healthy_batch<State, Events, Event, E, Health, Handle>(
+    state: &mut State,
+    events: Events,
+    mut ensure_healthy: Health,
+    mut handle_event: Handle,
+) -> Result<(), WriterHealthyBatchError<E>>
+where
+    Events: IntoIterator<Item = Event>,
+    Health: FnMut(&mut State) -> Result<(), E>,
+    Handle: FnMut(&mut State, Event) -> Result<(), E>,
+{
+    for event in events {
+        ensure_healthy(state).map_err(WriterHealthyBatchError::Health)?;
+        handle_event(state, event).map_err(WriterHealthyBatchError::Event)?;
+    }
+    Ok(())
 }
 
 fn reset_capture_epoch_then_shutdown_backend<F>(
@@ -240,6 +319,10 @@ fn should_restart_manual_current_word_after_drain(
     retry_after_drain_requested: bool,
 ) -> bool {
     deferred_len == 0 && retry_after_drain_requested
+}
+
+fn failed_manual_current_word_completion_error(request_id: u64, reason: String) -> SwitcherError {
+    SwitcherError::VirtualKeyboardWriterTransactionFailed { request_id, reason }
 }
 
 // Startup layout resync state
@@ -613,6 +696,94 @@ fn should_abort_manual_current_word_flow_on_queue_overflow(
 
 // Reset / invalidation helpers
 
+enum WordTrackingEvent {
+    PlainCharacter(Keystroke),
+    Backspace,
+    Boundary,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WordTrackingUpdate {
+    correction_tracking_enabled: bool,
+    overflow_started: bool,
+}
+
+fn apply_word_tracking_event_and_forward(
+    buffer: &mut Vec<Keystroke>,
+    overflowed: &mut bool,
+    word_context: &mut WordContext,
+    current_word_correction_state: &mut CurrentWordCorrectionState,
+    manual_hotkey_latch: &mut Option<ManualHotkeyLatch>,
+    event: WordTrackingEvent,
+    forward: impl FnOnce() -> Result<(), SwitcherError>,
+) -> Result<WordTrackingUpdate, SwitcherError> {
+    let update = match event {
+        WordTrackingEvent::PlainCharacter(stroke) => {
+            let overflow_started = !*overflowed && buffer.len() >= MAX_CORRECTION_KEYSTROKES;
+            if overflow_started {
+                buffer.clear();
+                *overflowed = true;
+            }
+
+            if *overflowed {
+                *current_word_correction_state = CurrentWordCorrectionState::Raw;
+                *manual_hotkey_latch = None;
+                word_context.valid = false;
+                word_context.followed_by_separator = false;
+                word_context.word_before_cursor.clear();
+                WordTrackingUpdate {
+                    correction_tracking_enabled: false,
+                    overflow_started,
+                }
+            } else {
+                buffer.push(stroke);
+                *current_word_correction_state =
+                    next_current_word_state_after_plain_character_input(
+                        *current_word_correction_state,
+                    );
+                word_context.valid = true;
+                word_context.followed_by_separator = false;
+                word_context.word_before_cursor.clear();
+                WordTrackingUpdate {
+                    correction_tracking_enabled: true,
+                    overflow_started: false,
+                }
+            }
+        }
+        WordTrackingEvent::Backspace => {
+            *current_word_correction_state = CurrentWordCorrectionState::Raw;
+            if !*overflowed {
+                if !buffer.is_empty() {
+                    buffer.pop();
+                } else if word_context.valid && word_context.followed_by_separator {
+                    *buffer = word_context.word_before_cursor.clone();
+                    word_context.followed_by_separator = false;
+                }
+            }
+            WordTrackingUpdate {
+                correction_tracking_enabled: !*overflowed && !buffer.is_empty(),
+                overflow_started: false,
+            }
+        }
+        WordTrackingEvent::Boundary => {
+            clear_word_context_state(
+                buffer,
+                word_context,
+                current_word_correction_state,
+                manual_hotkey_latch,
+            );
+            *overflowed = false;
+            WordTrackingUpdate {
+                correction_tracking_enabled: false,
+                overflow_started: false,
+            }
+        }
+    };
+
+    forward()?;
+    Ok(update)
+}
+
 fn clear_word_context_state(
     buffer: &mut Vec<Keystroke>,
     word_context: &mut WordContext,
@@ -659,6 +830,7 @@ pub struct DaemonService {
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
     buffer: Vec<Keystroke>,
+    word_buffer_overflowed: bool,
     current_word_correction_state: CurrentWordCorrectionState,
     word_context: WordContext,
     selected_text_runner: Option<SelectedTextJobRunner>,
@@ -686,6 +858,7 @@ impl DaemonService {
             modifiers: ModifierState::default(),
             shared_modifiers,
             buffer: Vec::new(),
+            word_buffer_overflowed: false,
             current_word_correction_state: CurrentWordCorrectionState::Raw,
             word_context: WordContext::default(),
             selected_text_runner: None,
@@ -715,25 +888,33 @@ impl DaemonService {
                 return Ok(());
             }
 
+            self.poll_manual_completion_and_ensure_writer_healthy()?;
             self.maybe_retry_input_backend()?;
-            self.poll_manual_current_word_completion()?;
 
             let fetch_timeout = bounded_capture_poll_timeout(self.event_fetch_timeout());
-            let events = if let Some(keyboard) = self.keyboard.as_mut() {
-                match keyboard.fetch_events_timeout(fetch_timeout) {
-                    Ok(events) => events,
-                    Err(error) => {
-                        log_input_debug("keyboard-read-error", &format!("error={error}"));
-                        if self.handle_runtime_input_failure(&error) {
-                            continue;
-                        }
-                        self.shutdown();
-                        return Err(error);
+            let fetch_result = run_writer_healthy_operation(
+                self,
+                DaemonService::poll_manual_completion_and_ensure_writer_healthy,
+                |service| {
+                    if let Some(keyboard) = service.keyboard.as_mut() {
+                        keyboard.fetch_events_timeout(fetch_timeout)
+                    } else {
+                        std::thread::sleep(INPUT_EVENT_WAIT_TIMEOUT);
+                        Ok(Vec::new())
                     }
+                },
+            );
+            let events = match fetch_result {
+                Ok(events) => events,
+                Err(WriterHealthyOperationError::Health(error)) => return Err(error),
+                Err(WriterHealthyOperationError::Operation(error)) => {
+                    log_input_debug("keyboard-read-error", &format!("error={error}"));
+                    if self.handle_runtime_input_failure(&error) {
+                        continue;
+                    }
+                    self.shutdown();
+                    return Err(error);
                 }
-            } else {
-                std::thread::sleep(INPUT_EVENT_WAIT_TIMEOUT);
-                Vec::new()
             };
 
             if let Err(error) = self.poll_layout_switch_capture_expiry() {
@@ -768,53 +949,68 @@ impl DaemonService {
                 );
             }
 
-            for event in events {
-                if let InputEventKind::Key(key) = event.kind() {
-                    if let Err(error) = self.handle_key_event(
-                        key,
-                        event.value(),
-                        event.timestamp(),
-                        InputOrigin::Physical,
-                    ) {
-                        log_input_debug(
-                            "event-handler-error",
-                            &format!("key={key:?} value={} error={error}", event.value()),
-                        );
-                        if self.handle_runtime_input_failure(&error) {
-                            continue 'event_loop;
+            let batch_result = process_writer_healthy_batch(
+                self,
+                events,
+                DaemonService::poll_manual_completion_and_ensure_writer_healthy,
+                |service, event| {
+                    if let InputEventKind::Key(key) = event.kind() {
+                        if let Err(error) = service.handle_key_event(
+                            key,
+                            event.value(),
+                            event.timestamp(),
+                            InputOrigin::Physical,
+                        ) {
+                            log_input_debug(
+                                "event-handler-error",
+                                &format!("key={key:?} value={} error={error}", event.value()),
+                            );
+                            return Err(error);
                         }
-                        self.shutdown();
-                        return Err(error);
-                    }
-                    processed_events += 1;
-                    if processed_events.is_multiple_of(EVENT_LOOP_HEARTBEAT_EVENTS)
-                        || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
-                    {
-                        let dbus_signal_drop_fields = self
-                            .dbus_signal_drop_counters
-                            .take_counts()
-                            .heartbeat_fields();
-                        if let Some(fields) = dbus_signal_drop_fields.as_deref() {
-                            log_layout_debug("dbus-signal-drop-summary", fields);
+                        processed_events += 1;
+                        if processed_events.is_multiple_of(EVENT_LOOP_HEARTBEAT_EVENTS)
+                            || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
+                        {
+                            let dbus_signal_drop_fields = service
+                                .dbus_signal_drop_counters
+                                .take_counts()
+                                .heartbeat_fields();
+                            if let Some(fields) = dbus_signal_drop_fields.as_deref() {
+                                log_layout_debug("dbus-signal-drop-summary", fields);
+                            }
+                            let dbus_signal_drop_fields = dbus_signal_drop_fields
+                                .map(|fields| format!(" {fields}"))
+                                .unwrap_or_default();
+                            log_input_debug(
+                                "event-loop-heartbeat",
+                                &format!(
+                                    "events_processed={processed_events} selected_text_in_progress={} writer_alive={}{}",
+                                    service
+                                        .selected_text_runner
+                                        .as_ref()
+                                        .is_some_and(SelectedTextJobRunner::is_in_progress),
+                                    service
+                                        .keyboard
+                                        .as_ref()
+                                        .is_some_and(KeyboardController::is_writer_alive),
+                                    dbus_signal_drop_fields,
+                                ),
+                            );
+                            last_heartbeat = Instant::now();
                         }
-                        let dbus_signal_drop_fields = dbus_signal_drop_fields
-                            .map(|fields| format!(" {fields}"))
-                            .unwrap_or_default();
-                        log_input_debug(
-                            "event-loop-heartbeat",
-                            &format!(
-                                "events_processed={processed_events} selected_text_in_progress={} writer_alive={}{}",
-                                self.selected_text_runner
-                                    .as_ref()
-                                    .is_some_and(SelectedTextJobRunner::is_in_progress),
-                                self.keyboard
-                                    .as_ref()
-                                    .is_some_and(KeyboardController::is_writer_alive),
-                                dbus_signal_drop_fields,
-                            ),
-                        );
-                        last_heartbeat = Instant::now();
                     }
+                    Ok(())
+                },
+            );
+            match batch_result {
+                Ok(()) => {}
+                Err(WriterHealthyBatchError::Health(error)) => return Err(error),
+                Err(WriterHealthyBatchError::Event(error)) => {
+                    if self.handle_runtime_input_failure(&error) {
+                        continue 'event_loop;
+                    }
+                    self.shutdown();
+                    return Err(error);
                 }
             }
 
@@ -828,10 +1024,39 @@ impl DaemonService {
     }
 
     fn event_fetch_timeout(&self) -> Duration {
-        match self.manual_current_word_flow {
+        let timeout = match self.manual_current_word_flow {
             ManualCurrentWordFlow::Idle => INPUT_EVENT_WAIT_TIMEOUT,
             ManualCurrentWordFlow::InFlight { .. } => MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT,
             ManualCurrentWordFlow::DrainingDeferredInput { .. } => Duration::ZERO,
+        };
+        active_keyboard_fetch_timeout(timeout, self.keyboard.is_some())
+    }
+
+    fn ensure_writer_healthy(&mut self) -> Result<(), SwitcherError> {
+        let error = self
+            .keyboard
+            .as_ref()
+            .and_then(KeyboardController::writer_health_error);
+        if let Err(error) = writer_health_result(error) {
+            log_input_debug("writer-health-error", &format!("error={error}"));
+            self.shutdown();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn poll_manual_completion_and_ensure_writer_healthy(&mut self) -> Result<(), SwitcherError> {
+        match poll_completion_before_writer_health(
+            self,
+            DaemonService::poll_manual_current_word_completion,
+            DaemonService::ensure_writer_healthy,
+        ) {
+            Ok(()) => Ok(()),
+            Err(CompletionBeforeWriterHealthError::Completion(error)) => {
+                self.shutdown();
+                Err(error)
+            }
+            Err(CompletionBeforeWriterHealthError::Health(error)) => Err(error),
         }
     }
 
@@ -971,7 +1196,10 @@ impl DaemonService {
                     ),
                 );
                 self.abort_manual_current_word_flow("manual-current-word-failed-after-mutation");
-                Ok(())
+                Err(failed_manual_current_word_completion_error(
+                    completion.request_id,
+                    error,
+                ))
             }
         }
     }
@@ -1449,6 +1677,22 @@ impl DaemonService {
 
         match key {
             evdev::Key::KEY_SPACE => {
+                if self.word_buffer_overflowed {
+                    let keyboard = self
+                        .keyboard
+                        .as_mut()
+                        .ok_or(SwitcherError::KeyboardNotFound)?;
+                    apply_word_tracking_event_and_forward(
+                        &mut self.buffer,
+                        &mut self.word_buffer_overflowed,
+                        &mut self.word_context,
+                        &mut self.current_word_correction_state,
+                        &mut self.manual_hotkey_latch,
+                        WordTrackingEvent::Boundary,
+                        || keyboard.forward_event(key, value),
+                    )?;
+                    return Ok(());
+                }
                 if should_commit_manually_corrected_current_word(
                     self.current_word_correction_state,
                     key,
@@ -1583,6 +1827,7 @@ impl DaemonService {
                 self.word_context.word_before_cursor = self.buffer.clone();
                 self.word_context.followed_by_separator = true;
                 self.buffer.clear();
+                self.word_buffer_overflowed = false;
                 self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
@@ -1635,14 +1880,20 @@ impl DaemonService {
                 self.keyboard_mut()?.forward_event(key, value)
             }
             evdev::Key::KEY_BACKSPACE => {
-                self.current_word_correction_state = CurrentWordCorrectionState::Raw;
-                if !self.buffer.is_empty() {
-                    self.buffer.pop();
-                } else if self.word_context.valid && self.word_context.followed_by_separator {
-                    self.buffer = self.word_context.word_before_cursor.clone();
-                    self.word_context.followed_by_separator = false;
-                }
-                self.keyboard_mut()?.forward_event(key, value)
+                let keyboard = self
+                    .keyboard
+                    .as_mut()
+                    .ok_or(SwitcherError::KeyboardNotFound)?;
+                apply_word_tracking_event_and_forward(
+                    &mut self.buffer,
+                    &mut self.word_buffer_overflowed,
+                    &mut self.word_context,
+                    &mut self.current_word_correction_state,
+                    &mut self.manual_hotkey_latch,
+                    WordTrackingEvent::Backspace,
+                    || keyboard.forward_event(key, value),
+                )?;
+                Ok(())
             }
             _ => {
                 let current_stroke = Keystroke {
@@ -1657,16 +1908,30 @@ impl DaemonService {
                     && !self.modifiers.is_meta_pressed();
 
                 if plain_character_input {
-                    self.current_word_correction_state =
-                        next_current_word_state_after_plain_character_input(
-                            self.current_word_correction_state,
+                    let keyboard = self
+                        .keyboard
+                        .as_mut()
+                        .ok_or(SwitcherError::KeyboardNotFound)?;
+                    let update = apply_word_tracking_event_and_forward(
+                        &mut self.buffer,
+                        &mut self.word_buffer_overflowed,
+                        &mut self.word_context,
+                        &mut self.current_word_correction_state,
+                        &mut self.manual_hotkey_latch,
+                        WordTrackingEvent::PlainCharacter(current_stroke),
+                        || keyboard.forward_event(key, value),
+                    )?;
+                    if update.overflow_started {
+                        log_input_debug(
+                            "word-buffer-limit",
+                            &format!(
+                                "limit={} correction_tracking=false",
+                                MAX_CORRECTION_KEYSTROKES
+                            ),
                         );
-                    // Once we are typing the current word again, the cursor is no longer
-                    // "after a finished word". Keep only the active buffer state.
-                    self.word_context.valid = true;
-                    self.word_context.followed_by_separator = false;
-                    self.word_context.word_before_cursor.clear();
-                    self.buffer.push(current_stroke);
+                    }
+                    self.maybe_run_pending_selected_text_switch()?;
+                    return Ok(());
                 } else if !is_modifier(key) {
                     self.invalidate_word_context();
                 }
@@ -1863,6 +2128,7 @@ impl DaemonService {
             separator_key,
             corrected_buffer,
         );
+        self.word_buffer_overflowed = false;
         log_input_debug(
             "commit-corrected-word",
             &format!(
@@ -2257,6 +2523,7 @@ impl DaemonService {
             &mut self.current_word_correction_state,
             &mut self.manual_hotkey_latch,
         );
+        self.word_buffer_overflowed = false;
         self.suppressed_hotkey_key = None;
         self.suppressed_undo_key = None;
         self.manual_hotkey_latch = None;
@@ -2282,6 +2549,7 @@ impl DaemonService {
             &mut self.current_word_correction_state,
             &mut self.manual_hotkey_latch,
         );
+        self.word_buffer_overflowed = false;
     }
 
     fn can_correct_word_before_cursor(&self) -> bool {
@@ -2427,6 +2695,121 @@ mod tests {
         }
     }
 
+    #[test]
+    fn word_tracking_reducer_forwards_overflow_until_a_real_boundary_resets_it() {
+        let mut buffer = Vec::new();
+        let mut overflowed = false;
+        let mut word_context = WordContext::default();
+        let mut correction_state = CurrentWordCorrectionState::Raw;
+        let mut manual_hotkey_latch = None;
+        let mut forwarded_physical_characters = 0usize;
+
+        for _ in 0..MAX_CORRECTION_KEYSTROKES {
+            let update = apply_word_tracking_event_and_forward(
+                &mut buffer,
+                &mut overflowed,
+                &mut word_context,
+                &mut correction_state,
+                &mut manual_hotkey_latch,
+                WordTrackingEvent::PlainCharacter(stroke(Key::KEY_A)),
+                || {
+                    forwarded_physical_characters += 1;
+                    Ok::<(), SwitcherError>(())
+                },
+            )
+            .unwrap();
+            assert!(update.correction_tracking_enabled);
+            assert!(!update.overflow_started);
+        }
+        assert_eq!(buffer.len(), MAX_CORRECTION_KEYSTROKES);
+        assert!(!overflowed);
+
+        let overflow = apply_word_tracking_event_and_forward(
+            &mut buffer,
+            &mut overflowed,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            WordTrackingEvent::PlainCharacter(stroke(Key::KEY_B)),
+            || {
+                forwarded_physical_characters += 1;
+                Ok::<(), SwitcherError>(())
+            },
+        )
+        .unwrap();
+        assert!(buffer.is_empty());
+        assert!(overflowed);
+        assert!(overflow.overflow_started);
+        assert!(!overflow.correction_tracking_enabled);
+
+        let suppressed = apply_word_tracking_event_and_forward(
+            &mut buffer,
+            &mut overflowed,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            WordTrackingEvent::PlainCharacter(stroke(Key::KEY_C)),
+            || {
+                forwarded_physical_characters += 1;
+                Ok::<(), SwitcherError>(())
+            },
+        )
+        .unwrap();
+        assert!(buffer.is_empty());
+        assert!(!suppressed.overflow_started);
+        assert!(!suppressed.correction_tracking_enabled);
+
+        let backspace = apply_word_tracking_event_and_forward(
+            &mut buffer,
+            &mut overflowed,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            WordTrackingEvent::Backspace,
+            || {
+                forwarded_physical_characters += 1;
+                Ok::<(), SwitcherError>(())
+            },
+        )
+        .unwrap();
+        assert!(buffer.is_empty());
+        assert!(overflowed, "backspace must not re-enable lost tracking");
+        assert!(!backspace.correction_tracking_enabled);
+
+        apply_word_tracking_event_and_forward(
+            &mut buffer,
+            &mut overflowed,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            WordTrackingEvent::Boundary,
+            || {
+                forwarded_physical_characters += 1;
+                Ok::<(), SwitcherError>(())
+            },
+        )
+        .unwrap();
+        assert!(!overflowed, "a real boundary must clear the overflow latch");
+
+        let next_word = apply_word_tracking_event_and_forward(
+            &mut buffer,
+            &mut overflowed,
+            &mut word_context,
+            &mut correction_state,
+            &mut manual_hotkey_latch,
+            WordTrackingEvent::PlainCharacter(stroke(Key::KEY_D)),
+            || {
+                forwarded_physical_characters += 1;
+                Ok::<(), SwitcherError>(())
+            },
+        )
+        .unwrap();
+        assert_eq!(buffer.len(), 1, "a boundary starts a fresh tracked word");
+        assert!(!overflowed);
+        assert!(next_word.correction_tracking_enabled);
+        assert_eq!(forwarded_physical_characters, MAX_CORRECTION_KEYSTROKES + 5);
+    }
+
     fn modifiers_with(pressed_keys: &[Key]) -> ModifierState {
         let mut modifiers = ModifierState::default();
         for key in pressed_keys {
@@ -2568,6 +2951,297 @@ mod tests {
             bounded_capture_poll_timeout(Duration::from_millis(10)),
             Duration::from_millis(10)
         );
+    }
+
+    #[test]
+    fn clone_writer_work_bounds_event_fetch_to_health_quantum() {
+        assert!(WRITER_HEALTH_POLL_QUANTUM <= Duration::from_millis(5));
+        assert_eq!(
+            active_keyboard_fetch_timeout(INPUT_EVENT_WAIT_TIMEOUT, true),
+            WRITER_HEALTH_POLL_QUANTUM
+        );
+        assert_eq!(
+            active_keyboard_fetch_timeout(INPUT_EVENT_WAIT_TIMEOUT, false),
+            INPUT_EVENT_WAIT_TIMEOUT
+        );
+        assert!(MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT <= WRITER_HEALTH_POLL_QUANTUM);
+    }
+
+    #[test]
+    fn writer_health_failure_after_fetch_stops_batch_before_first_event() {
+        let mut handled = Vec::new();
+        let result = process_writer_healthy_batch(
+            &mut handled,
+            [1, 2],
+            |_handled| {
+                Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 301 })
+            },
+            |handled, event| {
+                handled.push(event);
+                Ok::<(), SwitcherError>(())
+            },
+        );
+
+        assert!(handled.is_empty());
+        assert!(matches!(
+            result,
+            Err(WriterHealthyBatchError::Health(
+                SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 301 }
+            ))
+        ));
+    }
+
+    #[test]
+    fn writer_health_failure_after_failed_fetch_takes_priority() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+            health_checks: usize,
+        }
+
+        let mut state = State::default();
+        let result = run_writer_healthy_operation(
+            &mut state,
+            |state| {
+                state.trace.push("health");
+                state.health_checks += 1;
+                if state.health_checks == 2 {
+                    Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+                } else {
+                    Ok(())
+                }
+            },
+            |state| {
+                state.trace.push("fetch");
+                Err::<Vec<evdev::InputEvent>, _>(SwitcherError::Io(std::io::Error::other(
+                    "recoverable fetch failure",
+                )))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriterHealthyOperationError::Health(
+                SwitcherError::VirtualKeyboardWriterDisconnected
+            ))
+        ));
+        assert_eq!(state.trace, vec!["health", "fetch", "health"]);
+    }
+
+    #[test]
+    fn writer_health_failure_after_successful_fetch_discards_events() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+            health_checks: usize,
+        }
+
+        let mut state = State::default();
+        let result = run_writer_healthy_operation(
+            &mut state,
+            |state| {
+                state.trace.push("health");
+                state.health_checks += 1;
+                if state.health_checks == 2 {
+                    Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+                } else {
+                    Ok(())
+                }
+            },
+            |state| {
+                state.trace.push("fetch");
+                Ok::<_, SwitcherError>(vec![1, 2])
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriterHealthyOperationError::Health(
+                SwitcherError::VirtualKeyboardWriterDisconnected
+            ))
+        ));
+        assert_eq!(state.trace, vec!["health", "fetch", "health"]);
+    }
+
+    #[test]
+    fn completion_gate_applies_success_before_writer_health() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+            completion_applied: bool,
+        }
+
+        let mut state = State::default();
+        let result = poll_completion_before_writer_health(
+            &mut state,
+            |state| {
+                state.trace.push("completion");
+                state.completion_applied = true;
+                Ok::<(), SwitcherError>(())
+            },
+            |state| {
+                state.trace.push("health");
+                if state.completion_applied {
+                    Ok(())
+                } else {
+                    Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+                }
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(state.trace, vec!["completion", "health"]);
+    }
+
+    #[test]
+    fn failed_completion_precedes_dead_health_with_detailed_error() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+            health_called: bool,
+        }
+
+        let mut state = State::default();
+        let result = poll_completion_before_writer_health(
+            &mut state,
+            |state| {
+                state.trace.push("completion-log");
+                Err(failed_manual_current_word_completion_error(
+                    701,
+                    "detailed post-mutation failure".to_string(),
+                ))
+            },
+            |state| {
+                state.health_called = true;
+                Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(CompletionBeforeWriterHealthError::Completion(
+                SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: 701,
+                    reason,
+                }
+            )) if reason == "detailed post-mutation failure"
+        ));
+        assert_eq!(state.trace, vec!["completion-log"]);
+        assert!(!state.health_called);
+    }
+
+    #[test]
+    fn post_operation_gate_polls_completion_before_health() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+        }
+
+        let mut state = State::default();
+        let result = run_writer_healthy_operation(
+            &mut state,
+            |state| match poll_completion_before_writer_health(
+                state,
+                |state| {
+                    state.trace.push("completion");
+                    Ok::<(), SwitcherError>(())
+                },
+                |state| {
+                    state.trace.push("health");
+                    Ok::<(), SwitcherError>(())
+                },
+            ) {
+                Ok(()) => Ok(()),
+                Err(CompletionBeforeWriterHealthError::Completion(error))
+                | Err(CompletionBeforeWriterHealthError::Health(error)) => Err(error),
+            },
+            |state| {
+                state.trace.push("operation");
+                Ok::<_, SwitcherError>(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            state.trace,
+            vec!["completion", "health", "operation", "completion", "health"]
+        );
+    }
+
+    #[test]
+    fn batch_gate_polls_completion_before_health_for_every_event() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+        }
+
+        let mut state = State::default();
+        let result = process_writer_healthy_batch(
+            &mut state,
+            ["event-1", "event-2"],
+            |state| match poll_completion_before_writer_health(
+                state,
+                |state| {
+                    state.trace.push("completion");
+                    Ok::<(), SwitcherError>(())
+                },
+                |state| {
+                    state.trace.push("health");
+                    Ok::<(), SwitcherError>(())
+                },
+            ) {
+                Ok(()) => Ok(()),
+                Err(CompletionBeforeWriterHealthError::Completion(error))
+                | Err(CompletionBeforeWriterHealthError::Health(error)) => Err(error),
+            },
+            |state, event| {
+                state.trace.push(event);
+                Ok::<(), SwitcherError>(())
+            },
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            state.trace,
+            vec![
+                "completion",
+                "health",
+                "event-1",
+                "completion",
+                "health",
+                "event-2"
+            ]
+        );
+    }
+
+    #[test]
+    fn writer_health_failure_between_events_stops_before_second_event() {
+        let mut handled = Vec::new();
+        let mut health_checks = 0usize;
+        let result = process_writer_healthy_batch(
+            &mut handled,
+            [1, 2, 3],
+            |_handled| {
+                health_checks += 1;
+                if health_checks == 2 {
+                    Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 302 })
+                } else {
+                    Ok(())
+                }
+            },
+            |handled, event| {
+                handled.push(event);
+                Ok::<(), SwitcherError>(())
+            },
+        );
+
+        assert_eq!(handled, vec![1]);
+        assert!(matches!(
+            result,
+            Err(WriterHealthyBatchError::Health(
+                SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 302 }
+            ))
+        ));
     }
 
     // Startup layout resync

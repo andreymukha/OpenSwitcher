@@ -26,7 +26,7 @@
 - Create: `src/daemon/input_snapshot.rs`
 - Modify: `src/daemon/mod.rs`
 
-- [ ] **Step 1: Write RED tests for freshness and authorization**
+- [x] **Step 1: Write RED tests for freshness and authorization**
 
 Add focused tests using explicit `Instant` values. They must distinguish normal polling from an invalidation window and must prove that an unchanged confirmation does not invalidate a pending operation:
 
@@ -83,7 +83,7 @@ fn pending_authorization_survives_same_state_reconfirmation() {
 }
 ```
 
-- [ ] **Step 2: Run the focused RED test**
+- [x] **Step 2: Run the focused RED test**
 
 Run:
 
@@ -93,7 +93,7 @@ cargo test --lib input_snapshot -- --nocapture
 
 Expected: compile failure because `daemon::input_snapshot` and its types do not exist.
 
-- [ ] **Step 3: Implement the snapshot model**
+- [x] **Step 3: Implement the snapshot model**
 
 Register `pub(crate) mod input_snapshot;` and implement the explicit state model. `layout_generation` changes only when the effective layout value changes; a successful unchanged poll updates `confirmed_at` without changing that generation.
 
@@ -187,7 +187,7 @@ impl InputRuntimeSnapshot {
 }
 ```
 
-- [ ] **Step 4: Add the nonblocking publication cell tests**
+- [x] **Step 4: Add the nonblocking publication cell tests**
 
 ```rust
 #[test]
@@ -212,7 +212,7 @@ fn poisoned_publication_is_explicit_and_non_panicking() {
 }
 ```
 
-- [ ] **Step 5: Implement the publication cell**
+- [x] **Step 5: Implement the publication cell**
 
 ```rust
 #[derive(Clone, Debug)]
@@ -262,7 +262,7 @@ impl InputSnapshotPublication {
 }
 ```
 
-- [ ] **Step 6: Run GREEN and commit**
+- [x] **Step 6: Run GREEN and commit**
 
 Run:
 
@@ -287,7 +287,7 @@ git commit -m "feat: add input runtime snapshot model"
 - Modify: `src/daemon/input_snapshot.rs`
 - Modify: `src/daemon/runtime.rs`
 
-- [ ] **Step 1: Write RED tests for config publication isolation**
+- [x] **Step 1: Write RED tests for config publication isolation**
 
 Add tests proving the input-facing cell is independent from
 `ConfigService::inner` and failed saves do not advance its generation. Place
@@ -337,7 +337,7 @@ fn successful_settings_save_publishes_one_complete_generation() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -347,7 +347,7 @@ cargo test --lib input_snapshot_config -- --nocapture
 
 Expected: compile failure because `RuntimeState` does not expose an independent input snapshot publication.
 
-- [ ] **Step 3: Add the publication and settings gate to `RuntimeState`**
+- [x] **Step 3: Add the publication and settings gate to `RuntimeState`**
 
 Construct the initial value before moving runtime components, and keep publication writes outside filesystem I/O:
 
@@ -423,7 +423,7 @@ pub fn update_settings(
 
 Refactor `toggle_enabled_result` to acquire the same gate once and call a private under-gate helper rather than recursively locking it.
 
-- [ ] **Step 4: Run GREEN and regression tests**
+- [x] **Step 4: Run GREEN and regression tests**
 
 Run:
 
@@ -435,7 +435,7 @@ cargo test --test dbus_api -- --test-threads=1
 
 Expected: focused tests and existing runtime/D-Bus settings tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/daemon/input_snapshot.rs src/daemon/runtime.rs
@@ -450,7 +450,7 @@ git commit -m "fix: publish committed input configuration"
 - Modify: `src/daemon/runtime.rs`
 - Modify: `src/daemon/mod.rs`
 
-- [ ] **Step 1: Write RED request-queue and confirmation tests**
+- [x] **Step 1: Write RED request-queue and confirmation tests**
 
 Place these tests in `#[cfg(test)] mod layout_refresh_tests`.
 
@@ -488,7 +488,7 @@ fn backend_error_preserves_value_without_extending_freshness() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -498,7 +498,7 @@ cargo test --lib layout_refresh -- --nocapture
 
 Expected: compile failure because the request queue and publishing refresh cycle do not exist.
 
-- [ ] **Step 3: Implement capacity-one refresh requests**
+- [x] **Step 3: Implement capacity-one refresh requests**
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -534,7 +534,7 @@ impl LayoutRefreshRequests {
 }
 ```
 
-- [ ] **Step 4: Implement one publish-after-refresh cycle**
+- [x] **Step 4: Implement one publish-after-refresh cycle**
 
 Keep `sync_with_backend`, `periodic_sync_tick`, and desktop observation functions private to `runtime.rs`. The public startup method is explicitly named as pre-grab:
 
@@ -561,7 +561,7 @@ does not replace the published layout/context/features or extend
 `confirmed_at`; the last confirmed value remains available for status display
 while its age independently disables input transformations.
 
-- [ ] **Step 5: Replace sleeping polling with a wakeable coordinator**
+- [x] **Step 5: Replace sleeping polling with a wakeable coordinator**
 
 Use the capacity-one receiver with `INPUT_LAYOUT_POLL_INTERVAL`:
 
@@ -692,7 +692,7 @@ pub(crate) fn invalidate_layout_and_request_refresh(&self, reason: &str) {
 }
 ```
 
-- [ ] **Step 6: Add a blocked-backend isolation test**
+- [x] **Step 6: Add a blocked-backend isolation test**
 
 Use a barrier-controlled fake backend and release it before joining the test thread:
 
@@ -722,7 +722,7 @@ fn blocked_background_backend_does_not_block_snapshot_reads() {
 }
 ```
 
-- [ ] **Step 7: Run GREEN and commit**
+- [x] **Step 7: Run GREEN and commit**
 
 Run:
 
@@ -747,7 +747,7 @@ git commit -m "feat: refresh input snapshots off the input path"
 
 - Modify: `src/daemon/service.rs`
 
-- [ ] **Step 1: Add fresh-path behavior RED tests**
+- [x] **Step 1: Add fresh-path behavior RED tests**
 
 Extract pure decision helpers and encode the behavior that must not regress.
 Place the tests in `#[cfg(test)] mod service_snapshot_fresh_tests`:
@@ -791,7 +791,7 @@ fn fresh_snapshot_keeps_manual_correction_enabled() {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -801,7 +801,7 @@ cargo test --lib service_snapshot_fresh -- --nocapture
 
 Expected: compile failure because `DaemonService` still reads runtime state synchronously.
 
-- [ ] **Step 3: Add the service-local snapshot**
+- [x] **Step 3: Add the service-local snapshot**
 
 Load once before `try_initialize_input_backend`, then adopt only nonblocking publications:
 
@@ -836,7 +836,7 @@ fn adopt_input_snapshot_nonblocking(&mut self) {
 
 Call the adoption method before each `handle_key_event` and before finishing delayed/pending corrections. Use `self.input_snapshot.config.clone()` rather than `runtime.config_snapshot()`.
 
-- [ ] **Step 4: Replace runtime reads with local fields**
+- [x] **Step 4: Replace runtime reads with local fields**
 
 Add the pure decision boundary used by both fresh and stale tests:
 
@@ -926,7 +926,7 @@ Replace these input-path calls:
 
 Keep only atomics, capture routing, writer health, nonblocking logging, snapshot `try_read`, and refresh `try_send` on the input control path.
 
-- [ ] **Step 5: Remove synchronous service refreshes**
+- [x] **Step 5: Remove synchronous service refreshes**
 
 Delete service calls to:
 
@@ -959,7 +959,7 @@ The deferred manual-current-word path has no detailed switch enum. Its
 `Succeeded` completion and `FailedAfterMutation` completion both invalidate and
 request confirmation because either outcome may follow a backend mutation.
 
-- [ ] **Step 6: Add a source-boundary regression test**
+- [x] **Step 6: Add a source-boundary regression test**
 
 Use split literals so the test does not match its own forbidden strings:
 
@@ -979,7 +979,7 @@ fn daemon_service_has_no_synchronous_runtime_refresh_calls() {
 }
 ```
 
-- [ ] **Step 7: Run GREEN and commit**
+- [x] **Step 7: Run GREEN and commit**
 
 Run:
 
@@ -1005,7 +1005,7 @@ git commit -m "fix: consume snapshots in the grabbed input path"
 
 - Modify: `src/daemon/service.rs`
 
-- [ ] **Step 1: Add stale-path RED tests**
+- [x] **Step 1: Add stale-path RED tests**
 
 Place stale decision tests in
 `#[cfg(test)] mod service_snapshot_stale_tests`.
@@ -1052,7 +1052,7 @@ fn stale_separator_path_forwards_instead_of_suppressing() {
 }
 ```
 
-- [ ] **Step 2: Add pending-generation RED tests**
+- [x] **Step 2: Add pending-generation RED tests**
 
 Extend `PendingWordCommit` with `SnapshotAuthorization` and test every
 invalidation dimension. Place these tests in
@@ -1085,7 +1085,7 @@ fn cancelled_pending_commit_replays_separator_once() {
 }
 ```
 
-- [ ] **Step 3: Run RED**
+- [x] **Step 3: Run RED**
 
 Run:
 
@@ -1096,7 +1096,7 @@ cargo test --lib pending_snapshot_authorization -- --nocapture
 
 Expected: compile failure because stale routing and pending authorization are not implemented.
 
-- [ ] **Step 4: Implement fail-open decisions**
+- [x] **Step 4: Implement fail-open decisions**
 
 At every layout-dependent decision, compute status from the local snapshot and current atomic epoch. When unavailable:
 
@@ -1121,7 +1121,7 @@ For Space/Enter/Tab with no eligible layout, commit the raw word state and call 
 
 For a matched physical layout shortcut, preserve latching and normal OS forwarding, invalidate word context, and request confirmation without guessing or publishing a provisional status.
 
-- [ ] **Step 5: Fence and cancel pending commits**
+- [x] **Step 5: Fence and cancel pending commits**
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1163,7 +1163,7 @@ fn cancel_pending_word_commit(
 
 This emits the already-suppressed separator once; the physical release remains swallowed by the existing suppression ledger.
 
-- [ ] **Step 6: Run GREEN and conservation regressions**
+- [x] **Step 6: Run GREEN and conservation regressions**
 
 Run:
 
@@ -1176,7 +1176,7 @@ cargo test --lib keyboard_ -- --nocapture
 
 Expected: stale paths perform no correction, fresh paths remain enabled, and separator tests show one synthetic replay with no duplicate physical release.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/daemon/service.rs
@@ -1191,7 +1191,7 @@ git commit -m "fix: fence corrections by snapshot freshness"
 - Modify: `src/daemon/runtime.rs`
 - Modify: `src/dbus/mod.rs`
 
-- [ ] **Step 1: Add confirmed-status RED tests**
+- [x] **Step 1: Add confirmed-status RED tests**
 
 When the background refresh changes effective layout, publication must precede
 the pending-status flag. Provisional or stale snapshots are not signal sources.
@@ -1215,7 +1215,7 @@ fn status_snapshot_is_publishable(status: InputLayoutStatus) -> bool {
 }
 ```
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 
 Run:
 
@@ -1226,7 +1226,7 @@ cargo test --lib status_snapshot -- --nocapture
 Expected: the provisional-status test fails against current direct runtime
 cache reads.
 
-- [ ] **Step 3: Implement confirmed-only status publication**
+- [x] **Step 3: Implement confirmed-only status publication**
 
 In `DaemonService`, adopt the publication before sending `StatusChanged`; use
 `input_snapshot.enabled` and the confirmed `input_snapshot.layout_state`. If
@@ -1258,7 +1258,7 @@ The selected-text worker is intentionally unchanged: its current transport
 converts text through clipboard copy/paste and does not switch the system
 layout.
 
-- [ ] **Step 4: Run focused and module regression tests**
+- [x] **Step 4: Run focused and module regression tests**
 
 Run:
 
@@ -1272,7 +1272,7 @@ cargo test --test dbus_api -- --test-threads=1
 Expected: all focused and existing module/D-Bus tests pass; selected-text code
 has no diff in this slice.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/daemon/service.rs src/daemon/runtime.rs src/dbus/mod.rs
@@ -1285,7 +1285,7 @@ git commit -m "fix: publish only confirmed layout status"
 
 - Create: `docs/audits/2026-07-17-h01-input-runtime-snapshot-validation.md`
 
-- [ ] **Step 1: Run formatting and complete safe local verification**
+- [x] **Step 1: Run formatting and complete safe local verification**
 
 Run:
 
@@ -1307,7 +1307,7 @@ Expected: all commands pass, except already known host-sandbox D-Bus/Unix-socket
 such case must pass unchanged in the Mint guest before completion; the same
 compiled/package code is also exercised in Ubuntu.
 
-- [ ] **Step 2: Perform two-pass code review**
+- [x] **Step 2: Perform two-pass code review**
 
 Pass 1 checks the approved spec invariants and searches the complete service source for synchronous external/config/layout calls. Pass 2 checks race behavior, generation semantics, separator conservation, and fresh-path compatibility. Resolve every Critical/High/Medium finding before package build.
 
@@ -1320,7 +1320,7 @@ rg -n "Command::new|\.output\(\)|\.status\(\)" src/daemon/service.rs src/daemon/
 
 Expected: the first command finds no synchronous runtime refresh call in `DaemonService`; the second finds no external command execution in either input-facing file.
 
-- [ ] **Step 3: Build the canonical Debian package**
+- [x] **Step 3: Build the canonical Debian package**
 
 Run from the remediation worktree:
 
@@ -1332,7 +1332,7 @@ dpkg-deb --info dist/packages/open-switcher_0.1.0-1_amd64.deb
 
 Expected: package build and embedded tests pass; record the exact SHA-256 and package metadata.
 
-- [ ] **Step 4: Install the exact package in both retained VMs**
+- [x] **Step 4: Install the exact package in both retained VMs**
 
 Use the retained SSH identity and loopback forwarding after starting the
 existing Ubuntu (`127.0.0.1:22222`) and Mint (`127.0.0.1:22223`) guests. Install
@@ -1354,7 +1354,7 @@ ssh -p 22223 -i /home/andrey/VMs/OpenSwitcherLab/keys/id_ed25519 \
 Expected: package install succeeds in both profiles and each daemon unit reports
 `active` from `/usr/bin/open-switcher-daemon`.
 
-- [ ] **Step 5: Verify normal installed-package behavior**
+- [x] **Step 5: Verify normal installed-package behavior**
 
 Through the existing QEMU virtual keyboard and a harmless guest editor, verify
 the fresh path in both Ubuntu/GNOME/Wayland and Mint/Cinnamon/X11:
@@ -1377,7 +1377,7 @@ Capture the editor result and journal window under:
 
 Expected: behavior matches the pre-change package except for confirmed-status latency after an explicit layout change.
 
-- [ ] **Step 6: Inject a post-start hanging `xset` in the guest only**
+- [x] **Step 6: Inject a post-start hanging `xset` in the guest only**
 
 Create `/tmp/openswitcher-h01-bin/xset` in the guest so it delegates normally until `/tmp/openswitcher-h01-arm-hang` exists, then blocks. Put that directory first in the user-manager PATH, restart while unarmed, confirm the daemon is active, then arm the hang:
 
@@ -1390,7 +1390,7 @@ ssh -p 22223 -i /home/andrey/VMs/OpenSwitcherLab/keys/id_ed25519 \
 
 Expected: the daemon starts normally before the marker exists; a later background refresh blocks in the guest-only fake command.
 
-- [ ] **Step 7: Prove fail-open input and bounded release during the hang**
+- [x] **Step 7: Prove fail-open input and bounded release during the hang**
 
 While SSH remains the independent control path:
 
@@ -1401,7 +1401,7 @@ While SSH remains the independent control path:
 
 Expected: both strings arrive, the stale correction is skipped, and stop releases input in less than one second even though the background `xset` remains blocked. Record screenshot/journal/timing evidence under `mint-install-v1` with prefix `h01-snapshot-hung-backend-`.
 
-- [ ] **Step 8: Record validation and commit**
+- [x] **Step 8: Record validation and commit**
 
 The report must include commit identity, dirty state, package SHA, exact test counts, local sandbox-only failures, VM package identity, fresh-path results, hang timing, evidence paths, and the explicit limitation that this slice does not kill an indefinitely hung external child.
 

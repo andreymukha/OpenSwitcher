@@ -329,7 +329,15 @@ impl WriterTransactionControl {
     }
 
     fn cancellation_error(&self) -> SwitcherError {
-        if self.stop_requested.load(Ordering::SeqCst) {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.state() == WriterTransactionState::TimedOut
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+        {
+            self.timed_out_error()
+        } else if self.stop_requested.load(Ordering::SeqCst) {
             SwitcherError::VirtualKeyboardWriterDisconnected
         } else {
             self.timed_out_error()
@@ -5919,6 +5927,38 @@ mod tests {
             (WriterTransactionState::Pending, 0, true),
             "stop that linearized first must remain the terminal outcome"
         );
+    }
+
+    #[test]
+    fn writer_timeout_published_before_stop_remains_the_terminal_outcome() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_writer_state(
+            111,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+
+        let timeout = control.mark_timed_out();
+        {
+            let _terminal_guard = terminal_gate.lock().unwrap();
+            stop_requested.store(true, Ordering::SeqCst);
+        }
+        let terminal_outcome = control.cancellation_error();
+
+        assert!(matches!(
+            timeout,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 111 }
+        ));
+        assert_eq!(control.state(), WriterTransactionState::TimedOut);
+        assert_eq!(failure.load(Ordering::SeqCst), 111);
+        assert!(matches!(
+            terminal_outcome,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 111 }
+        ));
     }
 
     #[test]

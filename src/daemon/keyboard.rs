@@ -980,7 +980,6 @@ impl KeyboardController {
 
         if let Err(error) = self.real_device.release_grab() {
             log_input_debug("grab-release-error", &format!("error={error}"));
-            eprintln!("[input] Не удалось освободить grab клавиатуры: {error}");
         } else {
             log_input_debug("grab-released", "keyboard grab released during shutdown");
         }
@@ -1195,7 +1194,6 @@ impl Drop for GrabbedKeyboardDevice {
                     "grab-release-error",
                     &format!("during_drop=true error={error}"),
                 );
-                eprintln!("[input] Не удалось освободить grab клавиатуры в Drop: {error}");
             }
         }
         self.grabbed = false;

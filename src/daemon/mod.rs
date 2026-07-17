@@ -79,26 +79,47 @@ pub fn run() -> Result<(), SwitcherError> {
         start_dbus_endpoint(runtime.clone(), SERVICE_NAME)?;
 
     let mut service = DaemonService::new(runtime, connection)?;
-    let result = match panic::catch_unwind(AssertUnwindSafe(|| service.run())) {
-        Ok(result) => result,
-        Err(payload) => {
-            let reason = if let Some(text) = payload.downcast_ref::<&str>() {
-                *text
-            } else if let Some(text) = payload.downcast_ref::<String>() {
-                text.as_str()
-            } else {
-                "unknown panic payload"
-            };
-            log_input_debug("event-loop-panic", &format!("reason={reason}"));
-            eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
-            Err(SwitcherError::DaemonPanicked)
-        }
-    };
-    finalize_daemon_run(
+    let (result, input_loop_postmortem) =
+        match panic::catch_unwind(AssertUnwindSafe(|| service.run())) {
+            Ok(result) => (result, None),
+            Err(payload) => {
+                let reason = if let Some(text) = payload.downcast_ref::<&str>() {
+                    (*text).to_owned()
+                } else if let Some(text) = payload.downcast_ref::<String>() {
+                    text.clone()
+                } else {
+                    "unknown panic payload".to_owned()
+                };
+                log_input_debug("event-loop-panic", &format!("reason={reason}"));
+                (Err(SwitcherError::DaemonPanicked), Some(reason))
+            }
+        };
+    finalize_daemon_run_with_postmortem(
         result,
         || service.shutdown(),
         || capture_owner_monitor.stop(),
+        move || {
+            if let Some(reason) = input_loop_postmortem {
+                eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
+            }
+        },
     )
+}
+
+fn finalize_daemon_run_with_postmortem<Shutdown, StopMonitor, Postmortem>(
+    result: Result<(), SwitcherError>,
+    shutdown: Shutdown,
+    stop_monitor: StopMonitor,
+    postmortem: Postmortem,
+) -> Result<(), SwitcherError>
+where
+    Shutdown: FnOnce(),
+    StopMonitor: FnOnce() -> std::thread::Result<()>,
+    Postmortem: FnOnce(),
+{
+    let result = finalize_daemon_run(result, shutdown, stop_monitor);
+    postmortem();
+    result
 }
 
 fn finalize_daemon_run<Shutdown, StopMonitor>(
@@ -146,6 +167,7 @@ mod tests {
     use super::*;
     use crate::dbus::INTERFACE_NAME;
     use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState};
+    use std::cell::RefCell;
     use std::error::Error;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -186,6 +208,27 @@ mod tests {
             finalizer.join().unwrap(),
             Err(SwitcherError::KeyboardNotFound)
         ));
+    }
+
+    #[test]
+    fn input_loop_postmortem_is_reported_only_after_backend_shutdown() {
+        let phases = RefCell::new(Vec::new());
+
+        let result = finalize_daemon_run_with_postmortem(
+            Err(SwitcherError::DaemonPanicked),
+            || phases.borrow_mut().push("release-input"),
+            || {
+                phases.borrow_mut().push("stop-monitor");
+                Ok(())
+            },
+            || phases.borrow_mut().push("report-panic"),
+        );
+
+        assert!(matches!(result, Err(SwitcherError::DaemonPanicked)));
+        assert_eq!(
+            *phases.borrow(),
+            vec!["release-input", "stop-monitor", "report-panic"]
+        );
     }
 
     #[test]

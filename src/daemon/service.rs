@@ -2262,7 +2262,7 @@ impl DaemonService {
             outcome.layout_switch,
             CorrectionLayoutSwitchOutcome::AppliedUinput
                 | CorrectionLayoutSwitchOutcome::AppliedX11
-                | CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest
+                | CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest
         ) {
             self.runtime
                 .invalidate_layout_and_request_refresh("writer-layout-switch");
@@ -2444,11 +2444,10 @@ impl DaemonService {
         let epoch = self.runtime.input_layout_epoch();
         let status = self.input_snapshot.layout_status_at(Instant::now(), epoch);
         if !status_snapshot_is_publishable(status) {
-            let request = self.runtime.request_layout_refresh();
             self.runtime.defer_pending_status_change();
             log_layout_debug(
                 "status-signal-deferred",
-                &format!("status={status:?} request={request:?}"),
+                &format!("status={status:?} refresh=background-coordinator"),
             );
             return;
         }

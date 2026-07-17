@@ -1433,33 +1433,23 @@ undo_key = "Pause"
     }
 
     #[derive(Clone)]
-    struct CinnamonInputSourceReaderStub {
+    struct CinnamonCurrentGroupReaderStub {
         calls: Arc<AtomicUsize>,
-        sources: Result<Vec<CinnamonInputSource>, String>,
+        current_group: Result<u8, String>,
     }
 
-    impl CinnamonInputSourceReader for CinnamonInputSourceReaderStub {
-        fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String> {
+    impl CinnamonCurrentGroupReader for CinnamonCurrentGroupReaderStub {
+        fn cinnamon_current_group(&self) -> Result<u8, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.sources.clone()
+            self.current_group.clone()
         }
     }
 
-    fn cinnamon_input_source(source_id: &str, index: i32, active: bool) -> CinnamonInputSource {
-        CinnamonInputSource {
-            source_type: "xkb".to_string(),
-            source_id: source_id.to_string(),
-            index,
-            layout_code: source_id.to_string(),
-            active,
+    fn cinnamon_strict_pair_setup() -> LayoutSetup {
+        LayoutSetup::StrictPair {
+            en: english_layout(),
+            ru: russian_layout(),
         }
-    }
-
-    fn cinnamon_sources(active_source_id: &str) -> Vec<CinnamonInputSource> {
-        vec![
-            cinnamon_input_source("us", 0, active_source_id == "us"),
-            cinnamon_input_source("ru", 1, active_source_id == "ru"),
-        ]
     }
 
     struct SystemContextDetectorStub {
@@ -1561,30 +1551,39 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn cinnamon_x11_current_layout_observation_reads_active_us_as_english() {
+    fn cinnamon_x11_current_layout_observation_reads_xkb_group() {
+        let setup = cinnamon_strict_pair_setup();
+
         assert_eq!(
-            cinnamon_x11_current_layout_state_from_sources(&cinnamon_sources("us")),
+            cinnamon_x11_current_layout_state_from_group(0, &setup),
             known_layout_state(english_layout())
         );
-    }
-
-    #[test]
-    fn cinnamon_x11_current_layout_observation_reads_active_ru_as_russian() {
         assert_eq!(
-            cinnamon_x11_current_layout_state_from_sources(&cinnamon_sources("ru")),
+            cinnamon_x11_current_layout_state_from_group(1, &setup),
             known_layout_state(russian_layout())
         );
     }
 
     #[test]
-    fn cinnamon_x11_current_layout_observation_rejects_unknown_active_source() {
-        let sources = vec![
-            cinnamon_input_source("us", 0, false),
-            cinnamon_input_source("de", 1, true),
-        ];
+    fn cinnamon_x11_current_layout_observation_rejects_unmapped_xkb_group() {
+        assert_untrusted_observation(Some(cinnamon_x11_current_layout_state_from_group(
+            2,
+            &cinnamon_strict_pair_setup(),
+        )));
+    }
 
-        assert_untrusted_observation(Some(cinnamon_x11_current_layout_state_from_sources(
-            &sources,
+    #[test]
+    fn cinnamon_x11_current_layout_observation_rejects_missing_group_indices() {
+        let setup = LayoutSetup::StrictPair {
+            en: SystemLayout {
+                index: None,
+                ..english_layout()
+            },
+            ru: russian_layout(),
+        };
+
+        assert_untrusted_observation(Some(cinnamon_x11_current_layout_state_from_group(
+            0, &setup,
         )));
     }
 
@@ -1605,10 +1604,14 @@ undo_key = "Pause"
             sources: Some(trusted_gnome_sources()),
             mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "us")])),
         };
-        let cinnamon_reader = CinnamonInputSourceReaderStub {
+        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            sources: Ok(cinnamon_sources("us")),
+            current_group: Ok(0),
         };
+        *runtime
+            .layout_setup
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
 
         runtime.refresh_current_layout_observation_with_readers(&reader, &cinnamon_reader);
 
@@ -1840,9 +1843,9 @@ undo_key = "Pause"
             sources: Some(trusted_gnome_sources()),
             mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
-        let cinnamon_reader = CinnamonInputSourceReaderStub {
+        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
             calls: Arc::clone(&cinnamon_calls),
-            sources: Ok(cinnamon_sources("ru")),
+            current_group: Ok(1),
         };
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -1854,6 +1857,10 @@ undo_key = "Pause"
             }),
             cinnamon_x11_context(),
         );
+        *runtime
+            .layout_setup
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
 
         runtime.refresh_current_layout_observation_with_readers(&reader, &cinnamon_reader);
 
@@ -2089,9 +2096,9 @@ undo_key = "Pause"
             calls: Arc::new(AtomicUsize::new(0)),
             context: cinnamon_x11_context(),
         };
-        let cinnamon_reader = CinnamonInputSourceReaderStub {
+        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            sources: Ok(cinnamon_sources("ru")),
+            current_group: Ok(1),
         };
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -2106,6 +2113,10 @@ undo_key = "Pause"
             }),
             cinnamon_x11_context(),
         );
+        *runtime
+            .layout_setup
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
 
         assert_eq!(
             runtime.periodic_sync_tick_with_readers(&reader, &detector, &cinnamon_reader),
@@ -2878,56 +2889,39 @@ impl SystemContextSource for SystemContextDetector {
     }
 }
 
-trait CinnamonInputSourceReader {
-    fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String>;
+trait CinnamonCurrentGroupReader {
+    fn cinnamon_current_group(&self) -> Result<u8, String>;
 }
 
-struct CommandCinnamonInputSourceReader;
+struct X11CinnamonCurrentGroupReader;
 
-type CinnamonInputSourceRow = (
-    String,
-    String,
-    i32,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    i32,
-    bool,
-);
+impl CinnamonCurrentGroupReader for X11CinnamonCurrentGroupReader {
+    fn cinnamon_current_group(&self) -> Result<u8, String> {
+        use x11rb::protocol::xkb::{self, ConnectionExt as _};
 
-impl CinnamonInputSourceReader for CommandCinnamonInputSourceReader {
-    fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String> {
-        let connection =
-            zbus::blocking::Connection::session().map_err(|error| error.to_string())?;
-        let proxy = zbus::blocking::Proxy::new(
-            &connection,
-            "org.Cinnamon",
-            "/org/Cinnamon",
-            "org.Cinnamon",
-        )
-        .map_err(|error| error.to_string())?;
-        let rows: Vec<CinnamonInputSourceRow> = proxy
-            .call("GetInputSources", &())
+        let (connection, _) = x11rb::connect(None).map_err(|error| error.to_string())?;
+        connection
+            .xkb_use_extension(1, 0)
+            .map_err(|error| error.to_string())?
+            .reply()
             .map_err(|error| error.to_string())?;
-
-        Ok(rows
-            .into_iter()
-            .map(CinnamonInputSource::from_row)
-            .collect())
+        let current_group = connection
+            .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map(|state| u8::from(state.group))
+            .map_err(|error| error.to_string())?;
+        Ok(current_group)
     }
 }
 
 #[cfg(test)]
-struct PreserveCinnamonInputSourceReader;
+struct PreserveCinnamonCurrentGroupReader;
 
 #[cfg(test)]
-impl CinnamonInputSourceReader for PreserveCinnamonInputSourceReader {
-    fn cinnamon_input_sources(&self) -> Result<Vec<CinnamonInputSource>, String> {
-        Err("cinnamon reader unavailable in this path".to_string())
+impl CinnamonCurrentGroupReader for PreserveCinnamonCurrentGroupReader {
+    fn cinnamon_current_group(&self) -> Result<u8, String> {
+        Err("cinnamon XKB group reader unavailable in this path".to_string())
     }
 }
 
@@ -3430,7 +3424,7 @@ impl RuntimeState {
         self.periodic_sync_tick_with_readers(
             &CommandDesktopSettingsReader,
             &SystemContextDetector,
-            &CommandCinnamonInputSourceReader,
+            &X11CinnamonCurrentGroupReader,
         )
     }
 
@@ -3440,13 +3434,13 @@ impl RuntimeState {
         reader: &R,
         detector: &D,
     ) -> BackendSyncResult {
-        self.periodic_sync_tick_with_readers(reader, detector, &PreserveCinnamonInputSourceReader)
+        self.periodic_sync_tick_with_readers(reader, detector, &PreserveCinnamonCurrentGroupReader)
     }
 
     fn periodic_sync_tick_with_readers<
         R: DesktopSettingsReader,
         D: SystemContextSource,
-        C: CinnamonInputSourceReader,
+        C: CinnamonCurrentGroupReader,
     >(
         &self,
         reader: &R,
@@ -3805,7 +3799,7 @@ impl RuntimeState {
     fn refresh_current_layout_observation(&self) {
         self.refresh_current_layout_observation_with_readers(
             &CommandDesktopSettingsReader,
-            &CommandCinnamonInputSourceReader,
+            &X11CinnamonCurrentGroupReader,
         );
     }
 
@@ -3813,13 +3807,13 @@ impl RuntimeState {
     fn refresh_current_layout_observation_with_reader<R: DesktopSettingsReader>(&self, reader: &R) {
         self.refresh_current_layout_observation_with_readers(
             reader,
-            &PreserveCinnamonInputSourceReader,
+            &PreserveCinnamonCurrentGroupReader,
         );
     }
 
     fn refresh_current_layout_observation_with_readers<
         R: DesktopSettingsReader,
-        C: CinnamonInputSourceReader,
+        C: CinnamonCurrentGroupReader,
     >(
         &self,
         reader: &R,
@@ -3827,7 +3821,9 @@ impl RuntimeState {
     ) {
         if !is_gnome_wayland_context(self.system_context()) {
             if is_cinnamon_x11_context(self.system_context()) {
-                let Some(next_observation) = cinnamon_x11_current_layout_state(cinnamon_reader)
+                let layout_setup = self.layout_setup();
+                let Some(next_observation) =
+                    cinnamon_x11_current_layout_state(cinnamon_reader, &layout_setup)
                 else {
                     return;
                 };
@@ -4039,133 +4035,59 @@ fn effective_current_layout_state(
 
 // Cinnamon X11 observation
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CinnamonInputSource {
-    source_type: String,
-    source_id: String,
-    index: i32,
-    layout_code: String,
-    active: bool,
-}
-
-impl CinnamonInputSource {
-    fn from_row(row: CinnamonInputSourceRow) -> Self {
-        Self {
-            source_type: row.0,
-            source_id: row.1,
-            index: row.2,
-            layout_code: row.4,
-            active: row.11,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct TrustedCinnamonLayoutPair {
-    english_layout: SystemLayout,
-    russian_layout: SystemLayout,
-    current_layout: SystemLayout,
-}
-
-fn cinnamon_x11_current_layout_state<R: CinnamonInputSourceReader>(
+fn cinnamon_x11_current_layout_state<R: CinnamonCurrentGroupReader>(
     reader: &R,
+    setup: &LayoutSetup,
 ) -> Option<CurrentLayoutState> {
-    let sources = match reader.cinnamon_input_sources() {
-        Ok(sources) => sources,
+    let current_group = match reader.cinnamon_current_group() {
+        Ok(current_group) => current_group,
         Err(error) => {
             log_layout_debug(
                 "cinnamon-x11-observation",
-                &format!("result=preserve reason=sources-read-error error={error}"),
+                &format!("result=preserve reason=xkb-group-read-error error={error}"),
             );
             return None;
         }
     };
 
-    Some(cinnamon_x11_current_layout_state_from_sources(&sources))
+    Some(cinnamon_x11_current_layout_state_from_group(
+        current_group,
+        setup,
+    ))
 }
 
-fn cinnamon_x11_current_layout_state_from_sources(
-    sources: &[CinnamonInputSource],
+fn cinnamon_x11_current_layout_state_from_group(
+    current_group: u8,
+    setup: &LayoutSetup,
 ) -> CurrentLayoutState {
-    match trusted_cinnamon_layout_pair_from_sources(sources) {
-        Ok(pair) => known_layout_state_from_layout(pair.current_layout),
+    match trusted_cinnamon_layout_for_group(current_group, setup) {
+        Ok(layout) => known_layout_state_from_layout(layout),
         Err(reason) => cinnamon_x11_unknown_layout_state(reason),
     }
 }
 
-fn trusted_cinnamon_layout_pair_from_sources(
-    sources: &[CinnamonInputSource],
-) -> Result<TrustedCinnamonLayoutPair, &'static str> {
-    if sources.len() != 2 {
-        return Err("unsupported-configured-sources");
-    }
-
-    let mut english_layout = None;
-    let mut russian_layout = None;
-    let mut current_layout = None;
-
-    for source in sources {
-        let Some(layout) = trusted_cinnamon_xkb_layout(source) else {
-            return Err("unsupported-configured-sources");
-        };
-
-        if source.active {
-            current_layout = Some(layout.clone());
-        }
-
-        match layout.kind {
-            AppLayoutKind::English if english_layout.is_none() => english_layout = Some(layout),
-            AppLayoutKind::Russian if russian_layout.is_none() => russian_layout = Some(layout),
-            _ => return Err("unsupported-configured-sources"),
-        }
-    }
-
-    Ok(TrustedCinnamonLayoutPair {
-        english_layout: english_layout.ok_or("unsupported-configured-sources")?,
-        russian_layout: russian_layout.ok_or("unsupported-configured-sources")?,
-        current_layout: current_layout.ok_or("missing-active-source")?,
-    })
-}
-
-fn trusted_cinnamon_xkb_layout(source: &CinnamonInputSource) -> Option<SystemLayout> {
-    if source.source_type != "xkb" {
-        return None;
-    }
-
-    let layout_code = if matches!(source.source_id.as_str(), "us" | "gb" | "ru") {
-        source.source_id.as_str()
-    } else if matches!(source.layout_code.as_str(), "us" | "gb" | "ru") {
-        source.layout_code.as_str()
-    } else {
-        return None;
+fn trusted_cinnamon_layout_for_group(
+    current_group: u8,
+    setup: &LayoutSetup,
+) -> Result<SystemLayout, &'static str> {
+    let LayoutSetup::StrictPair { en, ru } = setup else {
+        return Err("unsupported-layout-setup");
     };
-
-    let (normalized_code, display_name, kind) = match layout_code {
-        "us" => (
-            LayoutCode::Us,
-            "English".to_string(),
-            AppLayoutKind::English,
-        ),
-        "gb" => (
-            LayoutCode::Gb,
-            "English (UK)".to_string(),
-            AppLayoutKind::English,
-        ),
-        "ru" => (
-            LayoutCode::Ru,
-            "Russian".to_string(),
-            AppLayoutKind::Russian,
-        ),
-        _ => return None,
+    let Some(english_group) = en.index else {
+        return Err("missing-layout-index");
     };
+    let Some(russian_group) = ru.index else {
+        return Err("missing-layout-index");
+    };
+    if english_group == russian_group {
+        return Err("duplicate-layout-index");
+    }
 
-    Some(SystemLayout {
-        backend_key: source.source_id.clone(),
-        normalized_code,
-        display_name,
-        kind,
-        index: u32::try_from(source.index).ok(),
-    })
+    match u32::from(current_group) {
+        group if group == english_group => Ok(en.clone()),
+        group if group == russian_group => Ok(ru.clone()),
+        _ => Err("unsupported-current-group"),
+    }
 }
 
 fn cinnamon_x11_unknown_layout_state(reason: &'static str) -> CurrentLayoutState {

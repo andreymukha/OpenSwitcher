@@ -46,8 +46,8 @@ const INPUT_WORKER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const SHUTDOWN_JOIN_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
-const CINNAMON_DBUS_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
-const CINNAMON_DBUS_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const CINNAMON_XKB_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
+const CINNAMON_XKB_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static NEXT_WRITER_TRANSACTION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_writer_transaction_request_id() -> u64 {
@@ -590,14 +590,14 @@ pub(crate) enum CorrectionLayoutSwitchOutcome {
     NotNeeded,
     AppliedUinput,
     AppliedX11,
-    AppliedCinnamonDbusXtest,
+    AppliedCinnamonXkbXtest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CorrectionReplayStrategy {
     Generic,
-    CinnamonDbusXtest,
-    CinnamonDbusXtestUnavailable,
+    CinnamonXkbXtest,
+    CinnamonXkbXtestUnavailable,
 }
 
 // Real keyboard device
@@ -2931,25 +2931,9 @@ enum CinnamonX11XtestRuntime {
     Available(Box<CinnamonX11XtestReplayer>),
 }
 
-type CinnamonInputSource = (
-    String,
-    String,
-    i32,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    String,
-    i32,
-    bool,
-);
-
 struct CinnamonX11XtestReplayer {
     x11: x11rb::rust_connection::RustConnection,
     root: u32,
-    dbus: zbus::blocking::Connection,
 }
 
 fn validate_cinnamon_plan_keycodes_with(
@@ -2980,15 +2964,18 @@ fn run_checked_external_call<T>(
     result
 }
 
-fn read_cinnamon_source_state_with(
-    control: Option<&WriterTransactionControl>,
-    read_active_source: impl FnOnce() -> Result<Option<i32>, SwitcherError>,
-    read_xkb_group: impl FnOnce() -> Result<u8, SwitcherError>,
-) -> Result<(Option<i32>, u8), SwitcherError> {
-    let active_source = run_checked_external_call(control, read_active_source)?;
-    ensure_transaction_active(control)?;
-    let xkb_group = run_checked_external_call(control, read_xkb_group)?;
-    Ok((active_source, xkb_group))
+fn cinnamon_xkb_target_group(num_groups: u8, current_group: u8) -> Result<u8, SwitcherError> {
+    if num_groups != 2 {
+        return Err(SwitcherError::Io(io::Error::other(format!(
+            "cinnamon-xkb-xtest-before-mutation: expected exactly two XKB groups, found {num_groups}",
+        ))));
+    }
+    if current_group >= num_groups {
+        return Err(SwitcherError::Io(io::Error::other(format!(
+            "cinnamon-xkb-xtest-before-mutation: current XKB group {current_group} is outside configured groups {num_groups}",
+        ))));
+    }
+    Ok((current_group + 1) % num_groups)
 }
 
 impl CinnamonX11XtestReplayer {
@@ -3010,109 +2997,78 @@ impl CinnamonX11XtestReplayer {
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
 
         let root = x11.setup().roots[screen_num].root;
-        let dbus = zbus::blocking::Connection::session()?;
-        Ok(Self { x11, root, dbus })
+        Ok(Self { x11, root })
     }
 
-    fn proxy(&self) -> Result<zbus::blocking::Proxy<'_>, SwitcherError> {
-        zbus::blocking::Proxy::new(&self.dbus, "org.Cinnamon", "/org/Cinnamon", "org.Cinnamon")
-            .map_err(SwitcherError::from)
-    }
-
-    fn input_sources(
+    fn num_xkb_groups(
         &self,
         control: Option<&WriterTransactionControl>,
-    ) -> Result<Vec<CinnamonInputSource>, SwitcherError> {
-        run_checked_external_call(control, || {
-            self.proxy()?
-                .call("GetInputSources", &())
-                .map_err(Into::into)
-        })
+    ) -> Result<u8, SwitcherError> {
+        use x11rb::protocol::xkb::{self, ConnectionExt as _};
+        let controls = run_checked_external_call(control, || {
+            self.x11
+                .xkb_get_controls(xkb::ID::USE_CORE_KBD.into())
+                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
+                .reply()
+                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
+        })?;
+        Ok(controls.num_groups)
     }
 
-    fn active_source_index(
+    fn target_xkb_group(
         &self,
         control: Option<&WriterTransactionControl>,
-    ) -> Result<Option<i32>, SwitcherError> {
-        Ok(self
-            .input_sources(control)?
-            .into_iter()
-            .find(|source| source.11)
-            .map(|source| source.2))
+    ) -> Result<u8, SwitcherError> {
+        let num_groups = self.num_xkb_groups(control)?;
+        let current_group = self.xkb_group(control)?;
+        cinnamon_xkb_target_group(num_groups, current_group)
     }
 
-    fn target_source_index(
+    fn activate_and_verify_group(
         &self,
-        control: Option<&WriterTransactionControl>,
-    ) -> Result<i32, SwitcherError> {
-        let sources = self.input_sources(control)?;
-        let Some(active) = sources.iter().find(|source| source.11) else {
-            return Err(SwitcherError::Io(io::Error::other(
-                "cinnamon-dbus-xtest-before-mutation: no active input source",
-            )));
-        };
-
-        let active_is_russian = is_cinnamon_russian_source(active);
-        let active_is_english = is_cinnamon_english_source(active);
-        if !active_is_russian && !active_is_english {
-            return Err(SwitcherError::Io(io::Error::other(format!(
-                "cinnamon-dbus-xtest-before-mutation: unsupported active source {}",
-                active.1
-            ))));
-        }
-
-        let target = if active_is_russian {
-            sources
-                .iter()
-                .find(|source| is_cinnamon_english_source(source))
-        } else {
-            sources
-                .iter()
-                .find(|source| is_cinnamon_russian_source(source))
-        };
-
-        target.map(|source| source.2).ok_or_else(|| {
-            SwitcherError::Io(io::Error::other(
-                "cinnamon-dbus-xtest-before-mutation: target input source not found",
-            ))
-        })
-    }
-
-    fn activate_and_verify_source(
-        &self,
-        target_index: i32,
+        target_group: u8,
         control: Option<&WriterTransactionControl>,
     ) -> Result<(), SwitcherError> {
-        let proxy = run_checked_external_call(control, || self.proxy())?;
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xkb::{self, ConnectionExt as _};
+
         authorize_transaction_mutation(control)?;
-        let activation_result: Result<(), SwitcherError> = proxy
-            .call("ActivateInputSourceIndex", &(target_index,))
-            .map_err(Into::into);
+        let activation_result = self
+            .x11
+            .xkb_latch_lock_state(
+                xkb::ID::USE_CORE_KBD.into(),
+                0u8.into(),
+                0u8.into(),
+                true,
+                target_group.into(),
+                0u8.into(),
+                false,
+                0,
+            )
+            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
+            .and_then(|_| {
+                self.x11
+                    .flush()
+                    .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
+            });
         ensure_transaction_active(control)?;
         activation_result?;
         let started = Instant::now();
-        let mut last_active_index = None;
         let mut last_xkb_group = None;
 
-        while started.elapsed() < CINNAMON_DBUS_SWITCH_TIMEOUT {
+        while started.elapsed() < CINNAMON_XKB_SWITCH_TIMEOUT {
             ensure_transaction_active(control)?;
-            let (active_index, xkb_group) = read_cinnamon_source_state_with(
-                control,
-                || self.active_source_index(control),
-                || self.xkb_group(control),
-            )?;
+            let xkb_group = self.xkb_group(control)?;
             ensure_transaction_active(control)?;
-            last_active_index = active_index;
             last_xkb_group = Some(xkb_group);
-            if active_index == Some(target_index) && i32::from(xkb_group) == target_index {
+            if xkb_group == target_group {
                 return Ok(());
             }
-            sleep_for_transaction(control, CINNAMON_DBUS_SWITCH_POLL_INTERVAL)?;
+            sleep_for_transaction(control, CINNAMON_XKB_SWITCH_POLL_INTERVAL)?;
         }
 
         Err(SwitcherError::Io(io::Error::other(format!(
-            "cinnamon-dbus-xtest-before-mutation: activation did not settle target={target_index} active={:?} xkb_group={:?}",
-            last_active_index,
+            "cinnamon-xkb-xtest-before-mutation: activation did not settle target_group={target_group} xkb_group={:?}",
             last_xkb_group,
         ))))
     }
@@ -3150,7 +3106,7 @@ impl CinnamonX11XtestReplayer {
         let setup = self.x11.setup();
         if keycode < setup.min_keycode || keycode > setup.max_keycode {
             return Err(SwitcherError::Io(io::Error::other(format!(
-                "cinnamon-dbus-xtest-before-mutation: keycode out of X11 range key={key:?} keycode={keycode} min={} max={}",
+                "cinnamon-xkb-xtest-before-mutation: keycode out of X11 range key={key:?} keycode={keycode} min={} max={}",
                 setup.min_keycode, setup.max_keycode
             ))));
         }
@@ -3165,7 +3121,7 @@ impl CinnamonX11XtestReplayer {
         })?;
         if mapping.keysyms.iter().all(|keysym| *keysym == 0) {
             return Err(SwitcherError::Io(io::Error::other(format!(
-                "cinnamon-dbus-xtest-before-mutation: keycode has empty mapping key={key:?} keycode={keycode}",
+                "cinnamon-xkb-xtest-before-mutation: keycode has empty mapping key={key:?} keycode={keycode}",
             ))));
         }
 
@@ -3282,9 +3238,9 @@ impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
         ensure_transaction_active(control)?;
         self.validate_plan_keycodes(plan, control)?;
         ensure_transaction_active(control)?;
-        let target_index = self.target_source_index(control)?;
+        let target_group = self.target_xkb_group(control)?;
         ensure_transaction_active(control)?;
-        self.activate_and_verify_source(target_index, control)
+        self.activate_and_verify_group(target_group, control)
     }
 
     fn key_down(
@@ -3300,19 +3256,11 @@ impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
     }
 }
 
-fn is_cinnamon_russian_source(source: &CinnamonInputSource) -> bool {
-    source.1 == "ru" || source.4 == "ru"
-}
-
-fn is_cinnamon_english_source(source: &CinnamonInputSource) -> bool {
-    matches!(source.1.as_str(), "us" | "gb") || matches!(source.4.as_str(), "us" | "gb")
-}
-
 fn evdev_key_to_x11_keycode(key: Key) -> Result<u8, SwitcherError> {
     let raw = key.code() + X11_EVDEV_KEYCODE_OFFSET;
     u8::try_from(raw).map_err(|_| {
         SwitcherError::Io(io::Error::other(format!(
-            "cinnamon-dbus-xtest-before-mutation: evdev keycode cannot fit in X11 keycode key={key:?} raw={raw}",
+            "cinnamon-xkb-xtest-before-mutation: evdev keycode cannot fit in X11 keycode key={key:?} raw={raw}",
         )))
     })
 }
@@ -3330,9 +3278,9 @@ fn select_correction_replay_strategy(
         && context.desktop_environment == DesktopEnvironment::Cinnamon
     {
         if cinnamon_xtest_available {
-            CorrectionReplayStrategy::CinnamonDbusXtest
+            CorrectionReplayStrategy::CinnamonXkbXtest
         } else {
-            CorrectionReplayStrategy::CinnamonDbusXtestUnavailable
+            CorrectionReplayStrategy::CinnamonXkbXtestUnavailable
         }
     } else {
         CorrectionReplayStrategy::Generic
@@ -3544,7 +3492,7 @@ fn run_cinnamon_x11_xtest_correction(
 
     restore_modifiers_xtest(replay, modifiers, control)?;
     Ok(CorrectionExecutionOutcome {
-        layout_switch: CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest,
+        layout_switch: CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest,
     })
 }
 
@@ -3558,7 +3506,7 @@ fn detect_current_system_context() -> SystemContext {
 
 fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11XtestRuntime {
     if select_correction_replay_strategy(context, true, true)
-        != CorrectionReplayStrategy::CinnamonDbusXtest
+        != CorrectionReplayStrategy::CinnamonXkbXtest
     {
         return CinnamonX11XtestRuntime::NotSelected;
     }
@@ -3567,7 +3515,7 @@ fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11X
         Ok(replayer) => {
             log_input_debug(
                 "correction-replay-strategy",
-                "session_type=x11 desktop=cinnamon strategy=cinnamon-dbus-xtest result=ready",
+                "session_type=x11 desktop=cinnamon strategy=cinnamon-xkb-xtest result=ready",
             );
             CinnamonX11XtestRuntime::Available(Box::new(replayer))
         }
@@ -3575,7 +3523,7 @@ fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11X
             log_input_debug(
                 "correction-replay-strategy",
                 &format!(
-                    "session_type=x11 desktop=cinnamon strategy=cinnamon-dbus-xtest result=unavailable error={error}"
+                    "session_type=x11 desktop=cinnamon strategy=cinnamon-xkb-xtest result=unavailable error={error}"
                 ),
             );
             CinnamonX11XtestRuntime::Unavailable(error.to_string())
@@ -3709,7 +3657,7 @@ fn run_correction(
             CinnamonX11XtestRuntime::Available(replay) => {
                 log_input_debug(
                     "correction-layout-switch",
-                    "strategy=cinnamon-dbus-xtest phase=prepare",
+                    "strategy=cinnamon-xkb-xtest phase=prepare",
                 );
                 let outcome = run_cinnamon_x11_xtest_correction(
                     replay.as_mut(),
@@ -3720,17 +3668,17 @@ fn run_correction(
                 )?;
                 log_input_debug(
                     "correction-layout-switch",
-                    "strategy=cinnamon-dbus-xtest result=ok",
+                    "strategy=cinnamon-xkb-xtest result=ok",
                 );
                 return Ok(outcome);
             }
             CinnamonX11XtestRuntime::Unavailable(reason) => {
                 log_input_debug(
                     "correction-layout-switch",
-                    &format!("strategy=cinnamon-dbus-xtest result=error reason={reason}"),
+                    &format!("strategy=cinnamon-xkb-xtest result=error reason={reason}"),
                 );
                 return Err(SwitcherError::Io(io::Error::other(format!(
-                    "cinnamon-dbus-xtest-before-mutation: {reason}"
+                    "cinnamon-xkb-xtest-before-mutation: {reason}"
                 ))));
             }
             CinnamonX11XtestRuntime::NotSelected => {}
@@ -3799,9 +3747,9 @@ fn run_correction(
                     config.layout_switch_combo, config.layout_delay_ms
                 ),
             ),
-            CorrectionLayoutSwitchOutcome::AppliedCinnamonDbusXtest => log_input_debug(
+            CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest => log_input_debug(
                 "correction-layout-switch",
-                "strategy=cinnamon-dbus-xtest result=ok",
+                "strategy=cinnamon-xkb-xtest result=ok",
             ),
             CorrectionLayoutSwitchOutcome::NotNeeded => {}
         }
@@ -4048,15 +3996,15 @@ fn run_virtual_keyboard_writer_loop(
                                         log_input_debug(
                                             "type-separator-execute",
                                             &format!(
-                                            "key={key:?} strategy=cinnamon-dbus-xtest result=ok"
-                                        ),
+                                                "key={key:?} strategy=cinnamon-xkb-xtest result=ok"
+                                            ),
                                         );
                                     }
                                     Err(error) => {
                                         log_input_debug(
                                     "type-separator-execute",
                                     &format!(
-                                        "key={key:?} strategy=cinnamon-dbus-xtest result=error action=fail-stop error={error}"
+                                        "key={key:?} strategy=cinnamon-xkb-xtest result=error action=fail-stop error={error}"
                                     ),
                                 );
                                     }
@@ -4067,7 +4015,7 @@ fn run_virtual_keyboard_writer_loop(
                                 log_input_debug(
                                 "type-separator-execute",
                                 &format!(
-                                    "key={key:?} strategy=cinnamon-dbus-xtest result=unavailable fallback=uinput reason={reason}"
+                                    "key={key:?} strategy=cinnamon-xkb-xtest result=unavailable fallback=uinput reason={reason}"
                                     ),
                                 );
                                 None
@@ -4869,14 +4817,27 @@ mod tests {
     }
 
     #[test]
-    fn cinnamon_x11_switching_correction_selects_cinnamon_dbus_xtest_replay() {
+    fn cinnamon_x11_switching_correction_selects_cinnamon_xkb_xtest_replay() {
         let strategy = select_correction_replay_strategy(
             test_context(SessionType::X11, DesktopEnvironment::Cinnamon),
             true,
             true,
         );
 
-        assert_eq!(strategy, CorrectionReplayStrategy::CinnamonDbusXtest);
+        assert_eq!(strategy, CorrectionReplayStrategy::CinnamonXkbXtest);
+    }
+
+    #[test]
+    fn cinnamon_xkb_target_group_toggles_an_exact_pair() {
+        assert_eq!(cinnamon_xkb_target_group(2, 0).unwrap(), 1);
+        assert_eq!(cinnamon_xkb_target_group(2, 1).unwrap(), 0);
+    }
+
+    #[test]
+    fn cinnamon_xkb_target_group_rejects_unsupported_state() {
+        assert!(cinnamon_xkb_target_group(1, 0).is_err());
+        assert!(cinnamon_xkb_target_group(3, 0).is_err());
+        assert!(cinnamon_xkb_target_group(2, 2).is_err());
     }
 
     #[test]
@@ -4904,7 +4865,7 @@ mod tests {
     #[test]
     fn cinnamon_x11_replay_readiness_failure_aborts_before_backspace() {
         let mut replay = FakeCinnamonX11XtestReplay {
-            prepare_error: Some("dbus unavailable"),
+            prepare_error: Some("XKB unavailable"),
             calls: Vec::new(),
             ..Default::default()
         };
@@ -5346,34 +5307,6 @@ mod tests {
             SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 93 }
         ));
         assert_eq!(mapping_calls.get(), 1);
-    }
-
-    #[test]
-    fn cinnamon_active_source_cancellation_stops_before_group_read() {
-        let control = WriterTransactionControl::with_timeout_for_test(94, Duration::from_secs(1));
-        let active_reads = Cell::new(0usize);
-        let group_reads = Cell::new(0usize);
-
-        let error = read_cinnamon_source_state_with(
-            Some(&control),
-            || {
-                active_reads.set(active_reads.get() + 1);
-                let _ = control.mark_timed_out();
-                Ok(Some(1))
-            },
-            || {
-                group_reads.set(group_reads.get() + 1);
-                Ok(1)
-            },
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 94 }
-        ));
-        assert_eq!(active_reads.get(), 1);
-        assert_eq!(group_reads.get(), 0);
     }
 
     #[test]

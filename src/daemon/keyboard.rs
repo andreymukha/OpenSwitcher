@@ -29,7 +29,10 @@ const KEYBOARD_SYMLINK_DIRS: [&str; 2] = ["/dev/input/by-path", "/dev/input/by-i
 const UINPUT_PATHS: [&str; 2] = ["/dev/uinput", "/dev/input/uinput"];
 pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(50);
+// Keep the X11 active-window watcher ahead of ordinary human typing. A longer
+// interval can invalidate the word buffer after the first key reached a newly
+// focused window, leaving manual correction with only a suffix of the word.
+const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
 // Transactional commands use the same total-order queue, but are represented as
 // single indivisible commands and get a larger bounded enqueue window because
@@ -6584,11 +6587,15 @@ mod tests {
     // Watcher readiness
 
     #[test]
-    fn watcher_polling_intervals_stay_within_idle_cpu_budget() {
+    fn pointer_watcher_polling_interval_stays_within_idle_cpu_budget() {
         assert!(POINTER_POLL_INTERVAL >= Duration::from_millis(10));
         assert!(POINTER_POLL_INTERVAL <= Duration::from_millis(20));
-        assert!(INPUT_TARGET_POLL_INTERVAL >= Duration::from_millis(10));
-        assert!(INPUT_TARGET_POLL_INTERVAL <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn input_target_poll_interval_stays_below_first_key_race_budget() {
+        assert!(INPUT_TARGET_POLL_INTERVAL >= Duration::from_millis(1));
+        assert!(INPUT_TARGET_POLL_INTERVAL <= Duration::from_millis(5));
     }
 
     #[test]

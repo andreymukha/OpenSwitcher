@@ -86,16 +86,19 @@ Ubuntu 24.04/GNOME/Wayland и Linux Mint 22.2/Cinnamon/X11.
 - dpkg package по-прежнему не установлен: владелец установит подготовленный
   `.deb` отдельно.
 
-Оставшийся privileged cleanup на момент handoff:
+Privileged cleanup выполнен владельцем в отдельном terminal и затем проверен
+agent read-only командами:
 
-- удалить непакетный `/etc/udev/rules.d/80-openswitcher-input.rules`;
-- снять named ACL `user:andrey` с `/dev/uinput`, `/dev/input/event4`,
-  `/dev/input/event8`, `/dev/input/event9`;
-- reload udev rules.
+- непакетный `/etc/udev/rules.d/80-openswitcher-input.rules` отсутствует;
+- named ACL `user:andrey` отсутствует на `/dev/uinput` и всех текущих
+  `/dev/input/event*`;
+- udev rules перечитаны;
+- persistent developer install и его runtime ACL полностью удалены.
 
-Причина: root-owned cleanup требует свежего `sudo -v`; agent не получает и не
-сохраняет пароль пользователя. После этой очистки новый Debian package сам
-установит package-owned rule и применит актуальный runtime ACL.
+Существующие устройства до следующего udev event ещё могут показывать runtime
+tag `uaccess` в udev database, но named ACL уже отсутствует. Установка нового
+Debian package штатно выполнит trigger, установит package-owned rule и применит
+актуальный runtime ACL. Agent не получал и не сохранял пароль пользователя.
 
 ## Открытый backlog
 

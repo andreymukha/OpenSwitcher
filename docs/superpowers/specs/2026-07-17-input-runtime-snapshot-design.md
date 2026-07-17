@@ -167,13 +167,15 @@ keystroke interpretation currently depends on the effective layout kind.
 
 ### Locally initiated layout changes
 
-A layout shortcut, writer correction that reports a layout switch, selected
-text switch completion, or any other local operation capable of changing the
-layout immediately marks the input snapshot `AwaitingConfirmation` and requests
-a refresh. D-Bus/tray layout status remains at the last confirmed value until
-the refresh succeeds; provisional state is not published as confirmed.
-Successful background observation returns the state to `Fresh` and publishes
-the resulting status change.
+A layout shortcut, writer correction that reports a layout switch, or any other
+local operation capable of changing the system layout immediately marks the
+input snapshot `AwaitingConfirmation` and requests a refresh. The current
+selected-text implementation converts text and sends copy/paste shortcuts but
+does not change the system layout, so it does not invalidate layout state.
+D-Bus/tray layout status remains at the last confirmed value until the refresh
+succeeds; provisional state is not published as confirmed. Successful
+background observation returns the state to `Fresh` and publishes the
+resulting status change.
 
 ### Pending correction generation
 

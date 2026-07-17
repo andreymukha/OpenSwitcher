@@ -1,3 +1,4 @@
+use crate::daemon::debug_log::{format_layout, try_debug_line, DebugLogKind};
 use crate::error::LayoutAutoDetectError;
 use crate::model::{
     AutoDetectedLayoutSwitch, DesktopEnvironment, DetectionConfidence, DetectionStrategy,
@@ -13,6 +14,15 @@ const XKB_OPTIONS_KEY: &str = "xkb-options";
 const XFCE_KEYBOARD_LAYOUT_CHANNEL: &str = "keyboard-layout";
 const XFCE_XKB_DISABLE_PROPERTY: &str = "/Default/XkbDisable";
 const XFCE_XKB_GROUP_PROPERTY: &str = "/Default/XkbOptions/Group";
+
+fn log_auto_detect_fallback(source: &str, error: &impl std::fmt::Display) {
+    let _ = try_debug_line(DebugLogKind::Layout, || {
+        format_layout(
+            "auto-detect-fallback",
+            &format!("source={source} error={error}"),
+        )
+    });
+}
 
 // Desktop settings reader
 
@@ -169,9 +179,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
             Ok(false) => self.detect_xfce_x11_managed(context),
             Ok(true) => self.detect_xfce_x11_system_defaults(context),
             Err(error) => {
-                eprintln!(
-                    "[layout-switch] Failed to read XFCE XkbDisable flag, using fallback: {error}"
-                );
+                log_auto_detect_fallback("xfce-xkb-disable", &error);
                 fallback_setting(
                     LayoutSwitchCombo::default(),
                     DetectionStrategy::XfceX11XfconfKeyboardLayout,
@@ -204,9 +212,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                     )
                 }),
             Err(error) => {
-                eprintln!(
-                    "[layout-switch] Failed to read XFCE layout group option, using fallback: {error}"
-                );
+                log_auto_detect_fallback("xfce-layout-group", &error);
                 fallback_setting(
                     LayoutSwitchCombo::default(),
                     DetectionStrategy::XfceX11XfconfKeyboardLayout,
@@ -235,9 +241,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                     )
                 }),
             Err(error) => {
-                eprintln!(
-                    "[layout-switch] Failed to read X11 runtime layout options, using fallback: {error}"
-                );
+                log_auto_detect_fallback("xfce-x11-options", &error);
                 fallback_setting(
                     LayoutSwitchCombo::default(),
                     DetectionStrategy::XfceX11SetXkbmapQuery,
@@ -268,9 +272,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                         .unwrap_or_else(|| self.detect_cinnamon_x11_setxkbmap_fallback(context))
                 }),
             Err(error) => {
-                eprintln!(
-                    "[layout-switch] Failed to read Cinnamon input source options, using fallback: {error}"
-                );
+                log_auto_detect_fallback("cinnamon-xkb-options", &error);
                 fallback_setting(
                     LayoutSwitchCombo::default(),
                     DetectionStrategy::CinnamonX11GSettingsXkbOptions,
@@ -336,9 +338,7 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                     )
                 }),
             Err(error) => {
-                eprintln!(
-                    "[layout-switch] Failed to read X11 runtime layout options for Cinnamon fallback, using fallback: {error}"
-                );
+                log_auto_detect_fallback("cinnamon-x11-options", &error);
                 fallback_setting(
                     LayoutSwitchCombo::default(),
                     DetectionStrategy::CinnamonX11GSettingsXkbOptions,
@@ -350,11 +350,9 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
     }
 
     fn detect_gnome_wayland(&self, context: SystemContext) -> LayoutSwitchSetting {
-        if let Some(combo) = self.detect_wm_input_source_binding(
-            GNOME_SWITCH_INPUT_SOURCE_KEY,
-            "primary",
-            "GNOME",
-        ) {
+        if let Some(combo) =
+            self.detect_wm_input_source_binding(GNOME_SWITCH_INPUT_SOURCE_KEY, "primary", "GNOME")
+        {
             return detected_setting(
                 combo,
                 DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
@@ -396,9 +394,9 @@ impl<R: DesktopSettingsReader> LayoutSwitchAutoDetector<R> {
                 .iter()
                 .find_map(|binding| combo_from_gnome_binding(binding)),
             Err(error) => {
-                eprintln!(
-                    "[layout-switch] Failed to read {desktop_label} {source} input source binding, using fallback: {error}"
-                );
+                let diagnostic_source =
+                    format!("{}-{}-binding", desktop_label.to_ascii_lowercase(), source);
+                log_auto_detect_fallback(&diagnostic_source, &error);
                 None
             }
         }

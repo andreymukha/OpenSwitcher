@@ -763,4 +763,12 @@ mod tests {
             "[daemon-capture] phase=start note=session-started"
         );
     }
+
+    #[test]
+    fn grab_reachable_layout_detection_has_no_direct_output() {
+        let source = include_str!("../layout_switch/mod.rs");
+
+        assert!(!source.contains("eprintln!"));
+        assert!(!source.contains("stderr()"));
+    }
 }

@@ -1,27 +1,9 @@
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::sync::OnceLock;
-
-const SELECTED_TEXT_DEBUG_ENV: &str = "OPEN_SWITCHER_SELECTED_TEXT_DEBUG";
-const SELECTED_TEXT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_SELECTED_TEXT_DEBUG_FILE";
-
-pub(crate) fn selected_text_debug_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(SELECTED_TEXT_DEBUG_ENV)
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false)
-    })
-}
+use crate::daemon::debug_log::{format_selected, try_debug_line, DebugLogKind};
 
 pub(crate) fn log_selected_text_debug(stage: &str, details: &str) {
-    if !selected_text_debug_enabled() {
-        return;
-    }
-
-    let line = format!("[selected-text-debug] stage={stage} {details}");
-    eprintln!("{line}");
-    append_selected_text_debug_line(&line);
+    let _ = try_debug_line(DebugLogKind::SelectedText, || {
+        format_selected(stage, details)
+    });
 }
 
 pub(crate) fn summarize_text(text: &str) -> String {
@@ -38,18 +20,10 @@ pub(crate) fn summarize_text(text: &str) -> String {
     format!("chars={chars} bytes={bytes} lines={lines} empty={empty} has_newline={has_newline}")
 }
 
-fn append_selected_text_debug_line(line: &str) {
-    let path = std::env::var(SELECTED_TEXT_DEBUG_FILE_ENV)
-        .unwrap_or_else(|_| "/tmp/open-switcher-selected-text.log".to_string());
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::summarize_text;
+    use crate::daemon::debug_log::format_selected;
 
     #[test]
     fn summarize_text_redacts_content() {
@@ -82,5 +56,18 @@ mod tests {
         assert!(multiline_summary.contains("lines=2"));
         assert!(!multiline_summary.contains("first private line"));
         assert!(!multiline_summary.contains("second private line"));
+    }
+
+    #[test]
+    fn formatted_selected_text_debug_line_contains_only_the_summary() {
+        let input = "password=secret-token";
+
+        let line = format_selected("copy", &summarize_text(input));
+
+        assert!(!line.contains("password"));
+        assert!(!line.contains("secret"));
+        assert!(!line.contains("token"));
+        assert!(line.contains("chars="));
+        assert!(line.starts_with("[selected-text-debug] stage=copy "));
     }
 }

@@ -1,13 +1,35 @@
 use std::array;
+use std::env;
 use std::fs::{File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
-use std::thread::JoinHandle;
+use std::sync::{mpsc, Arc, OnceLock};
+use std::thread::{self, JoinHandle};
 
+pub(crate) const DEBUG_LOG_QUEUE_CAPACITY: usize = 256;
 pub(crate) const MAX_DEBUG_RECORD_BYTES: usize = 4096;
+const DEBUG_ENV: [&str; 4] = [
+    "OPEN_SWITCHER_INPUT_DEBUG",
+    "OPEN_SWITCHER_LAYOUT_DEBUG",
+    "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG",
+    "OPEN_SWITCHER_SELECTED_TEXT_DEBUG",
+];
+const DEBUG_FILE_ENV: [&str; 4] = [
+    "OPEN_SWITCHER_INPUT_DEBUG_FILE",
+    "OPEN_SWITCHER_LAYOUT_DEBUG_FILE",
+    "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG_FILE",
+    "OPEN_SWITCHER_SELECTED_TEXT_DEBUG_FILE",
+];
+const DEFAULT_DEBUG_PATHS: [&str; 4] = [
+    "/tmp/open-switcher-input-debug.log",
+    "/tmp/open-switcher-layout-debug.log",
+    "/tmp/open-switcher-daemon-capture.log",
+    "/tmp/open-switcher-selected-text.log",
+];
+
+static GLOBAL_DEBUG_PRODUCER: OnceLock<DebugLogProducer> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DebugLogKind {
@@ -98,8 +120,22 @@ impl DebugLogProducer {
         self.dropped.values[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn dropped(&self, kind: DebugLogKind) -> u64 {
+    #[cfg(test)]
+    fn dropped(&self, kind: DebugLogKind) -> u64 {
         self.dropped.values[kind as usize].load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn any_enabled(&self) -> bool {
+        self.enabled_mask != 0
+    }
+
+    fn disabled() -> Self {
+        Self {
+            enabled_mask: 0,
+            sender: None,
+            dropped: Arc::new(DebugDropCounters::default()),
+        }
     }
 
     #[cfg(test)]
@@ -120,6 +156,88 @@ impl DebugLogProducer {
             receiver,
         )
     }
+}
+
+struct DebugLogConfig {
+    enabled_mask: u8,
+    paths: [PathBuf; 4],
+}
+
+impl DebugLogConfig {
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            enabled_mask: 0,
+            paths: array::from_fn(|index| PathBuf::from(DEFAULT_DEBUG_PATHS[index])),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_lookup(|name| env::var(name).ok())
+    }
+
+    fn from_lookup(mut lookup: impl FnMut(&str) -> Option<String>) -> Self {
+        let enabled_mask = DEBUG_ENV
+            .iter()
+            .enumerate()
+            .fold(0u8, |mask, (index, name)| {
+                let enabled = lookup(name).is_some_and(|value| is_truthy(&value));
+                mask | ((enabled as u8) << index)
+            });
+        let paths = array::from_fn(|index| {
+            lookup(DEBUG_FILE_ENV[index])
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_DEBUG_PATHS[index]))
+        });
+        Self {
+            enabled_mask,
+            paths,
+        }
+    }
+
+    #[cfg(test)]
+    fn enabled(&self, kind: DebugLogKind) -> bool {
+        self.enabled_mask & (1 << kind as u8) != 0
+    }
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+pub(crate) fn debug_enabled(kind: DebugLogKind) -> bool {
+    GLOBAL_DEBUG_PRODUCER
+        .get()
+        .is_some_and(|producer| producer.enabled(kind))
+}
+
+pub(crate) fn try_debug_line(
+    kind: DebugLogKind,
+    build: impl FnOnce() -> String,
+) -> DebugEnqueueOutcome {
+    GLOBAL_DEBUG_PRODUCER
+        .get()
+        .map(|producer| producer.try_enqueue_with(kind, build))
+        .unwrap_or(DebugEnqueueOutcome::Disabled)
+}
+
+pub(crate) fn format_input(stage: &str, details: &str) -> String {
+    format!("[input-debug] stage={stage} {details}")
+}
+
+pub(crate) fn format_layout(stage: &str, details: &str) -> String {
+    format!("[layout-debug] stage={stage} {details}")
+}
+
+pub(crate) fn format_capture(phase: &str, details: &str) -> String {
+    format!("[daemon-capture] phase={phase} {details}")
+}
+
+pub(crate) fn format_selected(stage: &str, details: &str) -> String {
+    format!("[selected-text-debug] stage={stage} {details}")
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
@@ -162,6 +280,50 @@ pub(crate) struct DebugLogRuntime {
     producer: DebugLogProducer,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+}
+
+impl DebugLogRuntime {
+    pub(crate) fn initialize_from_env() -> Self {
+        let runtime = Self::from_config(DebugLogConfig::from_env());
+        let _ = GLOBAL_DEBUG_PRODUCER.set(runtime.producer.clone());
+        runtime
+    }
+
+    fn from_config(config: DebugLogConfig) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        if config.enabled_mask == 0 {
+            return Self {
+                producer: DebugLogProducer::disabled(),
+                stop,
+                worker: None,
+            };
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(DEBUG_LOG_QUEUE_CAPACITY);
+        let producer = DebugLogProducer {
+            enabled_mask: config.enabled_mask,
+            sender: Some(sender),
+            dropped: Arc::new(DebugDropCounters::default()),
+        };
+        let worker_stop = Arc::clone(&stop);
+        let sink = ProductionDebugSink::new(config.paths);
+        let worker = thread::Builder::new()
+            .name("open-switcher-debug-log".to_string())
+            .spawn(move || run_debug_worker(receiver, worker_stop, sink));
+
+        match worker {
+            Ok(worker) => Self {
+                producer,
+                stop,
+                worker: Some(worker),
+            },
+            Err(_) => Self {
+                producer: DebugLogProducer::disabled(),
+                stop,
+                worker: None,
+            },
+        }
+    }
 }
 
 impl Drop for DebugLogRuntime {
@@ -533,5 +695,72 @@ mod tests {
 
         assert!(!unsafe_path.exists());
         assert_eq!(std::fs::read_to_string(target).unwrap(), "");
+    }
+
+    #[test]
+    fn disabled_config_creates_no_worker_or_channel() {
+        let runtime = DebugLogRuntime::from_config(DebugLogConfig::disabled());
+
+        assert!(runtime.worker.is_none());
+        assert!(runtime.producer.sender.is_none());
+        assert!(!runtime.producer.any_enabled());
+    }
+
+    #[test]
+    fn enabled_config_creates_one_lazy_worker_without_opening_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = array::from_fn(|index| temp.path().join(format!("{index}.log")));
+        let runtime = DebugLogRuntime::from_config(DebugLogConfig {
+            enabled_mask: 1 << DebugLogKind::Input as u8,
+            paths: paths.clone(),
+        });
+
+        assert!(runtime.worker.is_some());
+        assert!(runtime.producer.sender.is_some());
+        assert!(runtime.producer.enabled(DebugLogKind::Input));
+        assert!(paths.iter().all(|path| !path.exists()));
+        drop(runtime);
+    }
+
+    #[test]
+    fn startup_lookup_preserves_existing_flags_paths_and_defaults() {
+        let config = DebugLogConfig::from_lookup(|name| match name {
+            "OPEN_SWITCHER_INPUT_DEBUG" => Some("YES".to_string()),
+            "OPEN_SWITCHER_LAYOUT_DEBUG" => Some("0".to_string()),
+            "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG" => Some("on".to_string()),
+            "OPEN_SWITCHER_SELECTED_TEXT_DEBUG" => Some("true".to_string()),
+            "OPEN_SWITCHER_INPUT_DEBUG_FILE" => Some("/custom/input.log".to_string()),
+            _ => None,
+        });
+
+        assert!(config.enabled(DebugLogKind::Input));
+        assert!(!config.enabled(DebugLogKind::Layout));
+        assert!(config.enabled(DebugLogKind::Capture));
+        assert!(config.enabled(DebugLogKind::SelectedText));
+        assert_eq!(config.paths[0], PathBuf::from("/custom/input.log"));
+        assert_eq!(
+            config.paths[1],
+            PathBuf::from("/tmp/open-switcher-layout-debug.log")
+        );
+    }
+
+    #[test]
+    fn exact_existing_prefixes_are_preserved() {
+        assert_eq!(
+            format_input("writer", "ready=true"),
+            "[input-debug] stage=writer ready=true"
+        );
+        assert_eq!(
+            format_layout("sync", "result=ok"),
+            "[layout-debug] stage=sync result=ok"
+        );
+        assert_eq!(
+            format_selected("copy", "chars=3"),
+            "[selected-text-debug] stage=copy chars=3"
+        );
+        assert_eq!(
+            format_capture("start", "note=session-started"),
+            "[daemon-capture] phase=start note=session-started"
+        );
     }
 }

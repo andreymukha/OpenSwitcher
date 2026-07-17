@@ -36,6 +36,7 @@ impl runtime::TrayPresenceProbe for SessionBusTrayPresenceProbe {
 }
 
 pub fn run() -> Result<(), SwitcherError> {
+    let _debug_log_runtime = debug_log::DebugLogRuntime::initialize_from_env();
     let config_service = ConfigService::load(default_config_path())?;
     let runtime = Arc::new(RuntimeState::new(config_service));
     match runtime.config_snapshot() {

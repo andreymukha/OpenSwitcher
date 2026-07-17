@@ -1,5 +1,6 @@
 use crate::config::AppConfig;
 use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
+use crate::daemon::debug_log::{format_layout, try_debug_line, DebugLogKind};
 use crate::error::{
     CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
     ValidationError,
@@ -21,17 +22,12 @@ use crate::model::{
     MAX_CORRECTION_KEYSTROKES, MAX_CORRECTION_SCHEDULE_MS,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
-use std::env;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const LAYOUT_DEBUG_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG";
-const LAYOUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_LAYOUT_DEBUG_FILE";
 const BACKGROUND_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(300);
 const GNOME_INPUT_SOURCES_SCHEMA: &str = "org.gnome.desktop.input-sources";
 const GNOME_SOURCES_KEY: &str = "sources";
@@ -79,8 +75,7 @@ impl RuntimeConfigSnapshot {
         extra_backspaces: usize,
         switch_layout: bool,
     ) -> Result<Duration, ValidationError> {
-        if strokes > MAX_CORRECTION_KEYSTROKES
-            || extra_backspaces > MAX_CORRECTION_EXTRA_BACKSPACES
+        if strokes > MAX_CORRECTION_KEYSTROKES || extra_backspaces > MAX_CORRECTION_EXTRA_BACKSPACES
         {
             return Err(ValidationError::InputCorrectionPlanTooLarge {
                 max_strokes: MAX_CORRECTION_KEYSTROKES,
@@ -3975,25 +3970,7 @@ fn gnome_wayland_unknown_layout_state(reason: &'static str) -> CurrentLayoutStat
 // Logging helpers
 
 pub(crate) fn log_layout_debug(stage: &str, details: &str) {
-    if !layout_debug_enabled() {
-        return;
-    }
-
-    let line = format!("[layout-debug] stage={stage} {details}");
-    eprintln!("{line}");
-
-    let path = env::var(LAYOUT_DEBUG_FILE_ENV)
-        .unwrap_or_else(|_| "/tmp/open-switcher-layout-debug.log".to_string());
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
-fn layout_debug_enabled() -> bool {
-    matches!(
-        env::var(LAYOUT_DEBUG_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    let _ = try_debug_line(DebugLogKind::Layout, || format_layout(stage, details));
 }
 
 fn layout_label(is_english: bool) -> &'static str {

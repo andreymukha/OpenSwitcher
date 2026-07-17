@@ -1,3 +1,4 @@
+use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::error::SwitcherError;
@@ -26,8 +27,6 @@ const KEYBOARD_PATH_ENV: &str = "OPEN_SWITCHER_KEYBOARD_PATH";
 const KEYBOARD_SYMLINK_SUFFIX: &str = "-event-kbd";
 const KEYBOARD_SYMLINK_DIRS: [&str; 2] = ["/dev/input/by-path", "/dev/input/by-id"];
 const UINPUT_PATHS: [&str; 2] = ["/dev/uinput", "/dev/input/uinput"];
-const INPUT_DEBUG_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG";
-const INPUT_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_INPUT_DEBUG_FILE";
 pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -4206,26 +4205,7 @@ fn run_virtual_keyboard_writer_loop(
 }
 
 pub(crate) fn log_input_debug(stage: &str, details: &str) {
-    if !input_debug_enabled() {
-        return;
-    }
-
-    let line = format!("[input-debug] stage={stage} {details}");
-    eprintln!("{line}");
-
-    let path = env::var(INPUT_DEBUG_FILE_ENV)
-        .unwrap_or_else(|_| "/tmp/open-switcher-input-debug.log".to_string());
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        use std::io::Write;
-        let _ = writeln!(file, "{line}");
-    }
-}
-
-fn input_debug_enabled() -> bool {
-    matches!(
-        env::var(INPUT_DEBUG_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    let _ = try_debug_line(DebugLogKind::Input, || format_input(stage, details));
 }
 
 impl SharedModifierState {

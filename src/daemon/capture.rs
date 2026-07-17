@@ -1,15 +1,11 @@
+use crate::daemon::debug_log::{debug_enabled, format_capture, try_debug_line, DebugLogKind};
 use crate::error::CaptureError;
 use crate::model::{LayoutSwitchCaptureState, LayoutSwitchCombo};
 use evdev::Key;
 use std::collections::BTreeSet;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 const UNSUPPORTED_MESSAGE: &str = "Эта комбинация сейчас не поддерживается OpenSwitcher.";
-const CAPTURE_DEBUG_ENV: &str = "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG";
-const CAPTURE_DEBUG_FILE_ENV: &str = "OPEN_SWITCHER_DAEMON_CAPTURE_DEBUG_FILE";
 pub const CAPTURE_SOFT_LEASE: Duration = Duration::from_secs(10);
 pub const CAPTURE_ABSOLUTE_LEASE: Duration = Duration::from_secs(65);
 
@@ -510,24 +506,6 @@ impl LayoutSwitchCaptureSession {
     }
 }
 
-fn capture_debug_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(CAPTURE_DEBUG_ENV)
-            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-            .unwrap_or(false)
-    })
-}
-
-fn append_capture_debug_line(line: &str) {
-    let path = std::env::var(CAPTURE_DEBUG_FILE_ENV)
-        .unwrap_or_else(|_| "/tmp/open-switcher-daemon-capture.log".to_string());
-
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
 fn log_capture_debug(
     phase: &str,
     raw_key: Option<Key>,
@@ -536,18 +514,18 @@ fn log_capture_debug(
     evaluated: Option<EvaluatedCapture>,
     note: &str,
 ) {
-    if !capture_debug_enabled() {
+    if !debug_enabled(DebugLogKind::Capture) {
         return;
     }
-
-    let evaluation = evaluated.map(|value| value.evaluation);
-    let reason = evaluated.map(|value| value.reason).unwrap_or("-");
-    let line = format!(
-        "[daemon-capture] phase={phase} raw_key={raw_key:?} resolved={resolved_key:?} pressed={:?} evaluation={evaluation:?} reason={reason} note={note}",
-        progress.pressed_keys
-    );
-    eprintln!("{line}");
-    append_capture_debug_line(&line);
+    let _ = try_debug_line(DebugLogKind::Capture, || {
+        let evaluation = evaluated.map(|value| value.evaluation);
+        let reason = evaluated.map(|value| value.reason).unwrap_or("-");
+        let details = format!(
+            "raw_key={raw_key:?} resolved={resolved_key:?} pressed={:?} evaluation={evaluation:?} reason={reason} note={note}",
+            progress.pressed_keys
+        );
+        format_capture(phase, &details)
+    });
 }
 
 fn physical_capture_key_from_evdev(key: Key) -> Option<PhysicalCaptureKey> {

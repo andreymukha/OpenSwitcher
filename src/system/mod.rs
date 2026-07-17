@@ -1,5 +1,6 @@
 pub mod user_services;
 
+use crate::daemon::debug_log::{try_debug_line, DebugLogKind};
 use crate::error::SystemContextError;
 use crate::model::{DesktopEnvironment, DistroKind, SessionType, SystemContext};
 use std::env;
@@ -258,18 +259,9 @@ fn wayland_socket_is_live(path: &Path) -> bool {
 }
 
 fn log_session_detection_summary(summary: &SessionDetectionSummary) {
-    if !session_detection_debug_enabled() {
-        return;
-    }
-
-    eprintln!("[session-detect] {}", summary.log_fields());
-}
-
-fn session_detection_debug_enabled() -> bool {
-    matches!(
-        env::var("OPEN_SWITCHER_LAYOUT_DEBUG").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    let _ = try_debug_line(DebugLogKind::Layout, || {
+        format!("[session-detect] {}", summary.log_fields())
+    });
 }
 
 fn current_session_environment_from_sources(

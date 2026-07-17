@@ -3559,6 +3559,16 @@ fn switch_layout_with_fallback(
     if let Some(switcher) = x11_switcher {
         if let Err(e) = switcher.switch_layout_with_hooks(combo, &hooks) {
             log_input_debug("x11-layout-switcher", &format!("failed: {}", e));
+            if hooks.mutation_was_authorized() {
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=x11 result=error fallback=disabled reason=mutation-authorized",
+                        combo
+                    ),
+                );
+                return Err(e);
+            }
             log_input_debug(
                 "correction-layout-switch",
                 &format!(
@@ -4333,6 +4343,28 @@ mod tests {
         }
     }
 
+    struct MutationAuthorizedFailingLayoutSwitcher {
+        calls: usize,
+    }
+
+    impl LayoutSwitcher for MutationAuthorizedFailingLayoutSwitcher {
+        fn switch_layout(&mut self, _combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+            unreachable!("phase-aware test switcher uses switch_layout_with_hooks")
+        }
+
+        fn switch_layout_with_hooks(
+            &mut self,
+            _combo: LayoutSwitchCombo,
+            hooks: &LayoutSwitchHooks<'_>,
+        ) -> Result<(), SwitcherError> {
+            self.calls += 1;
+            hooks.authorize_mutation()?;
+            Err(SwitcherError::Io(io::Error::other(
+                "ambiguous failure after X11 mutation authorization",
+            )))
+        }
+    }
+
     #[derive(Default)]
     struct FakeCinnamonX11XtestReplay {
         prepare_error: Option<&'static str>,
@@ -5010,6 +5042,30 @@ mod tests {
         assert_eq!(outcome, CorrectionLayoutSwitchOutcome::AppliedUinput);
         assert_eq!(x11.calls, 1);
         assert_eq!(uinput.calls, 1);
+    }
+
+    #[test]
+    fn layout_fallback_does_not_retry_after_x11_mutation_was_authorized() {
+        let mut x11 = MutationAuthorizedFailingLayoutSwitcher { calls: 0 };
+        let mut uinput = FakeLayoutSwitcher {
+            calls: 0,
+            fail: false,
+            cancel_on_switch: None,
+        };
+
+        let error = switch_layout_with_fallback(
+            Some(&mut x11),
+            &mut uinput,
+            LayoutSwitchCombo::super_space(),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ambiguous failure after X11 mutation authorization"));
+        assert_eq!(x11.calls, 1);
+        assert_eq!(uinput.calls, 0);
     }
 
     #[test]

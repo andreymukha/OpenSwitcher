@@ -1,5 +1,6 @@
 use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, SessionType};
+use std::cell::Cell;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +43,7 @@ pub trait LayoutSwitcher {
 pub struct LayoutSwitchHooks<'a> {
     checkpoint: &'a dyn Fn() -> Result<(), SwitcherError>,
     authorize_mutation: &'a dyn Fn() -> Result<(), SwitcherError>,
+    mutation_authorized: Cell<bool>,
 }
 
 impl<'a> LayoutSwitchHooks<'a> {
@@ -52,6 +54,7 @@ impl<'a> LayoutSwitchHooks<'a> {
         Self {
             checkpoint,
             authorize_mutation,
+            mutation_authorized: Cell::new(false),
         }
     }
 
@@ -59,8 +62,14 @@ impl<'a> LayoutSwitchHooks<'a> {
         (self.checkpoint)()
     }
 
-    fn authorize_mutation(&self) -> Result<(), SwitcherError> {
-        (self.authorize_mutation)()
+    pub(crate) fn authorize_mutation(&self) -> Result<(), SwitcherError> {
+        (self.authorize_mutation)()?;
+        self.mutation_authorized.set(true);
+        Ok(())
+    }
+
+    pub(crate) fn mutation_was_authorized(&self) -> bool {
+        self.mutation_authorized.get()
     }
 }
 

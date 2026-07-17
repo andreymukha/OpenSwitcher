@@ -288,11 +288,10 @@ impl OpenSwitcherDbusApi {
 #[dbus_interface(name = "org.oswitch.core")]
 impl OpenSwitcherDbusApi {
     pub fn toggle(&self, #[zbus(signal_context)] ctxt: SignalContext<'_>) -> fdo::Result<()> {
-        let enabled = self
-            .runtime
+        self.runtime
             .toggle_enabled_result()
             .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
-        let layout = self.runtime.current_layout();
+        let (enabled, layout) = self.runtime.last_confirmed_status();
         emit_status_changed_from_context_best_effort("toggle", &ctxt, enabled, layout);
         Ok(())
     }
@@ -315,19 +314,15 @@ impl OpenSwitcherDbusApi {
     ) -> fdo::Result<UpdateSettingsResult> {
         let settings = Settings::try_from(settings)
             .map_err(|err| fdo::Error::from(DbusError::from(SettingsError::from(err))))?;
-        let enabled_before = self.runtime.is_enabled();
+        let (enabled_before, _) = self.runtime.last_confirmed_status();
         let result = self
             .runtime
             .update_settings(settings)
             .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
 
-        if self.runtime.is_enabled() != enabled_before {
-            emit_status_changed_from_context_best_effort(
-                "update-settings",
-                &ctxt,
-                self.runtime.is_enabled(),
-                self.runtime.current_layout(),
-            );
+        let (enabled, layout) = self.runtime.last_confirmed_status();
+        if enabled != enabled_before {
+            emit_status_changed_from_context_best_effort("update-settings", &ctxt, enabled, layout);
         }
 
         Ok(result)
@@ -414,12 +409,12 @@ impl OpenSwitcherDbusApi {
 
     #[dbus_interface(property)]
     pub fn is_enabled(&self) -> bool {
-        self.runtime.is_enabled()
+        self.runtime.last_confirmed_status().0
     }
 
     #[dbus_interface(property)]
     pub fn current_layout(&self) -> bool {
-        self.runtime.current_layout()
+        self.runtime.last_confirmed_status().1
     }
 
     #[dbus_interface(signal)]
@@ -468,8 +463,7 @@ pub fn emit_status_changed(
     connection: &Connection,
     runtime: &RuntimeState,
 ) -> Result<(), DbusError> {
-    let enabled = runtime.is_enabled();
-    let layout = runtime.current_layout();
+    let (enabled, layout) = runtime.last_confirmed_status();
     log_layout_debug(
         "dbus-emit-status",
         &format!(

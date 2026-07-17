@@ -20,7 +20,7 @@ use crate::daemon::switch_logic::{
 };
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::{CaptureError, SwitcherError};
-use crate::layout_backend::{AppLayoutKind, CurrentLayoutState};
+use crate::layout_backend::{legacy_current_layout_bool, AppLayoutKind, CurrentLayoutState};
 use crate::model::{
     HotkeyModifiers, HotkeySpec, LayoutSwitchCaptureState, SessionType, MAX_CORRECTION_KEYSTROKES,
 };
@@ -409,6 +409,10 @@ fn word_boundary_action(
 
 fn should_publish_pending_status_change(has_pending_status_change: bool) -> bool {
     has_pending_status_change
+}
+
+fn status_snapshot_is_publishable(status: InputLayoutStatus) -> bool {
+    matches!(status, InputLayoutStatus::Fresh)
 }
 
 fn auto_layout_correction_supported_for_layout(layout_kind: AppLayoutKind) -> bool {
@@ -2433,8 +2437,23 @@ impl DaemonService {
     }
 
     fn publish_status_changed(&mut self) {
-        let enabled = self.runtime.is_enabled();
-        let layout = self.runtime.current_layout();
+        if !self.adopt_input_snapshot_nonblocking() {
+            self.runtime.defer_pending_status_change();
+            return;
+        }
+        let epoch = self.runtime.input_layout_epoch();
+        let status = self.input_snapshot.layout_status_at(Instant::now(), epoch);
+        if !status_snapshot_is_publishable(status) {
+            let request = self.runtime.request_layout_refresh();
+            self.runtime.defer_pending_status_change();
+            log_layout_debug(
+                "status-signal-deferred",
+                &format!("status={status:?} request={request:?}"),
+            );
+            return;
+        }
+        let enabled = self.input_snapshot.enabled;
+        let layout = legacy_current_layout_bool(&self.input_snapshot.layout_state);
         log_layout_debug(
             "status-signal",
             &format!(
@@ -2447,7 +2466,6 @@ impl DaemonService {
             DbusSignalEvent::StatusChanged { enabled, layout },
             DbusSignalEventKind::StatusChanged,
         );
-        self.runtime.clear_pending_status_change();
     }
 
     fn try_publish_signal_event(
@@ -4593,5 +4611,28 @@ mod pending_snapshot_authorization_tests {
         .unwrap();
 
         assert_eq!(ledger, vec![evdev::Key::KEY_SPACE]);
+    }
+}
+
+#[cfg(test)]
+mod status_snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn provisional_layout_does_not_publish_status() {
+        assert!(!status_snapshot_is_publishable(
+            InputLayoutStatus::AwaitingConfirmation
+        ));
+    }
+
+    #[test]
+    fn stale_or_unknown_layout_does_not_publish_status() {
+        assert!(!status_snapshot_is_publishable(InputLayoutStatus::Stale));
+        assert!(!status_snapshot_is_publishable(InputLayoutStatus::Unknown));
+    }
+
+    #[test]
+    fn confirmed_fresh_layout_publishes_status() {
+        assert!(status_snapshot_is_publishable(InputLayoutStatus::Fresh));
     }
 }

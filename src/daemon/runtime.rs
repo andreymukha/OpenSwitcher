@@ -963,6 +963,53 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn status_snapshot_pending_is_owned_by_published_refresh() {
+        let initial = known_layout_state(english_layout());
+        let expected = known_layout_state(russian_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(expected.clone()),
+            }),
+        );
+
+        assert!(matches!(
+            runtime.sync_with_backend(),
+            BackendSyncResult::Updated { .. }
+        ));
+        assert!(
+            !runtime.take_pending_status_change(),
+            "unpublished runtime cache must not become a status signal source"
+        );
+
+        assert_eq!(
+            runtime.refresh_and_publish_layout(),
+            BackendSyncResult::Unchanged
+        );
+        assert_eq!(runtime.input_snapshot_before_grab().layout_state, expected);
+        assert!(runtime.take_pending_status_change());
+    }
+
+    #[test]
+    fn last_confirmed_status_ignores_provisional_runtime_cache() {
+        let now = Instant::now();
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(russian_layout())),
+            }),
+        );
+        runtime.force_input_confirmation_for_test(now);
+
+        assert!(matches!(
+            runtime.sync_with_backend(),
+            BackendSyncResult::Updated { .. }
+        ));
+
+        assert_eq!(runtime.last_confirmed_status(), (true, true));
+    }
+
+    #[test]
     fn sync_with_backend_reports_unchanged_when_snapshot_matches_cache() {
         let initial = known_layout_state(english_layout());
         let runtime = test_runtime_with_backend(
@@ -1168,11 +1215,11 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn sync_with_backend_marks_status_change_pending_only_for_updates() {
+    fn sync_with_backend_keeps_update_private_until_snapshot_publication() {
         let initial = known_layout_state(english_layout());
         let expected = known_layout_state(russian_layout());
         let runtime = test_runtime_with_backend(
-            initial,
+            initial.clone(),
             Box::new(SnapshotBackend {
                 snapshot: SnapshotOutcome::State(expected),
             }),
@@ -1183,8 +1230,8 @@ undo_key = "Pause"
             runtime.sync_with_backend(),
             BackendSyncResult::Updated { .. }
         ));
-        assert!(runtime.take_pending_status_change());
         assert!(!runtime.take_pending_status_change());
+        assert_eq!(runtime.input_snapshot_before_grab().layout_state, initial);
     }
 
     #[test]
@@ -1754,7 +1801,7 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn refresh_current_layout_observation_updates_runtime_cache_and_pending_status() {
+    fn refresh_current_layout_observation_updates_only_the_runtime_cache() {
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&calls),
@@ -1779,11 +1826,12 @@ undo_key = "Pause"
             runtime.current_layout_state(),
             known_layout_state(english_layout())
         );
-        assert!(runtime.take_pending_status_change());
+        assert!(!runtime.take_pending_status_change());
+        assert_eq!(runtime.last_confirmed_status(), (true, false));
     }
 
     #[test]
-    fn refresh_current_layout_observation_uses_cinnamon_reader_for_cinnamon_x11() {
+    fn refresh_current_layout_observation_uses_cinnamon_reader_without_publishing() {
         let gsettings_calls = Arc::new(AtomicUsize::new(0));
         let cinnamon_calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
@@ -1814,7 +1862,8 @@ undo_key = "Pause"
             runtime.current_layout_state(),
             known_layout_state(russian_layout())
         );
-        assert!(runtime.take_pending_status_change());
+        assert!(!runtime.take_pending_status_change());
+        assert_eq!(runtime.last_confirmed_status(), (true, true));
     }
 
     #[test]
@@ -2023,7 +2072,7 @@ undo_key = "Pause"
             runtime.current_layout_state(),
             known_layout_state(russian_layout())
         );
-        assert!(runtime.take_pending_status_change());
+        assert!(!runtime.take_pending_status_change());
         assert_eq!(reader_calls.load(Ordering::SeqCst), 2);
         assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
     }
@@ -2066,7 +2115,7 @@ undo_key = "Pause"
             runtime.current_layout_state(),
             known_layout_state(russian_layout())
         );
-        assert!(runtime.take_pending_status_change());
+        assert!(!runtime.take_pending_status_change());
     }
 
     #[test]
@@ -3024,6 +3073,14 @@ impl RuntimeState {
         self.input_snapshot.try_load()
     }
 
+    pub(crate) fn last_confirmed_status(&self) -> (bool, bool) {
+        let snapshot = self.input_snapshot.load_for_non_input_consumer();
+        (
+            snapshot.enabled,
+            legacy_current_layout_bool(&snapshot.layout_state),
+        )
+    }
+
     pub(crate) fn input_layout_epoch(&self) -> u64 {
         self.layout_invalidation_epoch.load(Ordering::Acquire)
     }
@@ -3180,7 +3237,6 @@ impl RuntimeState {
         *observation = next_observation;
 
         if previous_effective != next_effective {
-            self.pending_status_change.store(true, Ordering::SeqCst);
             log_layout_debug(
                 "current-layout-effective-state",
                 &format!("reason={reason} previous={previous_effective:?} next={next_effective:?}"),
@@ -3214,7 +3270,6 @@ impl RuntimeState {
             return BackendSyncResult::Unchanged;
         }
 
-        self.pending_status_change.store(true, Ordering::SeqCst);
         log_layout_debug(
             reason,
             &format!("previous={previous_effective:?} next={next_effective:?}"),
@@ -3406,8 +3461,10 @@ impl RuntimeState {
         let layout_state = self.current_layout_state();
         let features = self.feature_availability();
         let session_type = self.session_type();
+        let mut layout_changed = false;
         self.input_snapshot.update(|published| {
-            if published.layout_state != layout_state {
+            layout_changed = published.layout_state != layout_state;
+            if layout_changed {
                 published.layout_generation = published.layout_generation.saturating_add(1);
             }
             published.layout_state = layout_state;
@@ -3416,10 +3473,17 @@ impl RuntimeState {
             published.confirmed_layout_epoch = confirmed_layout_epoch;
             published.confirmed_at = Some(confirmed_at);
         });
+        if layout_changed {
+            self.pending_status_change.store(true, Ordering::Release);
+        }
     }
 
     pub fn take_pending_status_change(&self) -> bool {
         self.pending_status_change.swap(false, Ordering::SeqCst)
+    }
+
+    pub(crate) fn defer_pending_status_change(&self) {
+        self.pending_status_change.store(true, Ordering::Release);
     }
 
     pub fn clear_pending_status_change(&self) {

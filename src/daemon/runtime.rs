@@ -200,25 +200,26 @@ impl ConfigService {
     fn apply_detected_layout_switch_runtime(
         &self,
         detected: LayoutSwitchSetting,
-    ) -> Result<bool, SettingsError> {
+    ) -> Result<Option<RuntimeConfigSnapshot>, SettingsError> {
         let mut config = self
             .inner
             .write()
             .map_err(|_| SettingsError::LockPoisoned)?;
 
         if !should_redetect_layout_switch_after_context_upgrade(&config) {
-            return Ok(false);
+            return Ok(None);
         }
 
         if runtime_layout_switch_redetect_would_downgrade(config.settings().layout_switch, detected)
         {
-            return Ok(false);
+            return Ok(None);
         }
 
-        Ok(apply_detected_layout_switch_if_changed(
-            &mut config,
-            detected,
-        ))
+        if !apply_detected_layout_switch_if_changed(&mut config, detected) {
+            return Ok(None);
+        }
+
+        Ok(Some(RuntimeConfigSnapshot::from(&*config)))
     }
 
     fn should_redetect_layout_switch_after_context_upgrade(&self) -> Result<bool, SettingsError> {
@@ -2264,7 +2265,7 @@ undo_key = "Pause"
                 distro: DistroKind::Ubuntu,
             },
         );
-
+        let published_before = runtime.input_snapshot_before_grab();
         let _ = runtime.periodic_sync_tick_with(&reader, &detector);
 
         assert_eq!(runtime.system_context(), gnome_wayland_context());
@@ -2275,6 +2276,15 @@ undo_key = "Pause"
                 source: LayoutSwitchSource::Manual,
                 auto_detected: AutoDetectedLayoutSwitch::default(),
             }
+        );
+        let published_after = runtime.input_snapshot_before_grab();
+        assert_eq!(
+            published_after.config.layout_switch_combo,
+            LayoutSwitchCombo::caps_lock()
+        );
+        assert_eq!(
+            published_after.config_generation,
+            published_before.config_generation
         );
         assert_eq!(detector_calls.load(Ordering::SeqCst), 1);
     }
@@ -2310,7 +2320,7 @@ undo_key = "Pause"
                 distro: DistroKind::Ubuntu,
             },
         );
-
+        let published_before = runtime.input_snapshot_before_grab();
         let _ = runtime.periodic_sync_tick_with(&reader, &detector);
 
         assert_eq!(runtime.system_context(), gnome_wayland_context());
@@ -2325,6 +2335,15 @@ undo_key = "Pause"
                     context: gnome_wayland_context(),
                 },
             }
+        );
+        let published_after = runtime.input_snapshot_before_grab();
+        assert_eq!(
+            published_after.config.layout_switch_combo,
+            LayoutSwitchCombo::super_space()
+        );
+        assert_eq!(
+            published_after.config_generation,
+            published_before.config_generation + 1
         );
         assert_eq!(reader_calls.load(Ordering::SeqCst), 3);
     }
@@ -3385,7 +3404,7 @@ impl RuntimeState {
 
     // Layout backend sync
 
-    pub fn sync_with_backend(&self) -> BackendSyncResult {
+    fn sync_with_backend(&self) -> BackendSyncResult {
         let snapshot = {
             let mut backend_guard = self
                 .backend
@@ -3407,7 +3426,7 @@ impl RuntimeState {
         self.update_current_layout_cache(snapshot, "backend-sync-update")
     }
 
-    pub fn periodic_sync_tick(&self) -> BackendSyncResult {
+    fn periodic_sync_tick(&self) -> BackendSyncResult {
         self.periodic_sync_tick_with_readers(
             &CommandDesktopSettingsReader,
             &SystemContextDetector,
@@ -3598,14 +3617,18 @@ impl RuntimeState {
     ) -> Result<UpdateSettingsResult, SettingsError> {
         let result = self.config_service.update_settings(settings)?;
         let snapshot = self.config_service.snapshot()?;
-        self.enabled
-            .store(settings.auto_switch_enabled, Ordering::SeqCst);
+        self.publish_committed_config(snapshot);
+        Ok(result)
+    }
+
+    fn publish_committed_config(&self, snapshot: RuntimeConfigSnapshot) {
+        let enabled = snapshot.auto_switch_enabled;
+        self.enabled.store(enabled, Ordering::SeqCst);
         self.input_snapshot.update(|published| {
             published.config = snapshot;
-            published.enabled = settings.auto_switch_enabled;
+            published.enabled = enabled;
             published.config_generation = published.config_generation.saturating_add(1);
         });
-        Ok(result)
     }
 
     pub fn config_snapshot(&self) -> Result<RuntimeConfigSnapshot, SettingsError> {
@@ -3779,7 +3802,7 @@ impl RuntimeState {
 
     // GNOME Wayland observation
 
-    pub(crate) fn refresh_current_layout_observation(&self) {
+    fn refresh_current_layout_observation(&self) {
         self.refresh_current_layout_observation_with_readers(
             &CommandDesktopSettingsReader,
             &CommandCinnamonInputSourceReader,
@@ -3888,15 +3911,22 @@ impl RuntimeState {
         let detector = LayoutSwitchAutoDetector::with_reader(reader);
         let detected = detect_layout_switch_setting(context, &detector);
 
+        let _gate = self
+            .settings_update_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         match self
             .config_service
             .apply_detected_layout_switch_runtime(detected)
         {
-            Ok(true) => log_layout_debug(
-                "layout-switch-redetect",
-                &format!("context={context:?} result=applied setting={detected:?}"),
-            ),
-            Ok(false) => log_layout_debug(
+            Ok(Some(snapshot)) => {
+                self.publish_committed_config(snapshot);
+                log_layout_debug(
+                    "layout-switch-redetect",
+                    &format!("context={context:?} result=applied setting={detected:?}"),
+                );
+            }
+            Ok(None) => log_layout_debug(
                 "layout-switch-redetect",
                 &format!("context={context:?} result=unchanged-or-manual"),
             ),

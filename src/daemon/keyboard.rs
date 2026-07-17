@@ -142,6 +142,44 @@ struct PendingManualCurrentWordTransaction {
     completion: Option<ManualCurrentWordCompletion>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static DEFERRED_POLL_BEFORE_PENDING_ACTIVE_CHECK_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static DEFERRED_HEALTH_BEFORE_HANDLE_CHECK_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn install_deferred_poll_before_pending_active_check_hook(hook: impl FnOnce() + 'static) {
+    DEFERRED_POLL_BEFORE_PENDING_ACTIVE_CHECK_HOOK.with(|slot| {
+        assert!(slot.replace(Some(Box::new(hook))).is_none());
+    });
+}
+
+#[cfg(test)]
+fn run_deferred_poll_before_pending_active_check_hook() {
+    let hook = DEFERRED_POLL_BEFORE_PENDING_ACTIVE_CHECK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn install_deferred_health_before_handle_check_hook(hook: impl FnOnce() + 'static) {
+    DEFERRED_HEALTH_BEFORE_HANDLE_CHECK_HOOK.with(|slot| {
+        assert!(slot.replace(Some(Box::new(hook))).is_none());
+    });
+}
+
+#[cfg(test)]
+fn run_deferred_health_before_handle_check_hook() {
+    let hook = DEFERRED_HEALTH_BEFORE_HANDLE_CHECK_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 enum WriterCommand {
     Shutdown,
     Fast(WriterFastCommand),
@@ -307,6 +345,9 @@ impl WriterTransactionControl {
     }
 
     fn try_mark_timed_out_while_terminal_gate_is_held(&self) -> bool {
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return false;
+        }
         if self
             .state
             .compare_exchange(
@@ -331,7 +372,7 @@ impl WriterTransactionControl {
 
     fn mark_timed_out(&self) -> SwitcherError {
         let _ = self.try_mark_timed_out();
-        self.timed_out_error()
+        self.cancellation_error()
     }
 
     fn publish_completed(&self) -> bool {
@@ -1595,47 +1636,86 @@ impl VirtualKeyboardWriter {
             pending.completion = Some(completion);
         }
 
-        match pending.control.state() {
-            WriterTransactionState::Pending => {
-                pending.control.ensure_active()?;
-                if completion_channel_disconnected {
-                    return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+        loop {
+            match pending.control.state() {
+                WriterTransactionState::Pending => {
+                    #[cfg(test)]
+                    run_deferred_poll_before_pending_active_check_hook();
+                    if let Err(error) = pending.control.ensure_active() {
+                        if pending.control.state() == WriterTransactionState::Completed {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    if completion_channel_disconnected {
+                        if pending.control.state() == WriterTransactionState::Completed {
+                            continue;
+                        }
+                        return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+                    }
+                    let health_error = self.handle.health_error();
+                    match pending.control.state() {
+                        WriterTransactionState::Completed => continue,
+                        WriterTransactionState::TimedOut => {
+                            return Err(pending.control.timed_out_error());
+                        }
+                        WriterTransactionState::Pending => {}
+                    }
+                    return match health_error {
+                        Some(error) => Err(error),
+                        None => Ok(None),
+                    };
                 }
-                self.handle.ensure_alive()?;
-                Ok(None)
-            }
-            WriterTransactionState::TimedOut => Err(pending.control.timed_out_error()),
-            WriterTransactionState::Completed => {
-                let completion = match pending.completion.take() {
-                    Some(completion) => completion,
-                    None => self
-                        .completion_rx
-                        .try_recv()
-                        .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?,
-                };
-                if completion.request_id != pending.control.request_id() {
-                    return Err(SwitcherError::Io(io::Error::other(format!(
-                        "deferred completion request mismatch: pending={} received={}",
-                        pending.control.request_id(),
-                        completion.request_id,
-                    ))));
+                WriterTransactionState::TimedOut => {
+                    return Err(pending.control.timed_out_error());
                 }
-                self.pending_manual_current_word = None;
-                Ok(Some(completion))
+                WriterTransactionState::Completed => {
+                    let completion = match pending.completion.take() {
+                        Some(completion) => completion,
+                        None => self
+                            .completion_rx
+                            .try_recv()
+                            .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)?,
+                    };
+                    if completion.request_id != pending.control.request_id() {
+                        return Err(SwitcherError::Io(io::Error::other(format!(
+                            "deferred completion request mismatch: pending={} received={}",
+                            pending.control.request_id(),
+                            completion.request_id,
+                        ))));
+                    }
+                    self.pending_manual_current_word = None;
+                    return Ok(Some(completion));
+                }
             }
         }
     }
 
     fn health_error(&self) -> Option<SwitcherError> {
         if let Some(pending) = self.pending_manual_current_word.as_ref() {
-            match pending.control.state() {
-                WriterTransactionState::Completed => return None,
-                WriterTransactionState::TimedOut => {
-                    return Some(pending.control.timed_out_error());
-                }
-                WriterTransactionState::Pending => {
-                    if let Err(error) = pending.control.ensure_active() {
-                        return Some(error);
+            loop {
+                match pending.control.state() {
+                    WriterTransactionState::Completed => return None,
+                    WriterTransactionState::TimedOut => {
+                        return Some(pending.control.timed_out_error());
+                    }
+                    WriterTransactionState::Pending => {
+                        if let Err(error) = pending.control.ensure_active() {
+                            if pending.control.state() == WriterTransactionState::Completed {
+                                continue;
+                            }
+                            return Some(error);
+                        }
+                        #[cfg(test)]
+                        run_deferred_health_before_handle_check_hook();
+                        let health_error = self.handle.health_error();
+                        match pending.control.state() {
+                            WriterTransactionState::Completed => continue,
+                            WriterTransactionState::TimedOut => {
+                                return Some(pending.control.timed_out_error());
+                            }
+                            WriterTransactionState::Pending => return health_error,
+                        }
                     }
                 }
             }
@@ -5812,6 +5892,36 @@ mod tests {
     }
 
     #[test]
+    fn writer_stop_published_before_timeout_attempt_wins_without_poisoning_failure() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_writer_state(
+            110,
+            Duration::from_secs(1),
+            Arc::clone(&failure),
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+        {
+            let _terminal_guard = terminal_gate.lock().unwrap();
+            stop_requested.store(true, Ordering::SeqCst);
+        }
+
+        let error = control.mark_timed_out();
+
+        assert_eq!(
+            (
+                control.state(),
+                failure.load(Ordering::SeqCst),
+                matches!(error, SwitcherError::VirtualKeyboardWriterDisconnected),
+            ),
+            (WriterTransactionState::Pending, 0, true),
+            "stop that linearized first must remain the terminal outcome"
+        );
+    }
+
+    #[test]
     fn writer_failure_circuit_breaker_stops_next_mutation_after_timeout() {
         let failure = Arc::new(AtomicU64::new(0));
         let timed_out =
@@ -6414,6 +6524,139 @@ mod tests {
             .expect("published completion should be visible");
         assert_eq!(completion.request_id, request_id);
         assert!(writer.pending_manual_current_word.is_none());
+    }
+
+    #[test]
+    fn deferred_poll_accepts_completion_published_after_pending_state_snapshot() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let plan = CorrectionPlan {
+            buffer: Vec::new(),
+            extra_backspaces: 0,
+        };
+        let request_id = match writer
+            .begin_manual_current_word_correction(
+                plan.clone(),
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .unwrap()
+        {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            other => panic!("expected deferred command, got {other:?}"),
+        };
+        let control = match command_rx.recv().unwrap() {
+            WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => control,
+            _ => panic!("expected deferred correction command"),
+        };
+        let expected = ManualCurrentWordCompletion {
+            request_id,
+            outcome: ManualCurrentWordOutcome::Succeeded(plan),
+        };
+        completion_tx.send(expected.clone()).unwrap();
+
+        let (pending_observed_tx, pending_observed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let poller = thread::spawn(move || {
+            install_deferred_poll_before_pending_active_check_hook(move || {
+                pending_observed_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            writer.poll_manual_current_word_completion()
+        });
+
+        pending_observed_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("poll must pause after observing Pending");
+        assert!(control.publish_completed());
+        resume_tx.send(()).unwrap();
+
+        let completion = poller
+            .join()
+            .expect("poll thread should finish")
+            .expect("published completion must not become an active-state error");
+        assert_eq!(completion, Some(expected));
+    }
+
+    #[test]
+    fn deferred_completed_result_wins_over_concurrent_writer_death_health() {
+        let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let alive = Arc::new(AtomicBool::new(true));
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::clone(&alive),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: None,
+            completion_rx,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        let plan = CorrectionPlan {
+            buffer: Vec::new(),
+            extra_backspaces: 0,
+        };
+        let request_id = match writer
+            .begin_manual_current_word_correction(
+                plan.clone(),
+                test_runtime_config_snapshot(),
+                ModifierState::default(),
+            )
+            .unwrap()
+        {
+            ManualCurrentWordStartOutcome::Started(request_id) => request_id,
+            other => panic!("expected deferred command, got {other:?}"),
+        };
+        let control = match command_rx.recv().unwrap() {
+            WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => control,
+            _ => panic!("expected deferred correction command"),
+        };
+
+        let (pending_checked_tx, pending_checked_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let health_checker = thread::spawn(move || {
+            install_deferred_health_before_handle_check_hook(move || {
+                pending_checked_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            });
+            writer.health_error()
+        });
+
+        pending_checked_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("health check must pause after validating Pending");
+        completion_tx
+            .send(ManualCurrentWordCompletion {
+                request_id,
+                outcome: ManualCurrentWordOutcome::Succeeded(plan),
+            })
+            .unwrap();
+        assert!(control.publish_completed());
+        alive.store(false, Ordering::SeqCst);
+        resume_tx.send(()).unwrap();
+
+        let health_error = health_checker.join().expect("health thread should finish");
+        assert!(
+            health_error.is_none(),
+            "valid Completed must win over the writer-dead health observed afterward"
+        );
     }
 
     #[test]

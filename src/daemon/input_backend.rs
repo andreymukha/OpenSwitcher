@@ -40,6 +40,7 @@ pub trait InputBackendOpener {
 pub struct ActiveInputBackend {
     pub keyboard: KeyboardController,
     pub selected_text_runner: SelectedTextJobRunner,
+    pub initial_caps_lock_active: bool,
 }
 
 impl InputBackendHandle for ActiveInputBackend {
@@ -51,6 +52,16 @@ impl InputBackendHandle for ActiveInputBackend {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyboardInputBackendOpener;
 
+fn finish_prepared_input_backend<Prepared, Active, Dependent, Error>(
+    prepared: Prepared,
+    prepare_dependent: impl FnOnce(&Prepared) -> Result<Dependent, Error>,
+    activate: impl FnOnce(Prepared, &Dependent) -> Result<Active, Error>,
+) -> Result<(Active, Dependent), Error> {
+    let dependent = prepare_dependent(&prepared)?;
+    let active = activate(prepared, &dependent)?;
+    Ok((active, dependent))
+}
+
 impl InputBackendOpener for KeyboardInputBackendOpener {
     type Backend = ActiveInputBackend;
 
@@ -58,15 +69,31 @@ impl InputBackendOpener for KeyboardInputBackendOpener {
         &self,
         shared_modifiers: SharedModifierState,
     ) -> Result<OpenedInputBackend<Self::Backend>, SwitcherError> {
-        let keyboard = KeyboardController::open()?;
+        let prepared_keyboard = KeyboardController::prepare()?;
+        let ((mut keyboard, initial_caps_lock_active), selected_text_runner) =
+            finish_prepared_input_backend(
+                prepared_keyboard,
+                |keyboard| {
+                    SelectedTextJobRunner::new(
+                        keyboard.selection_transport(shared_modifiers.clone()),
+                    )
+                },
+                |keyboard, selected_text_runner| {
+                    selected_text_runner.ensure_ready()?;
+                    keyboard.activate()
+                },
+            )?;
+        if let Err(error) = selected_text_runner.ensure_ready() {
+            keyboard.shutdown();
+            return Err(error);
+        }
         let readiness = keyboard.readiness();
-        let selected_text_runner =
-            SelectedTextJobRunner::new(keyboard.selection_transport(shared_modifiers))?;
 
         Ok(OpenedInputBackend {
             backend: ActiveInputBackend {
                 keyboard,
                 selected_text_runner,
+                initial_caps_lock_active,
             },
             readiness,
         })
@@ -174,18 +201,11 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
         match self.opener.reopen_backend(shared_modifiers) {
             Ok(mut opened) => {
                 if opened.readiness.is_ready() {
-                    log_input_debug(
-                        "input-backend-transition",
-                        &format!(
-                            "phase={phase} previous_state={:?} next_state={:?} result=applied",
-                            self.state,
-                            InputBackendState::Ready,
-                        ),
-                    );
                     self.transition_to_ready();
                     return Ok(Some(opened));
                 }
 
+                opened.backend.shutdown();
                 log_input_debug(
                     "input-backend-transition",
                     &format!(
@@ -195,7 +215,6 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
                         opened.readiness,
                     ),
                 );
-                opened.backend.shutdown();
                 self.schedule_retry_with_reason(
                     "input backend readiness incomplete".to_string(),
                     now,
@@ -351,6 +370,82 @@ mod tests {
             watchers_ready: true,
             event_processing_ready: true,
         }
+    }
+
+    #[test]
+    fn dependent_workers_are_prepared_before_physical_grab() {
+        let phases = Rc::new(RefCell::new(vec!["keyboard-prepared"]));
+        let dependent_phases = Rc::clone(&phases);
+        let grab_phases = Rc::clone(&phases);
+
+        let (keyboard, dependent) = finish_prepared_input_backend(
+            "prepared-keyboard",
+            move |_| {
+                dependent_phases.borrow_mut().push("dependent-prepared");
+                Ok::<_, SwitcherError>("selected-text-worker")
+            },
+            move |keyboard, _| {
+                grab_phases.borrow_mut().push("grab");
+                Ok::<_, SwitcherError>(format!("{keyboard}-active"))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(keyboard, "prepared-keyboard-active");
+        assert_eq!(dependent, "selected-text-worker");
+        assert_eq!(
+            *phases.borrow(),
+            vec!["keyboard-prepared", "dependent-prepared", "grab"]
+        );
+    }
+
+    #[test]
+    fn dependent_worker_failure_never_attempts_physical_grab() {
+        let grab_attempted = Rc::new(RefCell::new(false));
+        let observed_grab_attempt = Rc::clone(&grab_attempted);
+
+        let result: Result<((), ()), SwitcherError> = finish_prepared_input_backend(
+            "prepared-keyboard",
+            |_| Err(SwitcherError::SelectedTextWorkerDisconnected),
+            move |_, _| {
+                *observed_grab_attempt.borrow_mut() = true;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::SelectedTextWorkerDisconnected)
+        ));
+        assert!(!*grab_attempted.borrow());
+    }
+
+    #[test]
+    fn dependent_worker_death_before_activation_never_attempts_physical_grab() {
+        let grab_attempted = Rc::new(RefCell::new(false));
+        let observed_grab_attempt = Rc::clone(&grab_attempted);
+
+        let result: Result<((), bool), SwitcherError> = finish_prepared_input_backend(
+            "prepared-keyboard",
+            |_| Ok(false),
+            move |_, dependent_alive| {
+                if !*dependent_alive {
+                    return Err(SwitcherError::InputWorkerDisconnected {
+                        worker: "selected-text-worker",
+                    });
+                }
+                *observed_grab_attempt.borrow_mut() = true;
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputWorkerDisconnected {
+                worker: "selected-text-worker"
+            })
+        ));
+        assert!(!*grab_attempted.borrow());
     }
 
     // Retry scheduling helpers

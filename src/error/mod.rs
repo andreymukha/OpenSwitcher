@@ -106,10 +106,21 @@ pub enum SwitcherError {
     SelectedText(#[from] SelectedTextError),
     #[error("Selected text worker thread is unavailable")]
     SelectedTextWorkerDisconnected,
+    #[error("Input worker {worker} is unavailable")]
+    InputWorkerDisconnected { worker: &'static str },
+    #[error("Input worker {worker} did not become ready within {timeout_ms} ms")]
+    InputWorkerStartupTimedOut {
+        worker: &'static str,
+        timeout_ms: u64,
+    },
+    #[error("Cannot install a newly grabbed input backend while another backend is active")]
+    InputBackendAlreadyActive,
     #[error("Daemon input loop panicked")]
     DaemonPanicked,
     #[error("Virtual keyboard writer is unavailable")]
     VirtualKeyboardWriterDisconnected,
+    #[error("Virtual keyboard writer did not become ready within {timeout_ms} ms")]
+    VirtualKeyboardWriterStartupTimedOut { timeout_ms: u64 },
     #[error("Virtual keyboard writer queue is saturated")]
     VirtualKeyboardWriterSaturated,
     #[error("Virtual keyboard writer transaction {request_id} exceeded its deadline")]
@@ -188,7 +199,8 @@ impl SwitcherError {
         match self {
             SwitcherError::KeyboardNotFound
             | SwitcherError::KeyboardAccessDenied { .. }
-            | SwitcherError::UinputAccessDenied { .. } => true,
+            | SwitcherError::UinputAccessDenied { .. }
+            | SwitcherError::InputWorkerDisconnected { .. } => true,
             SwitcherError::Io(error) => {
                 matches!(error.raw_os_error(), Some(19))
                     || error.to_string().contains("No such device")
@@ -245,6 +257,20 @@ mod tests {
         let error = SwitcherError::Io(std::io::Error::other("boom"));
 
         assert!(!error.is_recoverable_input_error());
+    }
+
+    #[test]
+    fn disconnected_worker_is_recoverable_but_startup_timeout_requires_process_restart() {
+        let disconnected = SwitcherError::InputWorkerDisconnected {
+            worker: "pointer-watcher",
+        };
+        let timed_out = SwitcherError::InputWorkerStartupTimedOut {
+            worker: "input-target-watcher",
+            timeout_ms: 5_000,
+        };
+
+        assert!(disconnected.is_recoverable_input_error());
+        assert!(!timed_out.is_recoverable_input_error());
     }
 
     #[test]

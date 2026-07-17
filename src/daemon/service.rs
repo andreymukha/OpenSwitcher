@@ -1,6 +1,7 @@
 use crate::daemon::capture::CaptureEventDisposition;
 use crate::daemon::input_backend::{
-    ActiveInputBackend, InputBackendLifecycle, KeyboardInputBackendOpener, OpenedInputBackend,
+    ActiveInputBackend, InputBackendHandle, InputBackendLifecycle, KeyboardInputBackendOpener,
+    OpenedInputBackend,
 };
 use crate::daemon::keyboard::{
     hotkey_trigger_to_evdev_key, is_character, is_modifier, is_wayland_focus_switch_shortcut,
@@ -221,6 +222,18 @@ where
 
     shutdown_backend();
     state_change
+}
+
+fn admit_input_backend_install<Backend>(
+    mut backend: Backend,
+    slot_occupied: bool,
+    release_backend: impl FnOnce(&mut Backend),
+) -> Result<Backend, SwitcherError> {
+    if slot_occupied {
+        release_backend(&mut backend);
+        return Err(SwitcherError::InputBackendAlreadyActive);
+    }
+    Ok(backend)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -873,12 +886,12 @@ impl DaemonService {
             startup_layout_resync: StartupLayoutResyncState::pending(),
             dbus_signal_drop_counters: DbusSignalDropCounters::default(),
         };
+        log_input_debug("event-loop-start", "daemon input loop starting");
         service.try_initialize_input_backend()?;
         Ok(service)
     }
 
     pub fn run(&mut self) -> Result<(), SwitcherError> {
-        log_input_debug("event-loop-start", "daemon input loop started");
         let mut processed_events = 0u64;
         let mut last_heartbeat = Instant::now();
 
@@ -2456,7 +2469,7 @@ impl DaemonService {
             .input_backend
             .initialize(self.shared_modifiers.clone(), Instant::now())?
         {
-            self.install_opened_input_backend(opened);
+            self.install_opened_input_backend(opened)?;
         }
         Ok(())
     }
@@ -2466,24 +2479,32 @@ impl DaemonService {
             .input_backend
             .try_recover(self.shared_modifiers.clone(), Instant::now())?
         {
-            self.install_opened_input_backend(opened);
+            self.install_opened_input_backend(opened)?;
         }
         Ok(())
     }
 
-    fn install_opened_input_backend(&mut self, opened: OpenedInputBackend<ActiveInputBackend>) {
-        self.drop_active_input_backend();
-
+    fn install_opened_input_backend(
+        &mut self,
+        opened: OpenedInputBackend<ActiveInputBackend>,
+    ) -> Result<(), SwitcherError> {
+        let backend = admit_input_backend_install(
+            opened.backend,
+            self.keyboard.is_some() || self.selected_text_runner.is_some(),
+            InputBackendHandle::shutdown,
+        )?;
         let ActiveInputBackend {
             keyboard,
             selected_text_runner,
-        } = opened.backend;
+            initial_caps_lock_active,
+        } = backend;
         let mut modifiers = ModifierState::default();
-        modifiers.set_caps_lock_active(keyboard.caps_lock_active());
+        modifiers.set_caps_lock_active(initial_caps_lock_active);
         self.modifiers = modifiers;
         self.shared_modifiers.store(self.modifiers);
         self.keyboard = Some(keyboard);
         self.selected_text_runner = Some(selected_text_runner);
+        Ok(())
     }
 
     fn handle_runtime_input_failure(&mut self, error: &SwitcherError) -> bool {
@@ -2851,6 +2872,21 @@ mod tests {
 
         assert_eq!(shutdown_count, 1);
         assert_eq!(state_change, Some(cancelled));
+    }
+
+    #[test]
+    fn occupied_install_slot_releases_new_grab_before_rejecting_backend() {
+        let mut phases = Vec::new();
+
+        let result = admit_input_backend_install("new-backend", true, |backend| {
+            phases.push(format!("release-{backend}"));
+        });
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputBackendAlreadyActive)
+        ));
+        assert_eq!(phases, vec!["release-new-backend"]);
     }
 
     #[test]

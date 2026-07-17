@@ -42,6 +42,8 @@ const TRANSACTION_BACKEND_GRACE: Duration = Duration::from_secs(1);
 const MAX_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const SHORTCUT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1);
 const TRANSACTION_SLEEP_QUANTUM: Duration = Duration::from_millis(5);
+const WRITER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const INPUT_WORKER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const SHUTDOWN_JOIN_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
@@ -109,6 +111,10 @@ pub struct KeyboardController {
     pointer_watcher: PointerWatcher,
     input_target_watcher: InputTargetWatcher,
     virtual_device: VirtualKeyboardWriter,
+}
+
+pub struct PreparedKeyboardController {
+    controller: KeyboardController,
 }
 
 // Selection keyboard transport
@@ -812,34 +818,140 @@ impl ModifierState {
 
 // Keyboard controller
 
+fn publish_writer_ready(
+    alive: &AtomicBool,
+    ready_tx: mpsc::SyncSender<()>,
+) -> Result<(), SwitcherError> {
+    alive.store(true, Ordering::SeqCst);
+    if ready_tx.send(()).is_err() {
+        alive.store(false, Ordering::SeqCst);
+        return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+    }
+    Ok(())
+}
+
+fn wait_for_writer_startup_ready(
+    ready_rx: &mpsc::Receiver<()>,
+    timeout: Duration,
+) -> Result<(), SwitcherError> {
+    match ready_rx.recv_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(SwitcherError::VirtualKeyboardWriterStartupTimedOut {
+                timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+            })
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        }
+    }
+}
+
+fn publish_input_worker_ready(
+    alive: &AtomicBool,
+    ready_tx: mpsc::SyncSender<()>,
+    worker: &'static str,
+) -> Result<(), SwitcherError> {
+    alive.store(true, Ordering::SeqCst);
+    if ready_tx.send(()).is_err() {
+        alive.store(false, Ordering::SeqCst);
+        return Err(SwitcherError::InputWorkerDisconnected { worker });
+    }
+    Ok(())
+}
+
+fn wait_for_input_worker_startup_ready(
+    ready_rx: &mpsc::Receiver<()>,
+    worker: &'static str,
+    timeout: Duration,
+) -> Result<(), SwitcherError> {
+    match ready_rx.recv_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(SwitcherError::InputWorkerStartupTimedOut {
+            worker,
+            timeout_ms: timeout.as_millis().min(u128::from(u64::MAX)) as u64,
+        }),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(SwitcherError::InputWorkerDisconnected { worker })
+        }
+    }
+}
+
+fn run_input_worker_poll_loop(
+    stop_requested: &AtomicBool,
+    worker: &'static str,
+    on_ready: impl FnOnce() -> Result<(), SwitcherError>,
+    mut poll_once: impl FnMut() -> bool,
+) -> Result<(), SwitcherError> {
+    if stop_requested.load(Ordering::SeqCst) {
+        return Err(SwitcherError::InputWorkerDisconnected { worker });
+    }
+    on_ready()?;
+    while !stop_requested.load(Ordering::SeqCst) {
+        if !poll_once() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_input_dependencies_ready(
+    writer_ready: bool,
+    pointer_watcher_ready: bool,
+    input_target_watcher_ready: bool,
+) -> Result<(), SwitcherError> {
+    if !writer_ready {
+        return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+    }
+    if !pointer_watcher_ready {
+        return Err(SwitcherError::InputWorkerDisconnected {
+            worker: "pointer-watcher",
+        });
+    }
+    if !input_target_watcher_ready {
+        return Err(SwitcherError::InputWorkerDisconnected {
+            worker: "input-target-watcher",
+        });
+    }
+    Ok(())
+}
+
+fn snapshot_then_acquire_grab<Target, Snapshot, Error>(
+    target: &mut Target,
+    snapshot: impl FnOnce(&mut Target) -> Result<Snapshot, Error>,
+    acquire_grab: impl FnOnce(&mut Target) -> Result<(), Error>,
+) -> Result<Snapshot, Error> {
+    let snapshot = snapshot(target)?;
+    acquire_grab(target)?;
+    Ok(snapshot)
+}
+
 impl KeyboardController {
-    pub fn open() -> Result<Self, SwitcherError> {
+    pub fn prepare() -> Result<PreparedKeyboardController, SwitcherError> {
         let keyboard_path = resolve_keyboard_path()?;
         let pointer_paths = find_pointer_devices(&keyboard_path);
-        let mut real_device = GrabbedKeyboardDevice::open(keyboard_path)?;
+        let real_device = GrabbedKeyboardDevice::open(keyboard_path)?;
         println!(
             "[INFO] Клавиатура: {}",
             real_device.name().unwrap_or("Unknown")
         );
-        thread::sleep(Duration::from_secs(1));
-        real_device.grab()?;
-
-        let virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
-        let pointer_watcher = PointerWatcher::spawn(pointer_paths);
         let session_type = detect_current_session_type();
-        let input_target_watcher = InputTargetWatcher::spawn(session_type);
-
-        println!("[OK] Open-Switcher запущен.");
+        let virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
+        let pointer_watcher = PointerWatcher::spawn(pointer_paths)?;
+        let input_target_watcher = InputTargetWatcher::spawn(session_type)?;
         log_input_debug(
-            "grab-acquired",
-            "keyboard grab established at controller startup",
+            "input-pipeline-prepared",
+            "writer and watchers prepared before physical keyboard grab",
         );
+        println!("[OK] Open-Switcher подготовлен к безопасному захвату клавиатуры.");
 
-        Ok(Self {
-            real_device,
-            pointer_watcher,
-            input_target_watcher,
-            virtual_device,
+        Ok(PreparedKeyboardController {
+            controller: Self {
+                real_device,
+                pointer_watcher,
+                input_target_watcher,
+                virtual_device,
+            },
         })
     }
 
@@ -957,10 +1069,6 @@ impl KeyboardController {
         self.virtual_device.health_error()
     }
 
-    pub fn caps_lock_active(&self) -> bool {
-        self.real_device.caps_lock_active().unwrap_or(false)
-    }
-
     pub fn readiness(&self) -> InputBackendReadiness {
         let keyboard_open = self.real_device.is_ready();
         let writer_ready = self.virtual_device.handle().is_alive();
@@ -973,6 +1081,29 @@ impl KeyboardController {
             watchers_ready,
             event_processing_ready: keyboard_open && writer_ready && watchers_ready,
         }
+    }
+}
+
+impl PreparedKeyboardController {
+    pub fn selection_transport(
+        &self,
+        modifiers: SharedModifierState,
+    ) -> SelectionKeyboardTransport {
+        self.controller.selection_transport(modifiers)
+    }
+
+    pub fn activate(mut self) -> Result<(KeyboardController, bool), SwitcherError> {
+        ensure_input_dependencies_ready(
+            self.controller.virtual_device.handle().is_alive(),
+            self.controller.pointer_watcher.is_ready(),
+            self.controller.input_target_watcher.is_ready(),
+        )?;
+        let caps_lock_active = snapshot_then_acquire_grab(
+            &mut self.controller.real_device,
+            |device| Ok::<_, SwitcherError>(device.caps_lock_active().unwrap_or(false)),
+            GrabbedKeyboardDevice::grab,
+        )?;
+        Ok((self.controller, caps_lock_active))
     }
 }
 
@@ -1075,98 +1206,131 @@ impl Drop for GrabbedKeyboardDevice {
 // Pointer watcher
 
 impl PointerWatcher {
-    fn spawn(paths: Vec<PathBuf>) -> Self {
+    fn spawn(paths: Vec<PathBuf>) -> Result<Self, SwitcherError> {
         let click_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
 
         if paths.is_empty() {
             log_input_debug("pointer-watcher-start", "devices=0 mode=disabled");
-            return Self {
+            return Ok(Self {
                 click_flag,
                 stop_flag,
                 alive,
                 required: false,
                 handle: None,
-            };
+            });
         }
 
+        let devices = open_pointer_devices(paths);
+        if devices.is_empty() {
+            log_input_debug(
+                "pointer-watcher-start",
+                "devices=0 mode=disabled reason=no-readable-pointer-devices",
+            );
+            return Ok(Self {
+                click_flag,
+                stop_flag,
+                alive,
+                required: false,
+                handle: None,
+            });
+        }
+
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let worker_click_flag = Arc::clone(&click_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
-            let _alive_guard = WorkerAliveGuard::new(worker_alive);
-            let mut devices = open_pointer_devices(paths);
+            let _alive_guard = WorkerAliveGuard::new(Arc::clone(&worker_alive));
+            let mut devices = devices;
             log_input_debug(
                 "pointer-watcher-start",
                 &format!("devices={}", devices.len()),
             );
-
-            while !worker_stop_flag.load(Ordering::SeqCst) {
-                let mut index = 0usize;
-                while index < devices.len() {
-                    let mut remove_device = false;
-                    let device = &mut devices[index];
-                    let device_name = device.device.name().unwrap_or("unknown").to_string();
-                    loop {
-                        match device.device.fetch_events() {
-                            Ok(events) => {
-                                let mut had_events = false;
-                                for event in events {
-                                    had_events = true;
-                                    if let evdev::InputEventKind::Key(key) = event.kind() {
-                                        if is_pointer_click(key)
-                                            && event.value() == 1
-                                            && device.pressed_buttons.insert(key)
-                                        {
-                                            worker_click_flag.store(true, Ordering::SeqCst);
-                                            log_input_debug(
-                                                "pointer-click",
-                                                &format!("device={device_name} key={key:?}"),
-                                            );
-                                        } else if is_pointer_click(key) && event.value() == 0 {
-                                            device.pressed_buttons.remove(&key);
+            let loop_result = run_input_worker_poll_loop(
+                &worker_stop_flag,
+                "pointer-watcher",
+                || publish_input_worker_ready(&worker_alive, ready_tx, "pointer-watcher"),
+                || {
+                    let mut index = 0usize;
+                    while index < devices.len() {
+                        let mut remove_device = false;
+                        let device = &mut devices[index];
+                        let device_name = device.device.name().unwrap_or("unknown").to_string();
+                        loop {
+                            match device.device.fetch_events() {
+                                Ok(events) => {
+                                    let mut had_events = false;
+                                    for event in events {
+                                        had_events = true;
+                                        if let evdev::InputEventKind::Key(key) = event.kind() {
+                                            if is_pointer_click(key)
+                                                && event.value() == 1
+                                                && device.pressed_buttons.insert(key)
+                                            {
+                                                worker_click_flag.store(true, Ordering::SeqCst);
+                                                log_input_debug(
+                                                    "pointer-click",
+                                                    &format!("device={device_name} key={key:?}"),
+                                                );
+                                            } else if is_pointer_click(key) && event.value() == 0 {
+                                                device.pressed_buttons.remove(&key);
+                                            }
                                         }
                                     }
-                                }
 
-                                if !had_events {
+                                    if !had_events {
+                                        break;
+                                    }
+                                }
+                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                                Err(error) => {
+                                    log_input_debug(
+                                        "pointer-read-error",
+                                        &format!("device={device_name} error={error}"),
+                                    );
+                                    remove_device = true;
                                     break;
                                 }
                             }
-                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                            Err(error) => {
-                                log_input_debug(
-                                    "pointer-read-error",
-                                    &format!("device={device_name} error={error}"),
-                                );
-                                remove_device = true;
-                                break;
-                            }
+                        }
+
+                        if remove_device {
+                            devices.remove(index);
+                        } else {
+                            index += 1;
                         }
                     }
 
-                    if remove_device {
-                        devices.remove(index);
-                    } else {
-                        index += 1;
-                    }
-                }
-
-                thread::sleep(POINTER_POLL_INTERVAL);
+                    thread::sleep(POINTER_POLL_INTERVAL);
+                    true
+                },
+            );
+            if let Err(error) = loop_result {
+                log_input_debug("pointer-watcher-stop", &format!("reason={error}"));
             }
 
             log_input_debug("pointer-watcher-stop", "reason=shutdown");
         });
-        alive.store(true, Ordering::SeqCst);
+        if let Err(error) = wait_for_input_worker_startup_ready(
+            &ready_rx,
+            "pointer-watcher",
+            INPUT_WORKER_STARTUP_READY_TIMEOUT,
+        ) {
+            stop_flag.store(true, Ordering::SeqCst);
+            alive.store(false, Ordering::SeqCst);
+            drop(handle);
+            return Err(error);
+        }
 
-        Self {
+        Ok(Self {
             click_flag,
             stop_flag,
             alive,
             required: true,
             handle: Some(handle),
-        }
+        })
     }
 
     fn take_click_invalidation(&self) -> bool {
@@ -1189,7 +1353,7 @@ impl PointerWatcher {
 // Input target watcher
 
 impl InputTargetWatcher {
-    fn spawn(session_type: SessionType) -> Self {
+    fn spawn(session_type: SessionType) -> Result<Self, SwitcherError> {
         let changed_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
@@ -1202,7 +1366,7 @@ impl InputTargetWatcher {
                     format_session_type(session_type)
                 ),
             );
-            return Self::disabled(changed_flag, stop_flag, alive);
+            return Ok(Self::disabled(changed_flag, stop_flag, alive));
         }
 
         let Ok(mut monitor) = ActiveWindowMonitor::connect() else {
@@ -1210,14 +1374,15 @@ impl InputTargetWatcher {
                 "input-target-watcher-disabled",
                 "reason=x11-active-window-unavailable",
             );
-            return Self::disabled(changed_flag, stop_flag, alive);
+            return Ok(Self::disabled(changed_flag, stop_flag, alive));
         };
 
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let worker_changed_flag = Arc::clone(&changed_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
-            let _alive_guard = WorkerAliveGuard::new(worker_alive);
+            let _alive_guard = WorkerAliveGuard::new(Arc::clone(&worker_alive));
             log_input_debug(
                 "input-target-watcher-start",
                 &format!(
@@ -1225,52 +1390,72 @@ impl InputTargetWatcher {
                     format_x11_window(monitor.current_window)
                 ),
             );
+            let loop_result = run_input_worker_poll_loop(
+                &worker_stop_flag,
+                "input-target-watcher",
+                || publish_input_worker_ready(&worker_alive, ready_tx, "input-target-watcher"),
+                || {
+                    let mut had_events = false;
 
-            while !worker_stop_flag.load(Ordering::SeqCst) {
-                let mut had_events = false;
-
-                loop {
-                    match monitor.poll_change() {
-                        Ok(Some((previous_window, current_window))) => {
-                            had_events = true;
-                            worker_changed_flag.store(true, Ordering::SeqCst);
-                            log_input_debug(
-                                "input-target-changed",
-                                &format!(
-                                    "source=_NET_ACTIVE_WINDOW previous={} current={}",
-                                    format_x11_window(previous_window),
-                                    format_x11_window(current_window)
-                                ),
-                            );
-                        }
-                        Ok(None) => break,
-                        Err(error) => {
-                            log_input_debug(
-                                "input-target-read-error",
-                                &format!("source=_NET_ACTIVE_WINDOW error={error}"),
-                            );
-                            log_input_debug("input-target-watcher-stop", "reason=watcher-error");
-                            return;
+                    loop {
+                        match monitor.poll_change() {
+                            Ok(Some((previous_window, current_window))) => {
+                                had_events = true;
+                                worker_changed_flag.store(true, Ordering::SeqCst);
+                                log_input_debug(
+                                    "input-target-changed",
+                                    &format!(
+                                        "source=_NET_ACTIVE_WINDOW previous={} current={}",
+                                        format_x11_window(previous_window),
+                                        format_x11_window(current_window)
+                                    ),
+                                );
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                log_input_debug(
+                                    "input-target-read-error",
+                                    &format!("source=_NET_ACTIVE_WINDOW error={error}"),
+                                );
+                                log_input_debug(
+                                    "input-target-watcher-stop",
+                                    "reason=watcher-error",
+                                );
+                                return false;
+                            }
                         }
                     }
-                }
 
-                if !had_events {
-                    thread::sleep(INPUT_TARGET_POLL_INTERVAL);
-                }
+                    if !had_events {
+                        thread::sleep(INPUT_TARGET_POLL_INTERVAL);
+                    }
+                    true
+                },
+            );
+            if let Err(error) = loop_result {
+                log_input_debug("input-target-watcher-stop", &format!("reason={error}"));
             }
 
             log_input_debug("input-target-watcher-stop", "reason=shutdown");
         });
-        alive.store(true, Ordering::SeqCst);
+        if let Err(error) = wait_for_input_worker_startup_ready(
+            &ready_rx,
+            "input-target-watcher",
+            INPUT_WORKER_STARTUP_READY_TIMEOUT,
+        ) {
+            stop_flag.store(true, Ordering::SeqCst);
+            alive.store(false, Ordering::SeqCst);
+            drop(handle);
+            return Err(error);
+        }
 
-        Self {
+        Ok(Self {
             changed_flag,
             stop_flag,
             alive,
             required: true,
             handle: Some(handle),
-        }
+        })
     }
 
     fn disabled(
@@ -1388,7 +1573,8 @@ impl VirtualKeyboardWriter {
         let device = create_virtual_keyboard(name)?;
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::channel();
-        let alive = Arc::new(AtomicBool::new(true));
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let alive = Arc::new(AtomicBool::new(false));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let transaction_failure_request_id = Arc::new(AtomicU64::new(0));
         let transaction_terminal_gate = Arc::new(Mutex::new(()));
@@ -1396,6 +1582,7 @@ impl VirtualKeyboardWriter {
         let worker_stop_requested = Arc::clone(&stop_requested);
         let worker_transaction_failure_request_id = Arc::clone(&transaction_failure_request_id);
         let worker_transaction_terminal_gate = Arc::clone(&transaction_terminal_gate);
+        let worker_ready_alive = Arc::clone(&alive);
 
         let join_handle = thread::spawn(move || {
             log_input_debug("writer-start", "virtual keyboard writer thread started");
@@ -1407,6 +1594,8 @@ impl VirtualKeyboardWriter {
                     worker_transaction_failure_request_id,
                     worker_stop_requested,
                     worker_transaction_terminal_gate,
+                    worker_ready_alive,
+                    ready_tx,
                 )
             }));
             worker_alive.store(false, Ordering::SeqCst);
@@ -1434,6 +1623,12 @@ impl VirtualKeyboardWriter {
                 }
             }
         });
+
+        if let Err(error) = wait_for_writer_startup_ready(&ready_rx, WRITER_STARTUP_READY_TIMEOUT) {
+            stop_requested.store(true, Ordering::SeqCst);
+            alive.store(false, Ordering::SeqCst);
+            return Err(error);
+        }
 
         Ok(Self {
             handle: VirtualKeyboardHandle {
@@ -3782,8 +3977,11 @@ fn run_writer_command_loop_with_stop(
     failure_request_id: &AtomicU64,
     stop_requested: &AtomicBool,
     terminal_gate: &Mutex<()>,
+    on_ready: impl FnOnce() -> Result<(), SwitcherError>,
     mut dispatch: impl FnMut(WriterCommand) -> Result<(), SwitcherError>,
 ) -> Result<(), SwitcherError> {
+    ensure_writer_running(failure_request_id, stop_requested, terminal_gate)?;
+    on_ready()?;
     for command in command_rx {
         if matches!(&command, WriterCommand::Shutdown) {
             break;
@@ -3811,11 +4009,12 @@ fn run_virtual_keyboard_writer_loop(
     failure_request_id: Arc<AtomicU64>,
     stop_requested: Arc<AtomicBool>,
     terminal_gate: Arc<Mutex<()>>,
+    writer_alive: Arc<AtomicBool>,
+    ready_tx: mpsc::SyncSender<()>,
 ) -> Result<(), SwitcherError> {
     let context = detect_current_system_context();
-    let session_type = context.session_type;
     let mut x11_switcher =
-        initialize_x11_switcher_for_session(session_type, X11LayoutSwitcher::new);
+        initialize_x11_switcher_for_session(context.session_type, X11LayoutSwitcher::new);
     let mut cinnamon_x11_xtest = initialize_cinnamon_x11_xtest_runtime(context);
 
     run_writer_command_loop_with_stop(
@@ -3823,6 +4022,7 @@ fn run_virtual_keyboard_writer_loop(
         &failure_request_id,
         &stop_requested,
         &terminal_gate,
+        || publish_writer_ready(&writer_alive, ready_tx),
         |command| {
             match command {
                 WriterCommand::Shutdown => unreachable!("shutdown handled before circuit breaker"),
@@ -4114,6 +4314,171 @@ mod tests {
             config: test_runtime_config_snapshot(),
             modifiers: ModifierState::default(),
         }
+    }
+
+    #[test]
+    fn writer_ready_is_published_only_when_command_loop_is_entered() {
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_alive = Arc::clone(&alive);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (initializer_entered_tx, initializer_entered_rx) = mpsc::channel();
+        let (allow_initializer_tx, allow_initializer_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            initializer_entered_tx.send(()).unwrap();
+            allow_initializer_rx.recv().unwrap();
+            let failure = AtomicU64::new(0);
+            let stop_requested = AtomicBool::new(false);
+            let terminal_gate = Mutex::new(());
+            let (command_tx, command_rx) = mpsc::channel();
+            command_tx.send(WriterCommand::Shutdown).unwrap();
+
+            run_writer_command_loop_with_stop(
+                command_rx,
+                &failure,
+                &stop_requested,
+                &terminal_gate,
+                || {
+                    worker_alive.store(true, Ordering::SeqCst);
+                    ready_tx
+                        .send(())
+                        .map_err(|_| SwitcherError::VirtualKeyboardWriterDisconnected)
+                },
+                |_| unreachable!("shutdown is handled by the command loop"),
+            )
+        });
+
+        initializer_entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initializer must start");
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!alive.load(Ordering::SeqCst));
+
+        allow_initializer_tx.send(()).unwrap();
+        ready_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("writer readiness must be published at command-loop entry");
+        assert!(alive.load(Ordering::SeqCst));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn writer_startup_wait_is_bounded_when_initializer_never_publishes_ready() {
+        let (_ready_tx, ready_rx) = mpsc::sync_channel(1);
+
+        let error = wait_for_writer_startup_ready(&ready_rx, Duration::ZERO).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterStartupTimedOut { timeout_ms: 0 }
+        ));
+    }
+
+    #[test]
+    fn input_worker_startup_wait_is_bounded_when_worker_never_becomes_ready() {
+        let (_ready_tx, ready_rx) = mpsc::sync_channel(1);
+
+        let error =
+            wait_for_input_worker_startup_ready(&ready_rx, "pointer-watcher", Duration::ZERO)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkerStartupTimedOut {
+                worker: "pointer-watcher",
+                timeout_ms: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn input_worker_ready_is_published_at_poll_loop_entry() {
+        let alive = Arc::new(AtomicBool::new(false));
+        let worker_alive = Arc::clone(&alive);
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let poll_stop = Arc::clone(&stop);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (setup_entered_tx, setup_entered_rx) = mpsc::channel();
+        let (allow_setup_tx, allow_setup_rx) = mpsc::channel();
+
+        let worker = thread::spawn(move || {
+            setup_entered_tx.send(()).unwrap();
+            allow_setup_rx.recv().unwrap();
+            run_input_worker_poll_loop(
+                &worker_stop,
+                "pointer-watcher",
+                || publish_input_worker_ready(&worker_alive, ready_tx, "pointer-watcher"),
+                || {
+                    poll_stop.store(true, Ordering::SeqCst);
+                    true
+                },
+            )
+        });
+
+        setup_entered_rx.recv().unwrap();
+        assert!(matches!(
+            ready_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!alive.load(Ordering::SeqCst));
+
+        allow_setup_tx.send(()).unwrap();
+        ready_rx.recv().unwrap();
+        assert!(alive.load(Ordering::SeqCst));
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn activation_rejects_dead_dependencies_before_physical_grab() {
+        assert!(matches!(
+            ensure_input_dependencies_ready(false, true, true),
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert!(matches!(
+            ensure_input_dependencies_ready(true, false, true),
+            Err(SwitcherError::InputWorkerDisconnected {
+                worker: "pointer-watcher"
+            })
+        ));
+        assert!(matches!(
+            ensure_input_dependencies_ready(true, true, false),
+            Err(SwitcherError::InputWorkerDisconnected {
+                worker: "input-target-watcher"
+            })
+        ));
+        assert!(ensure_input_dependencies_ready(true, true, true).is_ok());
+    }
+
+    #[test]
+    fn caps_lock_snapshot_is_taken_immediately_before_physical_grab() {
+        struct FakeKeyboard {
+            caps_lock_active: bool,
+            phases: Vec<&'static str>,
+        }
+
+        let mut keyboard = FakeKeyboard {
+            caps_lock_active: true,
+            phases: Vec::new(),
+        };
+        let caps_lock_active = snapshot_then_acquire_grab(
+            &mut keyboard,
+            |keyboard| {
+                keyboard.phases.push("caps-snapshot");
+                Ok::<_, SwitcherError>(keyboard.caps_lock_active)
+            },
+            |keyboard| {
+                keyboard.phases.push("grab");
+                Ok::<_, SwitcherError>(())
+            },
+        )
+        .unwrap();
+
+        assert!(caps_lock_active);
+        assert_eq!(keyboard.phases, vec!["caps-snapshot", "grab"]);
     }
 
     #[test]
@@ -6187,12 +6552,17 @@ mod tests {
         }
         drop(command_tx);
         let dispatched = Cell::new(0usize);
+        let ready_published = Cell::new(false);
 
         let error = run_writer_command_loop_with_stop(
             command_rx,
             &failure,
             &stop_requested,
             &terminal_gate,
+            || {
+                ready_published.set(true);
+                Ok(())
+            },
             |_command| {
                 dispatched.set(dispatched.get() + 1);
                 Ok(())
@@ -6204,6 +6574,7 @@ mod tests {
             error,
             SwitcherError::VirtualKeyboardWriterDisconnected
         ));
+        assert!(!ready_published.get());
         assert_eq!(dispatched.get(), 0);
     }
 
@@ -6310,15 +6681,21 @@ mod tests {
     }
 
     #[test]
-    fn pointer_watcher_readiness_is_true_when_disabled_by_policy() {
-        let watcher = PointerWatcher {
-            click_flag: Arc::new(AtomicBool::new(false)),
-            stop_flag: Arc::new(AtomicBool::new(false)),
-            alive: Arc::new(AtomicBool::new(false)),
-            required: false,
-            handle: None,
-        };
+    fn pointer_watcher_with_no_discovered_devices_is_disabled_and_ready() {
+        let watcher = PointerWatcher::spawn(Vec::new()).unwrap();
 
+        assert!(watcher.is_ready());
+    }
+
+    #[test]
+    fn pointer_watcher_with_no_readable_devices_is_disabled_without_false_worker_ready() {
+        let watcher = PointerWatcher::spawn(vec![PathBuf::from(
+            "/openswitcher-test/nonexistent-pointer-device",
+        )])
+        .unwrap();
+
+        assert!(!watcher.required);
+        assert!(!watcher.alive.load(Ordering::SeqCst));
         assert!(watcher.is_ready());
     }
 

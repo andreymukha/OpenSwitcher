@@ -2131,6 +2131,76 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn periodic_sync_tick_rejects_gnome_confirmation_when_observation_read_fails() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: None,
+            mru_sources: None,
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+        let initial = CurrentLayoutState::Known {
+            layout: english_layout(),
+            trustworthy: false,
+        };
+        let runtime = test_runtime_with_backend_and_context(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(initial),
+            }),
+            gnome_wayland_context(),
+        );
+
+        assert_eq!(
+            runtime.periodic_sync_tick_with_readers(
+                &reader,
+                &detector,
+                &PreserveCinnamonCurrentGroupReader,
+            ),
+            BackendSyncResult::Skipped
+        );
+    }
+
+    #[test]
+    fn periodic_sync_tick_rejects_cinnamon_confirmation_when_group_read_fails() {
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: Some(trusted_gnome_sources()),
+            mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: cinnamon_x11_context(),
+        };
+        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            current_group: Err("XKB unavailable".to_string()),
+        };
+        let initial = CurrentLayoutState::Known {
+            layout: english_layout(),
+            trustworthy: false,
+        };
+        let runtime = test_runtime_with_backend_and_context(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(initial),
+            }),
+            cinnamon_x11_context(),
+        );
+        *runtime
+            .layout_setup
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
+
+        assert_eq!(
+            runtime.periodic_sync_tick_with_readers(&reader, &detector, &cinnamon_reader),
+            BackendSyncResult::Skipped
+        );
+    }
+
+    #[test]
     fn periodic_sync_tick_skips_context_refresh_when_candidate_is_not_a_late_upgrade() {
         let reader_calls = Arc::new(AtomicUsize::new(0));
         let detector_calls = Arc::new(AtomicUsize::new(0));
@@ -3450,8 +3520,14 @@ impl RuntimeState {
         if self.refresh_system_context_with_detector(detector) {
             self.redetect_layout_switch_after_context_upgrade(reader);
         }
-        self.refresh_current_layout_observation_with_readers(reader, cinnamon_reader);
-        self.sync_with_backend()
+        let observation_confirmed =
+            self.refresh_current_layout_observation_with_readers(reader, cinnamon_reader);
+        let backend_result = self.sync_with_backend();
+        if observation_confirmed {
+            backend_result
+        } else {
+            BackendSyncResult::Skipped
+        }
     }
 
     pub(crate) fn initial_input_refresh_before_grab(&self) -> BackendSyncResult {
@@ -3796,19 +3872,22 @@ impl RuntimeState {
 
     // GNOME Wayland observation
 
-    fn refresh_current_layout_observation(&self) {
+    fn refresh_current_layout_observation(&self) -> bool {
         self.refresh_current_layout_observation_with_readers(
             &CommandDesktopSettingsReader,
             &X11CinnamonCurrentGroupReader,
-        );
+        )
     }
 
     #[cfg(test)]
-    fn refresh_current_layout_observation_with_reader<R: DesktopSettingsReader>(&self, reader: &R) {
+    fn refresh_current_layout_observation_with_reader<R: DesktopSettingsReader>(
+        &self,
+        reader: &R,
+    ) -> bool {
         self.refresh_current_layout_observation_with_readers(
             reader,
             &PreserveCinnamonCurrentGroupReader,
-        );
+        )
     }
 
     fn refresh_current_layout_observation_with_readers<
@@ -3818,26 +3897,27 @@ impl RuntimeState {
         &self,
         reader: &R,
         cinnamon_reader: &C,
-    ) {
+    ) -> bool {
         if !is_gnome_wayland_context(self.system_context()) {
             if is_cinnamon_x11_context(self.system_context()) {
                 let layout_setup = self.layout_setup();
                 let Some(next_observation) =
                     cinnamon_x11_current_layout_state(cinnamon_reader, &layout_setup)
                 else {
-                    return;
+                    return false;
                 };
                 self.update_current_layout_observation(Some(next_observation), "runtime-sync");
             } else {
                 self.clear_current_layout_observation();
             }
-            return;
+            return true;
         }
 
         let Some(next_observation) = gnome_wayland_current_layout_state(reader) else {
-            return;
+            return false;
         };
         self.update_current_layout_observation(Some(next_observation), "runtime-sync");
+        true
     }
 
     fn clear_current_layout_observation(&self) {

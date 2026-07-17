@@ -1,6 +1,9 @@
 use crate::config::AppConfig;
 use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
 use crate::daemon::debug_log::{format_layout, try_debug_line, DebugLogKind};
+use crate::daemon::input_snapshot::{
+    InputRuntimeSnapshot, InputSnapshotPublication, SnapshotTryLoad,
+};
 use crate::error::{
     CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
     ValidationError,
@@ -577,6 +580,19 @@ mod tests {
             inner: RwLock::new(AppConfig::default()),
         };
         let enabled = config_service.auto_switch_enabled().unwrap_or(true);
+        let feature_availability = FeatureAvailability {
+            auto_switch: false,
+            manual_word_fix: false,
+            selected_text_switch: true,
+            reason: Some("test".to_string()),
+        };
+        let initial_input_snapshot = initial_input_snapshot(
+            &config_service,
+            enabled,
+            feature_availability.clone(),
+            system_context.session_type,
+            initial_layout_state.clone(),
+        );
 
         RuntimeState {
             enabled: AtomicBool::new(enabled),
@@ -589,15 +605,13 @@ mod tests {
                 reason: "test".to_string(),
             }),
             layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(FeatureAvailability {
-                auto_switch: false,
-                manual_word_fix: false,
-                selected_text_switch: true,
-                reason: Some("test".to_string()),
-            }),
+            feature_availability: RwLock::new(feature_availability),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
+            settings_update_gate: Mutex::new(()),
+            input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
+            layout_invalidation_epoch: AtomicU64::new(0),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -1187,14 +1201,32 @@ undo_key = "Pause"
         system_context: SystemContext,
     ) -> RuntimeState {
         let enabled = config.features.auto_switch_enabled;
+        let layout_state = CurrentLayoutState::Unknown {
+            reason: "test".to_string(),
+        };
+        let feature_availability = FeatureAvailability {
+            auto_switch: false,
+            manual_word_fix: false,
+            selected_text_switch: true,
+            reason: Some("test".to_string()),
+        };
+        let config_service = ConfigService {
+            config_path: PathBuf::from("test-config.toml"),
+            inner: RwLock::new(config),
+        };
+        let initial_input_snapshot = initial_input_snapshot(
+            &config_service,
+            enabled,
+            feature_availability.clone(),
+            system_context.session_type,
+            layout_state.clone(),
+        );
         RuntimeState {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
             hotkey_capture_inhibition_started_at: Instant::now(),
             settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
-            layout_state: RwLock::new(CurrentLayoutState::Unknown {
-                reason: "test".to_string(),
-            }),
+            layout_state: RwLock::new(layout_state),
             backend: Mutex::new(Some(Box::new(SnapshotBackend {
                 snapshot: SnapshotOutcome::State(CurrentLayoutState::Unknown {
                     reason: "test".to_string(),
@@ -1204,18 +1236,13 @@ undo_key = "Pause"
                 reason: "test".to_string(),
             }),
             layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(FeatureAvailability {
-                auto_switch: false,
-                manual_word_fix: false,
-                selected_text_switch: true,
-                reason: Some("test".to_string()),
-            }),
+            feature_availability: RwLock::new(feature_availability),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
-            config_service: ConfigService {
-                config_path: PathBuf::from("test-config.toml"),
-                inner: RwLock::new(config),
-            },
+            config_service,
+            settings_update_gate: Mutex::new(()),
+            input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
+            layout_invalidation_epoch: AtomicU64::new(0),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -2492,9 +2519,34 @@ pub struct RuntimeState {
     system_context: RwLock<SystemContext>,
     current_layout_observation: RwLock<Option<CurrentLayoutState>>,
     config_service: ConfigService,
+    settings_update_gate: Mutex<()>,
+    input_snapshot: InputSnapshotPublication,
+    layout_invalidation_epoch: AtomicU64,
     capture_session: Mutex<LayoutSwitchCaptureSession>,
     background_sync_started: AtomicBool,
     pending_status_change: AtomicBool,
+}
+
+fn initial_input_snapshot(
+    config_service: &ConfigService,
+    enabled: bool,
+    features: FeatureAvailability,
+    session_type: SessionType,
+    layout_state: CurrentLayoutState,
+) -> InputRuntimeSnapshot {
+    InputRuntimeSnapshot {
+        config: config_service
+            .snapshot()
+            .unwrap_or_else(|_| RuntimeConfigSnapshot::from(&AppConfig::default())),
+        enabled,
+        features,
+        session_type,
+        layout_state,
+        config_generation: 0,
+        layout_generation: 0,
+        confirmed_layout_epoch: 0,
+        confirmed_at: None,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2657,6 +2709,14 @@ impl RuntimeState {
         let (backend, layout_state, layout_setup, layout_compatibility, feature_availability) =
             Self::initialize_layout_backend();
         let enabled = config_service.auto_switch_enabled().unwrap_or(true);
+        let system_context = SystemContextDetector::detect_current().unwrap_or_default();
+        let initial_input_snapshot = initial_input_snapshot(
+            &config_service,
+            enabled,
+            feature_availability.clone(),
+            system_context.session_type,
+            layout_state.clone(),
+        );
         let runtime = Self {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
@@ -2667,11 +2727,12 @@ impl RuntimeState {
             layout_setup: RwLock::new(layout_setup),
             layout_compatibility: RwLock::new(layout_compatibility),
             feature_availability: RwLock::new(feature_availability),
-            system_context: RwLock::new(
-                SystemContextDetector::detect_current().unwrap_or_default(),
-            ),
+            system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
+            settings_update_gate: Mutex::new(()),
+            input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
+            layout_invalidation_epoch: AtomicU64::new(0),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -2687,29 +2748,41 @@ impl RuntimeState {
             inner: RwLock::new(AppConfig::default()),
         };
         let enabled = config_service.auto_switch_enabled().unwrap_or(true);
+        let layout_state = CurrentLayoutState::Unknown {
+            reason: "test".to_string(),
+        };
+        let feature_availability = FeatureAvailability {
+            auto_switch: false,
+            manual_word_fix: false,
+            selected_text_switch: true,
+            reason: Some("test".to_string()),
+        };
+        let initial_input_snapshot = initial_input_snapshot(
+            &config_service,
+            enabled,
+            feature_availability.clone(),
+            system_context.session_type,
+            layout_state.clone(),
+        );
 
         Self {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
             hotkey_capture_inhibition_started_at: Instant::now(),
             settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
-            layout_state: RwLock::new(CurrentLayoutState::Unknown {
-                reason: "test".to_string(),
-            }),
+            layout_state: RwLock::new(layout_state),
             backend: Mutex::new(None),
             layout_setup: RwLock::new(LayoutSetup::Unsupported {
                 reason: "test".to_string(),
             }),
             layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(FeatureAvailability {
-                auto_switch: false,
-                manual_word_fix: false,
-                selected_text_switch: true,
-                reason: Some("test".to_string()),
-            }),
+            feature_availability: RwLock::new(feature_availability),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
+            settings_update_gate: Mutex::new(()),
+            input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
+            layout_invalidation_epoch: AtomicU64::new(0),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -2718,6 +2791,14 @@ impl RuntimeState {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn input_snapshot_before_grab(&self) -> InputRuntimeSnapshot {
+        self.input_snapshot.load_before_grab()
+    }
+
+    pub(crate) fn try_input_snapshot(&self) -> SnapshotTryLoad {
+        self.input_snapshot.try_load()
     }
 
     pub fn request_exit(&self) {
@@ -2766,9 +2847,13 @@ impl RuntimeState {
     }
 
     pub fn toggle_enabled_result(&self) -> Result<bool, SettingsError> {
+        let _gate = self
+            .settings_update_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut settings = self.get_settings()?;
         settings.auto_switch_enabled = !settings.auto_switch_enabled;
-        self.update_settings(settings)?;
+        self.update_settings_under_gate(settings)?;
         Ok(settings.auto_switch_enabled)
     }
 
@@ -3160,9 +3245,26 @@ impl RuntimeState {
         &self,
         settings: Settings,
     ) -> Result<UpdateSettingsResult, SettingsError> {
+        let _gate = self
+            .settings_update_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.update_settings_under_gate(settings)
+    }
+
+    fn update_settings_under_gate(
+        &self,
+        settings: Settings,
+    ) -> Result<UpdateSettingsResult, SettingsError> {
         let result = self.config_service.update_settings(settings)?;
+        let snapshot = self.config_service.snapshot()?;
         self.enabled
             .store(settings.auto_switch_enabled, Ordering::SeqCst);
+        self.input_snapshot.update(|published| {
+            published.config = snapshot;
+            published.enabled = settings.auto_switch_enabled;
+            published.config_generation = published.config_generation.saturating_add(1);
+        });
         Ok(result)
     }
 
@@ -3979,5 +4081,118 @@ fn layout_label(is_english: bool) -> &'static str {
         "EN"
     } else {
         "RU"
+    }
+}
+
+#[cfg(test)]
+mod input_snapshot_config_tests {
+    use super::*;
+    use crate::daemon::input_snapshot::SnapshotTryLoad;
+    use tempfile::TempDir;
+
+    fn test_runtime_with_config_path(config_path: PathBuf) -> RuntimeState {
+        let config = AppConfig::default();
+        let enabled = config.features.auto_switch_enabled;
+        let layout_state = CurrentLayoutState::Unknown {
+            reason: "test".to_string(),
+        };
+        let feature_availability = FeatureAvailability {
+            auto_switch: false,
+            manual_word_fix: false,
+            selected_text_switch: true,
+            reason: Some("test".to_string()),
+        };
+        let system_context = SystemContext::default();
+        let config_service = ConfigService {
+            config_path,
+            inner: RwLock::new(config),
+        };
+        let initial_input_snapshot = initial_input_snapshot(
+            &config_service,
+            enabled,
+            feature_availability.clone(),
+            system_context.session_type,
+            layout_state.clone(),
+        );
+        RuntimeState {
+            enabled: AtomicBool::new(enabled),
+            should_exit: AtomicBool::new(false),
+            hotkey_capture_inhibition_started_at: Instant::now(),
+            settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
+            layout_state: RwLock::new(layout_state),
+            backend: Mutex::new(None),
+            layout_setup: RwLock::new(LayoutSetup::Unsupported {
+                reason: "test".to_string(),
+            }),
+            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
+            feature_availability: RwLock::new(feature_availability),
+            system_context: RwLock::new(system_context),
+            current_layout_observation: RwLock::new(None),
+            config_service,
+            settings_update_gate: Mutex::new(()),
+            input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
+            layout_invalidation_epoch: AtomicU64::new(0),
+            capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
+            background_sync_started: AtomicBool::new(false),
+            pending_status_change: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn held_config_write_lock_does_not_block_input_snapshot_read() {
+        let runtime = test_runtime_with_config_path(PathBuf::from("test-config.toml"));
+        let _config_guard = runtime.config_service.inner.write().unwrap();
+
+        assert!(matches!(
+            runtime.try_input_snapshot(),
+            SnapshotTryLoad::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn failed_settings_save_does_not_publish_new_config_generation() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config-as-directory");
+        std::fs::create_dir(&config_path).unwrap();
+        let runtime = test_runtime_with_config_path(config_path);
+        let before = runtime.input_snapshot_before_grab();
+        let mut settings = runtime.get_settings().unwrap();
+        settings.fix_two_capitals = !settings.fix_two_capitals;
+
+        assert!(runtime.update_settings(settings).is_err());
+        let after = runtime.input_snapshot_before_grab();
+        assert_eq!(after.config_generation, before.config_generation);
+        assert_eq!(
+            after.config.fix_two_capitals,
+            before.config.fix_two_capitals
+        );
+    }
+
+    #[test]
+    fn successful_settings_save_publishes_one_complete_generation() {
+        let temp = TempDir::new().unwrap();
+        let runtime = test_runtime_with_config_path(temp.path().join("config.toml"));
+        let before = runtime.input_snapshot_before_grab();
+        let mut settings = runtime.get_settings().unwrap();
+        settings.fix_two_capitals = true;
+
+        runtime.update_settings(settings).unwrap();
+        let after = runtime.input_snapshot_before_grab();
+        assert_eq!(after.config_generation, before.config_generation + 1);
+        assert!(after.config.fix_two_capitals);
+    }
+
+    #[test]
+    fn toggles_publish_one_committed_generation_each() {
+        let temp = TempDir::new().unwrap();
+        let runtime = test_runtime_with_config_path(temp.path().join("config.toml"));
+        let before = runtime.input_snapshot_before_grab();
+
+        assert!(!runtime.toggle_enabled_result().unwrap());
+        assert!(runtime.toggle_enabled_result().unwrap());
+
+        let after = runtime.input_snapshot_before_grab();
+        assert_eq!(after.config_generation, before.config_generation + 2);
+        assert_eq!(after.enabled, runtime.is_enabled());
     }
 }

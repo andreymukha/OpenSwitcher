@@ -140,9 +140,9 @@ const RUSSIAN_PRIORITY_PHYSICAL_WORDS: &[&str] = &[
 // them separate avoids broadening EN -> RU technical-token guards.
 const RU_LAYOUT_COMMON_ENGLISH_WORDS: &[&str] = &[
     "you", "the", "and", "are", "can", "get", "not", "for", "but", "all", "one", "our", "out",
-    "see", "use", "work", "home", "time", "know", "want", "make", "need", "like", "good",
-    "love", "look", "come", "from", "have", "will", "with", "this", "that", "about", "after",
-    "people", "because", "should", "would", "could", "really", "please", "thanks",
+    "see", "use", "work", "home", "time", "know", "want", "make", "need", "like", "good", "love",
+    "look", "come", "from", "have", "will", "with", "this", "that", "about", "after", "people",
+    "because", "should", "would", "could", "really", "please", "thanks",
 ];
 
 pub fn manual_correction_plan(
@@ -547,7 +547,9 @@ fn contains_latin_vowel(word: &str) -> bool {
 }
 
 fn count_latin_vowels_without_y(word: &str) -> usize {
-    word.chars().filter(|ch| matches!(*ch, 'a' | 'e' | 'i' | 'o' | 'u')).count()
+    word.chars()
+        .filter(|ch| matches!(*ch, 'a' | 'e' | 'i' | 'o' | 'u'))
+        .count()
 }
 
 fn is_confident_english_for_russian_layout(word: &str) -> bool {
@@ -651,7 +653,10 @@ fn is_likely_english(word: &str) -> bool {
         return true;
     }
 
-    let eng_vowels = clean_word.chars().filter(|c| matches!(*c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y')).count();
+    let eng_vowels = clean_word
+        .chars()
+        .filter(|c| matches!(*c, 'a' | 'e' | 'i' | 'o' | 'u' | 'y'))
+        .count();
     if eng_vowels >= 2 && clean_word.len() <= 5 {
         return true;
     }
@@ -1476,16 +1481,16 @@ mod tests {
     #[test]
     fn russian_layout_common_english_four_letter_words_trigger_switch() {
         assert_russian_layout_words_switch(&[
-            "work", "home", "time", "know", "want", "make", "need", "like", "good", "love",
-            "look", "come", "from", "have", "will", "with", "this", "that",
+            "work", "home", "time", "know", "want", "make", "need", "like", "good", "love", "look",
+            "come", "from", "have", "will", "with", "this", "that",
         ]);
     }
 
     #[test]
     fn russian_layout_common_english_longer_words_trigger_switch() {
         assert_russian_layout_words_switch(&[
-            "about", "after", "people", "because", "should", "would", "could", "really",
-            "please", "thanks",
+            "about", "after", "people", "because", "should", "would", "could", "really", "please",
+            "thanks",
         ]);
     }
 
@@ -1604,7 +1609,13 @@ mod tests {
     #[test]
     fn russian_layout_negative_russian_priority_corpus_with_punctuation_does_not_switch() {
         assert_russian_layout_words_do_not_switch(&[
-            "ghbdtn,", "vfvf.", "rjn?", "yfghbvth!", "kexit.", "here,", "ckexfq?",
+            "ghbdtn,",
+            "vfvf.",
+            "rjn?",
+            "yfghbvth!",
+            "kexit.",
+            "here,",
+            "ckexfq?",
         ]);
     }
 

@@ -2,7 +2,8 @@ use crate::config::AppConfig;
 use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
 use crate::daemon::debug_log::{format_layout, try_debug_line, DebugLogKind};
 use crate::daemon::input_snapshot::{
-    InputRuntimeSnapshot, InputSnapshotPublication, SnapshotTryLoad,
+    InputRuntimeSnapshot, InputSnapshotPublication, LayoutRefreshRequests, RefreshRequestOutcome,
+    SnapshotTryLoad, INPUT_LAYOUT_POLL_INTERVAL,
 };
 use crate::error::{
     CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
@@ -27,11 +28,10 @@ use crate::model::{
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const BACKGROUND_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(300);
 const GNOME_INPUT_SOURCES_SCHEMA: &str = "org.gnome.desktop.input-sources";
 const GNOME_SOURCES_KEY: &str = "sources";
 const GNOME_MRU_SOURCES_KEY: &str = "mru-sources";
@@ -287,6 +287,7 @@ fn apply_detected_layout_switch_if_changed(
 mod tests {
     use super::*;
     use crate::daemon::capture::{CaptureEventDisposition, CaptureOwner, CAPTURE_SOFT_LEASE};
+    use crate::daemon::input_snapshot::RefreshRequestOutcome;
     use crate::error::{LayoutAutoDetectError, ValidationError};
     use crate::layout_backend::{
         AppLayoutKind, BackendCapabilities, CurrentLayoutState, LayoutBackendError,
@@ -300,7 +301,7 @@ mod tests {
     use std::io;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Barrier,
     };
     use tempfile::TempDir;
 
@@ -518,6 +519,105 @@ mod tests {
         }
     }
 
+    struct BlockingSnapshotBackend {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl BlockingSnapshotBackend {
+        fn new(entered: Arc<Barrier>, release: Arc<Barrier>) -> Self {
+            Self { entered, release }
+        }
+    }
+
+    impl LayoutBackend for BlockingSnapshotBackend {
+        fn id(&self) -> &'static str {
+            "blocking-test-backend"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::default()
+        }
+
+        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::DetectSetup,
+            ))
+        }
+
+        fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(known_layout_state(english_layout()))
+        }
+
+        fn switch_to(&mut self, _target: &SystemLayout) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchTo,
+            ))
+        }
+
+        fn switch_next(&mut self) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchNext,
+            ))
+        }
+
+        fn start_monitoring(&mut self, _sink: LayoutStateSink) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::StartMonitoring,
+            ))
+        }
+    }
+
+    struct PanickingSnapshotBackend;
+
+    impl LayoutBackend for PanickingSnapshotBackend {
+        fn id(&self) -> &'static str {
+            "panicking-test-backend"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities::default()
+        }
+
+        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::DetectSetup,
+            ))
+        }
+
+        fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
+            panic!("injected layout refresh panic");
+        }
+
+        fn switch_to(&mut self, _target: &SystemLayout) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchTo,
+            ))
+        }
+
+        fn switch_next(&mut self) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchNext,
+            ))
+        }
+
+        fn start_monitoring(&mut self, _sink: LayoutStateSink) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::StartMonitoring,
+            ))
+        }
+    }
+
     fn english_layout() -> SystemLayout {
         SystemLayout {
             backend_key: "us".to_string(),
@@ -593,6 +693,7 @@ mod tests {
             system_context.session_type,
             initial_layout_state.clone(),
         );
+        let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
 
         RuntimeState {
             enabled: AtomicBool::new(enabled),
@@ -612,6 +713,8 @@ mod tests {
             settings_update_gate: Mutex::new(()),
             input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
             layout_invalidation_epoch: AtomicU64::new(0),
+            layout_refresh_requests,
+            layout_refresh_receiver: Mutex::new(Some(layout_refresh_receiver)),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -892,6 +995,27 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn layout_refresh_backend_error_preserves_value_without_extending_freshness() {
+        let confirmed_at = Instant::now();
+        let initial = known_layout_state(english_layout());
+        let runtime = test_runtime_with_backend(
+            initial.clone(),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::Error,
+            }),
+        );
+        runtime.force_input_confirmation_for_test(confirmed_at);
+
+        assert_eq!(
+            runtime.refresh_and_publish_layout(),
+            BackendSyncResult::Skipped
+        );
+        let snapshot = runtime.input_snapshot_before_grab();
+        assert_eq!(snapshot.confirmed_at, Some(confirmed_at));
+        assert_eq!(snapshot.layout_state, initial);
+    }
+
+    #[test]
     fn periodic_sync_tick_delegates_to_backend_sync() {
         let initial = known_layout_state(english_layout());
         let expected = known_layout_state(russian_layout());
@@ -935,6 +1059,112 @@ undo_key = "Pause"
             can_observe_layout_changes: false,
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn layout_refresh_spawn_failure_disconnects_without_blocking_snapshot() {
+        let runtime = Arc::new(test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        ));
+        let error = runtime
+            .start_layout_refresh_coordinator_with(|job| {
+                drop(job);
+                Err(io::Error::other("injected spawn failure"))
+            })
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert!(matches!(
+            runtime.try_input_snapshot(),
+            SnapshotTryLoad::Loaded(_)
+        ));
+        assert_eq!(
+            runtime.request_layout_refresh(),
+            RefreshRequestOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn layout_refresh_invalidation_advances_epoch_before_queueing() {
+        let runtime = test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+        );
+        let before = runtime.input_layout_epoch();
+
+        runtime.invalidate_layout_and_request_refresh("test");
+
+        assert_eq!(runtime.input_layout_epoch(), before + 1);
+        assert_eq!(
+            runtime
+                .input_snapshot_before_grab()
+                .layout_status_at(Instant::now(), runtime.input_layout_epoch()),
+            crate::daemon::input_snapshot::InputLayoutStatus::AwaitingConfirmation
+        );
+    }
+
+    #[test]
+    fn layout_refresh_panicking_coordinator_degrades_to_snapshot_only() {
+        let runtime = Arc::new(test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(PanickingSnapshotBackend),
+        ));
+        runtime
+            .start_layout_refresh_coordinator_with(|job| {
+                thread::Builder::new()
+                    .name("test-layout-refresh-panic".to_string())
+                    .spawn(job)
+                    .map(|_| ())
+            })
+            .unwrap();
+        assert_eq!(
+            runtime.request_layout_refresh(),
+            RefreshRequestOutcome::Queued
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.background_sync_started.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!runtime.background_sync_started.load(Ordering::Acquire));
+        assert!(matches!(
+            runtime.try_input_snapshot(),
+            SnapshotTryLoad::Loaded(_)
+        ));
+        assert_eq!(
+            runtime.request_layout_refresh(),
+            RefreshRequestOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn layout_refresh_blocked_backend_does_not_block_snapshot_reads() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let runtime = Arc::new(test_runtime_with_backend(
+            known_layout_state(english_layout()),
+            Box::new(BlockingSnapshotBackend::new(
+                Arc::clone(&entered),
+                Arc::clone(&release),
+            )),
+        ));
+        let worker_runtime = Arc::clone(&runtime);
+        let worker = thread::spawn(move || worker_runtime.refresh_and_publish_layout());
+        entered.wait();
+
+        assert!(matches!(
+            runtime.try_input_snapshot(),
+            SnapshotTryLoad::Loaded(_)
+        ));
+
+        release.wait();
+        assert_eq!(worker.join().unwrap(), BackendSyncResult::Unchanged);
     }
 
     #[test]
@@ -1221,6 +1451,7 @@ undo_key = "Pause"
             system_context.session_type,
             layout_state.clone(),
         );
+        let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
         RuntimeState {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
@@ -1243,6 +1474,8 @@ undo_key = "Pause"
             settings_update_gate: Mutex::new(()),
             input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
             layout_invalidation_epoch: AtomicU64::new(0),
+            layout_refresh_requests,
+            layout_refresh_receiver: Mutex::new(Some(layout_refresh_receiver)),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -2522,6 +2755,8 @@ pub struct RuntimeState {
     settings_update_gate: Mutex<()>,
     input_snapshot: InputSnapshotPublication,
     layout_invalidation_epoch: AtomicU64,
+    layout_refresh_requests: LayoutRefreshRequests,
+    layout_refresh_receiver: Mutex<Option<mpsc::Receiver<()>>>,
     capture_session: Mutex<LayoutSwitchCaptureSession>,
     background_sync_started: AtomicBool,
     pending_status_change: AtomicBool,
@@ -2702,6 +2937,39 @@ fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+struct BackgroundSyncAliveGuard<'a> {
+    started: &'a AtomicBool,
+}
+
+impl Drop for BackgroundSyncAliveGuard<'_> {
+    fn drop(&mut self) {
+        self.started.store(false, Ordering::Release);
+    }
+}
+
+fn run_layout_refresh_loop(
+    runtime: Arc<RuntimeState>,
+    receiver: mpsc::Receiver<()>,
+    periodic_refresh_enabled: bool,
+) {
+    let _alive = BackgroundSyncAliveGuard {
+        started: &runtime.background_sync_started,
+    };
+    loop {
+        let should_refresh = match receiver.recv_timeout(INPUT_LAYOUT_POLL_INTERVAL) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => periodic_refresh_enabled,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if runtime.should_exit() {
+            break;
+        }
+        if should_refresh {
+            let _ = runtime.refresh_and_publish_layout();
+        }
+    }
+}
+
 impl RuntimeState {
     // Runtime state initialization and flags
 
@@ -2717,6 +2985,7 @@ impl RuntimeState {
             system_context.session_type,
             layout_state.clone(),
         );
+        let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
         let runtime = Self {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
@@ -2733,6 +3002,8 @@ impl RuntimeState {
             settings_update_gate: Mutex::new(()),
             input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
             layout_invalidation_epoch: AtomicU64::new(0),
+            layout_refresh_requests,
+            layout_refresh_receiver: Mutex::new(Some(layout_refresh_receiver)),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -2764,6 +3035,7 @@ impl RuntimeState {
             system_context.session_type,
             layout_state.clone(),
         );
+        let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
 
         Self {
             enabled: AtomicBool::new(enabled),
@@ -2783,6 +3055,8 @@ impl RuntimeState {
             settings_update_gate: Mutex::new(()),
             input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
             layout_invalidation_epoch: AtomicU64::new(0),
+            layout_refresh_requests,
+            layout_refresh_receiver: Mutex::new(Some(layout_refresh_receiver)),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
@@ -2799,6 +3073,35 @@ impl RuntimeState {
 
     pub(crate) fn try_input_snapshot(&self) -> SnapshotTryLoad {
         self.input_snapshot.try_load()
+    }
+
+    pub(crate) fn input_layout_epoch(&self) -> u64 {
+        self.layout_invalidation_epoch.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn request_layout_refresh(&self) -> RefreshRequestOutcome {
+        self.layout_refresh_requests.request()
+    }
+
+    pub(crate) fn invalidate_layout_and_request_refresh(&self, reason: &str) {
+        let epoch = self
+            .layout_invalidation_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        let outcome = self.request_layout_refresh();
+        log_layout_debug(
+            "input-layout-invalidated",
+            &format!("reason={reason} epoch={epoch} request={outcome:?}"),
+        );
+    }
+
+    #[cfg(test)]
+    fn force_input_confirmation_for_test(&self, confirmed_at: Instant) {
+        let epoch = self.input_layout_epoch();
+        self.input_snapshot.update(|published| {
+            published.confirmed_layout_epoch = epoch;
+            published.confirmed_at = Some(confirmed_at);
+        });
     }
 
     pub fn request_exit(&self) {
@@ -3139,6 +3442,38 @@ impl RuntimeState {
         self.sync_with_backend()
     }
 
+    pub(crate) fn initial_input_refresh_before_grab(&self) -> BackendSyncResult {
+        self.refresh_and_publish_layout()
+    }
+
+    fn refresh_and_publish_layout(&self) -> BackendSyncResult {
+        let epoch_before = self.input_layout_epoch();
+        let result = self.periodic_sync_tick();
+        let epoch_after = self.input_layout_epoch();
+
+        if !matches!(result, BackendSyncResult::Skipped) && epoch_before == epoch_after {
+            self.publish_confirmed_layout(Instant::now(), epoch_after);
+        }
+
+        result
+    }
+
+    fn publish_confirmed_layout(&self, confirmed_at: Instant, confirmed_layout_epoch: u64) {
+        let layout_state = self.current_layout_state();
+        let features = self.feature_availability();
+        let session_type = self.session_type();
+        self.input_snapshot.update(|published| {
+            if published.layout_state != layout_state {
+                published.layout_generation = published.layout_generation.saturating_add(1);
+            }
+            published.layout_state = layout_state;
+            published.features = features;
+            published.session_type = session_type;
+            published.confirmed_layout_epoch = confirmed_layout_epoch;
+            published.confirmed_at = Some(confirmed_at);
+        });
+    }
+
     pub fn take_pending_status_change(&self) -> bool {
         self.pending_status_change.swap(false, Ordering::SeqCst)
     }
@@ -3150,46 +3485,13 @@ impl RuntimeState {
     // Background sync and tray watchdog
 
     pub fn start_background_sync_polling(self: &Arc<Self>) {
-        let capabilities = {
-            let backend_guard = self
-                .backend
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let Some(backend) = backend_guard.as_ref() else {
-                return;
-            };
-            backend.capabilities()
-        };
-
-        if !background_sync_polling_enabled(capabilities) {
-            return;
-        }
-
-        self.refresh_current_layout_observation();
-
-        if self
-            .background_sync_started
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        let runtime = Arc::clone(self);
-        if let Err(error) = thread::Builder::new()
-            .name("layout-backend-poll".to_string())
-            .spawn(move || loop {
-                if runtime.should_exit() {
-                    break;
-                }
-                thread::sleep(BACKGROUND_SYNC_POLL_INTERVAL);
-                if runtime.should_exit() {
-                    break;
-                }
-                let _ = runtime.periodic_sync_tick();
-            })
-        {
-            self.background_sync_started.store(false, Ordering::SeqCst);
+        let result = self.start_layout_refresh_coordinator_with(|job| {
+            thread::Builder::new()
+                .name("layout-refresh-coordinator".to_string())
+                .spawn(job)
+                .map(|_| ())
+        });
+        if let Err(error) = result {
             log_layout_debug(
                 "background-sync-start",
                 &format!("failed=true error={error}"),
@@ -3201,9 +3503,39 @@ impl RuntimeState {
             "background-sync-start",
             &format!(
                 "enabled=true interval_ms={}",
-                BACKGROUND_SYNC_POLL_INTERVAL.as_millis()
+                INPUT_LAYOUT_POLL_INTERVAL.as_millis()
             ),
         );
+    }
+
+    fn start_layout_refresh_coordinator_with(
+        self: &Arc<Self>,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let periodic_refresh_enabled = {
+            let backend_guard = self
+                .backend
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            backend_guard
+                .as_ref()
+                .is_some_and(|backend| background_sync_polling_enabled(backend.capabilities()))
+        };
+        let receiver = self
+            .layout_refresh_receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| std::io::Error::other("layout refresh already started"))?;
+        self.background_sync_started.store(true, Ordering::Release);
+        let runtime = Arc::clone(self);
+        let job =
+            Box::new(move || run_layout_refresh_loop(runtime, receiver, periodic_refresh_enabled));
+        if let Err(error) = spawn(job) {
+            self.background_sync_started.store(false, Ordering::Release);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn start_tray_watchdog(
@@ -4114,6 +4446,7 @@ mod input_snapshot_config_tests {
             system_context.session_type,
             layout_state.clone(),
         );
+        let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
         RuntimeState {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
@@ -4132,6 +4465,8 @@ mod input_snapshot_config_tests {
             settings_update_gate: Mutex::new(()),
             input_snapshot: InputSnapshotPublication::new(initial_input_snapshot),
             layout_invalidation_epoch: AtomicU64::new(0),
+            layout_refresh_requests,
+            layout_refresh_receiver: Mutex::new(Some(layout_refresh_receiver)),
             capture_session: Mutex::new(LayoutSwitchCaptureSession::default()),
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),

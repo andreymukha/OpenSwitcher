@@ -50,7 +50,7 @@ pub fn run() -> Result<(), SwitcherError> {
             &format!("layout_switch_combo=unavailable error={error}"),
         ),
     }
-    match runtime.sync_with_backend() {
+    match runtime.initial_input_refresh_before_grab() {
         BackendSyncResult::Updated { current, .. } => {
             log_layout_debug(
                 "startup-sync",

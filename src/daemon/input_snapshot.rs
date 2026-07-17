@@ -1,7 +1,7 @@
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::layout_backend::{AppLayoutKind, CurrentLayoutState, FeatureAvailability};
 use crate::model::SessionType;
-use std::sync::{RwLock, TryLockError};
+use std::sync::{mpsc, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 pub(crate) const INPUT_LAYOUT_POLL_INTERVAL: Duration = Duration::from_millis(300);
@@ -138,6 +138,38 @@ impl InputSnapshotPublication {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         update(&mut snapshot);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefreshRequestOutcome {
+    Queued,
+    AlreadyPending,
+    Unavailable,
+}
+
+#[derive(Clone)]
+pub(crate) struct LayoutRefreshRequests {
+    sender: mpsc::SyncSender<()>,
+}
+
+impl LayoutRefreshRequests {
+    pub(crate) fn new() -> (Self, mpsc::Receiver<()>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        (Self { sender }, receiver)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, mpsc::Receiver<()>) {
+        Self::new()
+    }
+
+    pub(crate) fn request(&self) -> RefreshRequestOutcome {
+        match self.sender.try_send(()) {
+            Ok(()) => RefreshRequestOutcome::Queued,
+            Err(mpsc::TrySendError::Full(())) => RefreshRequestOutcome::AlreadyPending,
+            Err(mpsc::TrySendError::Disconnected(())) => RefreshRequestOutcome::Unavailable,
+        }
     }
 }
 
@@ -281,5 +313,27 @@ mod tests {
             publication.load_for_non_input_consumer().config_generation,
             2
         );
+    }
+}
+
+#[cfg(test)]
+mod layout_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_requests_coalesce_at_capacity_one() {
+        let (requests, receiver) = LayoutRefreshRequests::for_test();
+
+        assert_eq!(requests.request(), RefreshRequestOutcome::Queued);
+        assert_eq!(requests.request(), RefreshRequestOutcome::AlreadyPending);
+        assert_eq!(receiver.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn disconnected_refresh_request_never_becomes_an_input_error() {
+        let (requests, receiver) = LayoutRefreshRequests::for_test();
+        drop(receiver);
+
+        assert_eq!(requests.request(), RefreshRequestOutcome::Unavailable);
     }
 }

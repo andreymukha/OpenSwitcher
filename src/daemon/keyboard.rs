@@ -1050,6 +1050,11 @@ fn wait_for_input_worker_startup_ready(
     }
 }
 
+fn abort_input_worker_startup<T>(ready_rx: mpsc::Receiver<T>, request_stop: impl FnOnce()) {
+    drop(ready_rx);
+    request_stop();
+}
+
 fn run_input_worker_poll_loop(
     stop_requested: &AtomicBool,
     worker: &'static str,
@@ -1680,9 +1685,11 @@ impl InputTargetWatcher {
             "input-target-watcher",
             INPUT_WORKER_STARTUP_READY_TIMEOUT,
         ) {
-            stop_flag.store(true, Ordering::SeqCst);
-            alive.store(false, Ordering::SeqCst);
-            signal_input_target_stop(stop_wakeup.as_ref());
+            abort_input_worker_startup(ready_rx, || {
+                stop_flag.store(true, Ordering::SeqCst);
+                alive.store(false, Ordering::SeqCst);
+                signal_input_target_stop(stop_wakeup.as_ref());
+            });
             let _ = handle.join();
             return Err(error);
         }
@@ -4639,6 +4646,21 @@ mod tests {
                 timeout_ms: 0
             }
         ));
+    }
+
+    #[test]
+    fn startup_abort_drops_ready_receiver_before_requesting_worker_stop() {
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(0);
+        let observed = Cell::new(false);
+
+        abort_input_worker_startup(ready_rx, || {
+            observed.set(matches!(
+                ready_tx.try_send(()),
+                Err(mpsc::TrySendError::Disconnected(()))
+            ));
+        });
+
+        assert!(observed.get());
     }
 
     #[test]

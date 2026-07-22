@@ -6,12 +6,16 @@
 - Реализация fail-safe: `c8976a2..c3d3beb`; два найденных review-gap закрыты
   commit `c3d3beb`
 - Исправление владения `/dev/uinput`: vendoring `a1acf42`, RAII-fix `675b4d7`
+- Финальные race-fix: атомарная публикация writer result `a2cf8ca`, безопасный
+  abort позднего startup-ready `44aea09`, recovery отложенного replay
+  `d6ec3e2`, точная фиксация vendored `uinput` `9428b60`
 - Основной артефакт: Debian package `open-switcher 0.1.0-1`, `amd64`
 - Среда runtime: сохранённая VM `mint-install-v1`, Linux Mint/Cinnamon/X11
 - Статус: целевой отказ X11 watcher, в том числе во время активной
   синхронной коррекции, startup без X11 endpoint, потеря последнего pointer
   device, утечка uinput fd при recovery и автоматическое восстановление закрыты
-  кодом и package-first проверкой в доступных границах
+  кодом и package-first проверкой в доступных границах; четыре замечания
+  финального независимого review закрыты отдельными TDD-коммитами
 
 ## Что исправлено
 
@@ -56,26 +60,49 @@
 10. `Device::drop` сначала выполняет best-effort `UI_DEV_DESTROY`, затем всегда
     закрывает fd и помечает его закрытым. Это исключает и утечку, и двойное
     закрытие при штатном уничтожении объекта.
+11. Публикация подробного результата writer и перевод transaction в terminal
+    `Completed` теперь выполняются под одним `terminal_gate`. Поэтому смерть
+    watcher не может вклиниться между `reply.send(Err(...))` и terminal state и
+    заменить уже сформированную fatal writer error на recoverable
+    `InputWorkerDisconnected`.
+12. При timeout запуска X11 input-target watcher zero-capacity receiver
+    readiness явно уничтожается до stop/wakeup и `join`. Поздний
+    `ready_tx.send(())` получает `Disconnected`, а не блокирует worker и
+    recovery навсегда.
+13. Ошибка обработки одного отложенного input event теперь проходит через тот
+    же recoverable/fatal split, что чтение и основной event batch. Потеря
+    обязательного worker переводит backend в `Recovering` с тем же PID;
+    невосстановимая подробная ошибка сохраняется, а backend штатно завершается.
+14. Зависимость объявлена как `uinput = "=0.1.3"` вместе с локальным
+    `[patch.crates-io]`. Новая совместимая версия registry и пересоздание
+    `Cargo.lock` больше не могут незаметно обойти RAII-fix.
 
 Основные места в коде:
 
-- `src/daemon/keyboard.rs:992` — публикация readiness обязательного worker;
-- `src/daemon/keyboard.rs:1040` — общий readiness-контракт до grab;
-- `src/daemon/keyboard.rs:1096` — обязательное создание X11 monitor;
-- `src/daemon/keyboard.rs:1251` — runtime health обязательных worker;
+- `src/daemon/keyboard.rs:1023` — публикация readiness обязательного worker;
+- `src/daemon/keyboard.rs:1076` — общий readiness-контракт до grab;
+- `src/daemon/keyboard.rs:1132` — обязательное создание X11 monitor;
+- `src/daemon/keyboard.rs:1287` — runtime health обязательных worker;
 - `src/daemon/input_backend.rs:167` — классификация runtime-отказа;
 - `src/daemon/input_backend.rs:174` — переход в `Recovering`;
 - `src/daemon/service.rs:165` — маршрутизация health-ошибки;
-- `src/daemon/service.rs:186` и `:201` — health-границы операции и batch;
-- `src/daemon/service.rs:1098` — общая runtime-проверка backend;
-- `src/daemon/service.rs:2565` — reset и удаление активного backend;
-- `src/daemon/keyboard.rs:455` — terminal gate и stop активной transaction при
+- `src/daemon/service.rs:203` и `:218` — health-границы операции и batch;
+- `src/daemon/service.rs:1125` — общая runtime-проверка backend;
+- `src/daemon/service.rs:2592` — reset и удаление активного backend;
+- `src/daemon/keyboard.rs:445` — terminal gate и stop активной transaction при
   смерти обязательного input worker;
-- `src/daemon/keyboard.rs:483` — bounded ожидание writer reply с input-health;
-- `src/daemon/keyboard.rs:1394` — удаление потерянных pointer devices и переход
+- `src/daemon/keyboard.rs:514` — bounded ожидание writer reply с input-health;
+- `src/daemon/keyboard.rs:399` — единая terminal-gate публикация reply и
+  `Completed`;
+- `src/daemon/keyboard.rs:1053` и `:1688` — разрыв readiness-channel до
+  остановки и join неуспевшего X11 watcher;
+- `src/daemon/keyboard.rs:1430` — удаление потерянных pointer devices и переход
   N -> 0 в unavailable worker;
-- `src/daemon/keyboard.rs:2283` — подключение watcher health к синхронным
+- `src/daemon/keyboard.rs:2280` — подключение watcher health к синхронным
   correction transaction;
+- `src/daemon/service.rs:174` и `:1071` — recoverable/fatal маршрутизация
+  deferred replay;
+- `Cargo.toml:26` — exact pin локально исправленного `uinput 0.1.3`;
 - `vendor/uinput-0.1.3/src/device/builder.rs:258` — явная передача fd и
   `Builder::drop`;
 - `vendor/uinput-0.1.3/src/device/device.rs:78` — уничтожение устройства и
@@ -95,6 +122,14 @@
 - `Device::drop` оставлял свой fd открытым после `UI_DEV_DESTROY`;
 - `Builder::drop` оставлял fd открытым на error/abandon path;
 - передача fd от `Builder` к `Device` не имела проверяемой модели владения.
+- reply writer становился видим читателю до фиксации terminal `Completed`, что
+  оставляло реальное окно для маскировки detailed error смертью watcher;
+- после startup timeout живой receiver zero-capacity readiness-channel мог
+  оставить поздний sender заблокированным внутри `join`;
+- recoverable worker loss из deferred replay напрямую выходил из `run()` вместо
+  общего перехода backend в `Recovering`;
+- диапазон `uinput = "0.1.3"` не гарантировал выбор локального патча после
+  будущего пересоздания lock-файла.
 
 После GREEN:
 
@@ -104,14 +139,21 @@
 | targeted X11 startup policy tests | pass |
 | targeted lifecycle recovery tests | pass |
 | targeted service operation/batch routing tests | pass |
-| полная base library matrix | 590 passed, 0 failed |
-| полная `settings-ui` library matrix | 651 passed, 0 failed |
+| полная base library matrix | 594 passed, 0 failed |
+| полная `settings-ui` library matrix | 655 passed, 0 failed |
 | vendored `uinput` ownership tests | 3 passed, 0 failed |
-| package D-Bus matrix | 11 passed, 0 failed |
-| package shell checks | pass |
+| `cargo check --locked --offline --all-targets` | pass |
+| `cargo tree -i uinput --offline` | только локальный `vendor/uinput-0.1.3` |
 | targeted `rustfmt --check` изменённых Rust-файлов | pass |
 | `git diff --check` | pass |
 | поиск нового `unsafe` | новый `unsafe` отсутствует |
+
+Финальные regression-тесты называются
+`writer_reply_is_not_visible_before_terminal_completion_is_committed`,
+`startup_abort_drops_ready_receiver_before_requesting_worker_stop`,
+`deferred_input_worker_failure_requests_event_loop_recovery` и
+`fatal_deferred_input_failure_preserves_detailed_error`. Каждый сначала дал
+ожидаемый RED на прежней реализации, затем GREEN после минимального изменения.
 
 Некоторые stop-socket tests нельзя корректно выполнить в restricted host
 sandbox: sandbox запрещает `shutdown(2)` с `EPERM` и тест зависает в ожидании
@@ -129,21 +171,38 @@ wakeup. Тот же sibling test подтвердил именно `EPERM`. Эт
 точном upstream-коде зависимости и не означают новые ошибки компиляции. В этой
 ветке намеренно изменено только владение fd, без широкой миграции backend.
 
+## Независимое финальное ревью
+
+Повторное read-only ревью committed range `6056ea2..9428b60` отдельно проверило
+все четыре прежних блокера и не нашло новых `Critical` или `Important`.
+Подтверждены production wiring единого terminal gate, уничтожение startup
+receiver до `join`, recovery/fatal split deferred replay и разрешение Cargo
+ровно в локальный `uinput 0.1.3`. Итог ревью: `Ready to merge: Yes`.
+
+Как необязательное дальнейшее hardening отмечены два пробела тестов: writer
+race-test всё ещё использует ограниченное scheduling-window вместо полностью
+управляемого barrier-интерливинга cancellation/deadline, а deferred tests
+проверяют маршрутизатор и статически проверенное wiring, но не целую итерацию
+event-loop с fake recovery/shutdown hooks. По результатам ревью это не merge
+blockers; package-first recovery и функциональный runtime дополнительно
+проверяют фактическую интеграцию.
+
 ## Идентичность Debian package
 
 - финальный build command: `DEB_BUILD_OPTIONS=nocheck ./manage.sh package deb`;
 - package: `dist/packages/open-switcher_0.1.0-1_amd64.deb`;
-- размер: `3 079 132` bytes;
+- размер: `3 029 908` bytes;
 - SHA-256 package:
-  `e4eecab763d4335c8591852df0627886d4569281390b17cd7a0d36885c60dcfd`;
+  `12226f16cc74afebe22adf4aa5256ad3d388ceafac56720d8a1025b77c04ace0`;
 - SHA-256 packaged daemon:
-  `4dde6886b981aa86fa15b33a6dd0b295aecd9aa91098c1efa094e81a9e024174`.
+  `6dee0fd71611648c96c08162c6335e5fb45715305dace8a9f18912f10324b102`.
 
 Перед финальной сборкой обе полные Rust-матрицы были запущены заново, поэтому
 точная финальная пересборка выполнялась с `DEB_BUILD_OPTIONS=nocheck` и не
-дублировала их третий раз. Ранее package flow также подтвердил 11 D-Bus tests и
-shell checks. Остались только прежние lintian warnings по AppStream metadata,
-changelog и manpages.
+дублировала их третий раз. Package был установлен поверх предыдущей версии
+через `dpkg -i` внутри VM; из-за известного `M-09a` пользовательский сервис
+после установки явно перезапущен. Hash `/usr/bin/open-switcher-daemon` после
+restart совпал с hash daemon, извлечённого из этого DEB.
 
 Именно этот package установлен в VM. SHA-256 запущенного
 `/usr/bin/open-switcher-daemon` совпадает с hash packaged daemon.
@@ -238,6 +297,27 @@ daemon автоматически собирал новый pipeline и снов
 подтвердил, что восстановленный OpenSwitcher снова выполнил grab, а не просто
 остался в отключённом состоянии.
 
+### Контрольный прогон финального race-fix package
+
+После закрытия четырёх замечаний финального review был собран и установлен
+новый DEB с hash `12226f16...04ace0`. Контрольный daemon начал работу с PID
+`196148`; hash `/usr/bin/open-switcher-daemon` совпал с packaged daemon
+`6dee0fd7...24b102`.
+
+На этом точном бинарнике выполнены ещё три последовательных закрытия X11 fd
+watcher:
+
+| Цикл | Bounded probe получил grab | После автоматического recovery |
+|---:|---:|---|
+| 1 | `274.968 ms` от старта probe | тот же PID, 1 uinput fd, 1 virtual device, 12 threads |
+| 2 | `248.104 ms` от старта probe | тот же PID, 1 uinput fd, 1 virtual device, 12 threads |
+| 3 | `253.711 ms` от старта probe | тот же PID, 1 uinput fd, 1 virtual device, 12 threads |
+
+Время probe включает намеренную паузу `80 ms` перед инъекцией и attach/detach
+gdb, поэтому не интерпретируется как чистая latency обнаружения worker loss.
+После каждого recovery второй bounded probe получил timeout: клавиатура была
+снова захвачена восстановленным backend. Итог `3/3`, PID `196148` не менялся.
+
 ## Startup/retry без X11 endpoint
 
 Для отдельного startup-сценария только пользовательскому сервису внутри VM был
@@ -323,6 +403,13 @@ QEMU ввод направлялся через `video0` к виртуальны
 Дополнительно сценарий «новое окно -> `ыгвщ` -> движение tablet -> F12» повторён
 10 раз: `10/10` получили `sudo`, start PID и end PID также равны `167981`.
 
+На финальном race-fix package функциональная матрица повторена ещё раз:
+movement, scroll, physical click, Enter, Tab, space/F12, auto correction и two
+capitals дали `8/8`; start/end PID равны `196148`. Отдельный сценарий «новое
+окно -> `ыгвщ` -> движение tablet -> F12» дал `3/3`, также без смены PID. Это
+подтверждает, что новые terminal/startup/recovery границы не изменили обычную
+семантику коррекции и pointer invalidation.
+
 Отдельный ранее подтверждённый дефект случайного Caps Lock не относится к этой
 ветке и не объявляется исправленным. Механизм двух заглавных в текущем package
 прошёл runtime-проверку.
@@ -343,9 +430,9 @@ QEMU ввод направлялся через `video0` к виртуальны
 ## Итоговое состояние VM
 
 - `open-switcher-daemon.service`: `active/running`, `Result=success`;
-- PID: `177421`, 12 потоков, `NRestarts=0`;
+- PID: `196148`, 12 потоков, `NRestarts=0`;
 - daemon SHA-256
-  `4dde6886b981aa86fa15b33a6dd0b295aecd9aa91098c1efa094e81a9e024174`
+  `6dee0fd71611648c96c08162c6335e5fb45715305dace8a9f18912f10324b102`
   совпадает с package;
 - `DISPLAY=:0`, `XDG_SESSION_TYPE=x11`, layout group `0` (English);
 - временные debug manager variables отсутствуют;
@@ -367,6 +454,11 @@ QEMU ввод направлялся через `video0` к виртуальны
   инъекцией ошибки каждого отдельного ioctl/write внутри реального ядра.
 - Переход pointer watcher N -> 0 покрыт unit test, но runtime-unplug физического
   тачпада или QEMU pointer device не выполнялся.
+- Writer terminal race не проверен exhaustive scheduler/loom; текущий
+  regression-test и общий gate подтверждают исправление, но не перебирают все
+  возможные интерливинги.
+- Deferred recovery unit tests не поднимают полный event-loop с fake backend;
+  production wiring подтверждено независимым review и X11 package runtime.
 - Probe подтверждает реальное окно освобождения виртуального evdev-устройства,
   но не даёт hard-realtime гарантии для любого нагруженного физического хоста.
 - Отдельный дефект accidental Caps Lock и package update restart остаются за
@@ -386,4 +478,8 @@ fail-open: клавиатура остаётся доступна системе
 устранена и воспроизведённые аварийные сценарии — включая отказ во время
 активной коррекции — теперь проходят в package-first runtime. Подтверждённая
 утечка `/dev/uinput` fd также устранена: три recovery подряд не увеличили число
-fd или виртуальных устройств. Лаборатория сохранена для будущих проверок.
+fd или виртуальных устройств. Финальные гонки между writer result и watcher
+cancellation, поздним startup-ready и `join`, а также deferred replay и
+recovery закрыты целевыми regression tests и повторным package-first
+runtime. Exact pin предотвращает случайную потерю локального RAII-fix при
+будущем обновлении resolver state. Лаборатория сохранена для будущих проверок.

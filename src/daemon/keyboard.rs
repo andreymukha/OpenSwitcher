@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+use std::{net::Shutdown, os::unix::net::UnixStream};
 
 const INPUT_EVENT_KEYBOARD: i32 = 0x01;
 const MODIFIER_SYNC_DELAY_MS: u64 = 20;
@@ -630,6 +631,7 @@ struct InputTargetWatcher {
     alive: Arc<AtomicBool>,
     required: bool,
     handle: Option<JoinHandle<()>>,
+    stop_wakeup: Option<UnixStream>,
 }
 
 struct PointerDeviceState {
@@ -700,6 +702,16 @@ fn publish_x11_context_event(
             pointer_click_flag.store(true, Ordering::SeqCst);
             log_input_debug("pointer-click", &format!("source=xinput2 detail={detail}"));
         }
+    }
+}
+
+fn input_target_stop_wakeup_pair() -> io::Result<(UnixStream, UnixStream)> {
+    UnixStream::pair()
+}
+
+fn signal_input_target_stop(stop_wakeup: Option<&UnixStream>) {
+    if let Some(stop_wakeup) = stop_wakeup {
+        let _ = stop_wakeup.shutdown(Shutdown::Write);
     }
 }
 
@@ -1451,12 +1463,15 @@ impl InputTargetWatcher {
             ));
         };
 
+        let (stop_wakeup, worker_stop_wakeup) = input_target_stop_wakeup_pair()?;
+        let stop_wakeup = Some(stop_wakeup);
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let worker_changed_flag = Arc::clone(&changed_flag);
         let worker_pointer_click_flag = Arc::clone(&pointer_click_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
+            let _worker_stop_wakeup = worker_stop_wakeup;
             let _alive_guard = WorkerAliveGuard::new(Arc::clone(&worker_alive));
             log_input_debug(
                 "input-target-watcher-start",
@@ -1516,7 +1531,8 @@ impl InputTargetWatcher {
         ) {
             stop_flag.store(true, Ordering::SeqCst);
             alive.store(false, Ordering::SeqCst);
-            drop(handle);
+            signal_input_target_stop(stop_wakeup.as_ref());
+            let _ = handle.join();
             return Err(error);
         }
 
@@ -1527,6 +1543,7 @@ impl InputTargetWatcher {
             alive,
             required: true,
             handle: Some(handle),
+            stop_wakeup,
         })
     }
 
@@ -1543,6 +1560,7 @@ impl InputTargetWatcher {
             alive,
             required: false,
             handle: None,
+            stop_wakeup: None,
         }
     }
 
@@ -1553,6 +1571,7 @@ impl InputTargetWatcher {
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
+        signal_input_target_stop(self.stop_wakeup.as_ref());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -6866,6 +6885,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             required: false,
             handle: None,
+            stop_wakeup: None,
         };
 
         assert!(take_pointer_click_flags(
@@ -6921,6 +6941,41 @@ mod tests {
     }
 
     #[test]
+    fn input_target_stop_signal_wakes_idle_waiter() {
+        use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (stop_wakeup, stop_reader) = input_target_stop_wakeup_pair().unwrap();
+        let (x11_reader, _x11_writer) = UnixStream::pair().unwrap();
+
+        signal_input_target_stop(Some(&stop_wakeup));
+
+        assert_eq!(
+            wait_for_x11_or_stop(x11_reader.as_raw_fd(), stop_reader.as_raw_fd()).unwrap(),
+            X11WaitOutcome::StopRequested
+        );
+    }
+
+    #[test]
+    fn repeated_input_target_stop_is_idempotent() {
+        use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (stop_wakeup, stop_reader) = input_target_stop_wakeup_pair().unwrap();
+        let (x11_reader, _x11_writer) = UnixStream::pair().unwrap();
+
+        signal_input_target_stop(Some(&stop_wakeup));
+        signal_input_target_stop(Some(&stop_wakeup));
+
+        assert_eq!(
+            wait_for_x11_or_stop(x11_reader.as_raw_fd(), stop_reader.as_raw_fd()).unwrap(),
+            X11WaitOutcome::StopRequested
+        );
+    }
+
+    #[test]
     fn input_target_watcher_readiness_is_true_when_disabled_by_policy() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
@@ -6929,6 +6984,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             required: false,
             handle: None,
+            stop_wakeup: None,
         };
 
         assert!(watcher.is_ready());
@@ -6955,6 +7011,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             required: true,
             handle: None,
+            stop_wakeup: None,
         };
 
         assert!(!watcher.is_ready());
@@ -6969,6 +7026,7 @@ mod tests {
             alive: Arc::new(AtomicBool::new(true)),
             required: true,
             handle: None,
+            stop_wakeup: None,
         };
 
         assert!(watcher.is_ready());

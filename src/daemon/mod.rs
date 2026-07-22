@@ -8,6 +8,7 @@ pub mod runtime;
 pub mod selected_text;
 pub mod service;
 pub mod switch_logic;
+pub(crate) mod x11_wait;
 
 use crate::config::default_config_path;
 use crate::dbus::{CaptureOwnerMonitor, OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};

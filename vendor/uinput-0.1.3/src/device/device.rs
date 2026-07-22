@@ -77,8 +77,42 @@ impl Device {
 
 impl Drop for Device {
 	fn drop(&mut self) {
+		if self.fd < 0 {
+			return;
+		}
+
 		unsafe {
 			ui_dev_destroy(self.fd);
 		}
+		let _ = unistd::close(self.fd);
+		self.fd = -1;
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn pipe_write_fd() -> c_int {
+		let mut fds = [-1; 2];
+		assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+		assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+		fds[1]
+	}
+
+	fn fd_is_open(fd: c_int) -> bool {
+		unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+	}
+
+	#[test]
+	fn device_drop_closes_owned_fd() {
+		let fd = pipe_write_fd();
+		drop(Device::new(fd));
+
+		let still_open = fd_is_open(fd);
+		if still_open {
+			assert_eq!(unsafe { libc::close(fd) }, 0);
+		}
+		assert!(!still_open, "Device::drop left its fd open");
 	}
 }

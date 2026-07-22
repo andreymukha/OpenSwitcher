@@ -255,6 +255,12 @@ impl Builder {
 		self
 	}
 
+	fn into_raw_fd(mut self) -> c_int {
+		let fd = self.fd;
+		self.fd = -1;
+		fd
+	}
+
 	/// Create the defined device.
 	pub fn create(self) -> Res<Device> {
 		unsafe {
@@ -265,6 +271,62 @@ impl Builder {
 			try!(Errno::result(ui_dev_create(self.fd)));
 		}
 
-		Ok(Device::new(self.fd))
+		let fd = self.into_raw_fd();
+		Ok(Device::new(fd))
+	}
+}
+
+impl Drop for Builder {
+	fn drop(&mut self) {
+		if self.fd >= 0 {
+			let _ = unistd::close(self.fd);
+			self.fd = -1;
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn pipe_write_fd() -> c_int {
+		let mut fds = [-1; 2];
+		assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+		assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+		fds[1]
+	}
+
+	fn fd_is_open(fd: c_int) -> bool {
+		unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+	}
+
+	fn builder_with_fd(fd: c_int) -> Builder {
+		Builder {
+			fd: fd,
+			def: unsafe { ::std::mem::zeroed() },
+			abs: None,
+		}
+	}
+
+	#[test]
+	fn builder_drop_closes_owned_fd() {
+		let fd = pipe_write_fd();
+		drop(builder_with_fd(fd));
+
+		let still_open = fd_is_open(fd);
+		if still_open {
+			assert_eq!(unsafe { libc::close(fd) }, 0);
+		}
+		assert!(!still_open, "Builder::drop left its fd open");
+	}
+
+	#[test]
+	fn builder_into_raw_fd_transfers_ownership() {
+		let fd = pipe_write_fd();
+		let transferred = builder_with_fd(fd).into_raw_fd();
+
+		assert_eq!(transferred, fd);
+		assert!(fd_is_open(fd), "Builder closed the transferred fd");
+		assert_eq!(unsafe { libc::close(fd) }, 0);
 	}
 }

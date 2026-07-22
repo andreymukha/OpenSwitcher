@@ -1,251 +1,271 @@
-# OpenSwitcher Logical Pointer and Wakeable X11 Watcher Design
+# Проект исправления событий указателя и X11-наблюдателя
 
-**Date:** 2026-07-22
+**Дата:** 2026-07-22
 
-**Status:** Draft for approval
+**Статус:** черновик для согласования
 
-**Scope:** Pointer-context invalidation and the X11 active-window watcher only
+**Область:** только сброс контекста по событиям указателя и наблюдение за
+активным окном в X11
 
-## Goal
+## Цель
 
-Preserve the last typed-word context across accidental touchpad contact and
-pointer motion, invalidate it for a real logical click, and remove the X11
-active-window watcher's 5-ms idle polling without restoring the first-key race.
+Сохранять контекст последнего набранного слова при случайном касании тачпада
+или движении указателя, сбрасывать его при настоящем логическом клике и убрать
+5-миллисекундный фоновый опрос активного окна X11, не возвращая гонку первой
+клавиши.
 
-These are two independently testable changes. They must be implemented and
-committed separately so either can be reverted without changing the other.
+Это два независимо проверяемых изменения. Они должны быть реализованы и
+зафиксированы отдельными коммитами, чтобы любое из них можно было откатить,
+не затрагивая другое.
 
-## Confirmed Problems
+## Подтверждённые проблемы
 
-### Touch contact is classified as a click
+### Касание ошибочно считается кликом
 
-`is_pointer_click()` currently accepts every Linux key code from `BTN_LEFT`
-through `BTN_TOOL_DOUBLETAP`. That numeric range includes genuine mouse
-buttons, but also `BTN_TOUCH`, `BTN_TOOL_FINGER`, pen/tool presence, and other
-touch interaction codes. The pointer watcher therefore invalidates the word
-context when a readable touchpad reports contact during ordinary cursor
-movement.
+Сейчас `is_pointer_click()` принимает все Linux-коды клавиш от `BTN_LEFT`
+до `BTN_TOOL_DOUBLETAP`. В этот числовой диапазон входят не только настоящие
+кнопки мыши, но и `BTN_TOUCH`, `BTN_TOOL_FINGER`, события присутствия пера
+или другого инструмента и прочие коды взаимодействия с сенсорной поверхностью.
+Поэтому наблюдатель указателя сбрасывает контекст слова, когда доступный для
+чтения тачпад сообщает об обычном касании во время перемещения курсора.
 
-### The active-window watcher busy-polls its X11 queue
+### Наблюдатель активного окна постоянно опрашивает очередь X11
 
-The active-window watcher drains `x11rb::Connection::poll_for_event()` and,
-when the queue is empty, sleeps for 5 ms. The interval was reduced from 50 ms
-to prevent a reproduced partial-word correction immediately after an X11
-focus change. It restored correctness, but increased measured daemon idle CPU.
-Choosing another interval would only trade CPU usage against the same race.
+Наблюдатель активного окна извлекает события через
+`x11rb::Connection::poll_for_event()` и при пустой очереди засыпает на 5 мс.
+Ранее интервал увеличили с 5 до 50 мс ради снижения фоновой нагрузки. Это
+привело к воспроизводимой частичной коррекции слова: новое окно успевало
+получить ввод до того, как наблюдатель замечал смену фокуса. Возврат к 5 мс
+восстановил корректность, но повысил измеренную фоновую загрузку CPU.
 
-## Relevant Decision History
+Подбор очередного интервала лишь обменяет нагрузку CPU на вероятность той же
+гонки и поэтому не считается допустимым окончательным решением.
 
-- Commit `82fd2da` introduced the raw pointer classifier on 2026-04-01. Its
-  numeric range did not distinguish real buttons from touch/tool state, and no
-  regression test encoded that distinction.
-- Commit `8146173` introduced the X11 active-window watcher with a 5-ms queue
-  poll on 2026-04-04.
-- Commit `6761365` increased that interval to 50 ms on 2026-05-03 to reduce
-  idle CPU usage.
-- Commit `1c24968` restored 5 ms after reproducing partial-word correction when
-  a new window received input before the 50-ms watcher observed the focus
-  change.
+## История решений
 
-The new work preserves the correctness restored by `1c24968`; it does not
-retune an interval whose earlier value already caused a reproduced regression.
+- Коммит `82fd2da` от 2026-04-01 добавил классификатор сырых событий
+  указателя. Числовой диапазон не отличал настоящие кнопки от состояния
+  касания или инструмента, а теста на это различие не было.
+- Коммит `8146173` от 2026-04-04 добавил наблюдатель активного окна X11 с
+  опросом очереди каждые 5 мс.
+- Коммит `6761365` от 2026-05-03 увеличил интервал до 50 мс ради снижения
+  фоновой нагрузки.
+- Коммит `1c24968` вернул 5 мс после воспроизведения частичной коррекции,
+  когда новое окно получало ввод раньше, чем 50-миллисекундный наблюдатель
+  замечал смену фокуса.
 
-## Required Semantics
+Новая работа обязана сохранить корректность, восстановленную в `1c24968`.
+Она не должна снова настраивать наугад интервал, для которого уже известна
+воспроизводимая регрессия.
 
-Pointer context invalidation follows the desktop's logical action as closely
-as the session permits:
+## Требуемое поведение
 
-- pointer motion, light touch, tool/finger presence, scrolling, and gestures do
-  not invalidate the typed-word context;
-- a physical primary, secondary, middle, or navigation-button press does;
-- a touchpad tap that the X11 input stack converts into a logical button press
-  does;
-- duplicate observations of one physical/logical press are harmless and
-  coalesce into one invalidation flag;
-- no pointer device is grabbed and no pointer event is injected.
+Сброс контекста должен как можно точнее следовать логическому действию рабочего
+стола:
 
-The context may be invalidated on logical button press rather than waiting for
-release. Once a press begins, focus, selection, caret position, navigation, or
-a context menu may change, so the old word context is no longer trustworthy.
+- движение указателя, лёгкое касание, присутствие пальца или инструмента,
+  прокрутка и жесты не сбрасывают контекст набранного слова;
+- физическое нажатие основной, дополнительной, средней или навигационной
+  кнопки сбрасывает контекст;
+- тап по тачпаду сбрасывает контекст только тогда, когда стек ввода X11 уже
+  преобразовал его в логическое нажатие кнопки;
+- повторное наблюдение одного нажатия по сырому и X11-каналу безопасно:
+  сигналы объединяются в один флаг сброса;
+- OpenSwitcher не захватывает устройства указателя и не отправляет события
+  указателя.
 
-## Decision Rationale: Tap-to-click
+Контекст можно сбрасывать при логическом нажатии кнопки, не дожидаясь её
+отпускания. После начала нажатия могут измениться фокус, выделение, положение
+каретки, история навигации или контекстное меню, поэтому старому контексту
+слова больше нельзя доверять.
 
-OpenSwitcher must not classify a raw touch as a tap. The trusted boundary is
-the desktop input stack:
+## Почему tap-to-click учитывается только после решения системы
 
-1. raw `BTN_TOUCH`, `BTN_TOOL_*`, and motion events remain contact/movement and
-   are ignored;
-2. libinput applies its configured timing, movement, pressure, palm-rejection,
-   and click-method policy;
-3. only if the X11 input stack turns that interaction into a logical button
-   press does OpenSwitcher invalidate the context.
+OpenSwitcher не должен самостоятельно распознавать тап по сырым событиям
+тачпада. Границей доверия служит системный стек ввода:
 
-This means an accidental brush that merely moves the pointer does not reset the
-last word. If the desktop itself emits a click, however, it can already have
-moved the caret, cleared a selection, changed focus, opened a context menu, or
-navigated. Retaining the previous word after that state change would be unsafe:
-an immediate correction hotkey could delete or replace text at the new caret.
+1. сырые `BTN_TOUCH`, `BTN_TOOL_*` и события движения остаются касанием или
+   движением и игнорируются;
+2. libinput применяет настроенные правила времени, расстояния движения,
+   давления, защиты от ладони и метода клика;
+3. OpenSwitcher сбрасывает контекст только тогда, когда стек X11 уже превратил
+   взаимодействие в логическое нажатие кнопки.
 
-### Rejected alternatives
+Поэтому случайное касание, которое лишь передвинуло указатель, не уничтожает
+последнее слово. Но если рабочий стол действительно сформировал клик, он уже
+мог переставить каретку, снять выделение, изменить фокус, открыть контекстное
+меню или выполнить навигацию. Сохранение старого слова после такого изменения
+опасно: немедленное нажатие клавиши коррекции может удалить или заменить текст
+уже около новой каретки.
 
-- **Treat every touch contact as a click:** rejected because it is the
-  confirmed current bug and prevents correction after ordinary touchpad
-  movement.
-- **Recognize taps from raw touch data inside OpenSwitcher:** rejected because
-  it would duplicate libinput policy and disagree with desktop configuration,
-  palm rejection, or hardware quirks.
-- **Accept physical buttons only, even when X11 reports a logical tap:**
-  rejected because a real desktop click could move the caret while
-  OpenSwitcher retained stale word context. This favors a false negative at
-  the exact point where stale correction is most dangerous.
+### Отклонённые варианты
 
-The accepted failure bias is therefore: never reset for raw contact or motion;
-reset when a genuine physical button is observed, or when X11 reports that the
-desktop has actually produced a logical button press. Wayland retains the
-physical-button fallback because this project has no generic compositor-level
-logical-click observer there.
+- **Считать кликом любое касание.** Это подтверждённая текущая ошибка, которая
+  не позволяет исправить слово после обычного движения пальцем по тачпаду.
+- **Самостоятельно распознавать тапы по сырым данным.** Такой вариант
+  дублирует правила libinput и может расходиться с настройками рабочего стола,
+  защитой от ладони и особенностями конкретного оборудования.
+- **Учитывать только физические кнопки, даже если X11 сообщил о логическом
+  тапе.** Реальный системный клик может переставить каретку, пока OpenSwitcher
+  сохранит устаревшее слово. Ложное несрабатывание здесь опаснее, потому что
+  последующая коррекция может выполниться в другом месте.
 
-## Change A: Correct Pointer Invalidation
+Принятое правило: никогда не сбрасывать контекст по сырому касанию или
+движению; сбрасывать его при настоящей физической кнопке либо когда X11
+сообщает, что рабочий стол действительно создал логическое нажатие. В Wayland
+остаётся резервный вариант с физическими кнопками, поскольку в проекте нет
+универсального наблюдателя логических кликов на уровне композитора.
 
-### Raw-device classifier
+## Изменение A: правильное распознавание клика
 
-Replace the numeric key-code range with an explicit allow-list of genuine
-mouse buttons (`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`,
-`BTN_FORWARD`, `BTN_BACK`, and `BTN_TASK`). Explicitly reject `BTN_TOUCH`, all
-`BTN_TOOL_*` codes, joystick/gamepad buttons, and all relative/absolute motion
-events.
+### Классификатор сырых событий
 
-This raw path remains the session-independent fallback and detects physical
-mouse, TrackPoint, and clickpad-button presses. It intentionally does not try
-to infer a tap from raw touch coordinates or timing. Reimplementing libinput's
-tap thresholds, palm rejection, click method, and gesture policy would be less
-stable and could disagree with the desktop settings.
+Числовой диапазон заменяется явным списком настоящих кнопок мыши:
+`BTN_LEFT`, `BTN_RIGHT`, `BTN_MIDDLE`, `BTN_SIDE`, `BTN_EXTRA`,
+`BTN_FORWARD`, `BTN_BACK` и `BTN_TASK`. `BTN_TOUCH`, все `BTN_TOOL_*`,
+кнопки джойстиков и геймпадов, а также относительные и абсолютные события
+движения явно отклоняются.
 
-### X11 logical-click observation
+Этот путь остаётся независимым от типа сессии и обнаруживает физические кнопки
+мыши, TrackPoint и механическое нажатие clickpad. Он намеренно не пытается
+выводить тап из координат и времени сырых касаний: повторение порогов libinput,
+защиты от ладони, метода клика и правил жестов было бы менее стабильным и могло
+бы расходиться с настройками рабочего стола.
 
-On X11, extend the dedicated X11 monitor to select XInput2 raw button-press
-events on the root window without a grab. Accept logical button details for
-primary, middle, secondary, and navigation buttons; reject wheel-button
-details and valuator/motion events. Emulated button presses must not be
-discarded because tap-to-click may be represented that way by the X11 input
-stack.
+### Наблюдение логических кликов X11
 
-The X11 click signal and the raw-device signal feed the same atomic
-invalidation state. XInput2 setup is additive: if the extension or event
-selection is unavailable, active-window tracking continues and raw physical
-buttons remain the fallback.
+В X11 выделенный наблюдатель дополнительно подписывается через XInput2 на
+глобальные события нажатия кнопок, выбирая их на корневом окне без захвата
+устройства. Принимаются логические основная, средняя, дополнительная и
+навигационные кнопки. События колеса, движения и изменения координат
+отклоняются. Эмулированные нажатия не отбрасываются, поскольку таким образом
+стек X11 может представить tap-to-click.
 
-On Wayland there is no generic project backend that can observe every
-compositor-generated logical tap. This change therefore provides best-effort
-physical-button invalidation through evdev and deliberately does not guess
-touch gestures. Compositor-specific logical-click support is outside this
-slice.
+Сигналы X11 и сырых устройств записываются в одно атомарное состояние сброса.
+Поддержка XInput2 является дополнительной: если расширение или подписка
+недоступны, наблюдение за активным окном продолжает работать, а физические
+кнопки остаются резервным вариантом.
 
-### Staging
+В Wayland универсально наблюдать все логические тапы, созданные композитором,
+невозможно в рамках существующих backend проекта. Поэтому там гарантируется
+доступный через evdev вариант с физическими кнопками, но OpenSwitcher не
+пытается угадывать жесты. Интеграции с отдельными Wayland-композиторами в эту
+работу не входят.
 
-The first implementation commit adds the corrected classifier and X11
-logical-click event handling while retaining the current 5-ms X11 queue poll.
-This isolates click semantics from the wait-loop change.
+### Порядок внедрения
 
-## Change B: Wakeable Event-Driven X11 Wait
+Первый реализационный коммит добавляет правильный классификатор и обработку
+логического клика X11, сохраняя текущий 5-миллисекундный опрос очереди. Это
+отделяет изменение смысла клика от изменения механизма ожидания.
 
-After Change A passes, replace the sleep loop with a wakeable blocking wait on:
+## Изменение B: событийное ожидание X11 с пробуждением
 
-1. the file descriptor of the monitor's dedicated X11 connection; and
-2. a private shutdown descriptor owned by `InputTargetWatcher`.
+После проверки изменения A цикл с `sleep` заменяется блокирующим ожиданием,
+которое можно прервать. Наблюдатель одновременно ждёт:
 
-The watcher thread remains the sole user of its X11 connection. Its loop is:
+1. файловый дескриптор своего выделенного соединения X11;
+2. внутренний дескриптор пробуждения для остановки `InputTargetWatcher`.
 
-1. drain all events already buffered inside x11rb with `poll_for_event()`;
-2. process and coalesce active-window and logical-button events;
-3. check the stop flag;
-4. block until either the X11 descriptor or shutdown descriptor is readable;
-5. on X11 readiness, return to the drain step; on shutdown readiness, exit.
+Поток наблюдателя остаётся единственным владельцем соединения X11. Алгоритм:
 
-Draining before blocking is mandatory because x11rb can already hold a parsed
-event while the underlying socket is no longer readable. The shutdown path
-sets the existing atomic stop flag, signals the private descriptor, and then
-joins the worker. A naive uninterruptible `wait_for_event()` is not acceptable
-because it could hang daemon shutdown.
+1. извлечь через `poll_for_event()` все события, уже находящиеся во внутреннем
+   буфере x11rb;
+2. обработать и объединить события активного окна и логических кнопок;
+3. проверить флаг остановки;
+4. заблокироваться до готовности X11 или дескриптора остановки;
+5. при готовности X11 вернуться к извлечению событий, при сигнале остановки
+   завершить поток.
 
-The wait should use a small safe OS polling wrapper. No second thread may read
-the X11 connection. X11 EOF, hangup, or protocol errors preserve the current
-worker-failure policy: record a bounded diagnostic, mark the required worker
-dead, and allow existing controller health handling to release the input
-backend rather than silently continuing without target invalidation.
+Извлекать внутренние события до блокировки обязательно: x11rb может уже
+содержать разобранное событие, хотя сокет больше не отмечен как готовый к
+чтению. При остановке сначала устанавливается существующий атомарный флаг,
+затем сигнализируется дескриптор пробуждения и только после этого выполняется
+`join`. Простое непрерываемое `wait_for_event()` недопустимо, потому что
+может навсегда задержать завершение daemon.
 
-There is no periodic timer on the normal X11 path. `_NET_ACTIVE_WINDOW`
-remains the same source of truth; only the waiting mechanism changes.
+Для ожидания используется небольшая безопасная обёртка над системным
+механизмом `poll`. Второй поток не должен читать соединение X11. EOF, разрыв
+соединения и протокольные ошибки сохраняют существующую политику отказа:
+ограниченная диагностическая запись, перевод обязательного worker в
+неработоспособное состояние и передача управления существующему контролю
+здоровья, который должен освободить input backend, а не продолжать работу без
+сброса контекста при смене окна.
 
-## Failure Handling
+В штатном пути периодического таймера больше нет. Источником истины остаётся
+`_NET_ACTIVE_WINDOW`; меняется только способ ожидания события.
 
-| Failure | Required behavior |
+## Обработка отказов
+
+| Отказ | Требуемое поведение |
 |---|---|
-| Raw touch/motion event | Ignore it; retain word context |
-| XInput2 unavailable | Continue focus watching; use physical-button fallback |
-| Duplicate raw and X11 click | Coalesce through the existing atomic flag |
-| X11 connection error/disconnect | Worker becomes unhealthy; existing fail-safe controller path applies |
-| Shutdown while X11 is idle | Wake the wait descriptor and join promptly |
-| Shutdown notification already pending | Treat it as idempotent and exit |
-| Unexpected X11 event burst | Drain and coalesce without losing target-change invalidation |
+| Сырое касание или движение | Игнорировать и сохранить контекст слова |
+| XInput2 недоступен | Продолжить наблюдение за фокусом и использовать физические кнопки |
+| Один клик замечен по двум каналам | Объединить сигналы через существующий атомарный флаг |
+| Ошибка или разрыв соединения X11 | Worker становится неработоспособным; применяется существующий fail-safe путь контроллера |
+| Остановка при бездействующем X11 | Разбудить ожидание и своевременно присоединить поток |
+| Сигнал остановки уже ожидает обработки | Считать повторный сигнал безопасным и завершиться |
+| Неожиданный поток событий X11 | Извлечь и объединить события без потери сигнала смены активного окна |
 
-## Verification
+## Проверка
 
-Implementation follows TDD and does not exercise host input devices.
+Реализация выполняется через TDD и не взаимодействует с устройствами ввода
+хоста.
 
-### Safe local tests
+### Безопасные локальные тесты
 
-- explicit true/false table for every accepted mouse button and representative
-  touch/tool/gamepad codes;
-- XInput2 classifier tests for primary/secondary/middle/navigation, emulated
-  primary, wheel details, motion, and unrelated events;
-- duplicate raw/X11 press coalescing;
-- buffered-event-before-fd-wait regression test;
-- idle shutdown wakes and joins within a bounded deadline;
-- X11-readiness, shutdown-readiness, EOF, and error paths;
-- active-window changes remain observable without an interval constant.
+- таблица истинных и ложных результатов для всех принимаемых кнопок мыши и
+  характерных кодов касания, инструмента и геймпада;
+- тесты классификатора XInput2 для основной, средней, дополнительной,
+  навигационной и эмулированной кнопок, колеса, движения и посторонних событий;
+- объединение повторных сигналов одного нажатия от сырого и X11-источника;
+- регресс-тест события, уже находящегося во внутреннем буфере до ожидания
+  файлового дескриптора;
+- остановка бездействующего worker с пробуждением и `join` в ограниченный
+  срок;
+- готовность X11, готовность остановки, EOF и пути ошибок;
+- смена активного окна без периодической константы опроса.
 
-### Retained Mint/Cinnamon X11 VM
+### Сохранённая ВМ Mint/Cinnamon X11
 
-Validate the installed Debian package, not only a developer binary:
+Проверяется установленный Debian-пакет, а не только developer binary:
 
-- type a word, move the pointer with touchpad contact, then correct the full
-  word successfully;
-- repeat with accidental touch and with scrolling;
-- verify physical click and tap-to-click both invalidate the previous word;
-- verify mouse/TrackPoint primary, secondary, and middle buttons;
-- focus a new window and immediately type/correct, including the reproduced
-  `ыгвщ` + F12 case;
-- repeat rapid focus changes and first-key input;
-- stop and restart the user service while X11 is idle;
-- exercise X11 disconnect/error handling through the VM's independent control
-  channel;
-- rerun ordinary switching, automatic correction, Caps Lock correction, and
-  two-capitals correction;
-- compare idle CPU with the current 5-ms package.
+- набрать слово, коснуться тачпада и переместить курсор, затем успешно
+  исправить всё слово;
+- повторить со случайным касанием и прокруткой;
+- проверить, что физический клик и tap-to-click сбрасывают предыдущее слово;
+- проверить основные, дополнительные и средние кнопки мыши и TrackPoint;
+- сфокусировать новое окно и немедленно ввести или исправить слово, включая
+  воспроизведённый сценарий `ыгвщ` + F12;
+- повторить быстрые смены фокуса и ввод первой клавиши;
+- остановить и перезапустить пользовательскую службу при бездействующем X11;
+- проверить разрыв или ошибку X11 через независимый канал управления ВМ;
+- повторить обычное переключение, автокоррекцию, исправление Caps Lock и двух
+  заглавных букв;
+- сравнить фоновую загрузку CPU с текущим пакетом с интервалом 5 мс.
 
-Change B is accepted only if the functional matrix, prompt shutdown, and
-failure behavior pass. If it does not, Change A remains valid and the 5-ms
-polling implementation is retained; the interval is not increased or tuned by
-guesswork.
+Изменение B принимается только при успешном прохождении функциональной матрицы,
+быстрой остановке и правильном поведении при отказах. Если оно не проходит
+проверку, изменение A остаётся, а надёжный 5-миллисекундный опрос сохраняется.
+Увеличивать интервал или подбирать его наугад нельзя.
 
-## Non-goals
+## Что не входит в работу
 
-- no redesign of keyboard grabbing, writer queues, or runtime snapshots;
-- no changes to correction timing, layout polling, key mapping, or XTest
-  replay parameters;
-- no raw touch gesture recognizer;
-- no compositor-specific Wayland integration in this slice;
-- no VM-lab rebuild or cleanup.
+- переработка захвата клавиатуры, очередей writer или runtime snapshots;
+- изменение задержек коррекции, опроса раскладки, сопоставления клавиш или
+  параметров XTest replay;
+- собственный распознаватель жестов по сырым касаниям;
+- интеграция с конкретными Wayland-композиторами;
+- перестройка или удаление лаборатории ВМ.
 
-## Technical References
+## Технические источники
 
-- libinput tap-to-click maps qualifying touch sequences into button clicks and
-  explicitly warns callers not to recreate tap recognition from lower-level
-  gesture signals: <https://wayland.freedesktop.org/libinput/doc/latest/tapping.html>
-  and <https://wayland.freedesktop.org/libinput/doc/latest/gestures.html>;
-- XInput2 event selection is per client and does not require a pointer grab:
+- libinput преобразует подходящие последовательности касаний в клики и прямо
+  предупреждает не создавать собственное распознавание tap-to-click по
+  низкоуровневым сигналам жестов:
+  <https://wayland.freedesktop.org/libinput/doc/latest/tapping.html> и
+  <https://wayland.freedesktop.org/libinput/doc/latest/gestures.html>;
+- XInput2 позволяет клиенту подписаться на события без захвата указателя:
   <https://www.x.org/archive/X11R7.5/doc/man/man3/XISelectEvents.3.html>;
-- x11rb's event-loop integration notes require draining its internal event
-  buffer before waiting on the connection file descriptor:
+- документация интеграции x11rb с event loop требует извлекать внутренний
+  буфер событий до ожидания файлового дескриптора соединения:
   <https://docs.rs/x11rb/0.13.2/x11rb/event_loop_integration/>.

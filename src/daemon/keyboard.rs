@@ -1,6 +1,7 @@
 use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
+use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
 use crate::error::SwitcherError;
 use crate::model::{
     DesktopEnvironment, DistroKind, HotkeyTrigger, LayoutSwitchCombo, SessionType, SystemContext,
@@ -12,7 +13,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -30,10 +31,6 @@ const KEYBOARD_SYMLINK_DIRS: [&str; 2] = ["/dev/input/by-path", "/dev/input/by-i
 const UINPUT_PATHS: [&str; 2] = ["/dev/uinput", "/dev/input/uinput"];
 pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(20);
-// Keep the X11 active-window watcher ahead of ordinary human typing. A longer
-// interval can invalidate the word buffer after the first key reached a newly
-// focused window, leaving manual correction with only a suffix of the word.
-const INPUT_TARGET_POLL_INTERVAL: Duration = Duration::from_millis(5);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
 // Transactional commands use the same total-order queue, but are represented as
 // single indivisible commands and get a larger bounded enqueue window because
@@ -712,6 +709,26 @@ fn input_target_stop_wakeup_pair() -> io::Result<(UnixStream, UnixStream)> {
 fn signal_input_target_stop(stop_wakeup: Option<&UnixStream>) {
     if let Some(stop_wakeup) = stop_wakeup {
         let _ = stop_wakeup.shutdown(Shutdown::Write);
+    }
+}
+
+fn run_x11_event_cycle<Event>(
+    stop_requested: &AtomicBool,
+    mut next_event: impl FnMut() -> io::Result<Option<Event>>,
+    mut handle_event: impl FnMut(Event),
+    mut wait: impl FnMut() -> io::Result<X11WaitOutcome>,
+) -> io::Result<bool> {
+    while let Some(event) = next_event()? {
+        handle_event(event);
+    }
+
+    if stop_requested.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+
+    match wait()? {
+        X11WaitOutcome::X11Ready => Ok(true),
+        X11WaitOutcome::StopRequested => Ok(false),
     }
 }
 
@@ -1471,8 +1488,9 @@ impl InputTargetWatcher {
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
-            let _worker_stop_wakeup = worker_stop_wakeup;
             let _alive_guard = WorkerAliveGuard::new(Arc::clone(&worker_alive));
+            let x11_fd = monitor.connection_fd();
+            let stop_fd = worker_stop_wakeup.as_raw_fd();
             log_input_debug(
                 "input-target-watcher-start",
                 &format!(
@@ -1484,38 +1502,27 @@ impl InputTargetWatcher {
                 &worker_stop_flag,
                 "input-target-watcher",
                 || publish_input_worker_ready(&worker_alive, ready_tx, "input-target-watcher"),
-                || {
-                    let mut had_events = false;
-
-                    loop {
-                        match monitor.poll_context_event() {
-                            Ok(Some(event)) => {
-                                had_events = true;
-                                publish_x11_context_event(
-                                    event,
-                                    &worker_changed_flag,
-                                    &worker_pointer_click_flag,
-                                );
-                            }
-                            Ok(None) => break,
-                            Err(error) => {
-                                log_input_debug(
-                                    "input-target-read-error",
-                                    &format!("source=_NET_ACTIVE_WINDOW error={error}"),
-                                );
-                                log_input_debug(
-                                    "input-target-watcher-stop",
-                                    "reason=watcher-error",
-                                );
-                                return false;
-                            }
-                        }
+                || match run_x11_event_cycle(
+                    &worker_stop_flag,
+                    || monitor.poll_context_event(),
+                    |event| {
+                        publish_x11_context_event(
+                            event,
+                            &worker_changed_flag,
+                            &worker_pointer_click_flag,
+                        );
+                    },
+                    || wait_for_x11_or_stop(x11_fd, stop_fd),
+                ) {
+                    Ok(keep_running) => keep_running,
+                    Err(error) => {
+                        log_input_debug(
+                            "input-target-read-error",
+                            &format!("source=x11 error={error}"),
+                        );
+                        log_input_debug("input-target-watcher-stop", "reason=watcher-error");
+                        false
                     }
-
-                    if !had_events {
-                        thread::sleep(INPUT_TARGET_POLL_INTERVAL);
-                    }
-                    true
                 },
             );
             if let Err(error) = loop_result {
@@ -2260,6 +2267,10 @@ impl Drop for InputTargetWatcher {
 }
 
 impl ActiveWindowMonitor {
+    fn connection_fd(&self) -> RawFd {
+        self.conn.stream().as_raw_fd()
+    }
+
     fn connect() -> io::Result<Self> {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, EventMask};
@@ -6736,12 +6747,6 @@ mod tests {
     }
 
     #[test]
-    fn input_target_poll_interval_stays_below_first_key_race_budget() {
-        assert!(INPUT_TARGET_POLL_INTERVAL >= Duration::from_millis(1));
-        assert!(INPUT_TARGET_POLL_INTERVAL <= Duration::from_millis(5));
-    }
-
-    #[test]
     fn pointer_click_classifier_accepts_only_physical_pointer_buttons() {
         for key in [
             Key::BTN_LEFT,
@@ -6973,6 +6978,73 @@ mod tests {
             wait_for_x11_or_stop(x11_reader.as_raw_fd(), stop_reader.as_raw_fd()).unwrap(),
             X11WaitOutcome::StopRequested
         );
+    }
+
+    #[test]
+    fn buffered_x11_events_are_drained_before_fd_wait() {
+        use crate::daemon::x11_wait::X11WaitOutcome;
+        use std::cell::RefCell;
+
+        let stop_requested = AtomicBool::new(false);
+        let next_calls = Cell::new(0);
+        let order = RefCell::new(Vec::new());
+
+        let keep_running = run_x11_event_cycle(
+            &stop_requested,
+            || {
+                order.borrow_mut().push("next");
+                let call = next_calls.get();
+                next_calls.set(call + 1);
+                Ok(if call == 0 { Some(7) } else { None })
+            },
+            |event| {
+                assert_eq!(event, 7);
+                order.borrow_mut().push("handle");
+            },
+            || {
+                order.borrow_mut().push("wait");
+                Ok(X11WaitOutcome::X11Ready)
+            },
+        )
+        .unwrap();
+
+        assert!(keep_running);
+        assert_eq!(*order.borrow(), ["next", "handle", "next", "wait"]);
+    }
+
+    #[test]
+    fn stop_observed_after_drain_skips_fd_wait() {
+        use crate::daemon::x11_wait::X11WaitOutcome;
+        use std::cell::RefCell;
+
+        let stop_requested = AtomicBool::new(false);
+        let next_calls = Cell::new(0);
+        let wait_called = Cell::new(false);
+        let order = RefCell::new(Vec::new());
+
+        let keep_running = run_x11_event_cycle(
+            &stop_requested,
+            || {
+                order.borrow_mut().push("next");
+                let call = next_calls.get();
+                next_calls.set(call + 1);
+                Ok(if call == 0 { Some(7) } else { None })
+            },
+            |event| {
+                assert_eq!(event, 7);
+                order.borrow_mut().push("handle");
+                stop_requested.store(true, Ordering::SeqCst);
+            },
+            || {
+                wait_called.set(true);
+                Ok(X11WaitOutcome::X11Ready)
+            },
+        )
+        .unwrap();
+
+        assert!(!keep_running);
+        assert!(!wait_called.get());
+        assert_eq!(*order.borrow(), ["next", "handle", "next"]);
     }
 
     #[test]

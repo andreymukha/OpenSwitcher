@@ -625,6 +625,7 @@ struct PointerWatcher {
 
 struct InputTargetWatcher {
     changed_flag: Arc<AtomicBool>,
+    pointer_click_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     required: bool,
@@ -638,11 +639,68 @@ struct PointerDeviceState {
 
 // X11 active window monitor
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X11ContextEvent {
+    ActiveWindowChanged {
+        previous: Option<u32>,
+        current: Option<u32>,
+    },
+    PointerClick {
+        detail: u32,
+    },
+}
+
 struct ActiveWindowMonitor {
     conn: x11rb::rust_connection::RustConnection,
     root: u32,
     active_window_atom: u32,
     current_window: Option<u32>,
+}
+
+fn xinput_pointer_click_event_mask() -> x11rb::protocol::xinput::EventMask {
+    use x11rb::protocol::xinput::{Device, EventMask, XIEventMask};
+
+    EventMask {
+        deviceid: Device::ALL_MASTER.into(),
+        mask: vec![XIEventMask::RAW_BUTTON_PRESS],
+    }
+}
+
+fn x11_pointer_click_event(event: &x11rb::protocol::Event) -> Option<X11ContextEvent> {
+    match event {
+        x11rb::protocol::Event::XinputRawButtonPress(event)
+            if is_x11_pointer_click(event.detail) =>
+        {
+            Some(X11ContextEvent::PointerClick {
+                detail: event.detail,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn publish_x11_context_event(
+    event: X11ContextEvent,
+    changed_flag: &AtomicBool,
+    pointer_click_flag: &AtomicBool,
+) {
+    match event {
+        X11ContextEvent::ActiveWindowChanged { previous, current } => {
+            changed_flag.store(true, Ordering::SeqCst);
+            log_input_debug(
+                "input-target-changed",
+                &format!(
+                    "source=_NET_ACTIVE_WINDOW previous={} current={}",
+                    format_x11_window(previous),
+                    format_x11_window(current)
+                ),
+            );
+        }
+        X11ContextEvent::PointerClick { detail } => {
+            pointer_click_flag.store(true, Ordering::SeqCst);
+            log_input_debug("pointer-click", &format!("source=xinput2 detail={detail}"));
+        }
+    }
 }
 
 // Watcher worker lifecycle
@@ -918,6 +976,12 @@ fn ensure_input_dependencies_ready(
     Ok(())
 }
 
+fn take_pointer_click_flags(physical: &AtomicBool, logical: &AtomicBool) -> bool {
+    let physical = physical.swap(false, Ordering::SeqCst);
+    let logical = logical.swap(false, Ordering::SeqCst);
+    physical || logical
+}
+
 fn snapshot_then_acquire_grab<Target, Snapshot, Error>(
     target: &mut Target,
     snapshot: impl FnOnce(&mut Target) -> Result<Snapshot, Error>,
@@ -969,7 +1033,10 @@ impl KeyboardController {
     }
 
     pub fn take_pointer_click_invalidation(&self) -> bool {
-        self.pointer_watcher.take_click_invalidation()
+        take_pointer_click_flags(
+            &self.pointer_watcher.click_flag,
+            &self.input_target_watcher.pointer_click_flag,
+        )
     }
 
     pub fn take_input_target_invalidation(&self) -> bool {
@@ -1333,10 +1400,6 @@ impl PointerWatcher {
         })
     }
 
-    fn take_click_invalidation(&self) -> bool {
-        self.click_flag.swap(false, Ordering::SeqCst)
-    }
-
     fn stop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
@@ -1355,6 +1418,7 @@ impl PointerWatcher {
 impl InputTargetWatcher {
     fn spawn(session_type: SessionType) -> Result<Self, SwitcherError> {
         let changed_flag = Arc::new(AtomicBool::new(false));
+        let pointer_click_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
 
@@ -1366,7 +1430,12 @@ impl InputTargetWatcher {
                     format_session_type(session_type)
                 ),
             );
-            return Ok(Self::disabled(changed_flag, stop_flag, alive));
+            return Ok(Self::disabled(
+                changed_flag,
+                pointer_click_flag,
+                stop_flag,
+                alive,
+            ));
         }
 
         let Ok(mut monitor) = ActiveWindowMonitor::connect() else {
@@ -1374,11 +1443,17 @@ impl InputTargetWatcher {
                 "input-target-watcher-disabled",
                 "reason=x11-active-window-unavailable",
             );
-            return Ok(Self::disabled(changed_flag, stop_flag, alive));
+            return Ok(Self::disabled(
+                changed_flag,
+                pointer_click_flag,
+                stop_flag,
+                alive,
+            ));
         };
 
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let worker_changed_flag = Arc::clone(&changed_flag);
+        let worker_pointer_click_flag = Arc::clone(&pointer_click_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
@@ -1398,17 +1473,13 @@ impl InputTargetWatcher {
                     let mut had_events = false;
 
                     loop {
-                        match monitor.poll_change() {
-                            Ok(Some((previous_window, current_window))) => {
+                        match monitor.poll_context_event() {
+                            Ok(Some(event)) => {
                                 had_events = true;
-                                worker_changed_flag.store(true, Ordering::SeqCst);
-                                log_input_debug(
-                                    "input-target-changed",
-                                    &format!(
-                                        "source=_NET_ACTIVE_WINDOW previous={} current={}",
-                                        format_x11_window(previous_window),
-                                        format_x11_window(current_window)
-                                    ),
+                                publish_x11_context_event(
+                                    event,
+                                    &worker_changed_flag,
+                                    &worker_pointer_click_flag,
                                 );
                             }
                             Ok(None) => break,
@@ -1451,6 +1522,7 @@ impl InputTargetWatcher {
 
         Ok(Self {
             changed_flag,
+            pointer_click_flag,
             stop_flag,
             alive,
             required: true,
@@ -1460,11 +1532,13 @@ impl InputTargetWatcher {
 
     fn disabled(
         changed_flag: Arc<AtomicBool>,
+        pointer_click_flag: Arc<AtomicBool>,
         stop_flag: Arc<AtomicBool>,
         alive: Arc<AtomicBool>,
     ) -> Self {
         Self {
             changed_flag,
+            pointer_click_flag,
             stop_flag,
             alive,
             required: false,
@@ -2191,6 +2265,17 @@ impl ActiveWindowMonitor {
         conn.flush()
             .map_err(|error| io::Error::other(error.to_string()))?;
 
+        match Self::subscribe_pointer_clicks(&conn, root) {
+            Ok(()) => log_input_debug(
+                "input-target-xinput2",
+                "enabled=true source=raw-button-press",
+            ),
+            Err(error) => log_input_debug(
+                "input-target-xinput2",
+                &format!("enabled=false reason=subscription-failed error={error}"),
+            ),
+        }
+
         let current_window = Self::query_active_window(&conn, root, active_window_atom)?;
         Ok(Self {
             conn,
@@ -2200,7 +2285,26 @@ impl ActiveWindowMonitor {
         })
     }
 
-    fn poll_change(&mut self) -> io::Result<Option<(Option<u32>, Option<u32>)>> {
+    fn subscribe_pointer_clicks(
+        conn: &x11rb::rust_connection::RustConnection,
+        root: u32,
+    ) -> io::Result<()> {
+        use x11rb::connection::Connection as _;
+        use x11rb::protocol::xinput::ConnectionExt as _;
+
+        conn.xinput_xi_query_version(2, 0)
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .reply()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        conn.xinput_xi_select_events(root, &[xinput_pointer_click_event_mask()])
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .check()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        conn.flush()
+            .map_err(|error| io::Error::other(error.to_string()))
+    }
+
+    fn poll_context_event(&mut self) -> io::Result<Option<X11ContextEvent>> {
         use x11rb::connection::Connection as _;
         use x11rb::protocol::Event;
 
@@ -2213,6 +2317,10 @@ impl ActiveWindowMonitor {
                 return Ok(None);
             };
 
+            if let Some(event) = x11_pointer_click_event(&event) {
+                return Ok(Some(event));
+            }
+
             match event {
                 Event::PropertyNotify(property)
                     if property.window == self.root && property.atom == self.active_window_atom =>
@@ -2222,7 +2330,10 @@ impl ActiveWindowMonitor {
                         Self::query_active_window(&self.conn, self.root, self.active_window_atom)?;
                     if current_window != previous_window {
                         self.current_window = current_window;
-                        return Ok(Some((previous_window, current_window)));
+                        return Ok(Some(X11ContextEvent::ActiveWindowChanged {
+                            previous: previous_window,
+                            current: current_window,
+                        }));
                     }
                 }
                 _ => {}
@@ -2615,6 +2726,10 @@ fn is_pointer_click(key: Key) -> bool {
             | Key::BTN_BACK
             | Key::BTN_TASK
     )
+}
+
+fn is_x11_pointer_click(detail: u32) -> bool {
+    matches!(detail, 1 | 2 | 3 | 8 | 9)
 }
 
 fn format_x11_window(window: Option<u32>) -> String {
@@ -6642,6 +6757,125 @@ mod tests {
     }
 
     #[test]
+    fn x11_pointer_click_classifier_accepts_primary_middle_secondary_and_navigation() {
+        for detail in [1, 2, 3, 8, 9] {
+            assert!(is_x11_pointer_click(detail), "detail={detail}");
+        }
+    }
+
+    #[test]
+    fn x11_pointer_click_classifier_rejects_scroll_and_unknown_buttons() {
+        for detail in [0, 4, 5, 6, 7, 10] {
+            assert!(!is_x11_pointer_click(detail), "detail={detail}");
+        }
+    }
+
+    #[test]
+    fn pointer_click_invalidation_drains_both_sources() {
+        let physical = AtomicBool::new(true);
+        let logical = AtomicBool::new(true);
+
+        assert!(take_pointer_click_flags(&physical, &logical));
+        assert!(!physical.load(Ordering::SeqCst));
+        assert!(!logical.load(Ordering::SeqCst));
+        assert!(!take_pointer_click_flags(&physical, &logical));
+    }
+
+    #[test]
+    fn xinput_pointer_click_mask_selects_raw_press_for_all_master_devices() {
+        use x11rb::protocol::xinput::{Device, XIEventMask};
+
+        let mask = xinput_pointer_click_event_mask();
+
+        assert_eq!(mask.deviceid, u16::from(Device::ALL_MASTER));
+        assert_eq!(mask.mask, vec![XIEventMask::RAW_BUTTON_PRESS]);
+    }
+
+    #[test]
+    fn x11_pointer_click_event_accepts_emulated_primary_button() {
+        use x11rb::protocol::xinput::{PointerEventFlags, RawButtonPressEvent};
+        use x11rb::protocol::Event;
+
+        let event = Event::XinputRawButtonPress(RawButtonPressEvent {
+            detail: 1,
+            flags: PointerEventFlags::POINTER_EMULATED,
+            ..RawButtonPressEvent::default()
+        });
+
+        assert_eq!(
+            x11_pointer_click_event(&event),
+            Some(X11ContextEvent::PointerClick { detail: 1 })
+        );
+    }
+
+    #[test]
+    fn x11_pointer_click_event_rejects_scroll_and_non_pointer_events() {
+        use x11rb::protocol::xinput::RawButtonPressEvent;
+        use x11rb::protocol::xproto::KeyPressEvent;
+        use x11rb::protocol::Event;
+
+        let scroll = Event::XinputRawButtonPress(RawButtonPressEvent {
+            detail: 4,
+            ..RawButtonPressEvent::default()
+        });
+        let keyboard = Event::KeyPress(KeyPressEvent::default());
+
+        assert_eq!(x11_pointer_click_event(&scroll), None);
+        assert_eq!(x11_pointer_click_event(&keyboard), None);
+    }
+
+    #[test]
+    fn x11_context_events_set_only_the_matching_invalidation_flag() {
+        let changed = AtomicBool::new(false);
+        let pointer_click = AtomicBool::new(false);
+
+        publish_x11_context_event(
+            X11ContextEvent::ActiveWindowChanged {
+                previous: Some(1),
+                current: Some(2),
+            },
+            &changed,
+            &pointer_click,
+        );
+        assert!(changed.swap(false, Ordering::SeqCst));
+        assert!(!pointer_click.load(Ordering::SeqCst));
+
+        publish_x11_context_event(
+            X11ContextEvent::PointerClick { detail: 1 },
+            &changed,
+            &pointer_click,
+        );
+        assert!(!changed.load(Ordering::SeqCst));
+        assert!(pointer_click.swap(false, Ordering::SeqCst));
+    }
+
+    #[test]
+    fn input_target_logical_click_participates_in_combined_drain() {
+        let pointer_watcher = PointerWatcher {
+            click_flag: Arc::new(AtomicBool::new(false)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            required: false,
+            handle: None,
+        };
+        let logical_click = Arc::new(AtomicBool::new(true));
+        let input_target_watcher = InputTargetWatcher {
+            changed_flag: Arc::new(AtomicBool::new(false)),
+            pointer_click_flag: Arc::clone(&logical_click),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            alive: Arc::new(AtomicBool::new(false)),
+            required: false,
+            handle: None,
+        };
+
+        assert!(take_pointer_click_flags(
+            &pointer_watcher.click_flag,
+            &input_target_watcher.pointer_click_flag,
+        ));
+        assert!(!logical_click.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn pointer_watcher_with_no_discovered_devices_is_disabled_and_ready() {
         let watcher = PointerWatcher::spawn(Vec::new()).unwrap();
 
@@ -6690,6 +6924,7 @@ mod tests {
     fn input_target_watcher_readiness_is_true_when_disabled_by_policy() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            pointer_click_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             required: false,
@@ -6705,6 +6940,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         );
 
         assert!(watcher.is_ready());
@@ -6714,6 +6950,7 @@ mod tests {
     fn input_target_watcher_readiness_is_false_when_required_thread_is_dead() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            pointer_click_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             required: true,
@@ -6727,6 +6964,7 @@ mod tests {
     fn input_target_watcher_readiness_is_true_immediately_after_successful_spawn() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            pointer_click_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
             required: true,

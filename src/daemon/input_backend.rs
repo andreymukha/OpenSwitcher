@@ -171,6 +171,7 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
             | SwitcherError::UinputAccessDenied { .. } => {
                 Some(InputBackendState::WaitingForInputAccess)
             }
+            SwitcherError::InputWorkerDisconnected { .. } => Some(InputBackendState::Recovering),
             SwitcherError::Io(io_error)
                 if matches!(io_error.raw_os_error(), Some(19))
                     || io_error.to_string().contains("No such device") =>
@@ -500,6 +501,28 @@ mod tests {
 
         assert_eq!(lifecycle.state(), InputBackendState::Recovering);
         assert!(lifecycle.retry_deadline().is_some());
+    }
+
+    #[test]
+    fn runtime_input_worker_disconnect_enters_recovering() {
+        let opener = FakeOpener {
+            outcome: FakeOutcome::Ok {
+                shutdowns: Rc::new(RefCell::new(0)),
+                readiness: ready_readiness(),
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+        lifecycle.mark_backend_ready(ready_readiness());
+        let now = Instant::now();
+        let error = SwitcherError::InputWorkerDisconnected {
+            worker: "input-target-watcher",
+        };
+
+        assert!(lifecycle.record_runtime_failure(&error, now));
+        assert_eq!(lifecycle.state(), InputBackendState::Recovering);
+        assert!(lifecycle
+            .retry_deadline()
+            .is_some_and(|deadline| deadline > now));
     }
 
     #[test]

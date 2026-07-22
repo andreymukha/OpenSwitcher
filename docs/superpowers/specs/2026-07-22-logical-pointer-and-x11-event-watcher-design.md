@@ -34,6 +34,22 @@ to prevent a reproduced partial-word correction immediately after an X11
 focus change. It restored correctness, but increased measured daemon idle CPU.
 Choosing another interval would only trade CPU usage against the same race.
 
+## Relevant Decision History
+
+- Commit `82fd2da` introduced the raw pointer classifier on 2026-04-01. Its
+  numeric range did not distinguish real buttons from touch/tool state, and no
+  regression test encoded that distinction.
+- Commit `8146173` introduced the X11 active-window watcher with a 5-ms queue
+  poll on 2026-04-04.
+- Commit `6761365` increased that interval to 50 ms on 2026-05-03 to reduce
+  idle CPU usage.
+- Commit `1c24968` restored 5 ms after reproducing partial-word correction when
+  a new window received input before the 50-ms watcher observed the focus
+  change.
+
+The new work preserves the correctness restored by `1c24968`; it does not
+retune an interval whose earlier value already caused a reproduced regression.
+
 ## Required Semantics
 
 Pointer context invalidation follows the desktop's logical action as closely
@@ -51,6 +67,43 @@ as the session permits:
 The context may be invalidated on logical button press rather than waiting for
 release. Once a press begins, focus, selection, caret position, navigation, or
 a context menu may change, so the old word context is no longer trustworthy.
+
+## Decision Rationale: Tap-to-click
+
+OpenSwitcher must not classify a raw touch as a tap. The trusted boundary is
+the desktop input stack:
+
+1. raw `BTN_TOUCH`, `BTN_TOOL_*`, and motion events remain contact/movement and
+   are ignored;
+2. libinput applies its configured timing, movement, pressure, palm-rejection,
+   and click-method policy;
+3. only if the X11 input stack turns that interaction into a logical button
+   press does OpenSwitcher invalidate the context.
+
+This means an accidental brush that merely moves the pointer does not reset the
+last word. If the desktop itself emits a click, however, it can already have
+moved the caret, cleared a selection, changed focus, opened a context menu, or
+navigated. Retaining the previous word after that state change would be unsafe:
+an immediate correction hotkey could delete or replace text at the new caret.
+
+### Rejected alternatives
+
+- **Treat every touch contact as a click:** rejected because it is the
+  confirmed current bug and prevents correction after ordinary touchpad
+  movement.
+- **Recognize taps from raw touch data inside OpenSwitcher:** rejected because
+  it would duplicate libinput policy and disagree with desktop configuration,
+  palm rejection, or hardware quirks.
+- **Accept physical buttons only, even when X11 reports a logical tap:**
+  rejected because a real desktop click could move the caret while
+  OpenSwitcher retained stale word context. This favors a false negative at
+  the exact point where stale correction is most dangerous.
+
+The accepted failure bias is therefore: never reset for raw contact or motion;
+reset when a genuine physical button is observed, or when X11 reports that the
+desktop has actually produced a logical button press. Wayland retains the
+physical-button fallback because this project has no generic compositor-level
+logical-click observer there.
 
 ## Change A: Correct Pointer Invalidation
 

@@ -249,6 +249,13 @@ enum WriterTransactionState {
     TimedOut = 2,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriterCompletionPublication {
+    Completed,
+    Cancelled,
+    ReceiverDisconnected,
+}
+
 impl WriterTransactionState {
     fn from_raw(raw: u8) -> Self {
         match raw {
@@ -389,26 +396,50 @@ impl WriterTransactionControl {
         self.cancellation_error()
     }
 
-    fn publish_completed(&self) -> bool {
+    fn publish_completed_with(
+        &self,
+        publish_reply: impl FnOnce() -> bool,
+    ) -> WriterCompletionPublication {
         let _terminal_guard = self
             .terminal_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.stop_requested.load(Ordering::SeqCst) {
-            return false;
+        if self.stop_requested.load(Ordering::SeqCst)
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+            || self.state() != WriterTransactionState::Pending
+        {
+            return WriterCompletionPublication::Cancelled;
         }
-        if self.failure_request_id.load(Ordering::SeqCst) != 0 || Instant::now() >= self.deadline {
+        if Instant::now() >= self.deadline {
             let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
-            return false;
+            return WriterCompletionPublication::Cancelled;
         }
-        self.state
+        if !publish_reply() {
+            return WriterCompletionPublication::ReceiverDisconnected;
+        }
+
+        let completed = self
+            .state
             .compare_exchange(
                 WriterTransactionState::Pending as u8,
                 WriterTransactionState::Completed as u8,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .is_ok()
+            .is_ok();
+        debug_assert!(completed, "terminal gate must serialize completion");
+        if completed {
+            WriterCompletionPublication::Completed
+        } else {
+            WriterCompletionPublication::Cancelled
+        }
+    }
+
+    fn publish_completed(&self) -> bool {
+        matches!(
+            self.publish_completed_with(|| true),
+            WriterCompletionPublication::Completed
+        )
     }
 
     fn ensure_active_while_terminal_gate_is_held(&self) -> Result<(), SwitcherError> {
@@ -4155,23 +4186,18 @@ fn publish_writer_transaction_result(
     result: Result<CorrectionExecutionOutcome, SwitcherError>,
 ) -> Result<(), SwitcherError> {
     let failure_reason = result.as_ref().err().map(ToString::to_string);
-    if reply.send(result).is_err() {
-        return if control.is_cancelled() {
-            Err(control.cancellation_error())
-        } else {
-            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
-        };
-    }
-    if control.publish_completed() {
-        match failure_reason {
+    match control.publish_completed_with(|| reply.send(result).is_ok()) {
+        WriterCompletionPublication::Completed => match failure_reason {
             Some(reason) => Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
                 request_id: control.request_id(),
                 reason,
             }),
             None => Ok(()),
+        },
+        WriterCompletionPublication::Cancelled => Err(control.cancellation_error()),
+        WriterCompletionPublication::ReceiverDisconnected => {
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
         }
-    } else {
-        Err(control.cancellation_error())
     }
 }
 
@@ -4181,22 +4207,18 @@ fn publish_deferred_manual_completion(
     completion: ManualCurrentWordCompletion,
     failure_reason: Option<String>,
 ) -> Result<(), SwitcherError> {
-    if completion_tx.send(completion).is_err() {
-        return if control.is_cancelled() {
-            Err(control.cancellation_error())
-        } else {
+    match control.publish_completed_with(|| completion_tx.send(completion).is_ok()) {
+        WriterCompletionPublication::Completed => match failure_reason {
+            Some(reason) => Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: control.request_id(),
+                reason,
+            }),
+            None => Ok(()),
+        },
+        WriterCompletionPublication::Cancelled => Err(control.cancellation_error()),
+        WriterCompletionPublication::ReceiverDisconnected => {
             Err(SwitcherError::VirtualKeyboardWriterDisconnected)
-        };
-    }
-    if !control.publish_completed() {
-        return Err(control.cancellation_error());
-    }
-    match failure_reason {
-        Some(reason) => Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
-            request_id: control.request_id(),
-            reason,
-        }),
-        None => Ok(()),
+        }
     }
 }
 
@@ -6551,6 +6573,54 @@ mod tests {
             } if reason == "uinput write failed"
         ));
         assert!(!control.stop_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn writer_reply_is_not_visible_before_terminal_completion_is_committed() {
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_terminal_gate(
+            110,
+            Duration::from_secs(1),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&terminal_gate),
+        );
+        let publisher_control = control.clone();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let held_gate = terminal_gate.lock().unwrap();
+        let publisher = thread::spawn(move || {
+            publish_writer_transaction_result(
+                &publisher_control,
+                reply_tx,
+                Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: 110,
+                    reason: "uinput write failed".to_string(),
+                }),
+            )
+        });
+
+        let early_reply = reply_rx.recv_timeout(Duration::from_millis(50));
+        drop(held_gate);
+        let publisher_result = publisher.join().expect("publisher should not panic");
+
+        assert!(
+            matches!(early_reply, Err(mpsc::RecvTimeoutError::Timeout)),
+            "reply must not become visible before terminal state can be committed"
+        );
+        assert!(matches!(
+            publisher_result,
+            Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 110,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reply_rx.recv_timeout(Duration::from_millis(100)),
+            Ok(Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 110,
+                ..
+            }))
+        ));
+        assert_eq!(control.state(), WriterTransactionState::Completed);
     }
 
     #[test]

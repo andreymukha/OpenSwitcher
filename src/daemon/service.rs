@@ -170,6 +170,23 @@ fn route_runtime_health_failure<E>(error: E, recover: impl FnOnce(&E) -> bool) -
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredInputRouting {
+    Continue,
+    Recovered,
+}
+
+fn route_deferred_input_result<E>(
+    result: Result<(), E>,
+    recover: impl FnOnce(&E) -> bool,
+) -> Result<DeferredInputRouting, E> {
+    match result {
+        Ok(()) => Ok(DeferredInputRouting::Continue),
+        Err(error) if recover(&error) => Ok(DeferredInputRouting::Recovered),
+        Err(error) => Err(error),
+    }
+}
+
 fn poll_completion_before_writer_health<State, E, PollCompletion, EnsureHealth>(
     state: &mut State,
     poll_completion: PollCompletion,
@@ -1050,7 +1067,17 @@ impl DaemonService {
                 }
             }
 
-            self.drain_one_deferred_input_event()?;
+            let drain_result = self.drain_one_deferred_input_event();
+            match route_deferred_input_result(drain_result, |error| {
+                self.handle_runtime_input_failure(error)
+            }) {
+                Ok(DeferredInputRouting::Continue) => {}
+                Ok(DeferredInputRouting::Recovered) => continue 'event_loop,
+                Err(error) => {
+                    self.shutdown();
+                    return Err(error);
+                }
+            }
         }
     }
 
@@ -3063,6 +3090,39 @@ mod tests {
         assert!(matches!(
             result,
             Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 901 })
+        ));
+    }
+
+    #[test]
+    fn deferred_input_worker_failure_requests_event_loop_recovery() {
+        let recovery_called = Cell::new(false);
+        let result = route_deferred_input_result(
+            Err(SwitcherError::InputWorkerDisconnected {
+                worker: "input-target-watcher",
+            }),
+            |error| {
+                recovery_called.set(matches!(
+                    error,
+                    SwitcherError::InputWorkerDisconnected { .. }
+                ));
+                true
+            },
+        );
+
+        assert_eq!(result.unwrap(), DeferredInputRouting::Recovered);
+        assert!(recovery_called.get());
+    }
+
+    #[test]
+    fn fatal_deferred_input_failure_preserves_detailed_error() {
+        let result = route_deferred_input_result(
+            Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 902 }),
+            |_| false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 902 })
         ));
     }
 

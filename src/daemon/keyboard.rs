@@ -452,9 +452,38 @@ impl WriterTransactionControl {
         self.ensure_active_while_terminal_gate_is_held()
     }
 
+    fn try_request_stop_for_input_worker_loss(&self) -> bool {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop_requested.load(Ordering::SeqCst)
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+            || self.state() != WriterTransactionState::Pending
+        {
+            return false;
+        }
+        if Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return false;
+        }
+
+        self.stop_requested.store(true, Ordering::SeqCst);
+        true
+    }
+
+    #[cfg(test)]
     fn wait_for_reply(
         &self,
         reply_rx: mpsc::Receiver<Result<CorrectionExecutionOutcome, SwitcherError>>,
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+        self.wait_for_reply_with_input_health(reply_rx, || None)
+    }
+
+    fn wait_for_reply_with_input_health(
+        &self,
+        reply_rx: mpsc::Receiver<Result<CorrectionExecutionOutcome, SwitcherError>>,
+        mut input_worker_health_error: impl FnMut() -> Option<SwitcherError>,
     ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
         let mut received_reply = None;
 
@@ -482,6 +511,30 @@ impl WriterTransactionControl {
             {
                 if self.try_mark_timed_out() {
                     return Err(self.timed_out_error());
+                }
+                continue;
+            }
+
+            if received_reply.is_none() {
+                match reply_rx.try_recv() {
+                    Ok(reply) => received_reply = Some(reply),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if self.state() == WriterTransactionState::Pending
+                            && self.failure_request_id.load(Ordering::SeqCst) == 0
+                        {
+                            return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+                        }
+                    }
+                }
+            }
+
+            if let Some(input_worker_error) = input_worker_health_error() {
+                if received_reply.as_ref().is_some_and(Result::is_err) {
+                    return received_reply.expect("error reply was checked above");
+                }
+                if self.try_request_stop_for_input_worker_loss() {
+                    return Err(input_worker_error);
                 }
                 continue;
             }
@@ -1118,9 +1171,21 @@ impl KeyboardController {
         config: &RuntimeConfigSnapshot,
         modifiers: ModifierState,
     ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
-        self.virtual_device
-            .handle()
-            .apply_correction(plan.clone(), config.clone(), modifiers)
+        let virtual_device = self.virtual_device.handle();
+        let pointer_watcher = &self.pointer_watcher;
+        let input_target_watcher = &self.input_target_watcher;
+        virtual_device.apply_correction_with_input_health(
+            plan.clone(),
+            config.clone(),
+            modifiers,
+            || {
+                ensure_input_watchers_ready(
+                    pointer_watcher.is_ready(),
+                    input_target_watcher.is_ready(),
+                )
+                .err()
+            },
+        )
     }
 
     pub fn begin_manual_current_word_correction(
@@ -1148,10 +1213,20 @@ impl KeyboardController {
         config: &RuntimeConfigSnapshot,
         modifiers: ModifierState,
     ) -> Result<(), SwitcherError> {
-        self.virtual_device.handle().apply_same_layout_correction(
+        let virtual_device = self.virtual_device.handle();
+        let pointer_watcher = &self.pointer_watcher;
+        let input_target_watcher = &self.input_target_watcher;
+        virtual_device.apply_same_layout_correction_with_input_health(
             plan.clone(),
             config.clone(),
             modifiers,
+            || {
+                ensure_input_watchers_ready(
+                    pointer_watcher.is_ready(),
+                    input_target_watcher.is_ready(),
+                )
+                .err()
+            },
         )
     }
 
@@ -1316,6 +1391,64 @@ impl Drop for GrabbedKeyboardDevice {
 
 // Pointer watcher
 
+fn retain_available_pointer_devices<T>(
+    devices: &mut Vec<T>,
+    mut keep_after_poll: impl FnMut(&mut T) -> bool,
+) -> bool {
+    let mut index = 0usize;
+    while index < devices.len() {
+        if keep_after_poll(&mut devices[index]) {
+            index += 1;
+        } else {
+            devices.remove(index);
+        }
+    }
+    !devices.is_empty()
+}
+
+fn poll_pointer_device_until_idle(
+    device: &mut PointerDeviceState,
+    click_flag: &AtomicBool,
+) -> bool {
+    let device_name = device.device.name().unwrap_or("unknown").to_string();
+    loop {
+        match device.device.fetch_events() {
+            Ok(events) => {
+                let mut had_events = false;
+                for event in events {
+                    had_events = true;
+                    if let evdev::InputEventKind::Key(key) = event.kind() {
+                        if is_pointer_click(key)
+                            && event.value() == 1
+                            && device.pressed_buttons.insert(key)
+                        {
+                            click_flag.store(true, Ordering::SeqCst);
+                            log_input_debug(
+                                "pointer-click",
+                                &format!("device={device_name} key={key:?}"),
+                            );
+                        } else if is_pointer_click(key) && event.value() == 0 {
+                            device.pressed_buttons.remove(&key);
+                        }
+                    }
+                }
+
+                if !had_events {
+                    return true;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(error) => {
+                log_input_debug(
+                    "pointer-read-error",
+                    &format!("device={device_name} error={error}"),
+                );
+                return false;
+            }
+        }
+    }
+}
+
 impl PointerWatcher {
     fn spawn(paths: Vec<PathBuf>) -> Result<Self, SwitcherError> {
         let click_flag = Arc::new(AtomicBool::new(false));
@@ -1364,54 +1497,11 @@ impl PointerWatcher {
                 "pointer-watcher",
                 || publish_input_worker_ready(&worker_alive, ready_tx, "pointer-watcher"),
                 || {
-                    let mut index = 0usize;
-                    while index < devices.len() {
-                        let mut remove_device = false;
-                        let device = &mut devices[index];
-                        let device_name = device.device.name().unwrap_or("unknown").to_string();
-                        loop {
-                            match device.device.fetch_events() {
-                                Ok(events) => {
-                                    let mut had_events = false;
-                                    for event in events {
-                                        had_events = true;
-                                        if let evdev::InputEventKind::Key(key) = event.kind() {
-                                            if is_pointer_click(key)
-                                                && event.value() == 1
-                                                && device.pressed_buttons.insert(key)
-                                            {
-                                                worker_click_flag.store(true, Ordering::SeqCst);
-                                                log_input_debug(
-                                                    "pointer-click",
-                                                    &format!("device={device_name} key={key:?}"),
-                                                );
-                                            } else if is_pointer_click(key) && event.value() == 0 {
-                                                device.pressed_buttons.remove(&key);
-                                            }
-                                        }
-                                    }
-
-                                    if !had_events {
-                                        break;
-                                    }
-                                }
-                                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                                Err(error) => {
-                                    log_input_debug(
-                                        "pointer-read-error",
-                                        &format!("device={device_name} error={error}"),
-                                    );
-                                    remove_device = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        if remove_device {
-                            devices.remove(index);
-                        } else {
-                            index += 1;
-                        }
+                    if !retain_available_pointer_devices(&mut devices, |device| {
+                        poll_pointer_device_until_idle(device, &worker_click_flag)
+                    }) {
+                        log_input_debug("pointer-watcher-stop", "reason=all-started-devices-lost");
+                        return false;
                     }
 
                     thread::sleep(POINTER_POLL_INTERVAL);
@@ -2096,30 +2186,38 @@ impl VirtualKeyboardHandle {
         self.send_fast_command(WriterFastCommand::TypeSeparator { key })
     }
 
-    fn apply_correction(
+    fn apply_correction_with_input_health(
         &self,
         plan: CorrectionPlan,
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
+        input_worker_health_error: impl FnMut() -> Option<SwitcherError>,
     ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
-        self.run_transaction(WriterTransactionKind::ApplyCorrection {
-            plan,
-            config,
-            modifiers,
-        })
+        self.run_transaction_with_input_health(
+            WriterTransactionKind::ApplyCorrection {
+                plan,
+                config,
+                modifiers,
+            },
+            input_worker_health_error,
+        )
     }
 
-    fn apply_same_layout_correction(
+    fn apply_same_layout_correction_with_input_health(
         &self,
         plan: CorrectionPlan,
         config: RuntimeConfigSnapshot,
         modifiers: ModifierState,
+        input_worker_health_error: impl FnMut() -> Option<SwitcherError>,
     ) -> Result<(), SwitcherError> {
-        self.run_transaction(WriterTransactionKind::ApplySameLayoutCorrection {
-            plan,
-            config,
-            modifiers,
-        })
+        self.run_transaction_with_input_health(
+            WriterTransactionKind::ApplySameLayoutCorrection {
+                plan,
+                config,
+                modifiers,
+            },
+            input_worker_health_error,
+        )
         .map(|_| ())
     }
 
@@ -2141,12 +2239,33 @@ impl VirtualKeyboardHandle {
         self.run_transaction_with_timeout(kind, timeout)
     }
 
+    fn run_transaction_with_input_health(
+        &self,
+        kind: WriterTransactionKind,
+        input_worker_health_error: impl FnMut() -> Option<SwitcherError>,
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+        let timeout = kind.execution_timeout()?;
+        self.run_transaction_with_timeout_and_input_health(kind, timeout, input_worker_health_error)
+    }
+
     fn run_transaction_with_timeout(
         &self,
         kind: WriterTransactionKind,
         timeout: Duration,
     ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+        self.run_transaction_with_timeout_and_input_health(kind, timeout, || None)
+    }
+
+    fn run_transaction_with_timeout_and_input_health(
+        &self,
+        kind: WriterTransactionKind,
+        timeout: Duration,
+        mut input_worker_health_error: impl FnMut() -> Option<SwitcherError>,
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
         self.ensure_alive()?;
+        if let Some(error) = input_worker_health_error() {
+            return Err(error);
+        }
         let request_id = next_writer_transaction_request_id();
         let control = WriterTransactionControl::new_with_writer_state(
             request_id,
@@ -2161,7 +2280,7 @@ impl VirtualKeyboardHandle {
             kind,
             reply: reply_tx,
         })?;
-        control.wait_for_reply(reply_rx)
+        control.wait_for_reply_with_input_health(reply_rx, input_worker_health_error)
     }
 
     fn send_transaction_command(
@@ -6352,6 +6471,89 @@ mod tests {
     }
 
     #[test]
+    fn required_input_worker_loss_interrupts_pending_transaction_before_deadline() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let input_worker_alive = Arc::new(AtomicBool::new(true));
+        let caller_input_worker_alive = Arc::clone(&input_worker_alive);
+        let caller_handle = handle.clone();
+        let caller = thread::spawn(move || {
+            caller_handle.run_transaction_with_timeout_and_input_health(
+                copy_shortcut_transaction(),
+                Duration::from_secs(1),
+                || {
+                    (!caller_input_worker_alive.load(Ordering::SeqCst)).then_some(
+                        SwitcherError::InputWorkerDisconnected {
+                            worker: "input-target-watcher",
+                        },
+                    )
+                },
+            )
+        });
+
+        let command = command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("transaction should be accepted before watcher loss");
+        let (control, _held_reply_sender) = match command {
+            WriterCommand::Transaction(WriterTransaction::Execute { control, reply, .. }) => {
+                (control, reply)
+            }
+            _ => panic!("expected transaction command"),
+        };
+
+        let failure_started = Instant::now();
+        input_worker_alive.store(false, Ordering::SeqCst);
+        let error = caller
+            .join()
+            .expect("caller should wake after required watcher loss")
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkerDisconnected {
+                worker: "input-target-watcher"
+            }
+        ));
+        assert!(
+            failure_started.elapsed() < Duration::from_millis(200),
+            "watcher loss must interrupt the transaction instead of consuming its deadline"
+        );
+        assert!(handle.stop_requested.load(Ordering::SeqCst));
+        assert!(matches!(
+            control.ensure_active(),
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+    }
+
+    #[test]
+    fn queued_writer_error_wins_over_concurrent_input_worker_loss() {
+        let control = WriterTransactionControl::with_timeout_for_test(109, Duration::from_secs(1));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        reply_tx
+            .send(Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 109,
+                reason: "uinput write failed".to_string(),
+            }))
+            .unwrap();
+
+        let error = control
+            .wait_for_reply_with_input_health(reply_rx, || {
+                Some(SwitcherError::InputWorkerDisconnected {
+                    worker: "input-target-watcher",
+                })
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 109,
+                ref reason
+            } if reason == "uinput write failed"
+        ));
+        assert!(!control.stop_requested.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn writer_stop_wins_terminal_race_against_late_completion() {
         let failure = Arc::new(AtomicU64::new(0));
         let stop_requested = Arc::new(AtomicBool::new(false));
@@ -6957,6 +7159,21 @@ mod tests {
         assert!(!watcher.required);
         assert!(!watcher.alive.load(Ordering::SeqCst));
         assert!(watcher.is_ready());
+    }
+
+    #[test]
+    fn pointer_poll_cycle_stops_after_last_open_device_is_lost() {
+        let mut devices = vec!["touchpad", "mouse"];
+        let polled = Cell::new(0usize);
+
+        let keep_running = retain_available_pointer_devices(&mut devices, |_| {
+            polled.set(polled.get() + 1);
+            false
+        });
+
+        assert_eq!(polled.get(), 2, "removal must not skip the next device");
+        assert!(!keep_running);
+        assert!(devices.is_empty());
     }
 
     #[test]

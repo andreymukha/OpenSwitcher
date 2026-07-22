@@ -1459,6 +1459,25 @@ impl PointerWatcher {
 
 // Input target watcher
 
+fn prepare_input_target_monitor<T>(
+    session_type: SessionType,
+    connect: impl FnOnce() -> io::Result<T>,
+) -> Result<Option<T>, SwitcherError> {
+    if !should_enable_x11_input_target_watcher(session_type) {
+        return Ok(None);
+    }
+
+    connect().map(Some).map_err(|error| {
+        log_input_debug(
+            "input-target-watcher-start-error",
+            &format!("source=x11 error={error}"),
+        );
+        SwitcherError::InputWorkerDisconnected {
+            worker: "input-target-watcher",
+        }
+    })
+}
+
 impl InputTargetWatcher {
     fn spawn(session_type: SessionType) -> Result<Self, SwitcherError> {
         let changed_flag = Arc::new(AtomicBool::new(false));
@@ -1466,26 +1485,15 @@ impl InputTargetWatcher {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
 
-        if !should_enable_x11_input_target_watcher(session_type) {
+        let Some(mut monitor) =
+            prepare_input_target_monitor(session_type, ActiveWindowMonitor::connect)?
+        else {
             log_input_debug(
                 "input-target-watcher-disabled",
                 &format!(
                     "reason=non-x11-session session_type={}",
                     format_session_type(session_type)
                 ),
-            );
-            return Ok(Self::disabled(
-                changed_flag,
-                pointer_click_flag,
-                stop_flag,
-                alive,
-            ));
-        }
-
-        let Ok(mut monitor) = ActiveWindowMonitor::connect() else {
-            log_input_debug(
-                "input-target-watcher-disabled",
-                "reason=x11-active-window-unavailable",
             );
             return Ok(Self::disabled(
                 changed_flag,
@@ -7095,7 +7103,38 @@ mod tests {
     }
 
     #[test]
-    fn input_target_watcher_readiness_is_true_when_x11_monitor_is_unavailable() {
+    fn x11_input_target_connection_failure_is_recoverable_worker_failure() {
+        let error = prepare_input_target_monitor(SessionType::X11, || {
+            Err::<u8, _>(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "test X11 endpoint unavailable",
+            ))
+        })
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkerDisconnected {
+                worker: "input-target-watcher"
+            }
+        ));
+    }
+
+    #[test]
+    fn non_x11_input_target_does_not_attempt_x11_connection() {
+        let connect_called = Cell::new(false);
+        let monitor = prepare_input_target_monitor(SessionType::Wayland, || {
+            connect_called.set(true);
+            Ok::<_, io::Error>(7u8)
+        })
+        .unwrap();
+
+        assert_eq!(monitor, None);
+        assert!(!connect_called.get());
+    }
+
+    #[test]
+    fn disabled_input_target_watcher_object_is_ready() {
         let watcher = InputTargetWatcher::disabled(
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),

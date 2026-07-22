@@ -992,6 +992,13 @@ fn ensure_input_dependencies_ready(
     if !writer_ready {
         return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
     }
+    ensure_input_watchers_ready(pointer_watcher_ready, input_target_watcher_ready)
+}
+
+fn ensure_input_watchers_ready(
+    pointer_watcher_ready: bool,
+    input_target_watcher_ready: bool,
+) -> Result<(), SwitcherError> {
     if !pointer_watcher_ready {
         return Err(SwitcherError::InputWorkerDisconnected {
             worker: "pointer-watcher",
@@ -1164,6 +1171,14 @@ impl KeyboardController {
 
     pub fn writer_health_error(&self) -> Option<SwitcherError> {
         self.virtual_device.health_error()
+    }
+
+    pub fn input_worker_health_error(&self) -> Option<SwitcherError> {
+        ensure_input_watchers_ready(
+            self.pointer_watcher.is_ready(),
+            self.input_target_watcher.is_ready(),
+        )
+        .err()
     }
 
     pub fn readiness(&self) -> InputBackendReadiness {
@@ -4534,6 +4549,23 @@ mod tests {
             })
         ));
         assert!(ensure_input_dependencies_ready(true, true, true).is_ok());
+    }
+
+    #[test]
+    fn runtime_input_watcher_health_names_dead_required_worker() {
+        assert!(matches!(
+            ensure_input_watchers_ready(false, true),
+            Err(SwitcherError::InputWorkerDisconnected {
+                worker: "pointer-watcher"
+            })
+        ));
+        assert!(matches!(
+            ensure_input_watchers_ready(true, false),
+            Err(SwitcherError::InputWorkerDisconnected {
+                worker: "input-target-watcher"
+            })
+        ));
+        assert!(ensure_input_watchers_ready(true, true).is_ok());
     }
 
     #[test]

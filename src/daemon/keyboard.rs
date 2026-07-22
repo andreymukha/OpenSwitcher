@@ -2604,8 +2604,17 @@ fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
 }
 
 fn is_pointer_click(key: Key) -> bool {
-    let code = key.code();
-    (Key::BTN_LEFT.code()..=Key::BTN_TOOL_DOUBLETAP.code()).contains(&code)
+    matches!(
+        key,
+        Key::BTN_LEFT
+            | Key::BTN_RIGHT
+            | Key::BTN_MIDDLE
+            | Key::BTN_SIDE
+            | Key::BTN_EXTRA
+            | Key::BTN_FORWARD
+            | Key::BTN_BACK
+            | Key::BTN_TASK
+    )
 }
 
 fn format_x11_window(window: Option<u32>) -> String {
@@ -6596,6 +6605,40 @@ mod tests {
     fn input_target_poll_interval_stays_below_first_key_race_budget() {
         assert!(INPUT_TARGET_POLL_INTERVAL >= Duration::from_millis(1));
         assert!(INPUT_TARGET_POLL_INTERVAL <= Duration::from_millis(5));
+    }
+
+    #[test]
+    fn pointer_click_classifier_accepts_only_physical_pointer_buttons() {
+        for key in [
+            Key::BTN_LEFT,
+            Key::BTN_RIGHT,
+            Key::BTN_MIDDLE,
+            Key::BTN_SIDE,
+            Key::BTN_EXTRA,
+            Key::BTN_FORWARD,
+            Key::BTN_BACK,
+            Key::BTN_TASK,
+        ] {
+            assert!(is_pointer_click(key), "expected physical button: {key:?}");
+        }
+    }
+
+    #[test]
+    fn pointer_click_classifier_rejects_touch_tool_and_non_pointer_codes() {
+        for key in [
+            Key::BTN_TOUCH,
+            Key::BTN_TOOL_FINGER,
+            Key::BTN_TOOL_DOUBLETAP,
+            Key::BTN_TOOL_PEN,
+            Key::BTN_STYLUS,
+            Key::BTN_0,
+            Key::BTN_SOUTH,
+        ] {
+            assert!(
+                !is_pointer_click(key),
+                "must not be a pointer click: {key:?}"
+            );
+        }
     }
 
     #[test]

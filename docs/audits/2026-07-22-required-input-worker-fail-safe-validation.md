@@ -3,14 +3,15 @@
 - Дата: 2026-07-22
 - Ветка проверки: `perf/wakeable-x11-watcher`
 - База ветки: `94f0372` (`docs: validate pointer context invalidation`)
-- Реализация до финального review: `c8976a2..f1de2ab`; два найденных review-gap
-  закрыты в завершающем commit ветки вместе с этим отчётом
+- Реализация fail-safe: `c8976a2..c3d3beb`; два найденных review-gap закрыты
+  commit `c3d3beb`
+- Исправление владения `/dev/uinput`: vendoring `a1acf42`, RAII-fix `675b4d7`
 - Основной артефакт: Debian package `open-switcher 0.1.0-1`, `amd64`
 - Среда runtime: сохранённая VM `mint-install-v1`, Linux Mint/Cinnamon/X11
 - Статус: целевой отказ X11 watcher, в том числе во время активной
   синхронной коррекции, startup без X11 endpoint, потеря последнего pointer
-  device и автоматическое восстановление закрыты кодом и package-first
-  проверкой в доступных границах
+  device, утечка uinput fd при recovery и автоматическое восстановление закрыты
+  кодом и package-first проверкой в доступных границах
 
 ## Что исправлено
 
@@ -18,6 +19,13 @@
 ошибки X11, но daemon продолжал удерживать физическую клавиатуру через
 `EVIOCGRAB`. Атомарный признак смерти существовал, однако runtime-loop его не
 читал. Отдельно X11 startup допускал продолжение без работающего monitor.
+
+Во время повторных recovery-проверок обнаружен ещё один подтверждённый дефект
+серьёзности Medium: зависимость `uinput 0.1.3` уничтожала виртуальное устройство
+через `UI_DEV_DESTROY`, но не закрывала принадлежащий `Device` файловый
+дескриптор. У `Builder` также отсутствовал `Drop`, поэтому fd утекал на
+ошибочных и прерванных путях создания. При каждом восстановлении backend daemon
+мог накапливать ещё один открытый `/dev/uinput` fd.
 
 Теперь действуют следующие границы:
 
@@ -42,26 +50,36 @@
    как unavailable. Общий lifecycle снимает keyboard grab и пересобирает весь
    input pipeline. Политика optional startup при исходных нуле pointer devices
    не менялась.
+9. В точной локальной копии `uinput 0.1.3` `Builder` теперь закрывает свой fd на
+   всех путях `Drop`, а успешный `create` явно передаёт владение `Device` и
+   помечает исходный fd как переданный.
+10. `Device::drop` сначала выполняет best-effort `UI_DEV_DESTROY`, затем всегда
+    закрывает fd и помечает его закрытым. Это исключает и утечку, и двойное
+    закрытие при штатном уничтожении объекта.
 
 Основные места в коде:
 
-- `src/daemon/keyboard.rs:998` — общий readiness-контракт watcher;
-- `src/daemon/keyboard.rs:1176` — runtime health обязательных worker;
-- `src/daemon/keyboard.rs:1207` — activation gate до `EVIOCGRAB`;
-- `src/daemon/keyboard.rs:1462` — обязательное создание X11 monitor;
+- `src/daemon/keyboard.rs:992` — публикация readiness обязательного worker;
+- `src/daemon/keyboard.rs:1040` — общий readiness-контракт до grab;
+- `src/daemon/keyboard.rs:1096` — обязательное создание X11 monitor;
+- `src/daemon/keyboard.rs:1251` — runtime health обязательных worker;
 - `src/daemon/input_backend.rs:167` — классификация runtime-отказа;
 - `src/daemon/input_backend.rs:174` — переход в `Recovering`;
 - `src/daemon/service.rs:165` — маршрутизация health-ошибки;
 - `src/daemon/service.rs:186` и `:201` — health-границы операции и batch;
 - `src/daemon/service.rs:1098` — общая runtime-проверка backend;
-- `src/daemon/service.rs:2565` — reset и удаление активного backend.
+- `src/daemon/service.rs:2565` — reset и удаление активного backend;
 - `src/daemon/keyboard.rs:455` — terminal gate и stop активной transaction при
   смерти обязательного input worker;
 - `src/daemon/keyboard.rs:483` — bounded ожидание writer reply с input-health;
 - `src/daemon/keyboard.rs:1394` — удаление потерянных pointer devices и переход
   N -> 0 в unavailable worker;
 - `src/daemon/keyboard.rs:2283` — подключение watcher health к синхронным
-  correction transaction.
+  correction transaction;
+- `vendor/uinput-0.1.3/src/device/builder.rs:258` — явная передача fd и
+  `Builder::drop`;
+- `vendor/uinput-0.1.3/src/device/device.rs:78` — уничтожение устройства и
+  обязательный `close` fd.
 
 ## TDD и локальная проверка
 
@@ -73,7 +91,10 @@
 - health-ошибка не удаляла backend и не прекращала текущую обработку.
 - активная синхронная transaction могла не увидеть смерть watcher до deadline;
 - потеря последнего из ранее открытых pointer devices не завершала watcher;
-- watcher health мог скрыть уже поставленный в очередь подробный writer error.
+- watcher health мог скрыть уже поставленный в очередь подробный writer error;
+- `Device::drop` оставлял свой fd открытым после `UI_DEV_DESTROY`;
+- `Builder::drop` оставлял fd открытым на error/abandon path;
+- передача fd от `Builder` к `Device` не имела проверяемой модели владения.
 
 После GREEN:
 
@@ -85,6 +106,7 @@
 | targeted service operation/batch routing tests | pass |
 | полная base library matrix | 590 passed, 0 failed |
 | полная `settings-ui` library matrix | 651 passed, 0 failed |
+| vendored `uinput` ownership tests | 3 passed, 0 failed |
 | package D-Bus matrix | 11 passed, 0 failed |
 | package shell checks | pass |
 | targeted `rustfmt --check` изменённых Rust-файлов | pass |
@@ -102,15 +124,20 @@ wakeup. Тот же sibling test подтвердил именно `EPERM`. Эт
 работе `src/daemon/keyboard.rs`, `src/daemon/input_backend.rs` и
 `src/daemon/service.rs` отдельно проходят pinned `rustfmt 1.95`.
 
+Локальная копия старого `uinput 0.1.3` при сборке показывает 45 предупреждений
+о давно deprecated API (`try!`, `Error::description`). Они присутствуют в
+точном upstream-коде зависимости и не означают новые ошибки компиляции. В этой
+ветке намеренно изменено только владение fd, без широкой миграции backend.
+
 ## Идентичность Debian package
 
 - финальный build command: `DEB_BUILD_OPTIONS=nocheck ./manage.sh package deb`;
 - package: `dist/packages/open-switcher_0.1.0-1_amd64.deb`;
-- размер: `3 000 166` bytes;
+- размер: `3 079 132` bytes;
 - SHA-256 package:
-  `f97858007e397644336f6c28c8e3fd784244b223c386101abebfb427a5b3b006`;
+  `e4eecab763d4335c8591852df0627886d4569281390b17cd7a0d36885c60dcfd`;
 - SHA-256 packaged daemon:
-  `be57e010780a659e90f1a471da510572de04482f5ee5a249c1639217de6f7004`.
+  `4dde6886b981aa86fa15b33a6dd0b295aecd9aa91098c1efa094e81a9e024174`.
 
 Перед финальной сборкой обе полные Rust-матрицы были запущены заново, поэтому
 точная финальная пересборка выполнялась с `DEB_BUILD_OPTIONS=nocheck` и не
@@ -193,6 +220,24 @@ fail-safe recovery. Граница подтверждена детерминир
 `pointer_poll_cycle_stops_after_last_open_device_is_lost`. Физическое unplug
 реального тачпада не выполнялось и отдельно отмечено в ограничениях.
 
+### Повторные recovery и владение `/dev/uinput`
+
+После RAII-исправления в одном процессе daemon выполнены три последовательных
+закрытия подтверждённого X11 fd обязательного watcher. В каждом цикле
+независимый probe реально получал и сразу отпускал `EVIOCGRAB`, после чего тот же
+daemon автоматически собирал новый pipeline и снова захватывал устройство.
+
+| Цикл | Доступность grab после fault | Состояние после recovery |
+|---:|---:|---|
+| 1 | `282.967 ms` | PID `162433`, 1 uinput fd, 1 virtual device, 12 threads |
+| 2 | `256.882 ms` | PID `162433`, 1 uinput fd, 1 virtual device, 12 threads |
+| 3 | `263.764 ms` | PID `162433`, 1 uinput fd, 1 virtual device, 12 threads |
+
+Итог `3/3`: процесс не перезапускался, число `/dev/uinput` fd и виртуальных
+устройств не росло. Последующий timeout независимого probe в каждом цикле
+подтвердил, что восстановленный OpenSwitcher снова выполнил grab, а не просто
+остался в отключённом состоянии.
+
 ## Startup/retry без X11 endpoint
 
 Для отдельного startup-сценария только пользовательскому сервису внутри VM был
@@ -265,6 +310,19 @@ QEMU ввод направлялся через `video0` к виртуальны
 прошёл правильно. После исправления oracle вся матрица повторена одним чистым
 прогоном: `8/8`, start PID и end PID равны `141526`.
 
+После финального uinput package матрица была повторена ещё раз. Первый прогон
+дал ложные `7/8`: harness устанавливал Russian только в начале серии, хотя
+успешный F12 штатно переключает текущую раскладку. Поэтому следующая попытка
+могла начинаться в English и корректно преобразовываться обратно в `ыгвщ`.
+Обезличенный debug-log при этом фиксировал успешную correction transaction и
+не содержал pointer-click/context-reset. Harness исправлен: перед каждым
+сценарием он читает фактическую группу и при необходимости использует обычный
+`Super+Space`.
+
+Чистый итоговый прогон дал `8/8`, start PID и end PID равны `167981`.
+Дополнительно сценарий «новое окно -> `ыгвщ` -> движение tablet -> F12» повторён
+10 раз: `10/10` получили `sudo`, start PID и end PID также равны `167981`.
+
 Отдельный ранее подтверждённый дефект случайного Caps Lock не относится к этой
 ветке и не объявляется исправленным. Механизм двух заглавных в текущем package
 прошёл runtime-проверку.
@@ -285,12 +343,16 @@ QEMU ввод направлялся через `video0` к виртуальны
 ## Итоговое состояние VM
 
 - `open-switcher-daemon.service`: `active/running`, `Result=success`;
-- PID: `141526`, 12 потоков, `NRestarts=0`;
-- daemon hash совпадает с package;
+- PID: `177421`, 12 потоков, `NRestarts=0`;
+- daemon SHA-256
+  `4dde6886b981aa86fa15b33a6dd0b295aecd9aa91098c1efa094e81a9e024174`
+  совпадает с package;
 - `DISPLAY=:0`, `XDG_SESSION_TYPE=x11`, layout group `0` (English);
 - временные debug manager variables отсутствуют;
 - Xephyr, `X99` socket и Xed test process отсутствуют;
 - одно активное `Open-Switcher Virtual Device` и один открытый `/dev/uinput` fd;
+- штатные задержки восстановлены: `delay_ms=30`, `backspace_ms=0`,
+  `typing_ms=0`; auto correction, two capitals и accidental Caps Lock включены;
 - лаборатория сохранена и не удалялась.
 
 ## Ограничения
@@ -301,6 +363,8 @@ QEMU ввод направлялся через `video0` к виртуальны
   Wayland runtime в этой работе не запускался.
 - Fault injection закрывала только X11 connection fd watcher. Не моделировались
   зависание ядра, аппаратный отказ контроллера и полная остановка VM.
+- Исправление uinput-пути проверено unit tests и повторным X11 recovery, но не
+  инъекцией ошибки каждого отдельного ioctl/write внутри реального ядра.
 - Переход pointer watcher N -> 0 покрыт unit test, но runtime-unplug физического
   тачпада или QEMU pointer device не выполнялся.
 - Probe подтверждает реальное окно освобождения виртуального evdev-устройства,
@@ -320,5 +384,6 @@ fail-open: клавиатура остаётся доступна системе
 Абсолютную fail-safe гарантию для зависшего ядра или неисправного hardware дать
 нельзя, однако подтверждённая прежняя причина «watcher умер, grab остался»
 устранена и воспроизведённые аварийные сценарии — включая отказ во время
-активной коррекции — теперь проходят в package-first runtime. Лаборатория
-сохранена для будущих проверок.
+активной коррекции — теперь проходят в package-first runtime. Подтверждённая
+утечка `/dev/uinput` fd также устранена: три recovery подряд не увеличили число
+fd или виртуальных устройств. Лаборатория сохранена для будущих проверок.

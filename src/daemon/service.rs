@@ -162,6 +162,14 @@ enum CompletionBeforeWriterHealthError<E> {
     Health(E),
 }
 
+fn route_runtime_health_failure<E>(error: E, recover: impl FnOnce(&E) -> bool) -> Result<(), E> {
+    if recover(&error) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 fn poll_completion_before_writer_health<State, E, PollCompletion, EnsureHealth>(
     state: &mut State,
     poll_completion: PollCompletion,
@@ -901,13 +909,18 @@ impl DaemonService {
                 return Ok(());
             }
 
-            self.poll_manual_completion_and_ensure_writer_healthy()?;
+            if let Err(error) = self.poll_manual_completion_and_ensure_input_backend_healthy() {
+                route_runtime_health_failure(error, |error| {
+                    self.handle_runtime_input_failure(error)
+                })?;
+                continue 'event_loop;
+            }
             self.maybe_retry_input_backend()?;
 
             let fetch_timeout = bounded_capture_poll_timeout(self.event_fetch_timeout());
             let fetch_result = run_writer_healthy_operation(
                 self,
-                DaemonService::poll_manual_completion_and_ensure_writer_healthy,
+                DaemonService::poll_manual_completion_and_ensure_input_backend_healthy,
                 |service| {
                     if let Some(keyboard) = service.keyboard.as_mut() {
                         keyboard.fetch_events_timeout(fetch_timeout)
@@ -919,7 +932,12 @@ impl DaemonService {
             );
             let events = match fetch_result {
                 Ok(events) => events,
-                Err(WriterHealthyOperationError::Health(error)) => return Err(error),
+                Err(WriterHealthyOperationError::Health(error)) => {
+                    route_runtime_health_failure(error, |error| {
+                        self.handle_runtime_input_failure(error)
+                    })?;
+                    continue 'event_loop;
+                }
                 Err(WriterHealthyOperationError::Operation(error)) => {
                     log_input_debug("keyboard-read-error", &format!("error={error}"));
                     if self.handle_runtime_input_failure(&error) {
@@ -965,7 +983,7 @@ impl DaemonService {
             let batch_result = process_writer_healthy_batch(
                 self,
                 events,
-                DaemonService::poll_manual_completion_and_ensure_writer_healthy,
+                DaemonService::poll_manual_completion_and_ensure_input_backend_healthy,
                 |service, event| {
                     if let InputEventKind::Key(key) = event.kind() {
                         if let Err(error) = service.handle_key_event(
@@ -1017,7 +1035,12 @@ impl DaemonService {
             );
             match batch_result {
                 Ok(()) => {}
-                Err(WriterHealthyBatchError::Health(error)) => return Err(error),
+                Err(WriterHealthyBatchError::Health(error)) => {
+                    route_runtime_health_failure(error, |error| {
+                        self.handle_runtime_input_failure(error)
+                    })?;
+                    continue 'event_loop;
+                }
                 Err(WriterHealthyBatchError::Event(error)) => {
                     if self.handle_runtime_input_failure(&error) {
                         continue 'event_loop;
@@ -1072,11 +1095,26 @@ impl DaemonService {
         Ok(())
     }
 
-    fn poll_manual_completion_and_ensure_writer_healthy(&mut self) -> Result<(), SwitcherError> {
+    fn ensure_input_backend_healthy(&mut self) -> Result<(), SwitcherError> {
+        self.ensure_writer_healthy()?;
+        if let Some(error) = self
+            .keyboard
+            .as_ref()
+            .and_then(KeyboardController::input_worker_health_error)
+        {
+            log_input_debug("input-worker-health-error", &format!("error={error}"));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn poll_manual_completion_and_ensure_input_backend_healthy(
+        &mut self,
+    ) -> Result<(), SwitcherError> {
         match poll_completion_before_writer_health(
             self,
             DaemonService::poll_manual_current_word_completion,
-            DaemonService::ensure_writer_healthy,
+            DaemonService::ensure_input_backend_healthy,
         ) {
             Ok(()) => Ok(()),
             Err(CompletionBeforeWriterHealthError::Completion(error)) => {
@@ -2688,6 +2726,7 @@ mod tests {
     use super::*;
     use crate::model::{SelectedTextHotkey, SessionType, UndoKey};
     use evdev::Key;
+    use std::cell::Cell;
 
     // Test helpers
 
@@ -2992,6 +3031,39 @@ mod tests {
             INPUT_EVENT_WAIT_TIMEOUT
         );
         assert!(MANUAL_CURRENT_WORD_IN_FLIGHT_POLL_TIMEOUT <= WRITER_HEALTH_POLL_QUANTUM);
+    }
+
+    #[test]
+    fn recoverable_runtime_health_failure_requests_recovery() {
+        let recovery_called = Cell::new(false);
+        let result = route_runtime_health_failure(
+            SwitcherError::InputWorkerDisconnected {
+                worker: "input-target-watcher",
+            },
+            |error| {
+                recovery_called.set(matches!(
+                    error,
+                    SwitcherError::InputWorkerDisconnected { .. }
+                ));
+                true
+            },
+        );
+
+        assert!(result.is_ok());
+        assert!(recovery_called.get());
+    }
+
+    #[test]
+    fn fatal_runtime_health_failure_preserves_detailed_error() {
+        let result = route_runtime_health_failure(
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 901 },
+            |_| false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 901 })
+        ));
     }
 
     #[test]

@@ -307,6 +307,59 @@ bounded cleanup. Только после cleanup он публикует неф�
 `Alt down -> Tab down -> Tab up -> Alt up` остаётся полной и упорядоченной,
 даже если `Tab down` меняет окно.
 
+### Подтверждение deferred-событий и X11 focus barrier
+
+VM-проверка обнаружила отдельную гонку Cinnamon/X11. После F12 ledger сохранял
+полную последовательность `Alt+Tab` и последующие цифры, но считал каждое
+событие подтверждённым сразу после помещения команды в FIFO writer. Drain
+успевал поставить весь хвост в FIFO до того, как watcher сообщил новое значение
+`_NET_ACTIVE_WINDOW`. В результате Cinnamon мог поглотить текстовые события во
+время переключения окна, хотя отчёт ledger показывал `accepted=acknowledged`.
+
+Для deferred replay вводится более сильный контракт:
+
+1. Отдельная команда writer подтверждает событие только после успешных
+   `uinput write + synchronize`, а не после помещения в FIFO.
+2. В ledger одновременно находится не более одного отправленного, но ещё не
+   подтверждённого deferred-события. ACK имеет отдельный deadline 1 с.
+   Timeout, disconnect или backend error сохраняют событие в голове очереди и
+   запускают существующий release-first terminal recovery; неоднозначное
+   событие не воспроизводится через новое поколение backend.
+3. При физической последовательности X11 `Alt down -> Tab down -> Tab up ->
+   Alt up` session запоминает поколение active target до shortcut и sequence id
+   финального release.
+4. Все четыре события shortcut сначала отправляются и подтверждаются. После
+   финального release drain временно не отправляет следующий текстовый хвост,
+   пока X11 watcher не подтвердит новое поколение `_NET_ACTIVE_WINDOW`.
+5. Ожидание является состоянием event loop, а не блокирующим sleep: новые
+   физические события продолжают приниматься в ledger, watcher и writer
+   продолжают проверяться.
+6. Ожидание завершается сразу после события watcher. Защитный deadline —
+   300 мс. При deadline хвост не удаляется и не считается доставленным: barrier
+   снимается с диагностикой, после чего события отправляются в текущий target,
+   чтобы отказ watcher не превратился в бессрочную блокировку клавиатуры.
+7. Pointer click не получает дополнительную задержку: target обычно уже
+   изменён до replay, а существующая click-invalidation остаётся прежней.
+8. Обычный ввод, обычный Alt+Tab, F12 без пересечения и Wayland-путь этим
+   X11-барьером не изменяются. Wayland повторно проверяется в VM; отдельная
+   таймерная задержка без подтверждаемого target-сигнала заранее не вводится.
+
+Один session может хранить несколько focus-barrier markers в порядке sequence
+id, поэтому повторный Alt+Tab не заменяет предыдущий marker и не теряет хвост.
+Generation, а не одноразовый boolean, позволяет распознать target change, даже
+если основной event loop уже забрал invalidation flag для очистки word context.
+
+Рассматривались и отклонены два более простых варианта:
+
+- фиксированный sleep после Alt release — зависит от скорости desktop и
+  возвращает хрупкий «магический» тайминг;
+- replay по исходным timestamp — уменьшает вероятность гонки, но не доказывает
+  готовность target и замедляет любой deferred-хвост.
+
+Выбранный generation barrier затрагивает только подтверждённое редкое
+пересечение F12 и X11 focus shortcut. Обычная задержка равна времени реального
+события `_NET_ACTIVE_WINDOW`; 300 мс являются только fail-open deadline.
+
 ## Линеаризация cancel, completion, timeout и stop
 
 Персональная отмена текущей коррекции не использует глобальные
@@ -566,6 +619,17 @@ reconciliation должен иметь краткую безопасную за�
 8. actual `FailedAfterMutation` не маскируется мягкой отменой;
 9. обычные F12, auto correction, Caps Lock, two capitals, layout switch,
    Enter/Tab/Space и click/movement regressions сохраняют прежние результаты.
+10. deferred writer ACK не удаляет голову до успешных `write + synchronize`;
+    timeout и disconnect сохраняют неоднозначную голову до terminal
+    reconciliation;
+11. X11 `Alt+Tab` сначала подтверждает все releases, затем ждёт новое target
+    generation и только после этого отправляет текстовый хвост;
+12. target change до достижения barrier sequence id учитывается и не создаёт
+    лишнего ожидания;
+13. отсутствие target change снимает barrier по deadline без reset, потери
+    ledger или busy loop;
+14. два последовательных X11 focus shortcut сохраняют два marker и весь хвост
+    в исходном порядке.
 
 Локально запускаются только unit/fake-backend тесты. Они не открывают
 `/dev/input`, не создают активный `/dev/uinput`, не посылают реальные нажатия,

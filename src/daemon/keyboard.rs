@@ -939,6 +939,7 @@ struct PointerWatcher {
 
 struct InputTargetWatcher {
     changed_flag: Arc<AtomicBool>,
+    target_generation: Arc<AtomicU64>,
     pointer_click_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
@@ -998,10 +999,12 @@ fn publish_x11_context_event(
     event: X11ContextEvent,
     changed_flag: &AtomicBool,
     pointer_click_flag: &AtomicBool,
+    target_generation: &AtomicU64,
 ) {
     match event {
         X11ContextEvent::ActiveWindowChanged { previous, current } => {
             changed_flag.store(true, Ordering::SeqCst);
+            target_generation.fetch_add(1, Ordering::SeqCst);
             log_input_debug(
                 "input-target-changed",
                 &format!(
@@ -1424,6 +1427,10 @@ impl KeyboardController {
 
     pub fn take_input_target_invalidation(&self) -> bool {
         self.input_target_watcher.take_change_invalidation()
+    }
+
+    pub(crate) fn input_target_generation(&self) -> u64 {
+        self.input_target_watcher.target_generation()
     }
 
     pub fn release_grab_best_effort(&mut self) {
@@ -1969,6 +1976,7 @@ fn prepare_input_target_monitor<T>(
 impl InputTargetWatcher {
     fn spawn(session_type: SessionType) -> Result<Self, SwitcherError> {
         let changed_flag = Arc::new(AtomicBool::new(false));
+        let target_generation = Arc::new(AtomicU64::new(0));
         let pointer_click_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
@@ -1985,6 +1993,7 @@ impl InputTargetWatcher {
             );
             return Ok(Self::disabled(
                 changed_flag,
+                target_generation,
                 pointer_click_flag,
                 stop_flag,
                 alive,
@@ -1995,6 +2004,7 @@ impl InputTargetWatcher {
         let stop_wakeup = Some(stop_wakeup);
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let worker_changed_flag = Arc::clone(&changed_flag);
+        let worker_target_generation = Arc::clone(&target_generation);
         let worker_pointer_click_flag = Arc::clone(&pointer_click_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
@@ -2021,6 +2031,7 @@ impl InputTargetWatcher {
                             event,
                             &worker_changed_flag,
                             &worker_pointer_click_flag,
+                            &worker_target_generation,
                         );
                     },
                     || wait_for_x11_or_stop(x11_fd, stop_fd),
@@ -2058,6 +2069,7 @@ impl InputTargetWatcher {
 
         Ok(Self {
             changed_flag,
+            target_generation,
             pointer_click_flag,
             stop_flag,
             alive,
@@ -2069,12 +2081,14 @@ impl InputTargetWatcher {
 
     fn disabled(
         changed_flag: Arc<AtomicBool>,
+        target_generation: Arc<AtomicU64>,
         pointer_click_flag: Arc<AtomicBool>,
         stop_flag: Arc<AtomicBool>,
         alive: Arc<AtomicBool>,
     ) -> Self {
         Self {
             changed_flag,
+            target_generation,
             pointer_click_flag,
             stop_flag,
             alive,
@@ -2086,6 +2100,10 @@ impl InputTargetWatcher {
 
     fn take_change_invalidation(&self) -> bool {
         self.changed_flag.swap(false, Ordering::SeqCst)
+    }
+
+    fn target_generation(&self) -> u64 {
+        self.target_generation.load(Ordering::SeqCst)
     }
 
     fn request_stop(&self) {
@@ -9709,6 +9727,7 @@ mod tests {
     fn x11_context_events_set_only_the_matching_invalidation_flag() {
         let changed = AtomicBool::new(false);
         let pointer_click = AtomicBool::new(false);
+        let generation = AtomicU64::new(0);
 
         publish_x11_context_event(
             X11ContextEvent::ActiveWindowChanged {
@@ -9717,6 +9736,7 @@ mod tests {
             },
             &changed,
             &pointer_click,
+            &generation,
         );
         assert!(changed.swap(false, Ordering::SeqCst));
         assert!(!pointer_click.load(Ordering::SeqCst));
@@ -9725,9 +9745,49 @@ mod tests {
             X11ContextEvent::PointerClick { detail: 1 },
             &changed,
             &pointer_click,
+            &generation,
         );
         assert!(!changed.load(Ordering::SeqCst));
         assert!(pointer_click.swap(false, Ordering::SeqCst));
+    }
+
+    #[test]
+    fn x11_active_window_change_advances_generation_independently_of_flag_drain() {
+        let changed = AtomicBool::new(false);
+        let pointer_click = AtomicBool::new(false);
+        let generation = AtomicU64::new(0);
+
+        publish_x11_context_event(
+            X11ContextEvent::ActiveWindowChanged {
+                previous: Some(1),
+                current: Some(2),
+            },
+            &changed,
+            &pointer_click,
+            &generation,
+        );
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
+        assert!(changed.swap(false, Ordering::SeqCst));
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
+
+        publish_x11_context_event(
+            X11ContextEvent::ActiveWindowChanged {
+                previous: Some(2),
+                current: Some(3),
+            },
+            &changed,
+            &pointer_click,
+            &generation,
+        );
+        assert_eq!(generation.load(Ordering::SeqCst), 2);
+
+        publish_x11_context_event(
+            X11ContextEvent::PointerClick { detail: 1 },
+            &changed,
+            &pointer_click,
+            &generation,
+        );
+        assert_eq!(generation.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -9742,6 +9802,7 @@ mod tests {
         let logical_click = Arc::new(AtomicBool::new(true));
         let input_target_watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::clone(&logical_click),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
@@ -9923,6 +9984,7 @@ mod tests {
     fn input_target_watcher_readiness_is_true_when_disabled_by_policy() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
@@ -9969,6 +10031,7 @@ mod tests {
     fn disabled_input_target_watcher_object_is_ready() {
         let watcher = InputTargetWatcher::disabled(
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -9981,6 +10044,7 @@ mod tests {
     fn input_target_watcher_readiness_is_false_when_required_thread_is_dead() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
@@ -9996,6 +10060,7 @@ mod tests {
     fn input_target_watcher_readiness_is_true_immediately_after_successful_spawn() {
         let watcher = InputTargetWatcher {
             changed_flag: Arc::new(AtomicBool::new(false)),
+            target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),

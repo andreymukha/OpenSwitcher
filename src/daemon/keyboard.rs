@@ -577,6 +577,45 @@ impl WriterTransactionControl {
         }
     }
 
+    fn publish_failed_with(
+        &self,
+        publish_reply: impl FnOnce() -> bool,
+    ) -> WriterCompletionPublication {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop_requested.load(Ordering::SeqCst)
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+            || self.state() != WriterTransactionState::Pending
+        {
+            return WriterCompletionPublication::Cancelled;
+        }
+        if Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return WriterCompletionPublication::Cancelled;
+        }
+        if !publish_reply() {
+            return WriterCompletionPublication::ReceiverDisconnected;
+        }
+
+        let completed = self
+            .state
+            .compare_exchange(
+                WriterTransactionState::Pending as u8,
+                WriterTransactionState::Completed as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        debug_assert!(completed, "terminal gate must serialize failed completion");
+        if completed {
+            WriterCompletionPublication::Completed
+        } else {
+            WriterCompletionPublication::Cancelled
+        }
+    }
+
     fn publish_completed(&self) -> bool {
         matches!(
             self.publish_completed_with(|| true),
@@ -832,6 +871,7 @@ pub struct ManualCurrentWordCompletion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ManualCurrentWordOutcome {
     Succeeded(CorrectionPlan),
+    Cancelled,
     FailedAfterMutation(String),
 }
 
@@ -1458,6 +1498,14 @@ impl KeyboardController {
         &mut self,
     ) -> Result<Option<ManualCurrentWordCompletion>, SwitcherError> {
         self.virtual_device.poll_manual_current_word_completion()
+    }
+
+    pub(crate) fn request_manual_current_word_cancel(
+        &self,
+        request_id: u64,
+    ) -> WriterSoftCancelRequest {
+        self.virtual_device
+            .request_manual_current_word_cancel(request_id)
     }
 
     pub fn apply_same_layout_correction(
@@ -2430,6 +2478,15 @@ impl VirtualKeyboardWriter {
         }
     }
 
+    fn request_manual_current_word_cancel(&self, request_id: u64) -> WriterSoftCancelRequest {
+        match self.pending_manual_current_word.as_ref() {
+            Some(pending) if pending.control.request_id() == request_id => {
+                pending.control.request_soft_cancel()
+            }
+            Some(_) | None => WriterSoftCancelRequest::AlreadyCompleted,
+        }
+    }
+
     fn poll_manual_current_word_completion(
         &mut self,
     ) -> Result<Option<ManualCurrentWordCompletion>, SwitcherError> {
@@ -2469,7 +2526,14 @@ impl VirtualKeyboardWriter {
                         if pending.control.state() == WriterTransactionState::Completed {
                             continue;
                         }
-                        return Err(error);
+                        if !matches!(
+                            error,
+                            SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+                                request_id
+                            } if request_id == pending.control.request_id()
+                        ) {
+                            return Err(error);
+                        }
                     }
                     if completion_channel_disconnected {
                         if pending.control.state() == WriterTransactionState::Completed {
@@ -2528,7 +2592,14 @@ impl VirtualKeyboardWriter {
                             if pending.control.state() == WriterTransactionState::Completed {
                                 continue;
                             }
-                            return Some(error);
+                            if !matches!(
+                                error,
+                                SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+                                    request_id
+                                } if request_id == pending.control.request_id()
+                            ) {
+                                return Some(error);
+                            }
                         }
                         #[cfg(test)]
                         run_deferred_health_before_handle_check_hook();
@@ -4277,6 +4348,146 @@ fn release_uinput_stroke_keys(
     }
 }
 
+fn all_modifier_keys() -> Vec<Key> {
+    pressed_modifier_keys(ModifierState {
+        left_shift: true,
+        right_shift: true,
+        left_ctrl: true,
+        right_ctrl: true,
+        left_alt: true,
+        right_alt: true,
+        left_meta: true,
+        right_meta: true,
+        ..ModifierState::default()
+    })
+}
+
+fn retain_first_cleanup_error(
+    first_error: &mut Option<SwitcherError>,
+    result: Result<(), SwitcherError>,
+) {
+    if let Err(error) = result {
+        if first_error.is_none() {
+            *first_error = Some(error);
+        }
+    }
+}
+
+fn release_uinput_cleanup_keys_best_effort(
+    sink: &mut dyn UinputStrokeSink,
+    keys: &[Key],
+    control: &WriterTransactionControl,
+) {
+    for key in keys.iter().rev() {
+        if control.authorize_cleanup_mutation_start().is_ok() {
+            let _ = sink.write_key(*key, 0);
+        }
+    }
+    if control.authorize_cleanup_mutation_start().is_ok() {
+        let _ = sink.synchronize_keys();
+    }
+}
+
+fn normalize_uinput_modifiers_after_soft_cancel(
+    sink: &mut dyn UinputStrokeSink,
+    frozen: ModifierState,
+    control: &WriterTransactionControl,
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
+    for key in all_modifier_keys() {
+        let result = control
+            .authorize_cleanup_mutation_start()
+            .and_then(|_| sink.write_key(key, 0));
+        retain_first_cleanup_error(&mut first_error, result);
+    }
+    let sync_result = control
+        .authorize_cleanup_mutation_start()
+        .and_then(|_| sink.synchronize_keys());
+    retain_first_cleanup_error(&mut first_error, sync_result);
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    let mut restored = Vec::new();
+    for key in pressed_modifier_keys(frozen) {
+        if let Err(error) = control.authorize_cleanup_mutation_start() {
+            release_uinput_cleanup_keys_best_effort(sink, &restored, control);
+            return Err(error);
+        }
+        if let Err(error) = sink.write_key(key, 1) {
+            restored.push(key);
+            release_uinput_cleanup_keys_best_effort(sink, &restored, control);
+            return Err(error);
+        }
+        restored.push(key);
+    }
+    if let Err(error) = control
+        .authorize_cleanup_mutation_start()
+        .and_then(|_| sink.synchronize_keys())
+    {
+        release_uinput_cleanup_keys_best_effort(sink, &restored, control);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn release_xtest_cleanup_keys_best_effort(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    keys: &[Key],
+    control: &WriterTransactionControl,
+) {
+    for key in keys.iter().rev() {
+        if control.authorize_cleanup_mutation_start().is_ok() {
+            let _ = replay.key_up(*key);
+        }
+    }
+}
+
+fn normalize_xtest_modifiers_after_soft_cancel(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    frozen: ModifierState,
+    control: &WriterTransactionControl,
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
+    for key in all_modifier_keys() {
+        let result = control
+            .authorize_cleanup_mutation_start()
+            .and_then(|_| replay.key_up(key));
+        retain_first_cleanup_error(&mut first_error, result);
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+
+    let mut restored = Vec::new();
+    for key in pressed_modifier_keys(frozen) {
+        if let Err(error) = control.authorize_cleanup_mutation_start() {
+            release_xtest_cleanup_keys_best_effort(replay, &restored, control);
+            return Err(error);
+        }
+        if let Err(error) = replay.key_down(key, None) {
+            restored.push(key);
+            release_xtest_cleanup_keys_best_effort(replay, &restored, control);
+            return Err(error);
+        }
+        restored.push(key);
+    }
+    Ok(())
+}
+
+fn is_matching_soft_cancel(
+    error: &SwitcherError,
+    control: Option<&WriterTransactionControl>,
+) -> bool {
+    matches!(
+        (error, control),
+        (
+            SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id },
+            Some(control),
+        ) if *request_id == control.request_id()
+    )
+}
+
 fn replay_uinput_stroke(
     sink: &mut dyn UinputStrokeSink,
     key: Key,
@@ -4366,13 +4577,24 @@ fn run_correction(
                     "correction-layout-switch",
                     "strategy=cinnamon-xkb-xtest phase=prepare",
                 );
-                let outcome = run_cinnamon_x11_xtest_correction(
+                let result = run_cinnamon_x11_xtest_correction(
                     replay.as_mut(),
                     plan,
                     config,
                     modifiers,
                     control,
-                )?;
+                );
+                let outcome = match result {
+                    Err(error) if is_matching_soft_cancel(&error, control) => {
+                        normalize_xtest_modifiers_after_soft_cancel(
+                            replay.as_mut(),
+                            modifiers,
+                            control.expect("matching soft cancel requires transaction control"),
+                        )?;
+                        return Err(error);
+                    }
+                    result => result?,
+                };
                 log_input_debug(
                     "correction-layout-switch",
                     "strategy=cinnamon-xkb-xtest result=ok",
@@ -4392,93 +4614,109 @@ fn run_correction(
         }
     }
 
-    release_modifiers(device, modifiers, control)?;
-    replay_uinput_backspaces(
-        device,
-        plan.buffer.len() + plan.extra_backspaces,
-        Duration::from_millis(config.backspace_ms),
-        control,
-    )?;
-
-    let layout_switch = if switch_layout {
-        if x11_switcher.is_some() {
-            log_input_debug(
-                "correction-layout-switch",
-                &format!(
-                    "combo={:?} strategy=x11 hold_ms={}",
-                    config.layout_switch_combo, config.layout_delay_ms
-                ),
-            );
-        } else {
-            log_input_debug(
-                "correction-layout-switch",
-                &format!(
-                    "combo={:?} strategy=uinput hold_ms={}",
-                    config.layout_switch_combo, config.layout_delay_ms
-                ),
-            );
-        }
-
-        let layout_waiter = |duration: Duration| {
-            if duration.is_zero() {
-                authorize_transaction_mutation(control)
-            } else {
-                sleep_for_transaction(control, duration)
-            }
-        };
-        let mut uinput_switcher =
-            UinputLayoutSwitcher::new_with_waiter(device, config.layout_delay_ms, &layout_waiter);
-        let x11 = x11_switcher
-            .as_mut()
-            .map(|switcher| switcher as &mut dyn LayoutSwitcher);
-        ensure_transaction_active(control)?;
-        let outcome = switch_layout_with_fallback(
-            x11,
-            &mut uinput_switcher,
-            config.layout_switch_combo,
-            control,
-        )?;
-        ensure_transaction_active(control)?;
-        match outcome {
-            CorrectionLayoutSwitchOutcome::AppliedX11 => log_input_debug(
-                "correction-layout-switch",
-                &format!(
-                    "combo={:?} strategy=x11 result=ok",
-                    config.layout_switch_combo
-                ),
-            ),
-            CorrectionLayoutSwitchOutcome::AppliedUinput => log_input_debug(
-                "correction-layout-switch",
-                &format!(
-                    "combo={:?} strategy=uinput result=ok hold_ms={}",
-                    config.layout_switch_combo, config.layout_delay_ms
-                ),
-            ),
-            CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest => log_input_debug(
-                "correction-layout-switch",
-                "strategy=cinnamon-xkb-xtest result=ok",
-            ),
-            CorrectionLayoutSwitchOutcome::NotNeeded => {}
-        }
-        sleep_for_transaction(control, Duration::from_millis(config.layout_delay_ms))?;
-        outcome
-    } else {
-        CorrectionLayoutSwitchOutcome::NotNeeded
-    };
-
-    for stroke in &plan.buffer {
-        let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
-        replay_uinput_stroke(
+    let result = (|| {
+        release_modifiers(device, modifiers, control)?;
+        replay_uinput_backspaces(
             device,
-            stroke.key,
-            effective_shift,
-            Duration::from_millis(config.typing_ms),
+            plan.buffer.len() + plan.extra_backspaces,
+            Duration::from_millis(config.backspace_ms),
             control,
         )?;
-    }
 
-    restore_modifiers(device, modifiers, control)?;
-    Ok(CorrectionExecutionOutcome { layout_switch })
+        let layout_switch = if switch_layout {
+            if x11_switcher.is_some() {
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=x11 hold_ms={}",
+                        config.layout_switch_combo, config.layout_delay_ms
+                    ),
+                );
+            } else {
+                log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=uinput hold_ms={}",
+                        config.layout_switch_combo, config.layout_delay_ms
+                    ),
+                );
+            }
+
+            let layout_waiter = |duration: Duration| {
+                if duration.is_zero() {
+                    authorize_transaction_mutation(control)
+                } else {
+                    sleep_for_transaction(control, duration)
+                }
+            };
+            let mut uinput_switcher = UinputLayoutSwitcher::new_with_waiter(
+                device,
+                config.layout_delay_ms,
+                &layout_waiter,
+            );
+            let x11 = x11_switcher
+                .as_mut()
+                .map(|switcher| switcher as &mut dyn LayoutSwitcher);
+            ensure_transaction_active(control)?;
+            let outcome = switch_layout_with_fallback(
+                x11,
+                &mut uinput_switcher,
+                config.layout_switch_combo,
+                control,
+            )?;
+            ensure_transaction_active(control)?;
+            match outcome {
+                CorrectionLayoutSwitchOutcome::AppliedX11 => log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=x11 result=ok",
+                        config.layout_switch_combo
+                    ),
+                ),
+                CorrectionLayoutSwitchOutcome::AppliedUinput => log_input_debug(
+                    "correction-layout-switch",
+                    &format!(
+                        "combo={:?} strategy=uinput result=ok hold_ms={}",
+                        config.layout_switch_combo, config.layout_delay_ms
+                    ),
+                ),
+                CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest => log_input_debug(
+                    "correction-layout-switch",
+                    "strategy=cinnamon-xkb-xtest result=ok",
+                ),
+                CorrectionLayoutSwitchOutcome::NotNeeded => {}
+            }
+            sleep_for_transaction(control, Duration::from_millis(config.layout_delay_ms))?;
+            outcome
+        } else {
+            CorrectionLayoutSwitchOutcome::NotNeeded
+        };
+
+        for stroke in &plan.buffer {
+            let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
+            replay_uinput_stroke(
+                device,
+                stroke.key,
+                effective_shift,
+                Duration::from_millis(config.typing_ms),
+                control,
+            )?;
+        }
+
+        restore_modifiers(device, modifiers, control)?;
+        Ok(CorrectionExecutionOutcome { layout_switch })
+    })();
+    match result {
+        Err(error) if is_matching_soft_cancel(&error, control) => {
+            normalize_uinput_modifiers_after_soft_cancel(
+                device,
+                modifiers,
+                control.expect("matching soft cancel requires transaction control"),
+            )?;
+            Err(error)
+        }
+        result => result,
+    }
 }
 
 fn switch_layout_with_fallback(
@@ -4578,13 +4816,76 @@ fn publish_writer_transaction_result(
     }
 }
 
+fn classify_manual_current_word_result(
+    request_id: u64,
+    plan: CorrectionPlan,
+    result: Result<CorrectionExecutionOutcome, SwitcherError>,
+) -> (ManualCurrentWordOutcome, Option<String>) {
+    match result {
+        Ok(_) => (ManualCurrentWordOutcome::Succeeded(plan), None),
+        Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+            request_id: cancelled_id,
+        }) if cancelled_id == request_id => (ManualCurrentWordOutcome::Cancelled, None),
+        Err(error) => {
+            let reason = error.to_string();
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason.clone()),
+                Some(reason),
+            )
+        }
+    }
+}
+
 fn publish_deferred_manual_completion(
     control: &WriterTransactionControl,
     completion_tx: &mpsc::Sender<ManualCurrentWordCompletion>,
     completion: ManualCurrentWordCompletion,
     failure_reason: Option<String>,
 ) -> Result<(), SwitcherError> {
-    match control.publish_completed_with(|| completion_tx.send(completion).is_ok()) {
+    let cancelled = matches!(completion.outcome, ManualCurrentWordOutcome::Cancelled);
+    debug_assert!(!cancelled || failure_reason.is_none());
+    let mut completion = Some(completion);
+    let publication = if cancelled {
+        control.publish_soft_cancelled_with(|| {
+            completion_tx
+                .send(completion.take().expect("completion is sent once"))
+                .is_ok()
+        })
+    } else if failure_reason.is_some() {
+        control.publish_failed_with(|| {
+            completion_tx
+                .send(completion.take().expect("completion is sent once"))
+                .is_ok()
+        })
+    } else {
+        let publication = control.publish_completed_with(|| {
+            completion_tx
+                .send(completion.take().expect("completion is sent once"))
+                .is_ok()
+        });
+        if publication == WriterCompletionPublication::Cancelled
+            && matches!(
+                control.cancellation_error(),
+                SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+                    request_id
+                } if request_id == control.request_id()
+            )
+        {
+            debug_assert!(completion.is_some());
+            completion = Some(ManualCurrentWordCompletion {
+                request_id: control.request_id(),
+                outcome: ManualCurrentWordOutcome::Cancelled,
+            });
+            control.publish_soft_cancelled_with(|| {
+                completion_tx
+                    .send(completion.take().expect("completion is sent once"))
+                    .is_ok()
+            })
+        } else {
+            publication
+        }
+    };
+    match publication {
         WriterCompletionPublication::Completed => match failure_reason {
             Some(reason) => Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
                 request_id: control.request_id(),
@@ -4754,21 +5055,27 @@ fn run_virtual_keyboard_writer_loop(
                         Ok(outcome) => control.ensure_active().map(|_| outcome),
                         Err(error) => Err(error),
                     };
-                    let failure_reason = result.as_ref().err().map(ToString::to_string);
-                    let outcome = match result {
-                        Ok(_) => ManualCurrentWordOutcome::Succeeded(plan),
-                        Err(error) => {
-                            log_input_debug(
-                                "manual-current-word-writer-error",
-                                &format!(
-                                    "request_id={} elapsed_ms={} error={error}",
-                                    request_id,
-                                    started.elapsed().as_millis(),
-                                ),
-                            );
-                            ManualCurrentWordOutcome::FailedAfterMutation(error.to_string())
-                        }
-                    };
+                    let (outcome, failure_reason) =
+                        classify_manual_current_word_result(request_id, plan, result);
+                    match (&outcome, &failure_reason) {
+                        (ManualCurrentWordOutcome::Cancelled, _) => log_input_debug(
+                            "manual-current-word-writer-cancelled",
+                            &format!(
+                                "request_id={} elapsed_ms={}",
+                                request_id,
+                                started.elapsed().as_millis(),
+                            ),
+                        ),
+                        (_, Some(error)) => log_input_debug(
+                            "manual-current-word-writer-error",
+                            &format!(
+                                "request_id={} elapsed_ms={} error={error}",
+                                request_id,
+                                started.elapsed().as_millis(),
+                            ),
+                        ),
+                        _ => {}
+                    }
                     publish_deferred_manual_completion(
                         &control,
                         &completion_tx,
@@ -5941,6 +6248,115 @@ mod tests {
             sink.events,
             vec!["up:RightControl", "up:LeftControl", "up:LeftShift", "sync"]
         );
+    }
+
+    #[test]
+    fn soft_cancel_after_modifier_release_normalizes_uinput_to_frozen_state() {
+        let control = WriterTransactionControl::with_timeout_for_test(211, Duration::from_secs(1));
+        let frozen = ModifierState {
+            left_ctrl: true,
+            left_shift: true,
+            ..ModifierState::default()
+        };
+        let mut sink = FakeUinputStrokeSink::default();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        normalize_uinput_modifiers_after_soft_cancel(&mut sink, frozen, &control).unwrap();
+
+        assert_eq!(
+            sink.events,
+            vec![
+                "key:KEY_LEFTCTRL:0",
+                "key:KEY_RIGHTCTRL:0",
+                "key:KEY_LEFTSHIFT:0",
+                "key:KEY_RIGHTSHIFT:0",
+                "key:KEY_LEFTALT:0",
+                "key:KEY_RIGHTALT:0",
+                "key:KEY_LEFTMETA:0",
+                "key:KEY_RIGHTMETA:0",
+                "sync",
+                "key:KEY_LEFTCTRL:1",
+                "key:KEY_LEFTSHIFT:1",
+                "sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn soft_cancel_after_temporary_shift_normalizes_xtest_to_frozen_state() {
+        let control = WriterTransactionControl::with_timeout_for_test(212, Duration::from_secs(1));
+        let frozen = ModifierState {
+            right_ctrl: true,
+            ..ModifierState::default()
+        };
+        let mut replay = FakeCinnamonX11XtestReplay::default();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        normalize_xtest_modifiers_after_soft_cancel(&mut replay, frozen, &control).unwrap();
+
+        assert_eq!(
+            replay.calls,
+            vec![
+                "up:KEY_LEFTCTRL",
+                "up:KEY_RIGHTCTRL",
+                "up:KEY_LEFTSHIFT",
+                "up:KEY_RIGHTSHIFT",
+                "up:KEY_LEFTALT",
+                "up:KEY_RIGHTALT",
+                "up:KEY_LEFTMETA",
+                "up:KEY_RIGHTMETA",
+                "down:KEY_RIGHTCTRL",
+            ]
+        );
+    }
+
+    #[test]
+    fn soft_cancel_modifier_normalization_error_is_not_reclassified_as_cancelled() {
+        let control = WriterTransactionControl::with_timeout_for_test(213, Duration::from_secs(1));
+        let frozen = ModifierState {
+            left_ctrl: true,
+            left_shift: true,
+            ..ModifierState::default()
+        };
+        let mut replay = FakeCinnamonX11XtestReplay {
+            fail_key_down_on_call: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        let error =
+            normalize_xtest_modifiers_after_soft_cancel(&mut replay, frozen, &control).unwrap_err();
+
+        assert!(error.to_string().contains("key down failed"));
+        assert!(matches!(
+            classify_manual_current_word_result(
+                213,
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                Err(error),
+            ),
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason),
+                Some(failure_reason),
+            ) if reason.contains("key down failed") && failure_reason.contains("key down failed")
+        ));
+        assert!(replay.calls.ends_with(&[
+            "down:KEY_LEFTCTRL".to_string(),
+            "down:KEY_LEFTSHIFT".to_string(),
+            "up:KEY_LEFTSHIFT".to_string(),
+            "up:KEY_LEFTCTRL".to_string(),
+        ]));
     }
 
     #[test]
@@ -9216,6 +9632,148 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_manual_completion_is_published_as_nonfatal_and_writer_continues() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let control =
+            WriterTransactionControl::new(220, Duration::from_secs(1), Arc::clone(&failure));
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+        let (command_tx, command_rx) = mpsc::channel();
+        command_tx
+            .send(WriterCommand::DeferredManualCurrentWordCorrection {
+                control: control.clone(),
+                plan: CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                config: test_runtime_config_snapshot(),
+                modifiers: ModifierState::default(),
+            })
+            .unwrap();
+        command_tx
+            .send(WriterCommand::Fast(WriterFastCommand::ForwardEvent {
+                key: Key::KEY_A,
+                value: 1,
+            }))
+            .unwrap();
+        drop(command_tx);
+        let (completion_tx, completion_rx) = mpsc::channel();
+        let dispatched = Cell::new(0usize);
+
+        run_writer_command_loop_with(command_rx, &failure, |command| {
+            dispatched.set(dispatched.get() + 1);
+            match command {
+                WriterCommand::DeferredManualCurrentWordCorrection { control, .. } => {
+                    publish_deferred_manual_completion(
+                        &control,
+                        &completion_tx,
+                        ManualCurrentWordCompletion {
+                            request_id: 220,
+                            outcome: ManualCurrentWordOutcome::Cancelled,
+                        },
+                        None,
+                    )
+                }
+                WriterCommand::Fast(WriterFastCommand::ForwardEvent { .. }) => Ok(()),
+                _ => panic!("unexpected writer command"),
+            }
+        })
+        .unwrap();
+
+        assert_eq!(dispatched.get(), 2);
+        assert_eq!(
+            completion_rx.recv().unwrap(),
+            ManualCurrentWordCompletion {
+                request_id: 220,
+                outcome: ManualCurrentWordOutcome::Cancelled,
+            }
+        );
+        assert_eq!(control.state(), WriterTransactionState::Completed);
+        assert_eq!(failure.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn late_soft_cancel_replaces_unpublished_success_with_cancelled_completion() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let control =
+            WriterTransactionControl::new(222, Duration::from_secs(1), Arc::clone(&failure));
+        let (completion_tx, completion_rx) = mpsc::channel();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        publish_deferred_manual_completion(
+            &control,
+            &completion_tx,
+            ManualCurrentWordCompletion {
+                request_id: 222,
+                outcome: ManualCurrentWordOutcome::Succeeded(CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                }),
+            },
+            None,
+        )
+        .expect("late soft cancellation must remain nonfatal");
+
+        assert_eq!(
+            completion_rx.recv().unwrap(),
+            ManualCurrentWordCompletion {
+                request_id: 222,
+                outcome: ManualCurrentWordOutcome::Cancelled,
+            }
+        );
+        assert_eq!(control.state(), WriterTransactionState::Completed);
+        assert_eq!(failure.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn real_failure_is_not_masked_by_prior_soft_cancel() {
+        let failure = Arc::new(AtomicU64::new(0));
+        let control =
+            WriterTransactionControl::new(223, Duration::from_secs(1), Arc::clone(&failure));
+        let (completion_tx, completion_rx) = mpsc::channel();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        let error = publish_deferred_manual_completion(
+            &control,
+            &completion_tx,
+            ManualCurrentWordCompletion {
+                request_id: 223,
+                outcome: ManualCurrentWordOutcome::FailedAfterMutation(
+                    "cleanup failed".to_string(),
+                ),
+            },
+            Some("cleanup failed".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 223,
+                ..
+            }
+        ));
+        assert_eq!(
+            completion_rx.recv().unwrap(),
+            ManualCurrentWordCompletion {
+                request_id: 223,
+                outcome: ManualCurrentWordOutcome::FailedAfterMutation(
+                    "cleanup failed".to_string()
+                ),
+            }
+        );
+        assert_eq!(control.state(), WriterTransactionState::Completed);
+    }
+
+    #[test]
     fn begin_manual_current_word_correction_returns_request_id_immediately() {
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (_completion_tx, completion_rx) = mpsc::channel();
@@ -9331,6 +9889,59 @@ mod tests {
             .expect("poll should not fail");
 
         assert!(completion.is_none());
+    }
+
+    #[test]
+    fn requested_manual_soft_cancel_waits_for_cancelled_completion_without_health_failure() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
+        let (_completion_tx, completion_rx) = mpsc::channel();
+        let failure_request_id = Arc::new(AtomicU64::new(0));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_writer_state(
+            221,
+            Duration::from_secs(1),
+            Arc::clone(&failure_request_id),
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested,
+                transaction_failure_request_id: failure_request_id,
+                transaction_terminal_gate: terminal_gate,
+            },
+            join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx,
+            next_request_id: 222,
+            pending_manual_current_word: Some(PendingManualCurrentWordTransaction {
+                control: control.clone(),
+                completion: None,
+            }),
+        };
+
+        assert_eq!(
+            writer.request_manual_current_word_cancel(221),
+            WriterSoftCancelRequest::Requested
+        );
+        assert!(writer
+            .poll_manual_current_word_completion()
+            .expect("soft cancellation must wait for writer cleanup ACK")
+            .is_none());
+        assert!(writer.health_error().is_none());
+        assert_eq!(
+            writer.request_manual_current_word_cancel(999),
+            WriterSoftCancelRequest::AlreadyCompleted
+        );
+        assert!(matches!(
+            control.ensure_active(),
+            Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 221 })
+        ));
     }
 
     #[test]

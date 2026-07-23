@@ -1331,6 +1331,23 @@ impl DaemonService {
                     ManualCurrentWordFlow::DrainingDeferredInput { session };
                 Ok(())
             }
+            ManualCurrentWordOutcome::Cancelled => {
+                log_input_debug(
+                    "manual-current-word-completion",
+                    &format!(
+                        "request_id={} outcome=cancelled elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={}",
+                        completion.request_id,
+                        session.started_at.elapsed().as_millis(),
+                        session.deferred_input.len(),
+                        session.seen_real_next_step,
+                        session.retry_after_drain_requested,
+                    ),
+                );
+                self.invalidate_word_context();
+                self.manual_current_word_flow =
+                    ManualCurrentWordFlow::DrainingDeferredInput { session };
+                Ok(())
+            }
             ManualCurrentWordOutcome::FailedAfterMutation(error) => {
                 log_input_debug(
                     "manual-current-word-completion",

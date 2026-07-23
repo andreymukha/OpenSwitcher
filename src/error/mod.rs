@@ -121,6 +121,14 @@ pub enum SwitcherError {
     VirtualKeyboardWriterDisconnected,
     #[error("Virtual keyboard writer did not become ready within {timeout_ms} ms")]
     VirtualKeyboardWriterStartupTimedOut { timeout_ms: u64 },
+    #[error(
+        "Virtual keyboard writer did not stop within {timeout_ms} ms during {phase}; trigger: {trigger}"
+    )]
+    VirtualKeyboardWriterShutdownUnresponsive {
+        timeout_ms: u64,
+        phase: &'static str,
+        trigger: String,
+    },
     #[error("Virtual keyboard writer queue is saturated")]
     VirtualKeyboardWriterSaturated,
     #[error("Virtual keyboard writer transaction {request_id} exceeded its deadline")]

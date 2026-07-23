@@ -45,7 +45,7 @@ const TRANSACTION_SLEEP_QUANTUM: Duration = Duration::from_millis(5);
 const WRITER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_WORKER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
-const SHUTDOWN_JOIN_RETRY_WINDOW: Duration = Duration::from_millis(50);
+const WRITER_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
 const CINNAMON_XKB_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
 const CINNAMON_XKB_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -78,6 +78,12 @@ pub struct InputBackendReadiness {
     pub writer_ready: bool,
     pub watchers_ready: bool,
     pub event_processing_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriterShutdownOutcome {
+    Stopped,
+    Unresponsive { timeout_ms: u64 },
 }
 
 impl InputBackendReadiness {
@@ -138,9 +144,31 @@ struct VirtualKeyboardHandle {
 struct VirtualKeyboardWriter {
     handle: VirtualKeyboardHandle,
     join_handle: Option<JoinHandle<()>>,
+    exit_rx: mpsc::Receiver<()>,
+    shutdown_started_at: Option<Instant>,
+    shutdown_outcome: Option<WriterShutdownOutcome>,
     completion_rx: mpsc::Receiver<ManualCurrentWordCompletion>,
     next_request_id: u64,
     pending_manual_current_word: Option<PendingManualCurrentWordTransaction>,
+}
+
+struct WriterExitNotifier {
+    exit_tx: mpsc::SyncSender<()>,
+}
+
+impl Drop for WriterExitNotifier {
+    fn drop(&mut self) {
+        let _ = self.exit_tx.try_send(());
+    }
+}
+
+fn run_writer_thread_with_exit_notification<T, R>(
+    owned_device: T,
+    exit_tx: mpsc::SyncSender<()>,
+    run: impl FnOnce(T) -> R,
+) -> R {
+    let _exit_notifier = WriterExitNotifier { exit_tx };
+    run(owned_device)
 }
 
 struct PendingManualCurrentWordTransaction {
@@ -1184,7 +1212,9 @@ impl KeyboardController {
         run_keyboard_shutdown_sequence(|phase| match phase {
             KeyboardShutdownPhase::RequestWriterStop => self.virtual_device.request_stop(),
             KeyboardShutdownPhase::ReleaseGrab => self.release_grab_best_effort(),
-            KeyboardShutdownPhase::FinishWriterStop => self.virtual_device.finish_stop(),
+            KeyboardShutdownPhase::FinishWriterStop => {
+                let _ = self.virtual_device.finish_stop();
+            }
             KeyboardShutdownPhase::StopWatchers => {
                 self.pointer_watcher.stop();
                 self.input_target_watcher.stop();
@@ -1825,6 +1855,7 @@ impl VirtualKeyboardWriter {
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let alive = Arc::new(AtomicBool::new(false));
         let stop_requested = Arc::new(AtomicBool::new(false));
         let transaction_failure_request_id = Arc::new(AtomicU64::new(0));
@@ -1836,52 +1867,48 @@ impl VirtualKeyboardWriter {
         let worker_ready_alive = Arc::clone(&alive);
 
         let join_handle = thread::spawn(move || {
-            log_input_debug("writer-start", "virtual keyboard writer thread started");
-            let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_virtual_keyboard_writer_loop(
-                    device,
-                    command_rx,
-                    completion_tx,
-                    worker_transaction_failure_request_id,
-                    worker_stop_requested,
-                    worker_transaction_terminal_gate,
-                    worker_ready_alive,
-                    ready_tx,
-                )
-            }));
-            worker_alive.store(false, Ordering::SeqCst);
+            run_writer_thread_with_exit_notification(device, exit_tx, |device| {
+                log_input_debug("writer-start", "virtual keyboard writer thread started");
+                let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_virtual_keyboard_writer_loop(
+                        device,
+                        command_rx,
+                        completion_tx,
+                        worker_transaction_failure_request_id,
+                        worker_stop_requested,
+                        worker_transaction_terminal_gate,
+                        worker_ready_alive,
+                        ready_tx,
+                    )
+                }));
+                worker_alive.store(false, Ordering::SeqCst);
 
-            match loop_result {
-                Ok(Ok(())) => {
-                    log_input_debug("writer-stop", "virtual keyboard writer thread stopped");
+                match loop_result {
+                    Ok(Ok(())) => {
+                        log_input_debug("writer-stop", "virtual keyboard writer thread stopped");
+                    }
+                    Ok(Err(error)) => {
+                        log_input_debug("writer-error", &format!("error={error}"));
+                        eprintln!("[input] Ошибка writer path виртуальной клавиатуры: {error}");
+                    }
+                    Err(payload) => {
+                        let reason = if let Some(text) = payload.downcast_ref::<&str>() {
+                            *text
+                        } else if let Some(text) = payload.downcast_ref::<String>() {
+                            text.as_str()
+                        } else {
+                            "unknown panic payload"
+                        };
+                        log_input_debug("writer-panic", &format!("reason={reason}"));
+                        eprintln!(
+                            "[input] Writer path виртуальной клавиатуры аварийно завершился: {reason}"
+                        );
+                    }
                 }
-                Ok(Err(error)) => {
-                    log_input_debug("writer-error", &format!("error={error}"));
-                    eprintln!("[input] Ошибка writer path виртуальной клавиатуры: {error}");
-                }
-                Err(payload) => {
-                    let reason = if let Some(text) = payload.downcast_ref::<&str>() {
-                        *text
-                    } else if let Some(text) = payload.downcast_ref::<String>() {
-                        text.as_str()
-                    } else {
-                        "unknown panic payload"
-                    };
-                    log_input_debug("writer-panic", &format!("reason={reason}"));
-                    eprintln!(
-                        "[input] Writer path виртуальной клавиатуры аварийно завершился: {reason}"
-                    );
-                }
-            }
+            });
         });
 
-        if let Err(error) = wait_for_writer_startup_ready(&ready_rx, WRITER_STARTUP_READY_TIMEOUT) {
-            stop_requested.store(true, Ordering::SeqCst);
-            alive.store(false, Ordering::SeqCst);
-            return Err(error);
-        }
-
-        Ok(Self {
+        let mut writer = Self {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive,
@@ -1890,17 +1917,52 @@ impl VirtualKeyboardWriter {
                 transaction_terminal_gate,
             },
             join_handle: Some(join_handle),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
-        })
+        };
+        writer.finish_startup(
+            ready_rx,
+            WRITER_STARTUP_READY_TIMEOUT,
+            WRITER_SHUTDOWN_ACK_TIMEOUT,
+        )?;
+        Ok(writer)
     }
 
     fn handle(&self) -> VirtualKeyboardHandle {
         self.handle.clone()
     }
 
-    fn request_stop(&self) {
+    fn finish_startup(
+        &mut self,
+        ready_rx: mpsc::Receiver<()>,
+        startup_timeout: Duration,
+        shutdown_timeout: Duration,
+    ) -> Result<(), SwitcherError> {
+        let startup_error = match wait_for_writer_startup_ready(&ready_rx, startup_timeout) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        drop(ready_rx);
+        let trigger = startup_error.to_string();
+
+        match self.stop_with_timeout(shutdown_timeout) {
+            WriterShutdownOutcome::Stopped => Err(startup_error),
+            WriterShutdownOutcome::Unresponsive { timeout_ms } => {
+                Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                    timeout_ms,
+                    phase: "writer-startup",
+                    trigger,
+                })
+            }
+        }
+    }
+
+    fn request_stop(&mut self) {
+        self.shutdown_started_at.get_or_insert_with(Instant::now);
         let _terminal_guard = self
             .handle
             .transaction_terminal_gate
@@ -1910,20 +1972,36 @@ impl VirtualKeyboardWriter {
         self.handle.alive.store(false, Ordering::SeqCst);
     }
 
-    fn finish_stop(&mut self) {
-        if self.join_handle.is_some() {
-            self.send_shutdown_command();
+    fn finish_stop(&mut self) -> WriterShutdownOutcome {
+        self.finish_stop_with_timeout(WRITER_SHUTDOWN_ACK_TIMEOUT)
+    }
+
+    fn finish_stop_with_timeout(&mut self, timeout: Duration) -> WriterShutdownOutcome {
+        if let Some(outcome) = self.shutdown_outcome {
+            return outcome;
         }
-        self.join_writer_thread_best_effort();
+
+        if self.join_handle.is_some() {
+            self.send_shutdown_command_with_timeout(timeout);
+        }
+        self.join_writer_thread_with_timeout(timeout)
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> WriterShutdownOutcome {
+        self.stop_with_timeout(WRITER_SHUTDOWN_ACK_TIMEOUT)
+    }
+
+    fn stop_with_timeout(&mut self, timeout: Duration) -> WriterShutdownOutcome {
         self.request_stop();
-        self.finish_stop();
+        self.finish_stop_with_timeout(timeout)
     }
 
-    fn send_shutdown_command(&self) {
+    fn send_shutdown_command_with_timeout(&self, timeout: Duration) {
         let started = Instant::now();
+        let shutdown_started = self.shutdown_started_at.unwrap_or(started);
+        let shutdown_deadline = shutdown_started
+            .checked_add(timeout)
+            .unwrap_or(shutdown_started);
         let mut yielded = false;
         let mut command = WriterCommand::Shutdown;
 
@@ -1943,7 +2021,9 @@ impl VirtualKeyboardWriter {
                     return;
                 }
                 Err(mpsc::TrySendError::Full(returned_command)) => {
-                    if started.elapsed() >= SHUTDOWN_SEND_RETRY_WINDOW {
+                    if Instant::now() >= shutdown_deadline
+                        || started.elapsed() >= SHUTDOWN_SEND_RETRY_WINDOW
+                    {
                         log_input_debug(
                             "writer-shutdown-backpressure-failed",
                             &format!(
@@ -1969,35 +2049,58 @@ impl VirtualKeyboardWriter {
         }
     }
 
-    fn join_writer_thread_best_effort(&mut self) {
-        if let Some(join_handle) = self.join_handle.take() {
-            let started = Instant::now();
-            let mut yielded = false;
+    fn join_writer_thread_with_timeout(&mut self, timeout: Duration) -> WriterShutdownOutcome {
+        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        let started = self.shutdown_started_at.unwrap_or_else(Instant::now);
+        let deadline = started.checked_add(timeout).unwrap_or(started);
+        let mut wait_logged = false;
 
-            while !join_handle.is_finished() {
-                if started.elapsed() >= SHUTDOWN_JOIN_RETRY_WINDOW {
-                    log_input_debug(
-                        "writer-shutdown-join-timeout",
-                        &format!(
-                            "elapsed_us={} retry_window_us={}",
-                            started.elapsed().as_micros(),
-                            SHUTDOWN_JOIN_RETRY_WINDOW.as_micros()
-                        ),
-                    );
-                    return;
-                }
+        loop {
+            let Some(join_handle) = self.join_handle.as_ref() else {
+                self.shutdown_outcome = Some(WriterShutdownOutcome::Stopped);
+                return WriterShutdownOutcome::Stopped;
+            };
 
-                if !yielded {
-                    log_input_debug(
-                        "writer-shutdown-join-wait",
-                        &format!("retry_window_us={}", SHUTDOWN_JOIN_RETRY_WINDOW.as_micros()),
-                    );
-                    yielded = true;
-                }
-                thread::yield_now();
+            if join_handle.is_finished() {
+                let join_handle = self
+                    .join_handle
+                    .take()
+                    .expect("finished writer handle must still be owned");
+                let _ = join_handle.join();
+                self.shutdown_outcome = Some(WriterShutdownOutcome::Stopped);
+                return WriterShutdownOutcome::Stopped;
             }
 
-            let _ = join_handle.join();
+            let now = Instant::now();
+            if now >= deadline {
+                let outcome = WriterShutdownOutcome::Unresponsive { timeout_ms };
+                self.shutdown_outcome = Some(outcome);
+                log_input_debug(
+                    "writer-shutdown-join-timeout",
+                    &format!(
+                        "elapsed_us={} deadline_us={}",
+                        started.elapsed().as_micros(),
+                        timeout.as_micros()
+                    ),
+                );
+                return outcome;
+            }
+
+            if !wait_logged {
+                log_input_debug(
+                    "writer-shutdown-join-wait",
+                    &format!("deadline_us={}", timeout.as_micros()),
+                );
+                wait_logged = true;
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            match self.exit_rx.recv_timeout(remaining) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    thread::park_timeout(remaining.min(Duration::from_millis(1)));
+                }
+            }
         }
     }
 
@@ -2180,7 +2283,7 @@ impl VirtualKeyboardWriter {
 
 impl Drop for VirtualKeyboardWriter {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -5961,6 +6064,9 @@ mod tests {
                 let _keep_receiver_alive = command_rx;
                 let _ = release_rx.recv();
             })),
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -5995,7 +6101,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(AtomicU64::new(0));
         let terminal_gate = Arc::new(Mutex::new(()));
-        let writer = VirtualKeyboardWriter {
+        let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: Arc::clone(&alive),
@@ -6004,6 +6110,9 @@ mod tests {
                 transaction_terminal_gate: Arc::clone(&terminal_gate),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -6051,6 +6160,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: Some(thread::spawn(|| {})),
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -6094,6 +6206,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -6108,11 +6223,12 @@ mod tests {
     }
 
     #[test]
-    fn writer_stop_returns_when_writer_thread_does_not_finish() {
+    fn writer_stop_without_thread_exit_returns_unresponsive() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let alive = Arc::new(AtomicBool::new(true));
-        let writer = VirtualKeyboardWriter {
+        let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
                 command_tx,
                 alive: alive.clone(),
@@ -6123,34 +6239,466 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
                 let _ = release_rx.recv();
+                let _ = exit_tx.try_send(());
             })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
         };
-        let (done_tx, done_rx) = mpsc::channel();
 
-        let stopper = thread::spawn(move || {
-            let mut writer = writer;
-            writer.stop();
-            let _ = done_tx.send(());
-        });
+        let outcome = writer.stop_with_timeout(Duration::from_millis(10));
 
-        match done_rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(()) => {}
-            Err(error) => {
-                drop(release_tx);
-                stopper.join().expect("stop thread should finish");
-                panic!("writer stop should return without blocking forever on join: {error:?}");
-            }
-        }
-
-        drop(release_tx);
-        stopper.join().expect("stop thread should finish");
+        assert_eq!(
+            outcome,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 10 }
+        );
         assert!(
             !alive.load(Ordering::SeqCst),
             "writer must stop advertising itself as alive during teardown"
         );
+
+        release_tx.send(()).unwrap();
+        writer
+            .join_handle
+            .take()
+            .expect("timed-out writer handle must remain owned")
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn writer_stop_timeout_retains_join_handle() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_receiver_alive = command_rx;
+                let _ = release_rx.recv();
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let outcome = writer.stop_with_timeout(Duration::from_millis(10));
+
+        assert!(matches!(
+            outcome,
+            WriterShutdownOutcome::Unresponsive { .. }
+        ));
+        assert!(
+            writer.join_handle.is_some(),
+            "a timed-out writer must retain ownership of its JoinHandle"
+        );
+
+        release_tx.send(()).unwrap();
+        writer.join_handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn writer_stop_joins_after_exit_notification() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested,
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_receiver_alive = command_rx;
+                while !worker_stop_requested.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let outcome = writer.stop_with_timeout(Duration::from_millis(250));
+
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
+        assert!(
+            writer.join_handle.is_none(),
+            "successful shutdown must join and consume the writer handle"
+        );
+    }
+
+    #[test]
+    fn writer_stop_with_full_data_queue_acks_after_stop_check() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
+                key: Key::KEY_SPACE,
+            }))
+            .unwrap();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested,
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_full_queue = command_rx;
+                while !worker_stop_requested.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let outcome = writer.stop_with_timeout(Duration::from_millis(250));
+
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
+        assert!(writer.join_handle.is_none());
+    }
+
+    #[test]
+    fn writer_shutdown_deadline_includes_full_queue_wakeup_attempt() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        command_tx
+            .send(WriterCommand::Fast(WriterFastCommand::TypeSeparator {
+                key: Key::KEY_SPACE,
+            }))
+            .unwrap();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_full_queue = command_rx;
+                let _ = release_rx.recv();
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let started = Instant::now();
+        let outcome = writer.stop_with_timeout(Duration::ZERO);
+
+        assert_eq!(
+            outcome,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 0 }
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(25),
+            "the bounded shutdown deadline must include queue wakeup retries"
+        );
+
+        release_tx.send(()).unwrap();
+        writer.join_handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn writer_unresponsive_outcome_is_sticky_after_late_thread_exit() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_receiver_alive = command_rx;
+                let _ = release_rx.recv();
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let first = writer.stop_with_timeout(Duration::from_millis(10));
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while writer
+            .join_handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let repeated = writer.finish_stop_with_timeout(Duration::from_millis(100));
+
+        assert_eq!(
+            first,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 10 }
+        );
+        assert_eq!(repeated, first, "late exit must not authorize recovery");
+
+        if let Some(handle) = writer.join_handle.take() {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn writer_exit_notification_follows_owned_device_drop() {
+        struct DropTrace(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for DropTrace {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("owned-device-drop");
+            }
+        }
+
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let worker_trace = Arc::clone(&trace);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            run_writer_thread_with_exit_notification(
+                DropTrace(Arc::clone(&worker_trace)),
+                exit_tx,
+                |_owned_device| {
+                    worker_trace.lock().unwrap().push("loop-return");
+                },
+            );
+        });
+
+        exit_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("writer must publish its exit notification");
+        trace.lock().unwrap().push("exit-notification");
+        worker.join().expect("writer thread should join");
+        trace.lock().unwrap().push("join");
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            vec![
+                "loop-return",
+                "owned-device-drop",
+                "exit-notification",
+                "join",
+            ]
+        );
+    }
+
+    #[test]
+    fn writer_exit_notification_follows_owned_device_drop_during_unwind() {
+        struct DropTrace(Arc<AtomicBool>);
+
+        impl Drop for DropTrace {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let device_dropped = Arc::new(AtomicBool::new(false));
+        let worker_device_dropped = Arc::clone(&device_dropped);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            std::panic::catch_unwind(|| {
+                run_writer_thread_with_exit_notification(
+                    DropTrace(worker_device_dropped),
+                    exit_tx,
+                    |_owned_device| panic!("simulated writer panic"),
+                );
+            })
+        });
+
+        exit_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("unwinding writer must publish its exit notification");
+        assert!(
+            device_dropped.load(Ordering::SeqCst),
+            "exit notification must follow owned device destruction"
+        );
+        assert!(worker.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn writer_startup_error_is_preserved_after_confirmed_stop() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(0);
+        drop(ready_tx);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(false)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                drop(command_rx);
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let error = writer
+            .finish_startup(
+                ready_rx,
+                Duration::from_millis(10),
+                Duration::from_millis(250),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+        assert_eq!(
+            writer.shutdown_outcome,
+            Some(WriterShutdownOutcome::Stopped)
+        );
+        assert!(writer.join_handle.is_none());
+    }
+
+    #[test]
+    fn writer_startup_error_becomes_fail_stop_when_writer_is_unresponsive() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (_ready_tx, ready_rx) = mpsc::sync_channel::<()>(0);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(false)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_channels_alive = command_rx;
+                let _ = release_rx.recv();
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let error = writer
+            .finish_startup(
+                ready_rx,
+                Duration::from_millis(5),
+                Duration::from_millis(10),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 10,
+                phase: "writer-startup",
+                ref trigger,
+            } if trigger.contains("5 ms")
+        ));
+        assert!(writer.join_handle.is_some());
+
+        release_tx.send(()).unwrap();
+        writer.join_handle.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn writer_startup_timeout_releases_ready_sender_before_shutdown_wait() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<()>(0);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(false)),
+                stop_requested,
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_command_receiver_alive = command_rx;
+                while !worker_stop_requested.load(Ordering::SeqCst) {
+                    thread::yield_now();
+                }
+                let _ = ready_tx.send(());
+                let _ = exit_tx.try_send(());
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let error = writer
+            .finish_startup(
+                ready_rx,
+                Duration::ZERO,
+                Duration::from_millis(20),
+            )
+            .unwrap_err();
+        if let Some(handle) = writer.join_handle.take() {
+            handle.join().unwrap();
+        }
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterStartupTimedOut { timeout_ms: 0 }
+        ));
     }
 
     #[test]
@@ -7499,6 +8047,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7565,6 +8116,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7608,6 +8162,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7665,6 +8222,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7731,6 +8291,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7799,6 +8362,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7940,6 +8506,9 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _ = command_rx.recv();
             })),
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -7982,6 +8551,9 @@ mod tests {
                 }
                 drop(command_rx);
             })),
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -8022,6 +8594,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -8047,6 +8622,9 @@ mod tests {
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
             join_handle: None,
+            exit_rx: mpsc::channel().1,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
             completion_rx,
             next_request_id: 7,
             pending_manual_current_word: None,

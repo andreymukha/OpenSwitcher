@@ -102,14 +102,40 @@ enum KeyboardShutdownPhase {
     RequestWriterStop,
     ReleaseGrab,
     FinishWriterStop,
-    StopWatchers,
+    StopAndJoinWatchers,
+    DetachWatchers,
 }
 
-fn run_keyboard_shutdown_sequence(mut run_phase: impl FnMut(KeyboardShutdownPhase)) {
-    run_phase(KeyboardShutdownPhase::RequestWriterStop);
-    run_phase(KeyboardShutdownPhase::ReleaseGrab);
-    run_phase(KeyboardShutdownPhase::FinishWriterStop);
-    run_phase(KeyboardShutdownPhase::StopWatchers);
+fn run_keyboard_shutdown_sequence(
+    mut run_phase: impl FnMut(KeyboardShutdownPhase) -> Option<WriterShutdownOutcome>,
+) -> WriterShutdownOutcome {
+    let _ = run_phase(KeyboardShutdownPhase::RequestWriterStop);
+    let _ = run_phase(KeyboardShutdownPhase::ReleaseGrab);
+    let outcome = run_phase(KeyboardShutdownPhase::FinishWriterStop)
+        .expect("writer shutdown phase must return an outcome");
+    let watcher_phase = match outcome {
+        WriterShutdownOutcome::Stopped => KeyboardShutdownPhase::StopAndJoinWatchers,
+        WriterShutdownOutcome::Unresponsive { .. } => KeyboardShutdownPhase::DetachWatchers,
+    };
+    let _ = run_phase(watcher_phase);
+    outcome
+}
+
+fn resolve_error_after_writer_shutdown(
+    trigger: SwitcherError,
+    phase: &'static str,
+    outcome: WriterShutdownOutcome,
+) -> SwitcherError {
+    match outcome {
+        WriterShutdownOutcome::Stopped => trigger,
+        WriterShutdownOutcome::Unresponsive { timeout_ms } => {
+            SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms,
+                phase,
+                trigger: trigger.to_string(),
+            }
+        }
+    }
 }
 
 pub struct KeyboardController {
@@ -1155,9 +1181,35 @@ impl KeyboardController {
             real_device.name().unwrap_or("Unknown")
         );
         let session_type = detect_current_session_type();
-        let virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
-        let pointer_watcher = PointerWatcher::spawn(pointer_paths)?;
-        let input_target_watcher = InputTargetWatcher::spawn(session_type)?;
+        let mut virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
+        let mut pointer_watcher = match PointerWatcher::spawn(pointer_paths) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let outcome = virtual_device.stop();
+                return Err(resolve_error_after_writer_shutdown(
+                    error,
+                    "keyboard-prepare-pointer-watcher",
+                    outcome,
+                ));
+            }
+        };
+        let input_target_watcher = match InputTargetWatcher::spawn(session_type) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                let outcome = virtual_device.stop();
+                match outcome {
+                    WriterShutdownOutcome::Stopped => pointer_watcher.stop_and_join(),
+                    WriterShutdownOutcome::Unresponsive { .. } => {
+                        pointer_watcher.detach_for_process_fail_stop();
+                    }
+                }
+                return Err(resolve_error_after_writer_shutdown(
+                    error,
+                    "keyboard-prepare-input-target-watcher",
+                    outcome,
+                ));
+            }
+        };
         log_input_debug(
             "input-pipeline-prepared",
             "writer and watchers prepared before physical keyboard grab",
@@ -1208,18 +1260,28 @@ impl KeyboardController {
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) -> WriterShutdownOutcome {
         run_keyboard_shutdown_sequence(|phase| match phase {
-            KeyboardShutdownPhase::RequestWriterStop => self.virtual_device.request_stop(),
-            KeyboardShutdownPhase::ReleaseGrab => self.release_grab_best_effort(),
-            KeyboardShutdownPhase::FinishWriterStop => {
-                let _ = self.virtual_device.finish_stop();
+            KeyboardShutdownPhase::RequestWriterStop => {
+                self.virtual_device.request_stop();
+                None
             }
-            KeyboardShutdownPhase::StopWatchers => {
-                self.pointer_watcher.stop();
-                self.input_target_watcher.stop();
+            KeyboardShutdownPhase::ReleaseGrab => {
+                self.release_grab_best_effort();
+                None
             }
-        });
+            KeyboardShutdownPhase::FinishWriterStop => Some(self.virtual_device.finish_stop()),
+            KeyboardShutdownPhase::StopAndJoinWatchers => {
+                self.pointer_watcher.stop_and_join();
+                self.input_target_watcher.stop_and_join();
+                None
+            }
+            KeyboardShutdownPhase::DetachWatchers => {
+                self.pointer_watcher.detach_for_process_fail_stop();
+                self.input_target_watcher.detach_for_process_fail_stop();
+                None
+            }
+        })
     }
 
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
@@ -1346,23 +1408,40 @@ impl PreparedKeyboardController {
     }
 
     pub fn activate(mut self) -> Result<(KeyboardController, bool), SwitcherError> {
-        ensure_input_dependencies_ready(
+        if let Err(error) = ensure_input_dependencies_ready(
             self.controller.virtual_device.handle().is_alive(),
             self.controller.pointer_watcher.is_ready(),
             self.controller.input_target_watcher.is_ready(),
-        )?;
-        let caps_lock_active = snapshot_then_acquire_grab(
+        ) {
+            let outcome = self.controller.shutdown();
+            return Err(resolve_error_after_writer_shutdown(
+                error,
+                "keyboard-activate-readiness",
+                outcome,
+            ));
+        }
+        let caps_lock_active = match snapshot_then_acquire_grab(
             &mut self.controller.real_device,
             |device| Ok::<_, SwitcherError>(device.caps_lock_active().unwrap_or(false)),
             GrabbedKeyboardDevice::grab,
-        )?;
+        ) {
+            Ok(caps_lock_active) => caps_lock_active,
+            Err(error) => {
+                let outcome = self.controller.shutdown();
+                return Err(resolve_error_after_writer_shutdown(
+                    error,
+                    "keyboard-activate-grab",
+                    outcome,
+                ));
+            }
+        };
         Ok((self.controller, caps_lock_active))
     }
 }
 
 impl Drop for KeyboardController {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -1585,9 +1664,11 @@ impl PointerWatcher {
             "pointer-watcher",
             INPUT_WORKER_STARTUP_READY_TIMEOUT,
         ) {
-            stop_flag.store(true, Ordering::SeqCst);
-            alive.store(false, Ordering::SeqCst);
-            drop(handle);
+            abort_input_worker_startup(ready_rx, || {
+                stop_flag.store(true, Ordering::SeqCst);
+                alive.store(false, Ordering::SeqCst);
+            });
+            let _ = handle.join();
             return Err(error);
         }
 
@@ -1600,12 +1681,21 @@ impl PointerWatcher {
         })
     }
 
-    fn stop(&mut self) {
+    fn request_stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
+    }
+
+    fn stop_and_join(&mut self) {
+        self.request_stop();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    fn detach_for_process_fail_stop(&mut self) {
+        self.request_stop();
+        drop(self.handle.take());
     }
 
     fn is_ready(&self) -> bool {
@@ -1756,13 +1846,22 @@ impl InputTargetWatcher {
         self.changed_flag.swap(false, Ordering::SeqCst)
     }
 
-    fn stop(&mut self) {
+    fn request_stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.alive.store(false, Ordering::SeqCst);
         signal_input_target_stop(self.stop_wakeup.as_ref());
+    }
+
+    fn stop_and_join(&mut self) {
+        self.request_stop();
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+
+    fn detach_for_process_fail_stop(&mut self) {
+        self.request_stop();
+        drop(self.handle.take());
     }
 
     fn is_ready(&self) -> bool {
@@ -2539,13 +2638,13 @@ impl VirtualKeyboardHandle {
 
 impl Drop for PointerWatcher {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_and_join();
     }
 }
 
 impl Drop for InputTargetWatcher {
     fn drop(&mut self) {
-        self.stop();
+        self.stop_and_join();
     }
 }
 
@@ -6024,20 +6123,122 @@ mod tests {
     // Writer lifecycle / queue behavior
 
     #[test]
-    fn keyboard_shutdown_sequence_stops_writer_before_grab_release() {
+    fn keyboard_shutdown_releases_grab_before_waiting_for_writer_ack() {
         let mut phases = Vec::new();
 
-        run_keyboard_shutdown_sequence(|phase| phases.push(phase));
+        let outcome = run_keyboard_shutdown_sequence(|phase| {
+            phases.push(phase);
+            match phase {
+                KeyboardShutdownPhase::FinishWriterStop => Some(WriterShutdownOutcome::Stopped),
+                _ => None,
+            }
+        });
 
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
         assert_eq!(
             phases,
             vec![
                 KeyboardShutdownPhase::RequestWriterStop,
                 KeyboardShutdownPhase::ReleaseGrab,
                 KeyboardShutdownPhase::FinishWriterStop,
-                KeyboardShutdownPhase::StopWatchers,
+                KeyboardShutdownPhase::StopAndJoinWatchers,
             ]
         );
+    }
+
+    #[test]
+    fn keyboard_shutdown_joins_watchers_only_after_writer_stopped() {
+        let mut phases = Vec::new();
+
+        let outcome = run_keyboard_shutdown_sequence(|phase| {
+            phases.push(phase);
+            match phase {
+                KeyboardShutdownPhase::FinishWriterStop => Some(WriterShutdownOutcome::Stopped),
+                _ => None,
+            }
+        });
+
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
+        assert_eq!(
+            phases,
+            vec![
+                KeyboardShutdownPhase::RequestWriterStop,
+                KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::FinishWriterStop,
+                KeyboardShutdownPhase::StopAndJoinWatchers,
+            ]
+        );
+    }
+
+    #[test]
+    fn keyboard_shutdown_detaches_watchers_after_writer_unresponsive() {
+        let mut phases = Vec::new();
+
+        let outcome = run_keyboard_shutdown_sequence(|phase| {
+            phases.push(phase);
+            match phase {
+                KeyboardShutdownPhase::FinishWriterStop => {
+                    Some(WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 })
+                }
+                _ => None,
+            }
+        });
+
+        assert_eq!(
+            outcome,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 }
+        );
+        assert_eq!(
+            phases,
+            vec![
+                KeyboardShutdownPhase::RequestWriterStop,
+                KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::FinishWriterStop,
+                KeyboardShutdownPhase::DetachWatchers,
+            ]
+        );
+    }
+
+    #[test]
+    fn partial_prepare_error_is_preserved_after_stopped_writer() {
+        let trigger = SwitcherError::InputWorkerDisconnected {
+            worker: "pointer-watcher",
+        };
+
+        let error = resolve_error_after_writer_shutdown(
+            trigger,
+            "keyboard-prepare-pointer-watcher",
+            WriterShutdownOutcome::Stopped,
+        );
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkerDisconnected {
+                worker: "pointer-watcher"
+            }
+        ));
+    }
+
+    #[test]
+    fn partial_prepare_unresponsive_writer_returns_fail_stop() {
+        let trigger = SwitcherError::InputWorkerDisconnected {
+            worker: "input-target-watcher",
+        };
+
+        let error = resolve_error_after_writer_shutdown(
+            trigger,
+            "keyboard-prepare-input-target-watcher",
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+        );
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "keyboard-prepare-input-target-watcher",
+                ref trigger,
+            } if trigger == "Input worker input-target-watcher is unavailable"
+        ));
     }
 
     #[test]
@@ -6436,7 +6637,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_unresponsive_outcome_is_sticky_after_late_thread_exit() {
+    fn repeated_keyboard_shutdown_cannot_mask_unresponsive_after_late_writer_exit() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel::<()>();
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
@@ -6472,7 +6673,7 @@ mod tests {
         {
             thread::sleep(Duration::from_millis(1));
         }
-        let repeated = writer.finish_stop_with_timeout(Duration::from_millis(100));
+        let repeated = writer.stop_with_timeout(Duration::from_millis(100));
 
         assert_eq!(
             first,
@@ -6685,11 +6886,7 @@ mod tests {
         };
 
         let error = writer
-            .finish_startup(
-                ready_rx,
-                Duration::ZERO,
-                Duration::from_millis(20),
-            )
+            .finish_startup(ready_rx, Duration::ZERO, Duration::from_millis(20))
             .unwrap_err();
         if let Some(handle) = writer.join_handle.take() {
             handle.join().unwrap();

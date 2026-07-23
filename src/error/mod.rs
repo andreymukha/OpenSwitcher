@@ -282,6 +282,17 @@ mod tests {
     }
 
     #[test]
+    fn unresponsive_writer_shutdown_requires_process_restart() {
+        let error = SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+            timeout_ms: 1_000,
+            phase: "keyboard-shutdown",
+            trigger: "test trigger".to_string(),
+        };
+
+        assert!(!error.is_recoverable_input_error());
+    }
+
+    #[test]
     fn keyboard_access_denied_has_linux_input_setup_hint() {
         let error = SwitcherError::KeyboardAccessDenied {
             path: PathBuf::from("/dev/input/event4"),

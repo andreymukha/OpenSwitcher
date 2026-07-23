@@ -14,10 +14,12 @@ F12-коррекции с `Alt+Tab` в X11: deferred-событие считае
 `WriterTransaction`: один key event, ACK после успешных `uinput write +
 synchronize`, общий deadline 1 с и уже имеющийся fail-stop при неоднозначном
 исходе. X11 watcher сохраняет монотонное поколение active target независимо от
-одноразового invalidation flag. Session отмечает полные `Alt/Meta+Tab`
-последовательности по sequence id и после подтверждённого финального release
-приостанавливает только следующий deferred-хвост до смены поколения либо
-fail-open deadline 300 мс.
+одноразового invalidation flag. Session отслеживает один modifier chord от
+первого `Tab down` до финального отпускания всего семейства `Alt` либо `Meta`.
+Повторные `Tab` replay-ятся без пауз. После writer ACK финального release
+снимается generation baseline, и следующий press приостанавливается до смены
+поколения либо fail-open deadline 300 мс; ведущие release-события продолжают
+проходить.
 
 **Tech Stack:** Rust 2021/1.95, `evdev`, `uinput 0.1.3`, X11/XCB
 `_NET_ACTIVE_WINDOW`, `std::sync`, встроенный Rust test harness, Debian
@@ -337,9 +339,12 @@ git commit -m "fix: retain X11 input target generation"
 Добавить чистые тесты:
 
 ```text
-x11_full_alt_tab_records_marker_after_final_release
-x11_incomplete_alt_tab_does_not_record_marker
-x11_two_complete_shortcuts_preserve_marker_order
+x11_alt_tab_records_marker_after_modifier_release
+x11_active_chord_requires_tab_press_and_survives_until_modifier_release
+second_alt_tab_marker_cannot_replace_first_marker
+repeated_tab_forms_one_marker_with_final_release_baseline
+cinnamon_repeated_tab_replays_without_wait_until_final_modifier_release
+generation_change_before_final_release_ack_becomes_conservative_baseline
 x11_barrier_opens_immediately_after_generation_change
 x11_barrier_times_out_open_without_dropping_tail
 x11_barrier_allows_leading_releases_without_opening
@@ -356,19 +361,24 @@ Alt down(seq=1) -> Tab down(2) -> Tab up(3) -> Alt up(4)
 
 ```rust
 DeferredFocusBarrierMarker {
+    trigger_sequence_id: 2,
     after_sequence_id: 4,
-    target_generation: generation_before_tab,
+    target_generation: None,
+    deadline: None,
 }
 ```
 
-Incomplete-варианты обязаны покрыть отсутствие `Tab up` и отсутствие
-финального modifier release. Два полных shortcut не имеют права заменять друг
-друга.
+Active chord начинается на physical admission первого `Tab down`, но marker
+появляется только после физического события, которое отпустило всё выбранное
+семейство `Alt`/`Meta`. `Alt` без `Tab down` chord не создаёт. Повторные `Tab`
+под удерживаемым modifier обновляют trigger sequence id одного chord и не
+получают отдельный 300-ms barrier. Два отдельных завершённых chord сохраняют
+два marker в порядке поступления.
 
 Run:
 
 ```bash
-cargo test --locked --lib x11_full_alt_tab_records_marker_after_final_release
+cargo test --locked --lib x11_alt_tab_records_marker_after_modifier_release
 ```
 
 Expected RED: state machine ещё нет.
@@ -382,8 +392,9 @@ const X11_DEFERRED_FOCUS_BARRIER_TIMEOUT: Duration = Duration::from_millis(300);
 const X11_DEFERRED_FOCUS_BARRIER_POLL: Duration = Duration::from_millis(5);
 
 struct DeferredFocusBarrierMarker {
+    trigger_sequence_id: u64,
     after_sequence_id: u64,
-    target_generation: u64,
+    target_generation: Option<u64>,
     deadline: Option<Instant>,
 }
 
@@ -394,21 +405,22 @@ struct DeferredFocusBarrierState {
 }
 ```
 
-`DeferredFocusShortcut` хранит generation, факт `Tab down` и состояние,
-достаточное для подтверждения обоих release. Marker создаётся только когда:
+Active chord создаётся для первого physical `Tab down`, когда:
 
 - `Tab` был нажат с ровно одним focus modifier family (`Alt` либо `Meta`) и
   без `Ctrl`;
-- `Tab` уже отпущен;
-- участвующие `Alt/Meta` больше не нажаты.
+- session работает под X11.
 
 Текущий `is_wayland_focus_switch_shortcut()` переименовать в нейтральный
 `is_focus_switch_shortcut()`. Wayland-specific wrapper
 `should_invalidate_for_wayland_focus_switch_shortcut()` остаётся
 Wayland-only; X11 state machine использует только нейтральный classifier.
 
-Baseline generation снимается на `Tab down`. Финальный sequence id принадлежит
-последнему release, который завершил chord.
+Повторные `Tab down` внутри того же modifier chord обновляют последний trigger,
+но replay-ятся без ожидания generation. Marker получает sequence id физического
+события, после которого aggregate modifier действительно отпущен. Baseline
+generation не снимается при physical admission и не привязывается к
+промежуточному `Tab`.
 
 - [ ] **Step 3: Реализовать решения до/после ACK**
 
@@ -423,16 +435,23 @@ enum DeferredFocusBarrierDecision {
 }
 ```
 
-- `after_ack(sequence_id, generation, now)` ставит deadline только после ACK
-  финального release.
+- `after_ack(sequence_id, generation, now)` сохраняет post-ACK baseline и
+  ставит deadline только после ACK финального aggregate modifier release;
 - `before_next_event(generation, now, ledger_head)`:
   - удаляет marker сразу, если generation уже отличается;
+  - до ACK финального release не задерживает события chord;
   - возвращает `ReleaseAllowed`, если текущая голова ledger имеет `value == 0`;
     release отправляется и ACK-ается строго на своём месте, marker остаётся
     активным;
   - возвращает `Waiting`, пока deadline не истёк;
   - возвращает `TimedOut` и удаляет marker при 300 мс.
 - Timeout не удаляет и не ACK-ает следующий ledger event.
+- Active chord и активный marker сохраняют `DrainingDeferredInput`, даже если
+  ledger временно пуст; polling остаётся ограниченным
+  `X11_DEFERRED_FOCUS_BARRIER_POLL`.
+- На ожидание физического modifier release не ставится 300-ms timeout:
+  пользователь вправе удерживать `Alt/Meta` дольше. Это состояние не блокирует
+  FIFO; terminal backend failure очищает его существующим recovery.
 - Нельзя перепрыгивать через удерживаемый press/repeat ради более позднего
   release: порядок ledger остаётся строгим. Разрешаются только ведущие
   release-события, для которых соответствующий press уже был доставлен до
@@ -446,8 +465,7 @@ enum DeferredFocusBarrierDecision {
 `observed_physical_modifiers` передать:
 
 - `SessionType`;
-- admitted event;
-- текущее `KeyboardController::input_target_generation()`.
+- admitted event.
 
 Wayland invalidation остаётся прежним. X11 marker не является новым поводом
 отменять коррекцию и не меняет word context сам по себе.
@@ -542,8 +560,9 @@ Alt↓(1), Tab↓(2), Tab↑(3), Alt↑(4),
 Проверки:
 
 1. При generation `41` первые четыре события проходят и ACK-аются.
-2. До смены generation ни одно событие с sequence `5..=8` не передано и не
-   ACK-нуто.
+2. ACK sequence 4 снимает текущий generation как консервативный baseline.
+   До следующей смены generation ни одно событие с sequence `5..=8` не
+   передано и не ACK-нуто.
 3. При generation `42` хвост передан ровно один раз и в исходном порядке.
 4. Ledger пуст только после ACK sequence 8.
 
@@ -571,11 +590,14 @@ read persistent generation
 -> if TimedOut: log ids/counts only, continue
 -> handle one ledger head through origin-aware forwarding
 -> ACK ledger head
--> arm marker if this ACK completed focus shortcut
+-> read persistent generation after ACK
+-> arm marker if this ACK belongs to final aggregate modifier release
+-> finish drain only when ledger is empty and no active chord/marker remains
 ```
 
 Лог timeout не содержит key data или набранный текст. Достаточны request id,
-marker sequence id, elapsed/deadline и generation before/current.
+marker trigger/release sequence id, elapsed/deadline и generation
+baseline/current.
 
 Если `forward_deferred_event()` возвращает timeout/disconnect/backend error,
 `drain_deferred_head_with()` не ACK-ает голову. Ошибка поднимается в
@@ -625,7 +647,9 @@ invalidation и существующий полный `Alt+Tab` ledger test ос
 ```text
 deferred_forward_disconnect_keeps_ledger_head
 deferred_forward_write_error_keeps_ledger_head
-generation_change_before_final_release_skips_wait_after_ack
+generation_change_before_final_release_ack_becomes_conservative_baseline
+final_modifier_release_ack_sets_conservative_generation_baseline
+cinnamon_repeated_tab_replays_without_wait_until_final_modifier_release
 pointer_click_during_barrier_does_not_drop_marker_or_tail
 physical_events_admitted_while_barrier_waits_remain_ordered
 leading_modifier_release_is_not_delayed_by_barrier
@@ -686,7 +710,9 @@ Review A — соответствие спецификации:
 - ACK только после `write+synchronize`;
 - один in-flight deferred event;
 - 1-second sticky fail-stop;
-- marker после полного release;
+- один marker на завершённый modifier chord, без пауз между повторными `Tab`;
+- baseline после writer ACK финального aggregate modifier release;
+- опубликованные до ACK generation changes поглощаются baseline;
 - persistent generation;
 - 300 ms fail-open без pre-ACK;
 - release-first safety без обхода строгого ledger order;
@@ -876,9 +902,12 @@ Expected: только намеренные commits, tests/VM evidence отра�
   существующий fail-stop recovery без replay неоднозначного события.
 - После полного X11 `Alt/Meta+Tab` текст не отправляется до смены persistent
   target generation или bounded 300-ms fail-open.
+- Повторные `Tab` внутри одного удержания modifier replay-ятся без 300-ms пауз;
+  barrier активируется один раз после ACK финального `Alt/Meta up`.
 - Уже ожидающие leading key-up проходят до текстового ожидания, не снимают
   marker и не переставляются относительно других событий.
-- Несколько shortcut markers не заменяют друг друга.
+- Несколько завершённых modifier chords сохраняют отдельные markers и не
+  заменяют друг друга.
 - Обычный physical fast path, F12, pointer policy, reset events и Wayland
   остались прежними.
 - Исходный Mint/X11 stress проходит на exact Debian `0.1.0-3`, тот же package

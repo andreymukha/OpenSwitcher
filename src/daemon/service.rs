@@ -140,15 +140,15 @@ impl DeferredFocusModifier {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DeferredFocusShortcut {
-    target_generation: u64,
+    trigger_sequence_id: u64,
     modifier: DeferredFocusModifier,
-    tab_pressed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DeferredFocusBarrierMarker {
+    trigger_sequence_id: u64,
     after_sequence_id: u64,
-    target_generation: u64,
+    target_generation: Option<u64>,
     deadline: Option<Instant>,
 }
 
@@ -172,7 +172,6 @@ impl DeferredFocusBarrierState {
         session_type: SessionType,
         modifiers: ModifierState,
         event: DeferredInputEvent,
-        target_generation: u64,
     ) {
         if session_type != SessionType::X11 {
             return;
@@ -184,33 +183,24 @@ impl DeferredFocusBarrierState {
             } else {
                 DeferredFocusModifier::Meta
             };
-            match &mut self.active_shortcut {
-                Some(active) => active.tab_pressed = true,
-                None => {
-                    self.active_shortcut = Some(DeferredFocusShortcut {
-                        target_generation,
-                        modifier,
-                        tab_pressed: true,
-                    });
-                }
-            }
-        } else if event.key == evdev::Key::KEY_TAB && event.value == 0 {
-            if let Some(active) = &mut self.active_shortcut {
-                active.tab_pressed = false;
-            }
+            self.active_shortcut = Some(DeferredFocusShortcut {
+                trigger_sequence_id: event.sequence_id,
+                modifier,
+            });
         }
 
         let shortcut_complete = self
             .active_shortcut
-            .is_some_and(|active| !active.tab_pressed && !active.modifier.is_pressed(modifiers));
+            .is_some_and(|active| !active.modifier.is_pressed(modifiers));
         if shortcut_complete {
             let active = self
                 .active_shortcut
                 .take()
                 .expect("completed shortcut must exist");
             self.markers.push_back(DeferredFocusBarrierMarker {
+                trigger_sequence_id: active.trigger_sequence_id,
                 after_sequence_id: event.sequence_id,
-                target_generation: active.target_generation,
+                target_generation: None,
                 deadline: None,
             });
         }
@@ -223,10 +213,7 @@ impl DeferredFocusBarrierState {
         if marker.after_sequence_id != sequence_id {
             return;
         }
-        if marker.target_generation != target_generation {
-            self.markers.pop_front();
-            return;
-        }
+        marker.target_generation = Some(target_generation);
         marker.deadline = Some(
             now.checked_add(X11_DEFERRED_FOCUS_BARRIER_TIMEOUT)
                 .unwrap_or(now),
@@ -239,27 +226,37 @@ impl DeferredFocusBarrierState {
         now: Instant,
         ledger_head: Option<DeferredInputEvent>,
     ) -> DeferredFocusBarrierDecision {
-        let Some(marker) = self.markers.front().copied() else {
-            return DeferredFocusBarrierDecision::Ready;
-        };
-        let Some(deadline) = marker.deadline else {
-            return DeferredFocusBarrierDecision::Ready;
-        };
+        if let Some(marker) = self.markers.front().copied() {
+            if let Some(deadline) = marker.deadline {
+                if marker.target_generation != Some(target_generation) {
+                    self.markers.pop_front();
+                    return DeferredFocusBarrierDecision::Ready;
+                }
+                if now >= deadline {
+                    self.markers.pop_front();
+                    return DeferredFocusBarrierDecision::TimedOut { marker };
+                }
+                if ledger_head.is_some_and(|event| event.value == 0) {
+                    return DeferredFocusBarrierDecision::ReleaseAllowed;
+                }
+                return DeferredFocusBarrierDecision::Waiting {
+                    remaining: deadline.saturating_duration_since(now),
+                };
+            }
+        }
 
-        if marker.target_generation != target_generation {
-            self.markers.pop_front();
-            return DeferredFocusBarrierDecision::Ready;
+        if ledger_head.is_none()
+            && (self.active_shortcut.is_some()
+                || self
+                    .markers
+                    .front()
+                    .is_some_and(|marker| marker.deadline.is_none()))
+        {
+            return DeferredFocusBarrierDecision::Waiting {
+                remaining: X11_DEFERRED_FOCUS_BARRIER_POLL,
+            };
         }
-        if now >= deadline {
-            self.markers.pop_front();
-            return DeferredFocusBarrierDecision::TimedOut { marker };
-        }
-        if ledger_head.is_some_and(|event| event.value == 0) {
-            return DeferredFocusBarrierDecision::ReleaseAllowed;
-        }
-        DeferredFocusBarrierDecision::Waiting {
-            remaining: deadline.saturating_duration_since(now),
-        }
+        DeferredFocusBarrierDecision::Ready
     }
 
     fn event_fetch_timeout(
@@ -268,21 +265,32 @@ impl DeferredFocusBarrierState {
         now: Instant,
         ledger_head: Option<DeferredInputEvent>,
     ) -> Duration {
-        let Some(head) = ledger_head else {
-            return Duration::ZERO;
-        };
+        if ledger_head.is_none() && self.active_shortcut.is_some() {
+            return X11_DEFERRED_FOCUS_BARRIER_POLL;
+        }
         let Some(marker) = self.markers.front() else {
             return Duration::ZERO;
         };
         let Some(deadline) = marker.deadline else {
-            return Duration::ZERO;
+            return if ledger_head.is_none() {
+                X11_DEFERRED_FOCUS_BARRIER_POLL
+            } else {
+                Duration::ZERO
+            };
         };
-        if marker.target_generation != target_generation || now >= deadline || head.value == 0 {
+        if marker.target_generation != Some(target_generation)
+            || now >= deadline
+            || ledger_head.is_some_and(|event| event.value == 0)
+        {
             return Duration::ZERO;
         }
         deadline
             .saturating_duration_since(now)
             .min(X11_DEFERRED_FOCUS_BARRIER_POLL)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.active_shortcut.is_some() || !self.markers.is_empty()
     }
 
     #[cfg(test)]
@@ -828,7 +836,6 @@ fn observe_deferred_physical_focus_invalidation(
     flow: &mut ManualCurrentWordFlow,
     session_type: SessionType,
     event: DeferredInputEvent,
-    target_generation: u64,
 ) -> bool {
     let session = match flow {
         ManualCurrentWordFlow::InFlight { session }
@@ -843,7 +850,6 @@ fn observe_deferred_physical_focus_invalidation(
         session_type,
         session.observed_physical_modifiers,
         event,
-        target_generation,
     );
     should_invalidate_for_wayland_focus_switch_shortcut(
         session_type,
@@ -2041,7 +2047,14 @@ impl DaemonService {
             return Ok(());
         }
 
-        if let Some(event) = self.deferred_input.peek().copied() {
+        let event = self.deferred_input.peek().copied();
+        let has_focus_barrier = match &self.manual_current_word_flow {
+            ManualCurrentWordFlow::DrainingDeferredInput { session } => {
+                session.deferred_focus_barriers.has_pending()
+            }
+            _ => false,
+        };
+        if event.is_some() || has_focus_barrier {
             let target_generation = self
                 .keyboard
                 .as_ref()
@@ -2052,7 +2065,7 @@ impl DaemonService {
                 &mut self.manual_current_word_flow,
                 target_generation,
                 now,
-                Some(event),
+                event,
             ) {
                 DeferredFocusBarrierDecision::Waiting { .. } => return Ok(()),
                 DeferredFocusBarrierDecision::TimedOut { marker } => {
@@ -2069,8 +2082,8 @@ impl DaemonService {
                     log_input_debug(
                         "manual-current-word-focus-barrier-timeout",
                         &format!(
-                            "request_id={request_id} marker_sequence_id={} marker_target_generation={} current_target_generation={target_generation} overdue_ms={overdue_ms}",
-                            marker.after_sequence_id,
+                            "request_id={request_id} marker_trigger_sequence_id={} marker_target_generation={:?} current_target_generation={target_generation} overdue_ms={overdue_ms}",
+                            marker.trigger_sequence_id,
                             marker.target_generation,
                         ),
                     );
@@ -2078,7 +2091,9 @@ impl DaemonService {
                 DeferredFocusBarrierDecision::Ready
                 | DeferredFocusBarrierDecision::ReleaseAllowed => {}
             }
+        }
 
+        if let Some(event) = event {
             let handle_result = self.handle_key_event(event, InputOrigin::DeferredReplay);
             drain_deferred_head_with(&mut self.deferred_input, |head| {
                 debug_assert_eq!(head.sequence_id, event.sequence_id);
@@ -2176,16 +2191,10 @@ impl DaemonService {
             }
         }
 
-        let target_generation = self
-            .keyboard
-            .as_ref()
-            .ok_or(SwitcherError::KeyboardNotFound)?
-            .input_target_generation();
         let focus_invalidated = observe_deferred_physical_focus_invalidation(
             &mut self.manual_current_word_flow,
             self.input_snapshot.session_type,
             event,
-            target_generation,
         );
         if focus_invalidated {
             log_input_debug(
@@ -5691,14 +5700,12 @@ mod tests {
         sequence_id: u64,
         key: Key,
         value: i32,
-        target_generation: u64,
     ) {
         modifiers.update(key, value);
         state.observe_physical_event(
             session_type,
             *modifiers,
             sequenced_deferred_event(sequence_id, key, value),
-            target_generation,
         );
     }
 
@@ -5707,7 +5714,6 @@ mod tests {
         modifiers: &mut ModifierState,
         session_type: SessionType,
         first_sequence_id: u64,
-        target_generation: u64,
     ) {
         for (offset, key, value) in [
             (0, Key::KEY_LEFTALT, 1),
@@ -5722,84 +5728,313 @@ mod tests {
                 first_sequence_id + offset,
                 key,
                 value,
-                target_generation,
             );
         }
     }
 
     #[test]
-    fn x11_full_alt_tab_records_marker_after_final_release() {
+    fn x11_alt_tab_records_marker_after_modifier_release() {
         let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
 
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1, 41);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
 
         assert_eq!(
             state.markers(),
             &VecDeque::from([DeferredFocusBarrierMarker {
+                trigger_sequence_id: 2,
                 after_sequence_id: 4,
-                target_generation: 41,
+                target_generation: None,
                 deadline: None,
             }])
         );
     }
 
     #[test]
-    fn x11_incomplete_alt_tab_does_not_record_marker() {
-        let mut missing_modifier_release = DeferredFocusBarrierState::default();
+    fn generation_change_before_final_release_ack_becomes_conservative_baseline() {
+        let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
+        let started_at = Instant::now();
+
+        observe_focus_event(
+            &mut state,
+            &mut modifiers,
+            SessionType::X11,
+            1,
+            Key::KEY_LEFTALT,
+            1,
+        );
+        for (sequence_id, key, value) in [
+            (2, Key::KEY_TAB, 1),
+            (3, Key::KEY_TAB, 0),
+            (4, Key::KEY_LEFTALT, 0),
+        ] {
+            observe_focus_event(
+                &mut state,
+                &mut modifiers,
+                SessionType::X11,
+                sequence_id,
+                key,
+                value,
+            );
+        }
+
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        assert_eq!(state.markers()[0].target_generation, None);
+        state.after_ack(4, 42, started_at);
+        assert_eq!(state.markers()[0].target_generation, Some(42));
+        assert!(matches!(
+            state.before_next_event(
+                42,
+                started_at,
+                Some(sequenced_deferred_event(5, Key::KEY_1, 1)),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+        assert_eq!(
+            state.before_next_event(
+                43,
+                started_at,
+                Some(sequenced_deferred_event(5, Key::KEY_1, 1)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+    }
+
+    #[test]
+    fn final_modifier_release_ack_sets_conservative_generation_baseline() {
+        let mut state = DeferredFocusBarrierState::default();
+        let mut modifiers = ModifierState::default();
+        let started_at = Instant::now();
+
         for (sequence_id, key, value) in [
             (1, Key::KEY_LEFTALT, 1),
             (2, Key::KEY_TAB, 1),
             (3, Key::KEY_TAB, 0),
+            (4, Key::KEY_LEFTALT, 0),
         ] {
             observe_focus_event(
-                &mut missing_modifier_release,
+                &mut state,
                 &mut modifiers,
                 SessionType::X11,
                 sequence_id,
                 key,
                 value,
-                11,
             );
         }
-        assert!(missing_modifier_release.markers().is_empty());
-
-        let mut missing_tab_release = DeferredFocusBarrierState::default();
-        let mut modifiers = ModifierState::default();
-        for (sequence_id, key, value) in [
-            (1, Key::KEY_LEFTALT, 1),
-            (2, Key::KEY_TAB, 1),
-            (3, Key::KEY_LEFTALT, 0),
-        ] {
-            observe_focus_event(
-                &mut missing_tab_release,
-                &mut modifiers,
-                SessionType::X11,
-                sequence_id,
-                key,
-                value,
-                11,
-            );
-        }
-        assert!(missing_tab_release.markers().is_empty());
+        assert_eq!(
+            state.before_next_event(
+                40,
+                started_at,
+                Some(sequenced_deferred_event(2, Key::KEY_TAB, 1)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        assert_eq!(state.markers()[0].target_generation, None);
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        assert_eq!(state.markers()[0].target_generation, None);
+        state.after_ack(4, 41, started_at);
+        assert_eq!(state.markers()[0].target_generation, Some(41));
+        assert!(matches!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(5, Key::KEY_1, 1)),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+        assert_eq!(
+            state.before_next_event(
+                42,
+                started_at,
+                Some(sequenced_deferred_event(5, Key::KEY_1, 1)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
     }
 
     #[test]
-    fn x11_two_complete_shortcuts_preserve_marker_order() {
+    fn repeated_tab_forms_one_marker_with_final_release_baseline() {
         let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
-
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1, 21);
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 5, 22);
+        let started_at = Instant::now();
+        for (sequence_id, key, value) in [
+            (1, Key::KEY_LEFTALT, 1),
+            (2, Key::KEY_TAB, 1),
+            (3, Key::KEY_TAB, 0),
+            (4, Key::KEY_TAB, 1),
+            (5, Key::KEY_TAB, 0),
+            (6, Key::KEY_LEFTALT, 0),
+        ] {
+            observe_focus_event(
+                &mut state,
+                &mut modifiers,
+                SessionType::X11,
+                sequence_id,
+                key,
+                value,
+            );
+        }
 
         assert_eq!(
             state
                 .markers()
                 .iter()
-                .map(|marker| (marker.after_sequence_id, marker.target_generation))
+                .map(|marker| (marker.trigger_sequence_id, marker.after_sequence_id))
                 .collect::<Vec<_>>(),
-            vec![(4, 21), (8, 22)]
+            vec![(4, 6)]
+        );
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(2, Key::KEY_TAB, 1)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        assert_eq!(state.markers()[0].target_generation, None);
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(4, Key::KEY_TAB, 1)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        assert_eq!(state.markers()[0].target_generation, None);
+        assert_eq!(
+            state.before_next_event(
+                42,
+                started_at,
+                Some(sequenced_deferred_event(6, Key::KEY_LEFTALT, 0)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        assert_eq!(state.markers()[0].target_generation, None);
+        state.after_ack(6, 42, started_at);
+        assert_eq!(state.markers()[0].target_generation, Some(42));
+        assert!(matches!(
+            state.before_next_event(
+                42,
+                started_at,
+                Some(sequenced_deferred_event(7, Key::KEY_1, 1)),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+        assert_eq!(
+            state.before_next_event(
+                43,
+                started_at,
+                Some(sequenced_deferred_event(7, Key::KEY_1, 1)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+    }
+
+    #[test]
+    fn cinnamon_repeated_tab_replays_without_wait_until_final_modifier_release() {
+        let events = [
+            sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(2, Key::KEY_TAB, 1),
+            sequenced_deferred_event(3, Key::KEY_TAB, 0),
+            sequenced_deferred_event(4, Key::KEY_TAB, 1),
+            sequenced_deferred_event(5, Key::KEY_TAB, 0),
+            sequenced_deferred_event(6, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(7, Key::KEY_1, 1),
+        ];
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(912, &events);
+        let started_at = Instant::now();
+        let mut forwarded = Vec::new();
+
+        for _ in 0..6 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                41,
+                started_at,
+                &mut forwarded,
+            );
+        }
+        assert_eq!(forwarded, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(ledger.peek().map(|event| event.sequence_id), Some(7));
+        assert!(matches!(
+            deferred_focus_barrier_before_next_event(
+                &mut flow,
+                41,
+                started_at,
+                ledger.peek().copied(),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+
+        drain_one_focus_gated_test_event(&mut flow, &mut ledger, 42, started_at, &mut forwarded);
+        assert_eq!(forwarded, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn x11_active_chord_requires_tab_press_and_survives_until_modifier_release() {
+        let mut alt_only = DeferredFocusBarrierState::default();
+        let mut modifiers = ModifierState::default();
+        observe_focus_event(
+            &mut alt_only,
+            &mut modifiers,
+            SessionType::X11,
+            1,
+            Key::KEY_LEFTALT,
+            1,
+        );
+        assert!(alt_only.markers().is_empty());
+        assert!(!alt_only.has_pending());
+
+        let mut without_releases = DeferredFocusBarrierState::default();
+        let mut modifiers = ModifierState::default();
+        for (sequence_id, key, value) in [(1, Key::KEY_LEFTALT, 1), (2, Key::KEY_TAB, 1)] {
+            observe_focus_event(
+                &mut without_releases,
+                &mut modifiers,
+                SessionType::X11,
+                sequence_id,
+                key,
+                value,
+            );
+        }
+        assert!(without_releases.markers().is_empty());
+        assert!(without_releases.has_pending());
+        assert!(matches!(
+            without_releases.before_next_event(41, Instant::now(), None),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+    }
+
+    #[test]
+    fn second_alt_tab_marker_cannot_replace_first_marker() {
+        let mut state = DeferredFocusBarrierState::default();
+        let mut modifiers = ModifierState::default();
+
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 5);
+
+        assert_eq!(
+            state
+                .markers()
+                .iter()
+                .map(|marker| (marker.trigger_sequence_id, marker.target_generation))
+                .collect::<Vec<_>>(),
+            vec![(2, None), (6, None)]
         );
     }
 
@@ -5808,8 +6043,16 @@ mod tests {
         let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
         let started_at = Instant::now();
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1, 41);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
 
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
         state.after_ack(4, 41, started_at);
         assert_eq!(
             state.before_next_event(
@@ -5828,8 +6071,16 @@ mod tests {
         let mut modifiers = ModifierState::default();
         let started_at = Instant::now();
         let tail = sequenced_deferred_event(5, Key::KEY_1, 1);
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1, 41);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
 
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
         state.after_ack(4, 41, started_at);
         assert_eq!(
             state.before_next_event(41, started_at + Duration::from_millis(299), Some(tail),),
@@ -5845,8 +6096,9 @@ mod tests {
             ),
             DeferredFocusBarrierDecision::TimedOut {
                 marker: DeferredFocusBarrierMarker {
+                    trigger_sequence_id: 2,
                     after_sequence_id: 4,
-                    target_generation: 41,
+                    target_generation: Some(41),
                     ..
                 }
             }
@@ -5859,7 +6111,12 @@ mod tests {
         let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
         let started_at = Instant::now();
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1, 41);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
+        state.before_next_event(
+            41,
+            started_at,
+            Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+        );
         state.after_ack(4, 41, started_at);
 
         assert_eq!(
@@ -5886,7 +6143,12 @@ mod tests {
         let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
         let started_at = Instant::now();
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1, 41);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
+        state.before_next_event(
+            41,
+            started_at,
+            Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+        );
         state.after_ack(4, 41, started_at);
 
         assert_eq!(
@@ -5924,11 +6186,38 @@ mod tests {
     }
 
     #[test]
+    fn x11_barrier_wait_survives_temporarily_empty_ledger() {
+        let mut state = DeferredFocusBarrierState::default();
+        let mut modifiers = ModifierState::default();
+        let started_at = Instant::now();
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::X11, 1);
+        assert_eq!(
+            state.before_next_event(
+                41,
+                started_at,
+                Some(sequenced_deferred_event(4, Key::KEY_LEFTALT, 0)),
+            ),
+            DeferredFocusBarrierDecision::Ready
+        );
+        state.after_ack(4, 41, started_at);
+
+        assert!(matches!(
+            state.before_next_event(41, started_at, None),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+        assert_eq!(
+            state.event_fetch_timeout(41, started_at, None),
+            X11_DEFERRED_FOCUS_BARRIER_POLL
+        );
+        assert_eq!(state.markers().len(), 1);
+    }
+
+    #[test]
     fn wayland_deferred_shortcut_does_not_create_x11_barrier() {
         let mut state = DeferredFocusBarrierState::default();
         let mut modifiers = ModifierState::default();
 
-        observe_alt_tab(&mut state, &mut modifiers, SessionType::Wayland, 1, 41);
+        observe_alt_tab(&mut state, &mut modifiers, SessionType::Wayland, 1);
 
         assert!(state.markers().is_empty());
     }
@@ -5949,7 +6238,6 @@ mod tests {
                 &mut flow,
                 SessionType::X11,
                 sequenced_deferred_event(sequence_id, key, value),
-                41,
             ));
         }
 
@@ -5959,8 +6247,9 @@ mod tests {
         assert_eq!(
             session.deferred_focus_barriers.markers(),
             &VecDeque::from([DeferredFocusBarrierMarker {
+                trigger_sequence_id: 2,
                 after_sequence_id: 4,
-                target_generation: 41,
+                target_generation: None,
                 deadline: None,
             }])
         );
@@ -5968,7 +6257,6 @@ mod tests {
 
     fn x11_focus_barrier_flow(
         request_id: u64,
-        target_generation: u64,
         events: &[DeferredInputEvent],
     ) -> (ManualCurrentWordFlow, DeferredInputLedger) {
         let mut flow = ManualCurrentWordFlow::DrainingDeferredInput {
@@ -5981,7 +6269,6 @@ mod tests {
                 &mut flow,
                 SessionType::X11,
                 *event,
-                target_generation,
             ));
         }
         (flow, ledger)
@@ -6022,7 +6309,7 @@ mod tests {
             sequenced_deferred_event(7, Key::KEY_2, 1),
             sequenced_deferred_event(8, Key::KEY_2, 0),
         ];
-        let (mut flow, mut ledger) = x11_focus_barrier_flow(903, 41, &events);
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(903, &events);
         let started_at = Instant::now();
         let mut forwarded = Vec::new();
 
@@ -6071,7 +6358,7 @@ mod tests {
             sequenced_deferred_event(4, Key::KEY_LEFTALT, 0),
             sequenced_deferred_event(5, Key::KEY_1, 1),
         ];
-        let (mut flow, mut ledger) = x11_focus_barrier_flow(904, 41, &events);
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(904, &events);
         let started_at = Instant::now();
         let mut forwarded = Vec::new();
         for _ in 0..4 {
@@ -6112,7 +6399,7 @@ mod tests {
     }
 
     #[test]
-    fn x11_generation_barrier_forwards_leading_modifier_release_before_text_wait() {
+    fn leading_modifier_release_is_not_delayed_by_barrier() {
         let events = [
             sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
             sequenced_deferred_event(2, Key::KEY_TAB, 1),
@@ -6122,7 +6409,7 @@ mod tests {
             sequenced_deferred_event(6, Key::KEY_1, 1),
             sequenced_deferred_event(7, Key::KEY_1, 0),
         ];
-        let (mut flow, mut ledger) = x11_focus_barrier_flow(905, 41, &events);
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(905, &events);
         let started_at = Instant::now();
         let mut forwarded = Vec::new();
         for _ in 0..4 {
@@ -6156,6 +6443,247 @@ mod tests {
             ),
             DeferredFocusBarrierDecision::Waiting { .. }
         ));
+    }
+
+    #[test]
+    fn pointer_click_during_barrier_does_not_drop_marker_or_tail() {
+        let events = [
+            sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(2, Key::KEY_TAB, 1),
+            sequenced_deferred_event(3, Key::KEY_TAB, 0),
+            sequenced_deferred_event(4, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(5, Key::KEY_1, 1),
+        ];
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(906, &events);
+        let started_at = Instant::now();
+        let mut forwarded = Vec::new();
+        for _ in 0..4 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                41,
+                started_at,
+                &mut forwarded,
+            );
+        }
+
+        assert_eq!(
+            invalidate_manual_flow_context(&mut flow),
+            ManualFlowInvalidation::ContextOnly
+        );
+        let ManualCurrentWordFlow::DrainingDeferredInput { session } = &flow else {
+            panic!("pointer invalidation must preserve draining session");
+        };
+        assert_eq!(session.deferred_focus_barriers.markers().len(), 1);
+        assert_eq!(ledger.sequence_ids_for_test(), vec![5]);
+        assert!(matches!(
+            deferred_focus_barrier_before_next_event(
+                &mut flow,
+                41,
+                started_at,
+                ledger.peek().copied(),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+    }
+
+    #[test]
+    fn physical_events_admitted_while_barrier_waits_remain_ordered() {
+        let events = [
+            sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(2, Key::KEY_TAB, 1),
+            sequenced_deferred_event(3, Key::KEY_TAB, 0),
+            sequenced_deferred_event(4, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(5, Key::KEY_1, 1),
+        ];
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(907, &events);
+        let started_at = Instant::now();
+        let mut forwarded = Vec::new();
+        for _ in 0..4 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                41,
+                started_at,
+                &mut forwarded,
+            );
+        }
+        assert!(matches!(
+            deferred_focus_barrier_before_next_event(
+                &mut flow,
+                41,
+                started_at,
+                ledger.peek().copied(),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+
+        for event in [
+            sequenced_deferred_event(6, Key::KEY_2, 1),
+            sequenced_deferred_event(7, Key::KEY_2, 0),
+        ] {
+            ledger.admit(event);
+            assert!(!observe_deferred_physical_focus_invalidation(
+                &mut flow,
+                SessionType::X11,
+                event,
+            ));
+        }
+        assert_eq!(ledger.sequence_ids_for_test(), vec![5, 6, 7]);
+
+        while !ledger.is_empty() {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                42,
+                started_at,
+                &mut forwarded,
+            );
+        }
+        assert_eq!(forwarded, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn second_queued_alt_tab_waits_for_its_own_generation_change() {
+        let events = [
+            sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(2, Key::KEY_TAB, 1),
+            sequenced_deferred_event(3, Key::KEY_TAB, 0),
+            sequenced_deferred_event(4, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(5, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(6, Key::KEY_TAB, 1),
+            sequenced_deferred_event(7, Key::KEY_TAB, 0),
+            sequenced_deferred_event(8, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(9, Key::KEY_1, 1),
+        ];
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(910, &events);
+        let started_at = Instant::now();
+        let mut forwarded = Vec::new();
+
+        for _ in 0..4 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                41,
+                started_at,
+                &mut forwarded,
+            );
+        }
+        assert!(matches!(
+            deferred_focus_barrier_before_next_event(
+                &mut flow,
+                41,
+                started_at,
+                ledger.peek().copied(),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+
+        for _ in 0..4 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                42,
+                started_at,
+                &mut forwarded,
+            );
+        }
+        assert_eq!(forwarded, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(ledger.sequence_ids_for_test(), vec![9]);
+        assert!(matches!(
+            deferred_focus_barrier_before_next_event(
+                &mut flow,
+                42,
+                started_at,
+                ledger.peek().copied(),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+
+        drain_one_focus_gated_test_event(&mut flow, &mut ledger, 43, started_at, &mut forwarded);
+        assert_eq!(forwarded, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn blocked_press_is_not_reordered_past_its_later_release() {
+        let events = [
+            sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(2, Key::KEY_TAB, 1),
+            sequenced_deferred_event(3, Key::KEY_TAB, 0),
+            sequenced_deferred_event(4, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(5, Key::KEY_1, 1),
+            sequenced_deferred_event(6, Key::KEY_1, 0),
+        ];
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(908, &events);
+        let started_at = Instant::now();
+        let mut forwarded = Vec::new();
+        for _ in 0..4 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                41,
+                started_at,
+                &mut forwarded,
+            );
+        }
+
+        assert!(matches!(
+            deferred_focus_barrier_before_next_event(
+                &mut flow,
+                41,
+                started_at,
+                ledger.peek().copied(),
+            ),
+            DeferredFocusBarrierDecision::Waiting { .. }
+        ));
+        assert_eq!(ledger.sequence_ids_for_test(), vec![5, 6]);
+        assert_eq!(forwarded, vec![1, 2, 3, 4]);
+
+        drain_one_focus_gated_test_event(&mut flow, &mut ledger, 42, started_at, &mut forwarded);
+        drain_one_focus_gated_test_event(&mut flow, &mut ledger, 42, started_at, &mut forwarded);
+        assert_eq!(forwarded, vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn barrier_state_is_discarded_only_with_terminal_session_reset() {
+        let events = [
+            sequenced_deferred_event(1, Key::KEY_LEFTALT, 1),
+            sequenced_deferred_event(2, Key::KEY_TAB, 1),
+            sequenced_deferred_event(3, Key::KEY_TAB, 0),
+            sequenced_deferred_event(4, Key::KEY_LEFTALT, 0),
+            sequenced_deferred_event(5, Key::KEY_1, 1),
+        ];
+        let (mut flow, mut ledger) = x11_focus_barrier_flow(909, &events);
+        let started_at = Instant::now();
+        let mut forwarded = Vec::new();
+        for _ in 0..4 {
+            drain_one_focus_gated_test_event(
+                &mut flow,
+                &mut ledger,
+                41,
+                started_at,
+                &mut forwarded,
+            );
+        }
+
+        assert_eq!(
+            invalidate_manual_flow_context(&mut flow),
+            ManualFlowInvalidation::ContextOnly
+        );
+        let ManualCurrentWordFlow::DrainingDeferredInput { session } = &flow else {
+            panic!("non-terminal invalidation must preserve draining session");
+        };
+        assert_eq!(session.deferred_focus_barriers.markers().len(), 1);
+
+        let summary = reconcile_deferred_input_state_after_backend_shutdown(
+            &mut ledger,
+            &mut flow,
+            WriterShutdownOutcome::Stopped,
+        );
+        assert_eq!(summary.request_id, Some(909));
+        assert_eq!(summary.reconciled, 1);
+        assert!(ledger.is_empty());
+        assert!(matches!(flow, ManualCurrentWordFlow::Idle));
     }
 
     #[test]
@@ -6338,14 +6866,12 @@ mod tests {
             &mut flow,
             SessionType::Wayland,
             alt_down,
-            0,
         ));
         ledger.admit(tab_down);
         assert!(observe_deferred_physical_focus_invalidation(
             &mut flow,
             SessionType::Wayland,
             tab_down,
-            0,
         ));
         assert_eq!(
             invalidate_manual_flow_context(&mut flow),
@@ -6360,18 +6886,38 @@ mod tests {
     }
 
     #[test]
-    fn failed_replay_keeps_head_for_terminal_reconciliation() {
+    fn deferred_forward_disconnect_keeps_ledger_head() {
         use crate::daemon::deferred_input::DeferredInputLedger;
 
         let mut ledger = DeferredInputLedger::default();
         ledger.admit(sequenced_deferred_event(7, Key::KEY_A, 1));
         ledger.admit(sequenced_deferred_event(8, Key::KEY_A, 0));
 
-        assert_eq!(
-            drain_deferred_head_with(&mut ledger, |_| Err::<(), _>("writer-dead")),
-            Err("writer-dead")
-        );
+        assert!(matches!(
+            drain_deferred_head_with(&mut ledger, |_| {
+                Err::<(), _>(SwitcherError::VirtualKeyboardWriterDisconnected)
+            }),
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
         assert_eq!(ledger.sequence_ids_for_test(), vec![7, 8]);
+    }
+
+    #[test]
+    fn deferred_forward_write_error_keeps_ledger_head() {
+        let mut ledger = DeferredInputLedger::default();
+        ledger.admit(sequenced_deferred_event(9, Key::KEY_B, 1));
+        ledger.admit(sequenced_deferred_event(10, Key::KEY_B, 0));
+
+        assert!(matches!(
+            drain_deferred_head_with(&mut ledger, |_| {
+                Err::<(), _>(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: 77,
+                    reason: "uinput write failed".to_string(),
+                })
+            }),
+            Err(SwitcherError::VirtualKeyboardWriterTransactionFailed { request_id: 77, .. })
+        ));
+        assert_eq!(ledger.sequence_ids_for_test(), vec![9, 10]);
     }
 
     #[test]

@@ -14,7 +14,7 @@ use crate::config::default_config_path;
 use crate::dbus::{CaptureOwnerMonitor, OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
 use crate::system::is_dev_runtime_mode;
-use keyboard::log_input_debug;
+use keyboard::{log_input_debug, WriterShutdownOutcome};
 use runtime::{log_layout_debug, BackendSyncResult, ConfigService, RuntimeState};
 use service::DaemonService;
 use std::panic::{self, AssertUnwindSafe};
@@ -80,7 +80,14 @@ pub fn run() -> Result<(), SwitcherError> {
     let (connection, mut capture_owner_monitor) =
         start_dbus_endpoint(runtime.clone(), SERVICE_NAME)?;
 
-    let mut service = DaemonService::new(runtime, connection)?;
+    let mut service = match DaemonService::new(runtime, connection) {
+        Ok(service) => service,
+        Err(error) => {
+            return finalize_service_initialization_error(error, |mode| {
+                shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode)
+            });
+        }
+    };
     let (result, input_loop_postmortem) =
         match panic::catch_unwind(AssertUnwindSafe(|| service.run())) {
             Ok(result) => (result, None),
@@ -98,16 +105,43 @@ pub fn run() -> Result<(), SwitcherError> {
         };
     finalize_daemon_run_with_postmortem(
         result,
-        || {
-            let _ = service.shutdown();
-        },
-        || capture_owner_monitor.stop(),
+        || service.shutdown(),
+        |mode| shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode),
         move || {
             if let Some(reason) = input_loop_postmortem {
                 eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
             }
         },
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SecondaryShutdownMode {
+    Join,
+    DetachForProcessFailStop,
+}
+
+fn shutdown_capture_owner_monitor(
+    monitor: &mut CaptureOwnerMonitor,
+    mode: SecondaryShutdownMode,
+) -> std::thread::Result<()> {
+    match mode {
+        SecondaryShutdownMode::Join => monitor.stop(),
+        SecondaryShutdownMode::DetachForProcessFailStop => {
+            monitor.detach_for_process_fail_stop();
+            Ok(())
+        }
+    }
+}
+
+fn finalize_service_initialization_error<StopMonitor>(
+    error: SwitcherError,
+    stop_monitor: StopMonitor,
+) -> Result<(), SwitcherError>
+where
+    StopMonitor: FnOnce(SecondaryShutdownMode) -> std::thread::Result<()>,
+{
+    finalize_daemon_run(Err(error), || WriterShutdownOutcome::Stopped, stop_monitor)
 }
 
 fn finalize_daemon_run_with_postmortem<Shutdown, StopMonitor, Postmortem>(
@@ -117,8 +151,8 @@ fn finalize_daemon_run_with_postmortem<Shutdown, StopMonitor, Postmortem>(
     postmortem: Postmortem,
 ) -> Result<(), SwitcherError>
 where
-    Shutdown: FnOnce(),
-    StopMonitor: FnOnce() -> std::thread::Result<()>,
+    Shutdown: FnOnce() -> WriterShutdownOutcome,
+    StopMonitor: FnOnce(SecondaryShutdownMode) -> std::thread::Result<()>,
     Postmortem: FnOnce(),
 {
     let result = finalize_daemon_run(result, shutdown, stop_monitor);
@@ -132,11 +166,24 @@ fn finalize_daemon_run<Shutdown, StopMonitor>(
     stop_monitor: StopMonitor,
 ) -> Result<(), SwitcherError>
 where
-    Shutdown: FnOnce(),
-    StopMonitor: FnOnce() -> std::thread::Result<()>,
+    Shutdown: FnOnce() -> WriterShutdownOutcome,
+    StopMonitor: FnOnce(SecondaryShutdownMode) -> std::thread::Result<()>,
 {
-    shutdown();
-    if stop_monitor().is_err() {
+    let prior_fail_stop = matches!(
+        &result,
+        Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
+    );
+    let shutdown_outcome = shutdown();
+    let monitor_mode = if prior_fail_stop
+        || matches!(shutdown_outcome, WriterShutdownOutcome::Unresponsive { .. })
+    {
+        SecondaryShutdownMode::DetachForProcessFailStop
+    } else {
+        SecondaryShutdownMode::Join
+    };
+    let result = resolve_daemon_result_after_shutdown(result, shutdown_outcome);
+
+    if stop_monitor(monitor_mode).is_err() {
         log_layout_debug(
             "dbus-capture-owner-monitor-stop-error",
             "worker_panicked=true",
@@ -144,6 +191,33 @@ where
         eprintln!("[dbus] Capture owner monitor worker panicked during shutdown");
     }
     result
+}
+
+fn resolve_daemon_result_after_shutdown(
+    result: Result<(), SwitcherError>,
+    shutdown_outcome: WriterShutdownOutcome,
+) -> Result<(), SwitcherError> {
+    if matches!(
+        &result,
+        Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
+    ) {
+        return result;
+    }
+
+    match shutdown_outcome {
+        WriterShutdownOutcome::Stopped => result,
+        WriterShutdownOutcome::Unresponsive { timeout_ms } => {
+            let trigger = match result {
+                Ok(()) => "daemon run completed before writer shutdown".to_owned(),
+                Err(error) => error.to_string(),
+            };
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms,
+                phase: "daemon-finalize",
+                trigger,
+            })
+        }
+    }
 }
 
 fn start_dbus_endpoint(
@@ -169,6 +243,7 @@ fn prepare_dbus_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::keyboard::WriterShutdownOutcome;
     use crate::dbus::INTERFACE_NAME;
     use crate::model::{LayoutSwitchCapturePhase, LayoutSwitchCaptureState};
     use std::cell::RefCell;
@@ -190,8 +265,12 @@ mod tests {
         let finalizer = std::thread::spawn(move || {
             finalize_daemon_run(
                 Err(SwitcherError::KeyboardNotFound),
-                || input_released.store(true, Ordering::SeqCst),
                 || {
+                    input_released.store(true, Ordering::SeqCst);
+                    WriterShutdownOutcome::Stopped
+                },
+                |mode| {
+                    assert_eq!(mode, SecondaryShutdownMode::Join);
                     monitor_entered_tx.send(()).unwrap();
                     allow_monitor_stop_rx.recv().unwrap();
                     Ok(())
@@ -215,13 +294,137 @@ mod tests {
     }
 
     #[test]
+    fn clean_shutdown_preserves_primary_daemon_error_and_stops_monitor() {
+        let phases = RefCell::new(Vec::new());
+
+        let result = finalize_daemon_run(
+            Err(SwitcherError::KeyboardNotFound),
+            || {
+                phases.borrow_mut().push("release-input");
+                WriterShutdownOutcome::Stopped
+            },
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::Join);
+                phases.borrow_mut().push("join-monitor");
+                Ok(())
+            },
+        );
+
+        assert!(matches!(result, Err(SwitcherError::KeyboardNotFound)));
+        assert_eq!(*phases.borrow(), vec!["release-input", "join-monitor"]);
+    }
+
+    #[test]
+    fn unresponsive_shutdown_skips_monitor_join_and_returns_fatal_error() {
+        let (join_entered_tx, join_entered_rx) = mpsc::channel();
+
+        let result = finalize_daemon_run(
+            Ok(()),
+            || WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            |mode| {
+                if mode == SecondaryShutdownMode::Join {
+                    join_entered_tx.send(()).unwrap();
+                }
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "daemon-finalize",
+                ..
+            })
+        ));
+        assert!(matches!(
+            join_entered_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn unresponsive_shutdown_preserves_primary_error_in_trigger() {
+        let result = finalize_daemon_run(
+            Err(SwitcherError::KeyboardNotFound),
+            || WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::DetachForProcessFailStop);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "daemon-finalize",
+                ref trigger,
+            }) if trigger == "Keyboard device was not found"
+        ));
+    }
+
+    #[test]
+    fn prior_fail_stop_is_not_masked_by_repeated_shutdown() {
+        let result = finalize_daemon_run(
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 900,
+                phase: "backend-open",
+                trigger: "startup cleanup".to_owned(),
+            }),
+            || WriterShutdownOutcome::Stopped,
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::DetachForProcessFailStop);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 900,
+                phase: "backend-open",
+                ref trigger,
+            }) if trigger == "startup cleanup"
+        ));
+    }
+
+    #[test]
+    fn service_initialization_fail_stop_detaches_monitor() {
+        let result = finalize_service_initialization_error(
+            SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 800,
+                phase: "backend-open",
+                trigger: "dependent worker startup failed".to_owned(),
+            },
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::DetachForProcessFailStop);
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 800,
+                phase: "backend-open",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn input_loop_postmortem_is_reported_only_after_backend_shutdown() {
         let phases = RefCell::new(Vec::new());
 
         let result = finalize_daemon_run_with_postmortem(
             Err(SwitcherError::DaemonPanicked),
-            || phases.borrow_mut().push("release-input"),
             || {
+                phases.borrow_mut().push("release-input");
+                WriterShutdownOutcome::Stopped
+            },
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::Join);
                 phases.borrow_mut().push("stop-monitor");
                 Ok(())
             },

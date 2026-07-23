@@ -75,6 +75,11 @@ impl CaptureOwnerMonitor {
         self.stop_and_join()
     }
 
+    pub(crate) fn detach_for_process_fail_stop(&mut self) {
+        let _ = self.stop_sender.try_send(());
+        drop(self.worker.take());
+    }
+
     fn stop_and_join(&mut self) -> thread::Result<()> {
         let _ = self.stop_sender.try_send(());
         match self.worker.take() {
@@ -710,6 +715,40 @@ mod tests {
         assert!(monitor.stop().is_ok());
 
         Ok(())
+    }
+
+    #[test]
+    fn capture_owner_monitor_detach_makes_drop_nonblocking() {
+        let (worker_entered_tx, worker_entered_rx) = mpsc::channel();
+        let (release_worker_tx, release_worker_rx) = mpsc::channel();
+        let (worker_exited_tx, worker_exited_rx) = mpsc::channel();
+        let monitor = CaptureOwnerMonitor::spawn_worker(move |_stop_receiver, ready_sender| {
+            ready_sender.send(Ok(())).unwrap();
+            worker_entered_tx.send(()).unwrap();
+            release_worker_rx.recv().unwrap();
+            worker_exited_tx.send(()).unwrap();
+        })
+        .unwrap();
+        worker_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("monitor worker must enter its blocking section");
+
+        let (drop_completed_tx, drop_completed_rx) = mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            let mut monitor = monitor;
+            monitor.detach_for_process_fail_stop();
+            drop(monitor);
+            drop_completed_tx.send(()).unwrap();
+        });
+
+        drop_completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached monitor Drop must not join the blocked worker");
+        release_worker_tx.send(()).unwrap();
+        worker_exited_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detached test worker must exit after release");
+        dropper.join().unwrap();
     }
 
     #[test]

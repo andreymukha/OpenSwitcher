@@ -702,6 +702,61 @@ fn failed_manual_current_word_completion_error(request_id: u64, reason: String) 
     SwitcherError::VirtualKeyboardWriterTransactionFailed { request_id, reason }
 }
 
+fn invalidate_layout_after_manual_current_word_completion(
+    runtime: &RuntimeState,
+    outcome: &ManualCurrentWordOutcome,
+) {
+    let reason = match outcome {
+        ManualCurrentWordOutcome::Succeeded(_) => "manual-current-word-succeeded",
+        ManualCurrentWordOutcome::Cancelled => "manual-current-word-cancelled",
+        ManualCurrentWordOutcome::FailedAfterMutation(_) => {
+            "manual-current-word-failed-after-mutation"
+        }
+    };
+    runtime.invalidate_layout_and_request_refresh(reason);
+}
+
+enum ManualCurrentWordCompletionTransition {
+    Succeeded {
+        session: DeferredManualCurrentWordSession,
+        plan: CorrectionPlan,
+    },
+    Cancelled {
+        session: DeferredManualCurrentWordSession,
+    },
+    FailedAfterMutation {
+        session: DeferredManualCurrentWordSession,
+        error: String,
+    },
+}
+
+fn transition_manual_current_word_completion(
+    runtime: &RuntimeState,
+    flow: &mut ManualCurrentWordFlow,
+    completion: ManualCurrentWordCompletion,
+) -> Option<ManualCurrentWordCompletionTransition> {
+    let session = take_matching_manual_current_word_session(flow, completion.request_id)?;
+    invalidate_layout_after_manual_current_word_completion(runtime, &completion.outcome);
+
+    match completion.outcome {
+        ManualCurrentWordOutcome::Succeeded(plan) => {
+            *flow = ManualCurrentWordFlow::DrainingDeferredInput {
+                session: session.clone(),
+            };
+            Some(ManualCurrentWordCompletionTransition::Succeeded { session, plan })
+        }
+        ManualCurrentWordOutcome::Cancelled => {
+            *flow = ManualCurrentWordFlow::DrainingDeferredInput {
+                session: session.clone(),
+            };
+            Some(ManualCurrentWordCompletionTransition::Cancelled { session })
+        }
+        ManualCurrentWordOutcome::FailedAfterMutation(error) => {
+            Some(ManualCurrentWordCompletionTransition::FailedAfterMutation { session, error })
+        }
+    }
+}
+
 // Layout/action decision helpers
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -925,6 +980,58 @@ struct ManualHotkeyLatch {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SuppressedUndoEventRouting {
+    Swallow,
+    ClearedStalePress,
+    PassThrough,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct SuppressedUndoKeys {
+    keys: Vec<evdev::Key>,
+}
+
+impl SuppressedUndoKeys {
+    fn arm(&mut self, key: evdev::Key) {
+        if !self.keys.contains(&key) {
+            self.keys.push(key);
+        }
+    }
+
+    fn route_event(&mut self, key: evdev::Key, value: i32) -> SuppressedUndoEventRouting {
+        let position = self.keys.iter().position(|suppressed| *suppressed == key);
+        if value == 0 {
+            if let Some(position) = position {
+                self.keys.remove(position);
+                return SuppressedUndoEventRouting::Swallow;
+            }
+        } else if value == 1 {
+            if let Some(position) = position {
+                self.keys.remove(position);
+                return SuppressedUndoEventRouting::ClearedStalePress;
+            }
+        } else if position.is_some() {
+            return SuppressedUndoEventRouting::Swallow;
+        }
+        SuppressedUndoEventRouting::PassThrough
+    }
+
+    fn clear(&mut self) {
+        self.keys.clear();
+    }
+}
+
+fn register_suppressed_manual_hotkey_press(
+    suppressed: &mut SuppressedUndoKeys,
+    key: evdev::Key,
+    origin: InputOrigin,
+    flow_active: bool,
+) -> bool {
+    suppressed.arm(key);
+    should_request_manual_hotkey_retry_after_drain(origin, flow_active)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManualCurrentWordPhysicalEventAction {
     ProcessImmediately,
     Swallow,
@@ -944,22 +1051,6 @@ fn should_swallow_manual_hotkey_latched_event(
     value: i32,
 ) -> bool {
     manual_hotkey_latch.is_some_and(|latch| latch.key == key) && matches!(value, 0..=2)
-}
-
-fn should_swallow_suppressed_undo_release(
-    suppressed_undo_key: Option<evdev::Key>,
-    key: evdev::Key,
-    value: i32,
-) -> bool {
-    suppressed_undo_key == Some(key) && value == 0
-}
-
-fn should_clear_stale_suppressed_undo_on_press(
-    suppressed_undo_key: Option<evdev::Key>,
-    key: evdev::Key,
-    value: i32,
-) -> bool {
-    suppressed_undo_key == Some(key) && value == 1
 }
 
 fn should_clear_stale_suppressed_selected_hotkey_on_press(
@@ -1203,7 +1294,7 @@ pub struct DaemonService {
     word_context: WordContext,
     selected_text_runner: Option<SelectedTextJobRunner>,
     suppressed_hotkey_key: Option<evdev::Key>,
-    suppressed_undo_key: Option<evdev::Key>,
+    suppressed_undo_keys: SuppressedUndoKeys,
     manual_hotkey_latch: Option<ManualHotkeyLatch>,
     manual_current_word_flow: ManualCurrentWordFlow,
     deferred_input: DeferredInputLedger,
@@ -1236,7 +1327,7 @@ impl DaemonService {
             word_context: WordContext::default(),
             selected_text_runner: None,
             suppressed_hotkey_key: None,
-            suppressed_undo_key: None,
+            suppressed_undo_keys: SuppressedUndoKeys::default(),
             manual_hotkey_latch: None,
             manual_current_word_flow: ManualCurrentWordFlow::Idle,
             deferred_input: DeferredInputLedger::default(),
@@ -1595,21 +1686,23 @@ impl DaemonService {
         &mut self,
         completion: ManualCurrentWordCompletion,
     ) -> Result<(), SwitcherError> {
-        let Some(session) = take_matching_manual_current_word_session(
+        let request_id = completion.request_id;
+        let Some(transition) = transition_manual_current_word_completion(
+            self.runtime.as_ref(),
             &mut self.manual_current_word_flow,
-            completion.request_id,
+            completion,
         ) else {
             return Ok(());
         };
         let deferred_len = self.deferred_input.len();
 
-        match completion.outcome {
-            ManualCurrentWordOutcome::Succeeded(plan) => {
+        match transition {
+            ManualCurrentWordCompletionTransition::Succeeded { session, plan } => {
                 log_input_debug(
                     "manual-current-word-completion",
                     &format!(
                         "request_id={} outcome=success elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} buffer_len={} extra_backspaces={}",
-                        completion.request_id,
+                        request_id,
                         session.started_at.elapsed().as_millis(),
                         deferred_len,
                         session.seen_real_next_step,
@@ -1635,18 +1728,14 @@ impl DaemonService {
                         CurrentWordCorrectionState::ManuallyCorrected;
                     self.manual_hotkey_latch = None;
                 }
-                self.runtime
-                    .invalidate_layout_and_request_refresh("manual-current-word-succeeded");
-                self.manual_current_word_flow =
-                    ManualCurrentWordFlow::DrainingDeferredInput { session };
                 Ok(())
             }
-            ManualCurrentWordOutcome::Cancelled => {
+            ManualCurrentWordCompletionTransition::Cancelled { session } => {
                 log_input_debug(
                     "manual-current-word-completion",
                     &format!(
                         "request_id={} outcome=cancelled elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={}",
-                        completion.request_id,
+                        request_id,
                         session.started_at.elapsed().as_millis(),
                         deferred_len,
                         session.seen_real_next_step,
@@ -1654,29 +1743,23 @@ impl DaemonService {
                     ),
                 );
                 self.invalidate_word_context();
-                self.manual_current_word_flow =
-                    ManualCurrentWordFlow::DrainingDeferredInput { session };
                 Ok(())
             }
-            ManualCurrentWordOutcome::FailedAfterMutation(error) => {
+            ManualCurrentWordCompletionTransition::FailedAfterMutation { session, error } => {
                 log_input_debug(
                     "manual-current-word-completion",
                     &format!(
                         "request_id={} outcome=failed-after-mutation elapsed_ms={} deferred_len={} seen_real_next_step={} retry_after_drain_requested={} error={error}",
-                        completion.request_id,
+                        request_id,
                         session.started_at.elapsed().as_millis(),
                         deferred_len,
                         session.seen_real_next_step,
                         session.retry_after_drain_requested,
                     ),
                 );
-                self.runtime.invalidate_layout_and_request_refresh(
-                    "manual-current-word-failed-after-mutation",
-                );
                 self.abort_manual_current_word_flow("manual-current-word-failed-after-mutation");
                 Err(failed_manual_current_word_completion_error(
-                    completion.request_id,
-                    error,
+                    request_id, error,
                 ))
             }
         }
@@ -1838,7 +1921,7 @@ impl DaemonService {
         Ok(())
     }
 
-    fn request_manual_current_word_retry_after_drain(&mut self, _key: evdev::Key) {
+    fn request_manual_current_word_retry_after_drain(&mut self) {
         let session = match &mut self.manual_current_word_flow {
             ManualCurrentWordFlow::InFlight { session } => session,
             ManualCurrentWordFlow::CancelRequested { session } => session,
@@ -1893,24 +1976,15 @@ impl DaemonService {
             }
         }
 
-        if should_swallow_suppressed_undo_release(self.suppressed_undo_key, key, value) {
-            self.suppressed_undo_key = None;
-            return Ok(());
-        }
-
-        if should_clear_stale_suppressed_undo_on_press(self.suppressed_undo_key, key, value) {
-            log_input_debug(
-                "suppressed-undo-clear",
-                &format!("reason=stale-press key={key:?} value={value}"),
-            );
-            self.suppressed_undo_key = None;
-        }
-
-        if self.suppressed_undo_key == Some(key) {
-            if value == 0 {
-                self.suppressed_undo_key = None;
+        match self.suppressed_undo_keys.route_event(key, value) {
+            SuppressedUndoEventRouting::Swallow => return Ok(()),
+            SuppressedUndoEventRouting::ClearedStalePress => {
+                log_input_debug(
+                    "suppressed-undo-clear",
+                    &format!("reason=stale-press key={key:?} value={value}"),
+                );
             }
-            return Ok(());
+            SuppressedUndoEventRouting::PassThrough => {}
         }
 
         if should_swallow_suppressed_separator_release(self.suppressed_separator_key, key, value) {
@@ -1987,9 +2061,15 @@ impl DaemonService {
             origin,
         ) {
             ManualCurrentWordPhysicalEventAction::ProcessImmediately => {}
-            ManualCurrentWordPhysicalEventAction::Swallow => return Ok(()),
+            ManualCurrentWordPhysicalEventAction::Swallow => {
+                if value == 1 {
+                    self.suppressed_undo_keys.arm(key);
+                }
+                return Ok(());
+            }
             ManualCurrentWordPhysicalEventAction::RequestRetryAfterDrain => {
-                self.request_manual_current_word_retry_after_drain(key);
+                self.suppressed_undo_keys.arm(key);
+                self.request_manual_current_word_retry_after_drain();
                 return Ok(());
             }
             ManualCurrentWordPhysicalEventAction::Enqueue {
@@ -2133,12 +2213,14 @@ impl DaemonService {
             value,
             settings_hotkey_capture_inhibited,
         ) {
-            self.suppressed_undo_key = Some(key);
-            if should_request_manual_hotkey_retry_after_drain(
+            let flow_active = self.has_active_manual_current_word_flow();
+            if register_suppressed_manual_hotkey_press(
+                &mut self.suppressed_undo_keys,
+                key,
                 origin,
-                self.has_active_manual_current_word_flow(),
+                flow_active,
             ) {
-                self.request_manual_current_word_retry_after_drain(key);
+                self.request_manual_current_word_retry_after_drain();
                 return Ok(());
             }
             if self.begin_deferred_manual_current_word_correction(
@@ -3137,7 +3219,7 @@ impl DaemonService {
         );
         self.word_buffer_overflowed = false;
         self.suppressed_hotkey_key = None;
-        self.suppressed_undo_key = None;
+        self.suppressed_undo_keys.clear();
         self.manual_hotkey_latch = None;
         self.manual_current_word_flow = ManualCurrentWordFlow::Idle;
         self.suppressed_separator_key = None;
@@ -3260,10 +3342,12 @@ pub(crate) fn should_invalidate_for_wayland_focus_switch_shortcut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::runtime::ConfigService;
     use crate::model::{SelectedTextHotkey, SessionType, UndoKey};
     use evdev::Key;
     use std::cell::Cell;
     use std::collections::VecDeque;
+    use tempfile::TempDir;
 
     // Test helpers
 
@@ -5148,40 +5232,76 @@ mod tests {
 
     #[test]
     fn initiating_pause_release_is_swallowed_by_suppressed_undo_key() {
-        assert!(should_swallow_suppressed_undo_release(
-            Some(Key::KEY_PAUSE),
-            Key::KEY_PAUSE,
-            0,
+        let mut suppressed = SuppressedUndoKeys::default();
+        suppressed.arm(Key::KEY_PAUSE);
+        assert_eq!(
+            suppressed.route_event(Key::KEY_PAUSE, 0),
+            SuppressedUndoEventRouting::Swallow
+        );
+
+        suppressed.arm(Key::KEY_PAUSE);
+        assert_eq!(
+            suppressed.route_event(Key::KEY_PAUSE, 1),
+            SuppressedUndoEventRouting::ClearedStalePress
+        );
+
+        suppressed.arm(Key::KEY_PAUSE);
+        assert_eq!(
+            suppressed.route_event(Key::KEY_A, 0),
+            SuppressedUndoEventRouting::PassThrough
+        );
+    }
+
+    #[test]
+    fn reconfigured_replay_preserves_overlapping_hotkey_release_lifecycles() {
+        let mut suppressed = SuppressedUndoKeys::default();
+        assert!(!register_suppressed_manual_hotkey_press(
+            &mut suppressed,
+            Key::KEY_F12,
+            InputOrigin::Physical,
+            false,
         ));
-        assert!(!should_swallow_suppressed_undo_release(
-            Some(Key::KEY_PAUSE),
-            Key::KEY_PAUSE,
-            1,
-        ));
-        assert!(!should_swallow_suppressed_undo_release(
-            Some(Key::KEY_PAUSE),
+        assert!(register_suppressed_manual_hotkey_press(
+            &mut suppressed,
             Key::KEY_A,
-            0,
+            InputOrigin::DeferredReplay,
+            true,
         ));
+
+        let mut forwarded = Vec::new();
+        for (key, value) in [
+            (Key::KEY_A, 0),
+            (Key::KEY_F12, 0),
+            (Key::KEY_A, 0),
+            (Key::KEY_F12, 0),
+        ] {
+            if suppressed.route_event(key, value) == SuppressedUndoEventRouting::PassThrough {
+                forwarded.push((key, value));
+            }
+        }
+
+        assert_eq!(forwarded, vec![(Key::KEY_A, 0), (Key::KEY_F12, 0)]);
     }
 
     #[test]
     fn stale_suppressed_pause_press_is_cleared_for_keyboards_without_pause_release() {
-        assert!(should_clear_stale_suppressed_undo_on_press(
-            Some(Key::KEY_PAUSE),
-            Key::KEY_PAUSE,
-            1,
-        ));
-        assert!(!should_clear_stale_suppressed_undo_on_press(
-            Some(Key::KEY_PAUSE),
-            Key::KEY_PAUSE,
-            2,
-        ));
-        assert!(!should_clear_stale_suppressed_undo_on_press(
-            Some(Key::KEY_PAUSE),
-            Key::KEY_A,
-            1,
-        ));
+        let mut suppressed = SuppressedUndoKeys::default();
+        suppressed.arm(Key::KEY_PAUSE);
+        assert_eq!(
+            suppressed.route_event(Key::KEY_PAUSE, 1),
+            SuppressedUndoEventRouting::ClearedStalePress
+        );
+
+        suppressed.arm(Key::KEY_PAUSE);
+        assert_eq!(
+            suppressed.route_event(Key::KEY_PAUSE, 2),
+            SuppressedUndoEventRouting::Swallow
+        );
+
+        assert_eq!(
+            suppressed.route_event(Key::KEY_A, 1),
+            SuppressedUndoEventRouting::PassThrough
+        );
     }
 
     #[test]
@@ -5468,6 +5588,38 @@ mod tests {
 
         assert!(session.context_invalidated);
         assert!(matches!(flow, ManualCurrentWordFlow::Idle));
+    }
+
+    #[test]
+    fn cancelled_completion_enters_draining_and_invalidates_layout_snapshot() {
+        let temp = TempDir::new().unwrap();
+        let runtime =
+            RuntimeState::new(ConfigService::load(temp.path().join("config.toml")).unwrap());
+        let before = runtime.input_layout_epoch();
+        let mut flow = ManualCurrentWordFlow::InFlight {
+            session: deferred_flow_session(305),
+        };
+
+        let transition = transition_manual_current_word_completion(
+            &runtime,
+            &mut flow,
+            ManualCurrentWordCompletion {
+                request_id: 305,
+                outcome: ManualCurrentWordOutcome::Cancelled,
+            },
+        )
+        .expect("matching completion must transition the active flow");
+
+        assert!(matches!(
+            transition,
+            ManualCurrentWordCompletionTransition::Cancelled { .. }
+        ));
+        assert_eq!(runtime.input_layout_epoch(), before + 1);
+        assert!(matches!(
+            flow,
+            ManualCurrentWordFlow::DrainingDeferredInput { session }
+                if session.request_id == 305
+        ));
     }
 
     #[test]

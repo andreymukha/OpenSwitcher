@@ -35,8 +35,9 @@ pub trait LayoutSwitcher {
     ) -> Result<(), SwitcherError> {
         hooks.checkpoint()?;
         let result = self.switch_layout(combo);
-        hooks.checkpoint()?;
-        result
+        let checkpoint_result = hooks.checkpoint();
+        result?;
+        checkpoint_result
     }
 }
 
@@ -175,6 +176,19 @@ fn release_uinput_layout_keys(
     }
 }
 
+fn finish_uinput_layout_failure_after_cleanup(
+    error: SwitcherError,
+    cleanup_result: Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    if matches!(
+        error,
+        SwitcherError::VirtualKeyboardWriterTransactionCancelled { .. }
+    ) {
+        cleanup_result?;
+    }
+    Err(error)
+}
+
 fn execute_uinput_layout_switch_sequence(
     sink: &mut dyn UinputLayoutSink,
     combo: LayoutSwitchCombo,
@@ -187,24 +201,26 @@ fn execute_uinput_layout_switch_sequence(
 
     for key in modifiers.iter().chain(trigger_key) {
         if let Err(error) = ensure_active() {
-            let _ = release_uinput_layout_keys(sink, &pressed);
-            return Err(error);
+            let cleanup_result = release_uinput_layout_keys(sink, &pressed);
+            return finish_uinput_layout_failure_after_cleanup(error, cleanup_result);
         }
         if let Err(error) = sink.press_key(key) {
-            let _ = release_uinput_layout_keys(sink, &pressed);
-            return Err(error);
+            let cleanup_result = release_uinput_layout_keys(sink, &pressed);
+            return finish_uinput_layout_failure_after_cleanup(error, cleanup_result);
         }
         pressed.push(key);
     }
 
     if let Err(error) = sink.synchronize_keys() {
-        let _ = release_uinput_layout_keys(sink, &pressed);
-        return Err(error);
+        let cleanup_result = release_uinput_layout_keys(sink, &pressed);
+        return finish_uinput_layout_failure_after_cleanup(error, cleanup_result);
     }
     let wait_result = wait(delay);
     let release_result = release_uinput_layout_keys(sink, &pressed);
-    wait_result?;
-    release_result
+    match wait_result {
+        Ok(()) => release_result,
+        Err(error) => finish_uinput_layout_failure_after_cleanup(error, release_result),
+    }
 }
 
 impl<'a> LayoutSwitcher for UinputLayoutSwitcher<'a> {
@@ -234,13 +250,13 @@ fn execute_x11_layout_switch(
 ) -> Result<(), SwitcherError> {
     hooks.checkpoint()?;
     let num_groups = read_num_groups();
-    hooks.checkpoint()?;
     let num_groups = num_groups?;
+    hooks.checkpoint()?;
 
     hooks.checkpoint()?;
     let current_group = read_current_group();
-    hooks.checkpoint()?;
     let current_group = current_group?;
+    hooks.checkpoint()?;
 
     if num_groups <= 1 {
         return Ok(());
@@ -249,8 +265,9 @@ fn execute_x11_layout_switch(
     let next_group = (current_group + 1) % num_groups;
     hooks.authorize_mutation()?;
     let result = latch_group(next_group);
-    hooks.checkpoint()?;
-    result
+    let checkpoint_result = hooks.checkpoint();
+    result?;
+    checkpoint_result
 }
 
 pub struct X11LayoutSwitcher {
@@ -349,6 +366,8 @@ mod tests {
     #[derive(Default)]
     struct FakeUinputLayoutSink {
         events: Vec<String>,
+        release_calls: usize,
+        fail_release_on_call: Option<usize>,
     }
 
     impl UinputLayoutSink for FakeUinputLayoutSink {
@@ -358,8 +377,15 @@ mod tests {
         }
 
         fn release_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError> {
+            self.release_calls += 1;
             self.events.push(format!("up:{key:?}"));
-            Ok(())
+            if self.fail_release_on_call == Some(self.release_calls) {
+                Err(SwitcherError::Io(std::io::Error::other(
+                    "layout key release failed",
+                )))
+            } else {
+                Ok(())
+            }
         }
 
         fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
@@ -399,6 +425,131 @@ mod tests {
             sink.events,
             vec!["down:LeftControl", "up:LeftControl", "sync"]
         );
+    }
+
+    #[test]
+    fn uinput_layout_soft_cancel_does_not_mask_trigger_release_failure() {
+        let mut sink = FakeUinputLayoutSink {
+            fail_release_on_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = execute_uinput_layout_switch_sequence(
+            &mut sink,
+            LayoutSwitchCombo::CtrlSpace,
+            Duration::ZERO,
+            &|| Ok(()),
+            &|_| Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 203 }),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("layout key release failed"));
+        assert_eq!(
+            sink.events,
+            vec![
+                "down:LeftControl",
+                "down:Space",
+                "sync",
+                "up:Space",
+                "up:LeftControl",
+                "sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn uinput_layout_soft_cancel_between_presses_does_not_mask_cleanup_failure() {
+        let mut sink = FakeUinputLayoutSink {
+            fail_release_on_call: Some(1),
+            ..Default::default()
+        };
+        let checkpoint_calls = Cell::new(0);
+
+        let error = execute_uinput_layout_switch_sequence(
+            &mut sink,
+            LayoutSwitchCombo::CtrlSpace,
+            Duration::ZERO,
+            &|| {
+                let call = checkpoint_calls.get();
+                checkpoint_calls.set(call + 1);
+                if call == 1 {
+                    Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+                        request_id: 204,
+                    })
+                } else {
+                    Ok(())
+                }
+            },
+            &|_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("layout key release failed"));
+        assert_eq!(
+            sink.events,
+            vec!["down:LeftControl", "up:LeftControl", "sync"]
+        );
+    }
+
+    struct FailingDefaultHookLayoutSwitcher;
+
+    impl LayoutSwitcher for FailingDefaultHookLayoutSwitcher {
+        fn switch_layout(&mut self, _combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+            Err(SwitcherError::Io(std::io::Error::other(
+                "layout cleanup failed",
+            )))
+        }
+    }
+
+    #[test]
+    fn default_layout_hooks_do_not_mask_operation_failure_with_post_checkpoint_cancel() {
+        let mut switcher = FailingDefaultHookLayoutSwitcher;
+        let checkpoint_calls = Cell::new(0);
+        let checkpoint = || {
+            let call = checkpoint_calls.get();
+            checkpoint_calls.set(call + 1);
+            if call == 1 {
+                Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 205 })
+            } else {
+                Ok(())
+            }
+        };
+        let authorize = || Ok(());
+        let hooks = LayoutSwitchHooks::new(&checkpoint, &authorize);
+
+        let error = switcher
+            .switch_layout_with_hooks(LayoutSwitchCombo::CapsLock, &hooks)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("layout cleanup failed"));
+    }
+
+    #[test]
+    fn x11_latch_error_wins_over_post_mutation_soft_cancel() {
+        let cancelled = Cell::new(false);
+        let checkpoint = || {
+            if cancelled.get() {
+                Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 206 })
+            } else {
+                Ok(())
+            }
+        };
+        let authorize = || Ok(());
+        let hooks = LayoutSwitchHooks::new(&checkpoint, &authorize);
+
+        let error = execute_x11_layout_switch(
+            &hooks,
+            || Ok(2),
+            || Ok(0),
+            |_| {
+                cancelled.set(true);
+                Err(SwitcherError::Io(std::io::Error::other("x11 latch failed")))
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("x11 latch failed"));
+        assert!(hooks.mutation_was_authorized());
     }
 
     #[test]

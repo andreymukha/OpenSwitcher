@@ -291,6 +291,7 @@ struct WriterTransactionControl {
     deadline: Instant,
     state: Arc<AtomicU8>,
     soft_cancel_requested: Arc<AtomicBool>,
+    mutation_authorized: Arc<AtomicBool>,
     failure_request_id: Arc<AtomicU64>,
     stop_requested: Arc<AtomicBool>,
     terminal_gate: Arc<Mutex<()>>,
@@ -370,6 +371,7 @@ impl WriterTransactionControl {
                 .unwrap_or_else(Instant::now),
             state: Arc::new(AtomicU8::new(WriterTransactionState::Pending as u8)),
             soft_cancel_requested: Arc::new(AtomicBool::new(false)),
+            mutation_authorized: Arc::new(AtomicBool::new(false)),
             failure_request_id,
             stop_requested,
             terminal_gate,
@@ -666,7 +668,13 @@ impl WriterTransactionControl {
             .terminal_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.ensure_active_while_terminal_gate_is_held()
+        self.ensure_active_while_terminal_gate_is_held()?;
+        self.mutation_authorized.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn mutation_was_authorized(&self) -> bool {
+        self.mutation_authorized.load(Ordering::SeqCst)
     }
 
     fn authorize_cleanup_mutation_start(&self) -> Result<(), SwitcherError> {
@@ -3439,6 +3447,17 @@ fn sleep_for_transaction(
     }
 }
 
+fn finish_failed_operation_after_cleanup(
+    error: SwitcherError,
+    cleanup_result: Result<(), SwitcherError>,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    if is_matching_soft_cancel(&error, control) {
+        cleanup_result?;
+    }
+    Err(error)
+}
+
 fn release_modifiers(
     device: &mut uinput::Device,
     modifiers: ModifierState,
@@ -3458,22 +3477,22 @@ fn restore_modifiers(
     let mut restored = Vec::new();
     for key in pressed_uinput_modifier_keys(modifiers) {
         if let Err(error) = authorize_transaction_mutation(control) {
-            release_uinput_keys_best_effort(device, &restored);
-            return Err(error);
+            let cleanup_result = release_uinput_keys_best_effort(device, &restored);
+            return finish_failed_operation_after_cleanup(error, cleanup_result, control);
         }
         if let Err(error) = device.press(&key) {
-            release_uinput_keys_best_effort(device, &restored);
-            return Err(error.into());
+            let cleanup_result = release_uinput_keys_best_effort(device, &restored);
+            return finish_failed_operation_after_cleanup(error.into(), cleanup_result, control);
         }
         restored.push(key);
     }
     if let Err(error) = device.synchronize() {
-        release_uinput_keys_best_effort(device, &restored);
-        return Err(error.into());
+        let cleanup_result = release_uinput_keys_best_effort(device, &restored);
+        return finish_failed_operation_after_cleanup(error.into(), cleanup_result, control);
     }
     if let Err(error) = ensure_transaction_active(control) {
-        release_uinput_keys_best_effort(device, &restored);
-        return Err(error);
+        let cleanup_result = release_uinput_keys_best_effort(device, &restored);
+        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
     }
     Ok(())
 }
@@ -3512,11 +3531,24 @@ fn pressed_uinput_modifier_keys(modifiers: ModifierState) -> Vec<uinput::event::
 fn release_uinput_keys_best_effort(
     device: &mut uinput::Device,
     keys: &[uinput::event::keyboard::Key],
-) {
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
     for key in keys.iter().rev() {
-        let _ = device.release(key);
+        if let Err(error) = device.release(key) {
+            if first_error.is_none() {
+                first_error = Some(error.into());
+            }
+        }
     }
-    let _ = device.synchronize();
+    if let Err(error) = device.synchronize() {
+        if first_error.is_none() {
+            first_error = Some(error.into());
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 trait UinputShortcutSink {
@@ -3689,17 +3721,24 @@ fn is_case_sensitive_letter_key(key: Key) -> bool {
     )
 }
 
+struct XtestKeyDownAttempt {
+    // Once emit has started, its matching key-up is exception-safe cleanup for
+    // that exact attempt. Before that point no synthetic release is permitted.
+    mutation_attempted: bool,
+    result: Result<(), SwitcherError>,
+}
+
 trait CinnamonX11XtestReplay {
     fn prepare_for_layout_correction(
         &mut self,
         plan: &CorrectionPlan,
         control: Option<&WriterTransactionControl>,
     ) -> Result<(), SwitcherError>;
-    fn key_down(
+    fn key_down_attempt(
         &mut self,
         key: Key,
         control: Option<&WriterTransactionControl>,
-    ) -> Result<(), SwitcherError>;
+    ) -> XtestKeyDownAttempt;
     fn key_up(&mut self, key: Key) -> Result<(), SwitcherError>;
 }
 
@@ -3726,8 +3765,8 @@ fn validate_cinnamon_plan_keycodes_with(
     {
         ensure_transaction_active(control)?;
         let result = validate(key);
-        ensure_transaction_active(control)?;
         result?;
+        ensure_transaction_active(control)?;
     }
     Ok(())
 }
@@ -3738,8 +3777,9 @@ fn run_checked_external_call<T>(
 ) -> Result<T, SwitcherError> {
     ensure_transaction_active(control)?;
     let result = call();
+    let value = result?;
     ensure_transaction_active(control)?;
-    result
+    Ok(value)
 }
 
 fn cinnamon_xkb_target_group(num_groups: u8, current_group: u8) -> Result<u8, SwitcherError> {
@@ -3829,8 +3869,8 @@ impl CinnamonX11XtestReplayer {
                     .flush()
                     .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
             });
-        ensure_transaction_active(control)?;
         activation_result?;
+        ensure_transaction_active(control)?;
         let started = Instant::now();
         let mut last_xkb_group = None;
 
@@ -3942,7 +3982,7 @@ impl CinnamonX11XtestReplayer {
         stop_requested: Option<&AtomicBool>,
         terminal_gate: Option<&Mutex<()>>,
     ) -> Result<(), SwitcherError> {
-        validate_and_emit_xtest_key(
+        validate_and_emit_xtest_key_attempt(
             key,
             control,
             failure_request_id,
@@ -3950,6 +3990,26 @@ impl CinnamonX11XtestReplayer {
             terminal_gate,
             |key| self.validate_keycode(key, control),
             |keycode| self.emit_fake_key(keycode, pressed),
+        )
+        .result
+    }
+
+    fn fake_key_down_attempt(
+        &self,
+        key: Key,
+        control: Option<&WriterTransactionControl>,
+        failure_request_id: Option<&AtomicU64>,
+        stop_requested: Option<&AtomicBool>,
+        terminal_gate: Option<&Mutex<()>>,
+    ) -> XtestKeyDownAttempt {
+        validate_and_emit_xtest_key_attempt(
+            key,
+            control,
+            failure_request_id,
+            stop_requested,
+            terminal_gate,
+            |key| self.validate_keycode(key, control),
+            |keycode| self.emit_fake_key(keycode, true),
         )
     }
 
@@ -3960,18 +4020,65 @@ impl CinnamonX11XtestReplayer {
         stop_requested: &AtomicBool,
         terminal_gate: &Mutex<()>,
     ) -> Result<(), SwitcherError> {
-        let key_down_result = self.fake_key(
+        let key_down_attempt = self.fake_key_down_attempt(
             key,
-            true,
             None,
             Some(failure_request_id),
             Some(stop_requested),
             Some(terminal_gate),
         );
-        finish_fast_xtest_tap_attempt(key_down_result, || self.key_up(key))
+        finish_fast_xtest_tap_attempt(key_down_attempt, || self.key_up(key))
     }
 }
 
+fn validate_and_emit_xtest_key_attempt(
+    key: Key,
+    control: Option<&WriterTransactionControl>,
+    failure_request_id: Option<&AtomicU64>,
+    stop_requested: Option<&AtomicBool>,
+    terminal_gate: Option<&Mutex<()>>,
+    validate: impl FnOnce(Key) -> Result<u8, SwitcherError>,
+    emit: impl FnOnce(u8) -> Result<(), SwitcherError>,
+) -> XtestKeyDownAttempt {
+    let before_mutation = (|| {
+        ensure_transaction_active(control)?;
+        if let Some(failure_request_id) = failure_request_id {
+            ensure_writer_not_failed(failure_request_id)?;
+        }
+        let keycode = validate(key)?;
+        ensure_transaction_active(control)?;
+        if let Some(failure_request_id) = failure_request_id {
+            ensure_writer_not_failed(failure_request_id)?;
+        }
+        match (control, failure_request_id, stop_requested, terminal_gate) {
+            (Some(control), _, _, _) => control.authorize_mutation_start()?,
+            (None, Some(failure_request_id), Some(stop_requested), Some(terminal_gate)) => {
+                authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)?;
+            }
+            (None, Some(failure_request_id), _, None) => {
+                ensure_writer_not_failed(failure_request_id)?;
+            }
+            (None, None, _, _) => {}
+            (None, Some(_), None, Some(_)) => {
+                return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+            }
+        }
+        Ok(keycode)
+    })();
+
+    match before_mutation {
+        Ok(keycode) => XtestKeyDownAttempt {
+            mutation_attempted: true,
+            result: emit(keycode),
+        },
+        Err(error) => XtestKeyDownAttempt {
+            mutation_attempted: false,
+            result: Err(error),
+        },
+    }
+}
+
+#[cfg(test)]
 fn validate_and_emit_xtest_key(
     key: Key,
     control: Option<&WriterTransactionControl>,
@@ -3981,30 +4088,16 @@ fn validate_and_emit_xtest_key(
     validate: impl FnOnce(Key) -> Result<u8, SwitcherError>,
     emit: impl FnOnce(u8) -> Result<(), SwitcherError>,
 ) -> Result<(), SwitcherError> {
-    ensure_transaction_active(control)?;
-    if let Some(failure_request_id) = failure_request_id {
-        ensure_writer_not_failed(failure_request_id)?;
-    }
-    let keycode = validate(key);
-    ensure_transaction_active(control)?;
-    if let Some(failure_request_id) = failure_request_id {
-        ensure_writer_not_failed(failure_request_id)?;
-    }
-    let keycode = keycode?;
-    match (control, failure_request_id, stop_requested, terminal_gate) {
-        (Some(control), _, _, _) => control.authorize_mutation_start()?,
-        (None, Some(failure_request_id), Some(stop_requested), Some(terminal_gate)) => {
-            authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)?;
-        }
-        (None, Some(failure_request_id), _, None) => {
-            ensure_writer_not_failed(failure_request_id)?;
-        }
-        (None, None, _, _) => {}
-        (None, Some(_), None, Some(_)) => {
-            return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
-        }
-    }
-    emit(keycode)
+    validate_and_emit_xtest_key_attempt(
+        key,
+        control,
+        failure_request_id,
+        stop_requested,
+        terminal_gate,
+        validate,
+        emit,
+    )
+    .result
 }
 
 impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
@@ -4021,12 +4114,12 @@ impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
         self.activate_and_verify_group(target_group, control)
     }
 
-    fn key_down(
+    fn key_down_attempt(
         &mut self,
         key: Key,
         control: Option<&WriterTransactionControl>,
-    ) -> Result<(), SwitcherError> {
-        self.fake_key(key, true, control, None, None, None)
+    ) -> XtestKeyDownAttempt {
+        self.fake_key_down_attempt(key, control, None, None, None)
     }
 
     fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
@@ -4103,18 +4196,18 @@ fn restore_modifiers_xtest(
     let mut restored = Vec::new();
     for key in pressed_modifier_keys(modifiers) {
         if let Err(error) = ensure_transaction_active(control) {
-            release_xtest_keys_best_effort(replay, &restored);
-            return Err(error);
+            let cleanup_result = release_xtest_keys_best_effort(replay, &restored);
+            return finish_failed_operation_after_cleanup(error, cleanup_result, control);
         }
         if let Err(error) = xtest_key_down_exception_safe(replay, key, control) {
-            release_xtest_keys_best_effort(replay, &restored);
-            return Err(error);
+            let cleanup_result = release_xtest_keys_best_effort(replay, &restored);
+            return finish_failed_operation_after_cleanup(error, cleanup_result, control);
         }
         restored.push(key);
     }
     if let Err(error) = ensure_transaction_active(control) {
-        release_xtest_keys_best_effort(replay, &restored);
-        return Err(error);
+        let cleanup_result = release_xtest_keys_best_effort(replay, &restored);
+        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
     }
     Ok(())
 }
@@ -4124,18 +4217,34 @@ fn xtest_key_down_exception_safe(
     key: Key,
     control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
-    match replay.key_down(key, control) {
+    let attempt = replay.key_down_attempt(key, control);
+    if !attempt.mutation_attempted {
+        return attempt.result;
+    }
+    match attempt.result {
         Ok(()) => Ok(()),
         Err(error) => {
-            let _ = replay.key_up(key);
-            Err(error)
+            let cleanup_result = replay.key_up(key);
+            finish_failed_operation_after_cleanup(error, cleanup_result, control)
         }
     }
 }
 
-fn release_xtest_keys_best_effort(replay: &mut dyn CinnamonX11XtestReplay, keys: &[Key]) {
+fn release_xtest_keys_best_effort(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    keys: &[Key],
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
     for key in keys.iter().rev() {
-        let _ = replay.key_up(*key);
+        if let Err(error) = replay.key_up(*key) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -4175,9 +4284,9 @@ fn xtest_key_tap(
     control: Option<&WriterTransactionControl>,
 ) -> Result<(), SwitcherError> {
     ensure_transaction_active(control)?;
-    let key_down_result = replay.key_down(key, control);
+    let key_down_attempt = replay.key_down_attempt(key, control);
     complete_xtest_tap_attempt(
-        key_down_result,
+        key_down_attempt,
         || sleep_for_transaction(control, Duration::from_millis(2)),
         || replay.key_up(key),
         || sleep_for_transaction(control, delay),
@@ -4185,25 +4294,28 @@ fn xtest_key_tap(
 }
 
 fn complete_xtest_tap_attempt(
-    key_down_result: Result<(), SwitcherError>,
+    key_down_attempt: XtestKeyDownAttempt,
     transition_wait: impl FnOnce() -> Result<(), SwitcherError>,
     key_up: impl FnOnce() -> Result<(), SwitcherError>,
     final_wait: impl FnOnce() -> Result<(), SwitcherError>,
 ) -> Result<(), SwitcherError> {
+    if !key_down_attempt.mutation_attempted {
+        return key_down_attempt.result;
+    }
     let transition_result = transition_wait();
     let key_up_result = key_up();
-    key_down_result?;
-    transition_result?;
+    key_down_attempt.result?;
     key_up_result?;
+    transition_result?;
     final_wait()
 }
 
 fn finish_fast_xtest_tap_attempt(
-    key_down_result: Result<(), SwitcherError>,
+    key_down_attempt: XtestKeyDownAttempt,
     key_up: impl FnOnce() -> Result<(), SwitcherError>,
 ) -> Result<(), SwitcherError> {
     complete_xtest_tap_attempt(
-        key_down_result,
+        key_down_attempt,
         || {
             thread::sleep(Duration::from_millis(2));
             Ok(())
@@ -4227,13 +4339,15 @@ fn replay_xtest_stroke(
     ensure_transaction_active(control)?;
     xtest_key_down_exception_safe(replay, Key::KEY_LEFTSHIFT, control)?;
     if let Err(error) = sleep_for_transaction(control, Duration::from_millis(1)) {
-        let _ = replay.key_up(Key::KEY_LEFTSHIFT);
-        return Err(error);
+        let cleanup_result = replay.key_up(Key::KEY_LEFTSHIFT);
+        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
     }
     let tap_result = xtest_key_tap(replay, key, typing_delay, control);
     let shift_release_result = replay.key_up(Key::KEY_LEFTSHIFT);
-    tap_result?;
-    shift_release_result
+    match tap_result {
+        Ok(()) => shift_release_result,
+        Err(error) => finish_failed_operation_after_cleanup(error, shift_release_result, control),
+    }
 }
 
 fn run_cinnamon_x11_xtest_correction(
@@ -4431,15 +4545,20 @@ fn normalize_uinput_modifiers_after_soft_cancel(
     Ok(())
 }
 
-fn release_xtest_cleanup_keys_best_effort(
-    replay: &mut dyn CinnamonX11XtestReplay,
-    keys: &[Key],
+fn normalize_uinput_modifiers_after_soft_cancel_if_needed(
+    sink: &mut dyn UinputStrokeSink,
+    frozen: ModifierState,
     control: &WriterTransactionControl,
-) {
+) -> Result<(), SwitcherError> {
+    if !control.mutation_was_authorized() {
+        return Ok(());
+    }
+    normalize_uinput_modifiers_after_soft_cancel(sink, frozen, control)
+}
+
+fn release_xtest_cleanup_keys_best_effort(replay: &mut dyn CinnamonX11XtestReplay, keys: &[Key]) {
     for key in keys.iter().rev() {
-        if control.authorize_cleanup_mutation_start().is_ok() {
-            let _ = replay.key_up(*key);
-        }
+        let _ = replay.key_up(*key);
     }
 }
 
@@ -4462,17 +4581,31 @@ fn normalize_xtest_modifiers_after_soft_cancel(
     let mut restored = Vec::new();
     for key in pressed_modifier_keys(frozen) {
         if let Err(error) = control.authorize_cleanup_mutation_start() {
-            release_xtest_cleanup_keys_best_effort(replay, &restored, control);
+            release_xtest_cleanup_keys_best_effort(replay, &restored);
             return Err(error);
         }
-        if let Err(error) = replay.key_down(key, None) {
-            restored.push(key);
-            release_xtest_cleanup_keys_best_effort(replay, &restored, control);
+        let attempt = replay.key_down_attempt(key, None);
+        if let Err(error) = attempt.result {
+            if attempt.mutation_attempted {
+                restored.push(key);
+            }
+            release_xtest_cleanup_keys_best_effort(replay, &restored);
             return Err(error);
         }
         restored.push(key);
     }
     Ok(())
+}
+
+fn normalize_xtest_modifiers_after_soft_cancel_if_needed(
+    replay: &mut dyn CinnamonX11XtestReplay,
+    frozen: ModifierState,
+    control: &WriterTransactionControl,
+) -> Result<(), SwitcherError> {
+    if !control.mutation_was_authorized() {
+        return Ok(());
+    }
+    normalize_xtest_modifiers_after_soft_cancel(replay, frozen, control)
 }
 
 fn is_matching_soft_cancel(
@@ -4502,33 +4635,37 @@ fn replay_uinput_stroke(
         sink.write_key(Key::KEY_LEFTSHIFT, 1)?;
         pressed.push(Key::KEY_LEFTSHIFT);
         if let Err(error) = sink.synchronize_keys() {
-            let _ = release_uinput_stroke_keys(sink, &pressed);
-            return Err(error);
+            let cleanup_result = release_uinput_stroke_keys(sink, &pressed);
+            return finish_failed_operation_after_cleanup(error, cleanup_result, control);
         }
         if let Err(error) = sleep_for_transaction(control, Duration::from_millis(1)) {
-            let _ = release_uinput_stroke_keys(sink, &pressed);
-            return Err(error);
+            let cleanup_result = release_uinput_stroke_keys(sink, &pressed);
+            return finish_failed_operation_after_cleanup(error, cleanup_result, control);
         }
     }
 
     if let Err(error) = authorize_transaction_mutation(control) {
-        let _ = release_uinput_stroke_keys(sink, &pressed);
-        return Err(error);
+        let cleanup_result = release_uinput_stroke_keys(sink, &pressed);
+        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
     }
     if let Err(error) = sink.write_key(key, 1) {
-        let _ = release_uinput_stroke_keys(sink, &pressed);
-        return Err(error);
+        let cleanup_result = release_uinput_stroke_keys(sink, &pressed);
+        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
     }
     pressed.push(key);
     if let Err(error) = sink.synchronize_keys() {
-        let _ = release_uinput_stroke_keys(sink, &pressed);
-        return Err(error);
+        let cleanup_result = release_uinput_stroke_keys(sink, &pressed);
+        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
     }
 
     let transition_wait = sleep_for_transaction(control, Duration::from_millis(2));
     let release_result = release_uinput_stroke_keys(sink, &pressed);
-    transition_wait?;
-    release_result?;
+    match transition_wait {
+        Ok(()) => release_result?,
+        Err(error) => {
+            finish_failed_operation_after_cleanup(error, release_result, control)?;
+        }
+    }
     sleep_for_transaction(control, typing_delay)
 }
 
@@ -4586,7 +4723,7 @@ fn run_correction(
                 );
                 let outcome = match result {
                     Err(error) if is_matching_soft_cancel(&error, control) => {
-                        normalize_xtest_modifiers_after_soft_cancel(
+                        normalize_xtest_modifiers_after_soft_cancel_if_needed(
                             replay.as_mut(),
                             modifiers,
                             control.expect("matching soft cancel requires transaction control"),
@@ -4708,7 +4845,7 @@ fn run_correction(
     })();
     match result {
         Err(error) if is_matching_soft_cancel(&error, control) => {
-            normalize_uinput_modifiers_after_soft_cancel(
+            normalize_uinput_modifiers_after_soft_cancel_if_needed(
                 device,
                 modifiers,
                 control.expect("matching soft cancel requires transaction control"),
@@ -5695,14 +5832,24 @@ mod tests {
     struct FakeUinputStrokeSink {
         events: Vec<String>,
         cancel_on_sync: Option<WriterTransactionControl>,
+        soft_cancel_on_sync: Option<WriterTransactionControl>,
+        fail_write_on_call: Option<usize>,
+        write_calls: usize,
         fail_sync_on_call: Option<usize>,
         sync_calls: usize,
     }
 
     impl UinputStrokeSink for FakeUinputStrokeSink {
         fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
+            self.write_calls += 1;
             self.events.push(format!("key:{key:?}:{value}"));
-            Ok(())
+            if self.fail_write_on_call == Some(self.write_calls) {
+                Err(SwitcherError::Io(io::Error::other(
+                    "stroke key write failed",
+                )))
+            } else {
+                Ok(())
+            }
         }
 
         fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
@@ -5710,6 +5857,9 @@ mod tests {
             self.events.push("sync".to_string());
             if let Some(control) = self.cancel_on_sync.take() {
                 let _ = control.mark_timed_out();
+            }
+            if let Some(control) = self.soft_cancel_on_sync.take() {
+                let _ = control.request_soft_cancel();
             }
             if self.fail_sync_on_call == Some(self.sync_calls) {
                 return Err(SwitcherError::Io(io::Error::other("stroke sync failed")));
@@ -5786,8 +5936,11 @@ mod tests {
         prepare_error: Option<&'static str>,
         calls: Vec<String>,
         cancel_on_call: Option<usize>,
+        soft_cancel_on_call: Option<usize>,
         control: Option<WriterTransactionControl>,
         key_down_calls: usize,
+        pre_mutation_cancel_on_key_down_call: Option<usize>,
+        pre_mutation_fail_key_down_on_call: Option<usize>,
         fail_key_down_on_call: Option<usize>,
         key_up_calls: usize,
         fail_key_up_on_call: Option<usize>,
@@ -5799,6 +5952,11 @@ mod tests {
             if self.cancel_on_call == Some(self.calls.len()) {
                 if let Some(control) = &self.control {
                     let _ = control.mark_timed_out();
+                }
+            }
+            if self.soft_cancel_on_call == Some(self.calls.len()) {
+                if let Some(control) = &self.control {
+                    let _ = control.request_soft_cancel();
                 }
             }
         }
@@ -5817,17 +5975,37 @@ mod tests {
             Ok(())
         }
 
-        fn key_down(
+        fn key_down_attempt(
             &mut self,
             key: Key,
-            _control: Option<&WriterTransactionControl>,
-        ) -> Result<(), SwitcherError> {
+            control: Option<&WriterTransactionControl>,
+        ) -> XtestKeyDownAttempt {
             self.key_down_calls += 1;
+            if self.pre_mutation_cancel_on_key_down_call == Some(self.key_down_calls) {
+                let control = control.expect("pre-mutation cancel test requires control");
+                let _ = control.request_soft_cancel();
+                return XtestKeyDownAttempt {
+                    mutation_attempted: false,
+                    result: control.ensure_active(),
+                };
+            }
+            if self.pre_mutation_fail_key_down_on_call == Some(self.key_down_calls) {
+                return XtestKeyDownAttempt {
+                    mutation_attempted: false,
+                    result: Err(SwitcherError::Io(io::Error::other(
+                        "key down failed before mutation",
+                    ))),
+                };
+            }
             self.record_call(format!("down:{key:?}"));
-            if self.fail_key_down_on_call == Some(self.key_down_calls) {
+            let result = if self.fail_key_down_on_call == Some(self.key_down_calls) {
                 Err(SwitcherError::Io(io::Error::other("key down failed")))
             } else {
                 Ok(())
+            };
+            XtestKeyDownAttempt {
+                mutation_attempted: true,
+                result,
             }
         }
 
@@ -6003,6 +6181,133 @@ mod tests {
     }
 
     #[test]
+    fn soft_cancel_does_not_mask_xtest_key_up_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(214, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            soft_cancel_on_call: Some(1),
+            control: Some(control.clone()),
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = xtest_key_tap(
+            &mut replay,
+            Key::KEY_SPACE,
+            Duration::from_millis(1),
+            Some(&control),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("key up failed"));
+        assert!(matches!(
+            classify_manual_current_word_result(
+                214,
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                Err(error),
+            ),
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason),
+                Some(failure_reason),
+            ) if reason.contains("key up failed") && failure_reason.contains("key up failed")
+        ));
+    }
+
+    #[test]
+    fn xtest_soft_cancel_before_key_down_permit_emits_no_release() {
+        let control = WriterTransactionControl::with_timeout_for_test(227, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            pre_mutation_cancel_on_key_down_call: Some(1),
+            control: Some(control.clone()),
+            ..Default::default()
+        };
+
+        let error =
+            xtest_key_tap(&mut replay, Key::KEY_A, Duration::ZERO, Some(&control)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 227 }
+        ));
+        assert!(replay.calls.is_empty());
+        assert_eq!(replay.key_up_calls, 0);
+    }
+
+    #[test]
+    fn soft_cancel_during_xtest_shift_setup_does_not_mask_shift_release_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(218, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            soft_cancel_on_call: Some(1),
+            control: Some(control.clone()),
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+
+        let error = replay_xtest_stroke(
+            &mut replay,
+            Key::KEY_A,
+            true,
+            Duration::ZERO,
+            Some(&control),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("key up failed"));
+        assert!(matches!(
+            classify_manual_current_word_result(
+                218,
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                Err(error),
+            ),
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason),
+                Some(failure_reason),
+            ) if reason.contains("key up failed") && failure_reason.contains("key up failed")
+        ));
+    }
+
+    #[test]
+    fn soft_cancel_during_xtest_tap_does_not_mask_shift_release_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(219, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            soft_cancel_on_call: Some(2),
+            control: Some(control.clone()),
+            fail_key_up_on_call: Some(2),
+            ..Default::default()
+        };
+
+        let error = replay_xtest_stroke(
+            &mut replay,
+            Key::KEY_A,
+            true,
+            Duration::ZERO,
+            Some(&control),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("key up failed"));
+        assert!(matches!(
+            classify_manual_current_word_result(
+                219,
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                Err(error),
+            ),
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason),
+                Some(failure_reason),
+            ) if reason.contains("key up failed") && failure_reason.contains("key up failed")
+        ));
+    }
+
+    #[test]
     fn transactional_xtest_tap_releases_after_ambiguous_key_down_error_and_keeps_primary_error() {
         let mut replay = FakeCinnamonX11XtestReplay {
             fail_key_down_on_call: Some(1),
@@ -6112,7 +6417,10 @@ mod tests {
         let key_up_called = Cell::new(false);
 
         let error = finish_fast_xtest_tap_attempt(
-            Err(SwitcherError::Io(io::Error::other("fast key down failed"))),
+            XtestKeyDownAttempt {
+                mutation_attempted: true,
+                result: Err(SwitcherError::Io(io::Error::other("fast key down failed"))),
+            },
             || {
                 key_up_called.set(true);
                 Err(SwitcherError::Io(io::Error::other("fast key up failed")))
@@ -6126,12 +6434,39 @@ mod tests {
 
     #[test]
     fn fast_xtest_tap_returns_key_up_error_when_key_down_succeeds() {
-        let error = finish_fast_xtest_tap_attempt(Ok(()), || {
-            Err(SwitcherError::Io(io::Error::other("fast key up failed")))
-        })
+        let error = finish_fast_xtest_tap_attempt(
+            XtestKeyDownAttempt {
+                mutation_attempted: true,
+                result: Ok(()),
+            },
+            || Err(SwitcherError::Io(io::Error::other("fast key up failed"))),
+        )
         .unwrap_err();
 
         assert!(error.to_string().contains("fast key up failed"));
+    }
+
+    #[test]
+    fn fast_xtest_tap_skips_release_when_key_down_was_not_attempted() {
+        let key_up_called = Cell::new(false);
+
+        let error = finish_fast_xtest_tap_attempt(
+            XtestKeyDownAttempt {
+                mutation_attempted: false,
+                result: Err(SwitcherError::VirtualKeyboardWriterDisconnected),
+            },
+            || {
+                key_up_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+        assert!(!key_up_called.get());
     }
 
     #[test]
@@ -6207,6 +6542,73 @@ mod tests {
     }
 
     #[test]
+    fn soft_cancel_after_xtest_modifier_restore_does_not_mask_cleanup_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(224, Duration::from_secs(1));
+        let mut replay = FakeCinnamonX11XtestReplay {
+            soft_cancel_on_call: Some(1),
+            control: Some(control.clone()),
+            fail_key_up_on_call: Some(1),
+            ..Default::default()
+        };
+        let modifiers = ModifierState {
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+
+        let error = restore_modifiers_xtest(&mut replay, modifiers, Some(&control)).unwrap_err();
+
+        assert!(error.to_string().contains("key up failed"));
+        assert_eq!(replay.calls, vec!["down:KEY_LEFTCTRL", "up:KEY_LEFTCTRL"]);
+    }
+
+    #[test]
+    fn checked_external_call_error_wins_over_post_call_soft_cancel() {
+        let control = WriterTransactionControl::with_timeout_for_test(225, Duration::from_secs(1));
+
+        let error = run_checked_external_call(Some(&control), || {
+            assert_eq!(
+                control.request_soft_cancel(),
+                WriterSoftCancelRequest::Requested
+            );
+            Err::<(), _>(SwitcherError::Io(io::Error::other("external call failed")))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("external call failed"));
+    }
+
+    #[test]
+    fn xtest_validation_error_wins_over_post_validation_soft_cancel() {
+        let control = WriterTransactionControl::with_timeout_for_test(226, Duration::from_secs(1));
+        let emitted = Cell::new(false);
+
+        let error = validate_and_emit_xtest_key(
+            Key::KEY_A,
+            Some(&control),
+            None,
+            None,
+            None,
+            |_| {
+                assert_eq!(
+                    control.request_soft_cancel(),
+                    WriterSoftCancelRequest::Requested
+                );
+                Err(SwitcherError::Io(io::Error::other(
+                    "xtest validation failed",
+                )))
+            },
+            |_| {
+                emitted.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("xtest validation failed"));
+        assert!(!emitted.get());
+    }
+
+    #[test]
     fn shortcut_cleanup_attempts_every_release_and_sync_after_first_error() {
         use uinput::event::keyboard::Key as UinputKey;
 
@@ -6259,12 +6661,14 @@ mod tests {
             ..ModifierState::default()
         };
         let mut sink = FakeUinputStrokeSink::default();
+        control.authorize_mutation_start().unwrap();
         assert_eq!(
             control.request_soft_cancel(),
             WriterSoftCancelRequest::Requested
         );
 
-        normalize_uinput_modifiers_after_soft_cancel(&mut sink, frozen, &control).unwrap();
+        normalize_uinput_modifiers_after_soft_cancel_if_needed(&mut sink, frozen, &control)
+            .unwrap();
 
         assert_eq!(
             sink.events,
@@ -6293,12 +6697,14 @@ mod tests {
             ..ModifierState::default()
         };
         let mut replay = FakeCinnamonX11XtestReplay::default();
+        control.authorize_mutation_start().unwrap();
         assert_eq!(
             control.request_soft_cancel(),
             WriterSoftCancelRequest::Requested
         );
 
-        normalize_xtest_modifiers_after_soft_cancel(&mut replay, frozen, &control).unwrap();
+        normalize_xtest_modifiers_after_soft_cancel_if_needed(&mut replay, frozen, &control)
+            .unwrap();
 
         assert_eq!(
             replay.calls,
@@ -6317,6 +6723,44 @@ mod tests {
     }
 
     #[test]
+    fn soft_cancel_before_first_mutation_skips_uinput_normalization() {
+        let control = WriterTransactionControl::with_timeout_for_test(216, Duration::from_secs(1));
+        let frozen = ModifierState {
+            left_alt: true,
+            ..ModifierState::default()
+        };
+        let mut sink = FakeUinputStrokeSink::default();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        normalize_uinput_modifiers_after_soft_cancel_if_needed(&mut sink, frozen, &control)
+            .unwrap();
+
+        assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn soft_cancel_before_first_mutation_skips_xtest_normalization() {
+        let control = WriterTransactionControl::with_timeout_for_test(217, Duration::from_secs(1));
+        let frozen = ModifierState {
+            left_alt: true,
+            ..ModifierState::default()
+        };
+        let mut replay = FakeCinnamonX11XtestReplay::default();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        normalize_xtest_modifiers_after_soft_cancel_if_needed(&mut replay, frozen, &control)
+            .unwrap();
+
+        assert!(replay.calls.is_empty());
+    }
+
+    #[test]
     fn soft_cancel_modifier_normalization_error_is_not_reclassified_as_cancelled() {
         let control = WriterTransactionControl::with_timeout_for_test(213, Duration::from_secs(1));
         let frozen = ModifierState {
@@ -6328,13 +6772,15 @@ mod tests {
             fail_key_down_on_call: Some(2),
             ..Default::default()
         };
+        control.authorize_mutation_start().unwrap();
         assert_eq!(
             control.request_soft_cancel(),
             WriterSoftCancelRequest::Requested
         );
 
         let error =
-            normalize_xtest_modifiers_after_soft_cancel(&mut replay, frozen, &control).unwrap_err();
+            normalize_xtest_modifiers_after_soft_cancel_if_needed(&mut replay, frozen, &control)
+                .unwrap_err();
 
         assert!(error.to_string().contains("key down failed"));
         assert!(matches!(
@@ -6360,6 +6806,75 @@ mod tests {
     }
 
     #[test]
+    fn xtest_normalization_releases_restored_modifiers_after_pre_mutation_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(228, Duration::from_secs(1));
+        let frozen = ModifierState {
+            left_ctrl: true,
+            left_shift: true,
+            ..ModifierState::default()
+        };
+        let mut replay = FakeCinnamonX11XtestReplay {
+            pre_mutation_fail_key_down_on_call: Some(2),
+            ..Default::default()
+        };
+        control.authorize_mutation_start().unwrap();
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+
+        let error =
+            normalize_xtest_modifiers_after_soft_cancel(&mut replay, frozen, &control).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("key down failed before mutation"));
+        assert_eq!(
+            replay.calls,
+            vec![
+                "up:KEY_LEFTCTRL",
+                "up:KEY_RIGHTCTRL",
+                "up:KEY_LEFTSHIFT",
+                "up:KEY_RIGHTSHIFT",
+                "up:KEY_LEFTALT",
+                "up:KEY_RIGHTALT",
+                "up:KEY_LEFTMETA",
+                "up:KEY_RIGHTMETA",
+                "down:KEY_LEFTCTRL",
+                "up:KEY_LEFTCTRL",
+            ]
+        );
+    }
+
+    #[test]
+    fn xtest_normalization_balances_restored_modifier_after_terminal_race() {
+        let control = WriterTransactionControl::with_timeout_for_test(229, Duration::from_secs(1));
+        let frozen = ModifierState {
+            left_ctrl: true,
+            left_shift: true,
+            ..ModifierState::default()
+        };
+        let mut replay = FakeCinnamonX11XtestReplay {
+            cancel_on_call: Some(9),
+            control: Some(control.clone()),
+            ..Default::default()
+        };
+        control.authorize_mutation_start().unwrap();
+
+        let error =
+            normalize_xtest_modifiers_after_soft_cancel(&mut replay, frozen, &control).unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 229 }
+        ));
+        assert!(replay.calls.ends_with(&[
+            "down:KEY_LEFTCTRL".to_string(),
+            "up:KEY_LEFTCTRL".to_string()
+        ]));
+    }
+
+    #[test]
     fn generic_shifted_typing_cancellation_releases_shift_before_returning() {
         let control = WriterTransactionControl::with_timeout_for_test(90, Duration::from_secs(1));
         let mut sink = FakeUinputStrokeSink {
@@ -6379,6 +6894,68 @@ mod tests {
             sink.events,
             vec!["key:KEY_LEFTSHIFT:1", "sync", "key:KEY_LEFTSHIFT:0", "sync",]
         );
+    }
+
+    #[test]
+    fn soft_cancel_does_not_mask_uinput_key_release_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(215, Duration::from_secs(1));
+        let mut sink = FakeUinputStrokeSink {
+            soft_cancel_on_sync: Some(control.clone()),
+            fail_write_on_call: Some(2),
+            ..Default::default()
+        };
+
+        let error =
+            replay_uinput_stroke(&mut sink, Key::KEY_A, false, Duration::ZERO, Some(&control))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("stroke key write failed"));
+        assert!(matches!(
+            classify_manual_current_word_result(
+                215,
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                Err(error),
+            ),
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason),
+                Some(failure_reason),
+            ) if reason.contains("stroke key write failed")
+                && failure_reason.contains("stroke key write failed")
+        ));
+    }
+
+    #[test]
+    fn soft_cancel_during_uinput_shift_setup_does_not_mask_shift_release_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(221, Duration::from_secs(1));
+        let mut sink = FakeUinputStrokeSink {
+            soft_cancel_on_sync: Some(control.clone()),
+            fail_write_on_call: Some(2),
+            ..Default::default()
+        };
+
+        let error =
+            replay_uinput_stroke(&mut sink, Key::KEY_A, true, Duration::ZERO, Some(&control))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("stroke key write failed"));
+        assert!(matches!(
+            classify_manual_current_word_result(
+                221,
+                CorrectionPlan {
+                    buffer: Vec::new(),
+                    extra_backspaces: 0,
+                },
+                Err(error),
+            ),
+            (
+                ManualCurrentWordOutcome::FailedAfterMutation(reason),
+                Some(failure_reason),
+            ) if reason.contains("stroke key write failed")
+                && failure_reason.contains("stroke key write failed")
+        ));
     }
 
     #[test]

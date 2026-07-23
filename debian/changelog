@@ -1,3 +1,11 @@
+open-switcher (0.1.0-2) unstable; urgency=high
+
+  * Require acknowledged virtual keyboard writer shutdown before backend
+    recovery, and fail-stop the daemon for a clean systemd restart on timeout.
+  * Close the physical keyboard fd immediately if EVIOCGRAB release fails.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Thu, 23 Jul 2026 04:15:09 +0300
+
 open-switcher (0.1.0-1) unstable; urgency=medium
 
   * Initial public GitHub Release package.

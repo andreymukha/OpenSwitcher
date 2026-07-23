@@ -20,6 +20,24 @@ pub enum InputBackendState {
     Ready,
 }
 
+fn runtime_failure_recovery_state(error: &SwitcherError) -> Option<InputBackendState> {
+    match error {
+        SwitcherError::KeyboardNotFound
+        | SwitcherError::KeyboardAccessDenied { .. }
+        | SwitcherError::UinputAccessDenied { .. } => {
+            Some(InputBackendState::WaitingForInputAccess)
+        }
+        SwitcherError::InputWorkerDisconnected { .. } => Some(InputBackendState::Recovering),
+        SwitcherError::Io(io_error)
+            if matches!(io_error.raw_os_error(), Some(19))
+                || io_error.to_string().contains("No such device") =>
+        {
+            Some(InputBackendState::Recovering)
+        }
+        _ => None,
+    }
+}
+
 pub trait InputBackendHandle {
     fn shutdown(&mut self) -> WriterShutdownOutcome;
 }
@@ -214,25 +232,15 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
         }
     }
 
+    pub fn can_recover_runtime_failure(&self, error: &SwitcherError) -> bool {
+        self.writer_fail_stop.is_none() && runtime_failure_recovery_state(error).is_some()
+    }
+
     pub fn record_runtime_failure(&mut self, error: &SwitcherError, now: Instant) -> bool {
         if self.writer_fail_stop.is_some() {
             return false;
         }
-        let next_state = match error {
-            SwitcherError::KeyboardNotFound
-            | SwitcherError::KeyboardAccessDenied { .. }
-            | SwitcherError::UinputAccessDenied { .. } => {
-                Some(InputBackendState::WaitingForInputAccess)
-            }
-            SwitcherError::InputWorkerDisconnected { .. } => Some(InputBackendState::Recovering),
-            SwitcherError::Io(io_error)
-                if matches!(io_error.raw_os_error(), Some(19))
-                    || io_error.to_string().contains("No such device") =>
-            {
-                Some(InputBackendState::Recovering)
-            }
-            _ => None,
-        };
+        let next_state = runtime_failure_recovery_state(error);
 
         if let Some(next_state) = next_state {
             self.transition_with_retry(next_state, error, now);
@@ -752,7 +760,7 @@ mod tests {
     }
 
     #[test]
-    fn unresponsive_partial_backend_does_not_call_opener_again() {
+    fn unresponsive_writer_forbids_second_backend_install() {
         let opens = Rc::new(RefCell::new(0));
         let opener = FakeOpener {
             outcome: FakeOutcome::OkCounted {

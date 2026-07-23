@@ -98,7 +98,9 @@ pub fn run() -> Result<(), SwitcherError> {
         };
     finalize_daemon_run_with_postmortem(
         result,
-        || service.shutdown(),
+        || {
+            let _ = service.shutdown();
+        },
         || capture_owner_monitor.stop(),
         move || {
             if let Some(reason) = input_loop_postmortem {

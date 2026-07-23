@@ -8,9 +8,10 @@ use crate::daemon::input_snapshot::{
 };
 use crate::daemon::keyboard::{
     hotkey_trigger_to_evdev_key, is_character, is_modifier, is_wayland_focus_switch_shortcut,
-    log_input_debug, CorrectionLayoutSwitchOutcome, KeyboardController,
-    ManualCurrentWordCompletion, ManualCurrentWordOutcome, ManualCurrentWordStartOutcome,
-    ModifierState, SharedModifierState, INPUT_EVENT_WAIT_TIMEOUT,
+    log_input_debug, resolve_error_after_writer_shutdown, CorrectionLayoutSwitchOutcome,
+    KeyboardController, ManualCurrentWordCompletion, ManualCurrentWordOutcome,
+    ManualCurrentWordStartOutcome, ModifierState, SharedModifierState, WriterShutdownOutcome,
+    INPUT_EVENT_WAIT_TIMEOUT,
 };
 use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
@@ -162,11 +163,14 @@ enum CompletionBeforeWriterHealthError<E> {
     Health(E),
 }
 
-fn route_runtime_health_failure<E>(error: E, recover: impl FnOnce(&E) -> bool) -> Result<(), E> {
-    if recover(&error) {
-        Ok(())
-    } else {
-        Err(error)
+fn route_runtime_health_failure<E>(
+    error: E,
+    recover: impl FnOnce(&E) -> Result<bool, E>,
+) -> Result<(), E> {
+    match recover(&error) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(error),
+        Err(recovery_error) => Err(recovery_error),
     }
 }
 
@@ -178,12 +182,15 @@ enum DeferredInputRouting {
 
 fn route_deferred_input_result<E>(
     result: Result<(), E>,
-    recover: impl FnOnce(&E) -> bool,
+    recover: impl FnOnce(&E) -> Result<bool, E>,
 ) -> Result<DeferredInputRouting, E> {
     match result {
         Ok(()) => Ok(DeferredInputRouting::Continue),
-        Err(error) if recover(&error) => Ok(DeferredInputRouting::Recovered),
-        Err(error) => Err(error),
+        Err(error) => match recover(&error) {
+            Ok(true) => Ok(DeferredInputRouting::Recovered),
+            Ok(false) => Err(error),
+            Err(recovery_error) => Err(recovery_error),
+        },
     }
 }
 
@@ -233,12 +240,12 @@ where
     Ok(())
 }
 
-fn reset_capture_epoch_then_shutdown_backend<F>(
+fn reset_capture_epoch_then_shutdown_backend<F, R>(
     reset_result: Result<Option<LayoutSwitchCaptureState>, CaptureError>,
     shutdown_backend: F,
-) -> Option<LayoutSwitchCaptureState>
+) -> (Option<LayoutSwitchCaptureState>, R)
 where
-    F: FnOnce(),
+    F: FnOnce() -> R,
 {
     let state_change = match reset_result {
         Ok(state_change) => state_change,
@@ -248,20 +255,76 @@ where
         }
     };
 
-    shutdown_backend();
-    state_change
+    let shutdown_result = shutdown_backend();
+    (state_change, shutdown_result)
 }
 
 fn admit_input_backend_install<Backend>(
     mut backend: Backend,
     slot_occupied: bool,
-    release_backend: impl FnOnce(&mut Backend),
+    release_backend: impl FnOnce(&mut Backend) -> WriterShutdownOutcome,
 ) -> Result<Backend, SwitcherError> {
     if slot_occupied {
-        release_backend(&mut backend);
-        return Err(SwitcherError::InputBackendAlreadyActive);
+        let outcome = release_backend(&mut backend);
+        return Err(resolve_error_after_writer_shutdown(
+            SwitcherError::InputBackendAlreadyActive,
+            "backend-install",
+            outcome,
+        ));
     }
     Ok(backend)
+}
+
+fn recover_runtime_failure_after_backend_shutdown<State>(
+    state: &mut State,
+    error: &SwitcherError,
+    recoverable: bool,
+    shutdown_backend: impl FnOnce(&mut State) -> WriterShutdownOutcome,
+    commit_recovery: impl FnOnce(&mut State),
+) -> Result<bool, SwitcherError> {
+    if !recoverable {
+        return Ok(false);
+    }
+
+    match shutdown_backend(state) {
+        WriterShutdownOutcome::Stopped => {
+            commit_recovery(state);
+            Ok(true)
+        }
+        WriterShutdownOutcome::Unresponsive { timeout_ms } => {
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms,
+                phase: "runtime-recovery",
+                trigger: error.to_string(),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WriterShutdownLatch {
+    unresponsive: Option<WriterShutdownOutcome>,
+}
+
+impl WriterShutdownLatch {
+    fn observe(&mut self, outcome: WriterShutdownOutcome) -> WriterShutdownOutcome {
+        if let Some(latched) = self.unresponsive {
+            return latched;
+        }
+
+        if matches!(outcome, WriterShutdownOutcome::Unresponsive { .. }) {
+            self.unresponsive = Some(outcome);
+        }
+        outcome
+    }
+
+    fn observe_error(&mut self, error: &SwitcherError) {
+        if let SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { timeout_ms, .. } = error {
+            self.observe(WriterShutdownOutcome::Unresponsive {
+                timeout_ms: *timeout_ms,
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -864,6 +927,7 @@ pub struct DaemonService {
     input_snapshot: InputRuntimeSnapshot,
     signal_publisher: DbusSignalPublisher,
     input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
+    writer_shutdown_latch: WriterShutdownLatch,
     keyboard: Option<KeyboardController>,
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
@@ -893,6 +957,7 @@ impl DaemonService {
             input_snapshot,
             signal_publisher,
             input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
+            writer_shutdown_latch: WriterShutdownLatch::default(),
             keyboard: None,
             modifiers: ModifierState::default(),
             shared_modifiers,
@@ -922,7 +987,6 @@ impl DaemonService {
 
         'event_loop: loop {
             if self.runtime.should_exit() {
-                self.shutdown();
                 return Ok(());
             }
 
@@ -957,17 +1021,15 @@ impl DaemonService {
                 }
                 Err(WriterHealthyOperationError::Operation(error)) => {
                     log_input_debug("keyboard-read-error", &format!("error={error}"));
-                    if self.handle_runtime_input_failure(&error) {
+                    if self.handle_runtime_input_failure(&error)? {
                         continue;
                     }
-                    self.shutdown();
                     return Err(error);
                 }
             };
 
             if let Err(error) = self.poll_layout_switch_capture_expiry() {
                 log_input_debug("capture-expiry-poll-error", &format!("error={error}"));
-                self.shutdown();
                 return Err(error);
             }
 
@@ -1059,10 +1121,9 @@ impl DaemonService {
                     continue 'event_loop;
                 }
                 Err(WriterHealthyBatchError::Event(error)) => {
-                    if self.handle_runtime_input_failure(&error) {
+                    if self.handle_runtime_input_failure(&error)? {
                         continue 'event_loop;
                     }
-                    self.shutdown();
                     return Err(error);
                 }
             }
@@ -1073,17 +1134,14 @@ impl DaemonService {
             }) {
                 Ok(DeferredInputRouting::Continue) => {}
                 Ok(DeferredInputRouting::Recovered) => continue 'event_loop,
-                Err(error) => {
-                    self.shutdown();
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
         }
     }
 
-    pub fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) -> WriterShutdownOutcome {
         log_input_debug("event-loop-stop", "daemon input loop stopping");
-        self.drop_active_input_backend();
+        self.drop_active_input_backend()
     }
 
     fn event_fetch_timeout(&self) -> Duration {
@@ -1116,7 +1174,6 @@ impl DaemonService {
             .and_then(KeyboardController::writer_health_error);
         if let Err(error) = writer_health_result(error) {
             log_input_debug("writer-health-error", &format!("error={error}"));
-            self.shutdown();
             return Err(error);
         }
         Ok(())
@@ -1144,10 +1201,7 @@ impl DaemonService {
             DaemonService::ensure_input_backend_healthy,
         ) {
             Ok(()) => Ok(()),
-            Err(CompletionBeforeWriterHealthError::Completion(error)) => {
-                self.shutdown();
-                Err(error)
-            }
+            Err(CompletionBeforeWriterHealthError::Completion(error)) => Err(error),
             Err(CompletionBeforeWriterHealthError::Health(error)) => Err(error),
         }
     }
@@ -2570,13 +2624,17 @@ impl DaemonService {
         &mut self,
         opened: OpenedInputBackend<ActiveInputBackend>,
     ) -> Result<(), SwitcherError> {
-        let backend = admit_input_backend_install(
+        let backend = match admit_input_backend_install(
             opened.backend,
             self.keyboard.is_some() || self.selected_text_runner.is_some(),
-            |backend| {
-                let _ = InputBackendHandle::shutdown(backend);
-            },
-        )?;
+            InputBackendHandle::shutdown,
+        ) {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.writer_shutdown_latch.observe_error(&error);
+                return Err(error);
+            }
+        };
         let ActiveInputBackend {
             keyboard,
             selected_text_runner,
@@ -2591,31 +2649,41 @@ impl DaemonService {
         Ok(())
     }
 
-    fn handle_runtime_input_failure(&mut self, error: &SwitcherError) -> bool {
-        if self
-            .input_backend
-            .record_runtime_failure(error, Instant::now())
-        {
-            self.reset_transient_input_state("input-backend-unavailable");
-            self.drop_active_input_backend();
-            return true;
-        }
-
-        false
+    fn handle_runtime_input_failure(
+        &mut self,
+        error: &SwitcherError,
+    ) -> Result<bool, SwitcherError> {
+        let recoverable = self.input_backend.can_recover_runtime_failure(error);
+        let now = Instant::now();
+        recover_runtime_failure_after_backend_shutdown(
+            self,
+            error,
+            recoverable,
+            DaemonService::drop_active_input_backend,
+            |service| {
+                service.reset_transient_input_state("input-backend-unavailable");
+                let transitioned = service.input_backend.record_runtime_failure(error, now);
+                debug_assert!(transitioned);
+            },
+        )
     }
 
-    fn drop_active_input_backend(&mut self) {
+    fn drop_active_input_backend(&mut self) -> WriterShutdownOutcome {
         let reset_result = self.runtime.reset_layout_switch_capture_input_epoch();
-        let state_change = reset_capture_epoch_then_shutdown_backend(reset_result, || {
-            // Drop selected-text transport clones before stopping the writer so the
-            // virtual keyboard shutdown is not held open by an idle helper worker.
-            self.selected_text_runner = None;
+        let (state_change, outcome) =
+            reset_capture_epoch_then_shutdown_backend(reset_result, || {
+                // Drop selected-text transport clones before stopping the writer so the
+                // virtual keyboard shutdown is not held open by an idle helper worker.
+                self.selected_text_runner = None;
 
-            if let Some(mut keyboard) = self.keyboard.take() {
-                keyboard.shutdown();
-            }
-        });
+                if let Some(mut keyboard) = self.keyboard.take() {
+                    keyboard.shutdown()
+                } else {
+                    WriterShutdownOutcome::Stopped
+                }
+            });
         self.observe_layout_switch_capture_state_change(state_change);
+        self.writer_shutdown_latch.observe(outcome)
     }
 
     // Transient input state reset / invalidation
@@ -2907,16 +2975,23 @@ mod tests {
     }
 
     #[test]
-    fn capture_reset_backend_shutdown_runs_once_when_reset_lock_is_poisoned() {
+    fn capture_reset_returns_shutdown_outcome_when_lock_is_poisoned() {
         let mut shutdown_count = 0;
 
-        let state_change = reset_capture_epoch_then_shutdown_backend(
+        let (state_change, outcome) = reset_capture_epoch_then_shutdown_backend(
             Err(crate::error::CaptureError::LockPoisoned),
-            || shutdown_count += 1,
+            || {
+                shutdown_count += 1;
+                crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 }
+            },
         );
 
         assert_eq!(shutdown_count, 1);
         assert_eq!(state_change, None);
+        assert_eq!(
+            outcome,
+            crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 }
+        );
     }
 
     #[test]
@@ -2924,13 +2999,18 @@ mod tests {
         let mut shutdown_count = 0;
         let cancelled = LayoutSwitchCaptureState::cancelled();
 
-        let state_change =
+        let (state_change, outcome) =
             reset_capture_epoch_then_shutdown_backend(Ok(Some(cancelled.clone())), || {
-                shutdown_count += 1
+                shutdown_count += 1;
+                crate::daemon::keyboard::WriterShutdownOutcome::Stopped
             });
 
         assert_eq!(shutdown_count, 1);
         assert_eq!(state_change, Some(cancelled));
+        assert_eq!(
+            outcome,
+            crate::daemon::keyboard::WriterShutdownOutcome::Stopped
+        );
     }
 
     #[test]
@@ -2939,6 +3019,7 @@ mod tests {
 
         let result = admit_input_backend_install("new-backend", true, |backend| {
             phases.push(format!("release-{backend}"));
+            crate::daemon::keyboard::WriterShutdownOutcome::Stopped
         });
 
         assert!(matches!(
@@ -2946,6 +3027,95 @@ mod tests {
             Err(SwitcherError::InputBackendAlreadyActive)
         ));
         assert_eq!(phases, vec!["release-new-backend"]);
+    }
+
+    #[test]
+    fn occupied_install_slot_preserves_unresponsive_release_failure() {
+        let result = admit_input_backend_install("new-backend", true, |_| {
+            crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 }
+        });
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "backend-install",
+                ref trigger,
+            }) if trigger == "Cannot install a newly grabbed input backend while another backend is active"
+        ));
+    }
+
+    #[test]
+    fn runtime_recovery_state_changes_only_after_writer_stopped() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+            recovering: bool,
+        }
+
+        let mut state = State::default();
+        let error = SwitcherError::InputWorkerDisconnected {
+            worker: "pointer-watcher",
+        };
+        let recovered = recover_runtime_failure_after_backend_shutdown(
+            &mut state,
+            &error,
+            true,
+            |state| {
+                state.trace.push("shutdown");
+                crate::daemon::keyboard::WriterShutdownOutcome::Stopped
+            },
+            |state| {
+                state.trace.push("recovering");
+                state.recovering = true;
+            },
+        )
+        .unwrap();
+
+        assert!(recovered);
+        assert!(state.recovering);
+        assert_eq!(state.trace, vec!["shutdown", "recovering"]);
+    }
+
+    #[test]
+    fn runtime_recovery_propagates_unresponsive_shutdown() {
+        let mut recovery_committed = false;
+        let error = SwitcherError::InputWorkerDisconnected {
+            worker: "pointer-watcher",
+        };
+        let result = recover_runtime_failure_after_backend_shutdown(
+            &mut recovery_committed,
+            &error,
+            true,
+            |_| crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            |recovery_committed| *recovery_committed = true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "runtime-recovery",
+                ref trigger,
+            }) if trigger == "Input worker pointer-watcher is unavailable"
+        ));
+        assert!(!recovery_committed);
+    }
+
+    #[test]
+    fn service_latches_unresponsive_shutdown_across_repeated_calls() {
+        let mut latch = WriterShutdownLatch::default();
+
+        let first = latch.observe(
+            crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+        );
+        let repeated = latch.observe(crate::daemon::keyboard::WriterShutdownOutcome::Stopped);
+
+        assert_eq!(first, repeated);
+        assert_eq!(
+            repeated,
+            crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 }
+        );
     }
 
     #[test]
@@ -3074,7 +3244,7 @@ mod tests {
                     error,
                     SwitcherError::InputWorkerDisconnected { .. }
                 ));
-                true
+                Ok(true)
             },
         );
 
@@ -3086,7 +3256,7 @@ mod tests {
     fn fatal_runtime_health_failure_preserves_detailed_error() {
         let result = route_runtime_health_failure(
             SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 901 },
-            |_| false,
+            |_| Ok(false),
         );
 
         assert!(matches!(
@@ -3107,7 +3277,7 @@ mod tests {
                     error,
                     SwitcherError::InputWorkerDisconnected { .. }
                 ));
-                true
+                Ok(true)
             },
         );
 
@@ -3119,12 +3289,33 @@ mod tests {
     fn fatal_deferred_input_failure_preserves_detailed_error() {
         let result = route_deferred_input_result(
             Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 902 }),
-            |_| false,
+            |_| Ok(false),
         );
 
         assert!(matches!(
             result,
             Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 902 })
+        ));
+    }
+
+    #[test]
+    fn runtime_routing_propagates_unresponsive_shutdown() {
+        let result = route_runtime_health_failure(
+            SwitcherError::InputWorkerDisconnected {
+                worker: "pointer-watcher",
+            },
+            |_| {
+                Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                    timeout_ms: 1_000,
+                    phase: "runtime-recovery",
+                    trigger: "pointer watcher stopped".to_string(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
         ));
     }
 

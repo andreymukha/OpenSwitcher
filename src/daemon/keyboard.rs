@@ -2139,11 +2139,7 @@ fn should_enable_x11_input_target_watcher(session_type: SessionType) -> bool {
     session_type == SessionType::X11
 }
 
-pub(crate) fn is_wayland_focus_switch_shortcut(
-    modifiers: ModifierState,
-    key: Key,
-    value: i32,
-) -> bool {
+pub(crate) fn is_focus_switch_shortcut(modifiers: ModifierState, key: Key, value: i32) -> bool {
     if value != 1 || key != Key::KEY_TAB || modifiers.is_ctrl_pressed() {
         return false;
     }
@@ -5831,22 +5827,22 @@ mod tests {
 
     #[test]
     fn wayland_focus_switch_shortcut_matches_alt_or_super_tab() {
-        assert!(is_wayland_focus_switch_shortcut(
+        assert!(is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTALT, 1)]),
             Key::KEY_TAB,
             1,
         ));
-        assert!(is_wayland_focus_switch_shortcut(
+        assert!(is_focus_switch_shortcut(
             pressed(&[(Key::KEY_RIGHTALT, 1), (Key::KEY_LEFTSHIFT, 1)]),
             Key::KEY_TAB,
             1,
         ));
-        assert!(is_wayland_focus_switch_shortcut(
+        assert!(is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTMETA, 1)]),
             Key::KEY_TAB,
             1,
         ));
-        assert!(is_wayland_focus_switch_shortcut(
+        assert!(is_focus_switch_shortcut(
             pressed(&[(Key::KEY_RIGHTMETA, 1), (Key::KEY_RIGHTSHIFT, 1)]),
             Key::KEY_TAB,
             1,
@@ -5855,42 +5851,42 @@ mod tests {
 
     #[test]
     fn wayland_focus_switch_shortcut_rejects_non_focus_switch_events() {
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             ModifierState::default(),
             Key::KEY_TAB,
             1,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTSHIFT, 1)]),
             Key::KEY_TAB,
             1,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTCTRL, 1), (Key::KEY_LEFTALT, 1)]),
             Key::KEY_TAB,
             1,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTCTRL, 1), (Key::KEY_LEFTMETA, 1)]),
             Key::KEY_TAB,
             1,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTALT, 1)]),
             Key::KEY_A,
             1,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTMETA, 1)]),
             Key::KEY_A,
             1,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTALT, 1)]),
             Key::KEY_TAB,
             0,
         ));
-        assert!(!is_wayland_focus_switch_shortcut(
+        assert!(!is_focus_switch_shortcut(
             pressed(&[(Key::KEY_LEFTALT, 1)]),
             Key::KEY_TAB,
             2,

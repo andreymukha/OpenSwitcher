@@ -2573,7 +2573,9 @@ impl DaemonService {
         let backend = admit_input_backend_install(
             opened.backend,
             self.keyboard.is_some() || self.selected_text_runner.is_some(),
-            InputBackendHandle::shutdown,
+            |backend| {
+                let _ = InputBackendHandle::shutdown(backend);
+            },
         )?;
         let ActiveInputBackend {
             keyboard,

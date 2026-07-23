@@ -81,7 +81,7 @@ pub struct InputBackendReadiness {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WriterShutdownOutcome {
+pub enum WriterShutdownOutcome {
     Stopped,
     Unresponsive { timeout_ms: u64 },
 }
@@ -121,7 +121,7 @@ fn run_keyboard_shutdown_sequence(
     outcome
 }
 
-fn resolve_error_after_writer_shutdown(
+pub(crate) fn resolve_error_after_writer_shutdown(
     trigger: SwitcherError,
     phase: &'static str,
     outcome: WriterShutdownOutcome,
@@ -1405,6 +1405,10 @@ impl PreparedKeyboardController {
         modifiers: SharedModifierState,
     ) -> SelectionKeyboardTransport {
         self.controller.selection_transport(modifiers)
+    }
+
+    pub(crate) fn shutdown(&mut self) -> WriterShutdownOutcome {
+        self.controller.shutdown()
     }
 
     pub fn activate(mut self) -> Result<(KeyboardController, bool), SwitcherError> {

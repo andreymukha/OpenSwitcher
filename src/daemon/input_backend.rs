@@ -1,5 +1,6 @@
 use crate::daemon::keyboard::{
-    log_input_debug, InputBackendReadiness, KeyboardController, SharedModifierState,
+    log_input_debug, resolve_error_after_writer_shutdown, InputBackendReadiness,
+    KeyboardController, SharedModifierState, WriterShutdownOutcome,
 };
 use crate::daemon::selected_text::SelectedTextJobRunner;
 use crate::error::SwitcherError;
@@ -20,7 +21,7 @@ pub enum InputBackendState {
 }
 
 pub trait InputBackendHandle {
-    fn shutdown(&mut self);
+    fn shutdown(&mut self) -> WriterShutdownOutcome;
 }
 
 pub struct OpenedInputBackend<B: InputBackendHandle> {
@@ -44,14 +45,15 @@ pub struct ActiveInputBackend {
 }
 
 impl InputBackendHandle for ActiveInputBackend {
-    fn shutdown(&mut self) {
-        self.keyboard.shutdown();
+    fn shutdown(&mut self) -> WriterShutdownOutcome {
+        self.keyboard.shutdown()
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyboardInputBackendOpener;
 
+#[cfg(test)]
 fn finish_prepared_input_backend<Prepared, Active, Dependent, Error>(
     prepared: Prepared,
     prepare_dependent: impl FnOnce(&Prepared) -> Result<Dependent, Error>,
@@ -62,6 +64,15 @@ fn finish_prepared_input_backend<Prepared, Active, Dependent, Error>(
     Ok((active, dependent))
 }
 
+fn shutdown_backend_after_error(
+    backend: &mut impl InputBackendHandle,
+    error: SwitcherError,
+    phase: &'static str,
+) -> SwitcherError {
+    let outcome = backend.shutdown();
+    resolve_error_after_writer_shutdown(error, phase, outcome)
+}
+
 impl InputBackendOpener for KeyboardInputBackendOpener {
     type Backend = ActiveInputBackend;
 
@@ -69,34 +80,68 @@ impl InputBackendOpener for KeyboardInputBackendOpener {
         &self,
         shared_modifiers: SharedModifierState,
     ) -> Result<OpenedInputBackend<Self::Backend>, SwitcherError> {
-        let prepared_keyboard = KeyboardController::prepare()?;
-        let ((mut keyboard, initial_caps_lock_active), selected_text_runner) =
-            finish_prepared_input_backend(
-                prepared_keyboard,
-                |keyboard| {
-                    SelectedTextJobRunner::new(
-                        keyboard.selection_transport(shared_modifiers.clone()),
-                    )
-                },
-                |keyboard, selected_text_runner| {
-                    selected_text_runner.ensure_ready()?;
-                    keyboard.activate()
-                },
-            )?;
+        let mut prepared_keyboard = KeyboardController::prepare()?;
+        let selected_text_runner = match SelectedTextJobRunner::new(
+            prepared_keyboard.selection_transport(shared_modifiers),
+        ) {
+            Ok(runner) => runner,
+            Err(error) => {
+                let outcome = prepared_keyboard.shutdown();
+                return Err(resolve_error_after_writer_shutdown(
+                    error,
+                    "backend-open",
+                    outcome,
+                ));
+            }
+        };
         if let Err(error) = selected_text_runner.ensure_ready() {
-            keyboard.shutdown();
-            return Err(error);
+            drop(selected_text_runner);
+            let outcome = prepared_keyboard.shutdown();
+            return Err(resolve_error_after_writer_shutdown(
+                error,
+                "backend-open",
+                outcome,
+            ));
         }
-        let readiness = keyboard.readiness();
+        let (keyboard, initial_caps_lock_active) = match prepared_keyboard.activate() {
+            Ok(active) => active,
+            Err(error) => {
+                drop(selected_text_runner);
+                return Err(error);
+            }
+        };
+        let mut backend = ActiveInputBackend {
+            keyboard,
+            selected_text_runner,
+            initial_caps_lock_active,
+        };
+        if let Err(error) = backend.selected_text_runner.ensure_ready() {
+            return Err(shutdown_backend_after_error(
+                &mut backend,
+                error,
+                "backend-open",
+            ));
+        }
+        let readiness = backend.keyboard.readiness();
 
-        Ok(OpenedInputBackend {
-            backend: ActiveInputBackend {
-                keyboard,
-                selected_text_runner,
-                initial_caps_lock_active,
-            },
-            readiness,
-        })
+        Ok(OpenedInputBackend { backend, readiness })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LatchedWriterShutdownFailure {
+    timeout_ms: u64,
+    phase: &'static str,
+    trigger: String,
+}
+
+impl LatchedWriterShutdownFailure {
+    fn to_error(&self) -> SwitcherError {
+        SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+            timeout_ms: self.timeout_ms,
+            phase: self.phase,
+            trigger: self.trigger.clone(),
+        }
     }
 }
 
@@ -107,6 +152,7 @@ pub struct InputBackendLifecycle<O: InputBackendOpener> {
     retry_attempt: usize,
     retry_deadline: Option<Instant>,
     last_error: Option<String>,
+    writer_fail_stop: Option<LatchedWriterShutdownFailure>,
 }
 
 impl<O: InputBackendOpener> InputBackendLifecycle<O> {
@@ -117,6 +163,7 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
             retry_attempt: 0,
             retry_deadline: Some(Instant::now()),
             last_error: None,
+            writer_fail_stop: None,
         }
     }
 
@@ -133,7 +180,7 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
     }
 
     pub fn mark_backend_ready(&mut self, readiness: InputBackendReadiness) {
-        if readiness.is_ready() {
+        if self.writer_fail_stop.is_none() && readiness.is_ready() {
             self.transition_to_ready();
         }
     }
@@ -151,6 +198,9 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
         shared_modifiers: SharedModifierState,
         now: Instant,
     ) -> Result<Option<OpenedInputBackend<O::Backend>>, SwitcherError> {
+        if let Some(failure) = &self.writer_fail_stop {
+            return Err(failure.to_error());
+        }
         if self.state == InputBackendState::Ready || !self.retry_due(now) {
             return Ok(None);
         }
@@ -159,12 +209,15 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
     }
 
     pub fn record_startup_failure(&mut self, error: &SwitcherError, now: Instant) {
-        if error.is_recoverable_input_error() {
+        if self.writer_fail_stop.is_none() && error.is_recoverable_input_error() {
             self.transition_with_retry(InputBackendState::WaitingForInputAccess, error, now);
         }
     }
 
     pub fn record_runtime_failure(&mut self, error: &SwitcherError, now: Instant) -> bool {
+        if self.writer_fail_stop.is_some() {
+            return false;
+        }
         let next_state = match error {
             SwitcherError::KeyboardNotFound
             | SwitcherError::KeyboardAccessDenied { .. }
@@ -190,15 +243,20 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
     }
 
     pub fn retry_due(&self, now: Instant) -> bool {
-        self.retry_deadline.is_some_and(|deadline| now >= deadline)
+        self.writer_fail_stop.is_none()
+            && self.retry_deadline.is_some_and(|deadline| now >= deadline)
     }
 
     fn try_reopen(
         &mut self,
-        phase: &str,
+        phase: &'static str,
         shared_modifiers: SharedModifierState,
         now: Instant,
     ) -> Result<Option<OpenedInputBackend<O::Backend>>, SwitcherError> {
+        if let Some(failure) = &self.writer_fail_stop {
+            return Err(failure.to_error());
+        }
+
         match self.opener.reopen_backend(shared_modifiers) {
             Ok(mut opened) => {
                 if opened.readiness.is_ready() {
@@ -206,7 +264,7 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
                     return Ok(Some(opened));
                 }
 
-                opened.backend.shutdown();
+                let shutdown_outcome = opened.backend.shutdown();
                 log_input_debug(
                     "input-backend-transition",
                     &format!(
@@ -216,12 +274,22 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
                         opened.readiness,
                     ),
                 );
-                self.schedule_retry_with_reason(
-                    "input backend readiness incomplete".to_string(),
-                    now,
-                );
-                Ok(None)
+                let trigger = "input backend readiness incomplete".to_string();
+                match shutdown_outcome {
+                    WriterShutdownOutcome::Stopped => {
+                        self.schedule_retry_with_reason(trigger, now);
+                        Ok(None)
+                    }
+                    WriterShutdownOutcome::Unresponsive { timeout_ms } => {
+                        Err(self.latch_writer_fail_stop(timeout_ms, "backend-readiness", trigger))
+                    }
+                }
             }
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms,
+                phase,
+                trigger,
+            }) => Err(self.latch_writer_fail_stop(timeout_ms, phase, trigger)),
             Err(error) if error.is_recoverable_input_error() => {
                 log_input_debug(
                     "input-backend-transition",
@@ -239,6 +307,7 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
     }
 
     fn transition_to_ready(&mut self) {
+        debug_assert!(self.writer_fail_stop.is_none());
         self.state = InputBackendState::Ready;
         self.retry_attempt = 0;
         self.retry_deadline = None;
@@ -267,6 +336,31 @@ impl<O: InputBackendOpener> InputBackendLifecycle<O> {
         self.retry_deadline = Some(now + retry_delay_for_attempt(self.retry_attempt));
         self.retry_attempt += 1;
     }
+
+    fn latch_writer_fail_stop(
+        &mut self,
+        timeout_ms: u64,
+        phase: &'static str,
+        trigger: String,
+    ) -> SwitcherError {
+        let failure = LatchedWriterShutdownFailure {
+            timeout_ms,
+            phase,
+            trigger,
+        };
+        let error = failure.to_error();
+        log_input_debug(
+            "input-backend-transition",
+            &format!(
+                "phase={phase} previous_state={:?} next_state={:?} result=process-fail-stop error={error}",
+                self.state, self.state,
+            ),
+        );
+        self.retry_deadline = None;
+        self.last_error = Some(error.to_string());
+        self.writer_fail_stop = Some(failure);
+        error
+    }
 }
 
 fn retry_delay_for_attempt(attempt: usize) -> Duration {
@@ -279,6 +373,7 @@ fn retry_delay_for_attempt(attempt: usize) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::keyboard::WriterShutdownOutcome;
     use crate::error::SwitcherError;
     use std::cell::RefCell;
     use std::path::PathBuf;
@@ -288,11 +383,13 @@ mod tests {
     struct FakeBackend {
         active_backends: Option<Rc<RefCell<usize>>>,
         shutdowns: Rc<RefCell<usize>>,
+        shutdown_outcome: WriterShutdownOutcome,
     }
 
     impl InputBackendHandle for FakeBackend {
-        fn shutdown(&mut self) {
+        fn shutdown(&mut self) -> WriterShutdownOutcome {
             *self.shutdowns.borrow_mut() += 1;
+            self.shutdown_outcome
         }
     }
 
@@ -309,11 +406,19 @@ mod tests {
         Ok {
             shutdowns: Rc<RefCell<usize>>,
             readiness: InputBackendReadiness,
+            shutdown_outcome: WriterShutdownOutcome,
         },
         OkTracked {
             active_backends: Rc<RefCell<usize>>,
             shutdowns: Rc<RefCell<usize>>,
             readiness: InputBackendReadiness,
+            shutdown_outcome: WriterShutdownOutcome,
+        },
+        OkCounted {
+            opens: Rc<RefCell<usize>>,
+            shutdowns: Rc<RefCell<usize>>,
+            readiness: InputBackendReadiness,
+            shutdown_outcome: WriterShutdownOutcome,
         },
         KeyboardAccessDenied,
     }
@@ -335,10 +440,12 @@ mod tests {
                 FakeOutcome::Ok {
                     shutdowns,
                     readiness,
+                    shutdown_outcome,
                 } => Ok(OpenedInputBackend {
                     backend: FakeBackend {
                         active_backends: None,
                         shutdowns: shutdowns.clone(),
+                        shutdown_outcome: *shutdown_outcome,
                     },
                     readiness: *readiness,
                 }),
@@ -346,12 +453,30 @@ mod tests {
                     active_backends,
                     shutdowns,
                     readiness,
+                    shutdown_outcome,
                 } => {
                     *active_backends.borrow_mut() += 1;
                     Ok(OpenedInputBackend {
                         backend: FakeBackend {
                             active_backends: Some(active_backends.clone()),
                             shutdowns: shutdowns.clone(),
+                            shutdown_outcome: *shutdown_outcome,
+                        },
+                        readiness: *readiness,
+                    })
+                }
+                FakeOutcome::OkCounted {
+                    opens,
+                    shutdowns,
+                    readiness,
+                    shutdown_outcome,
+                } => {
+                    *opens.borrow_mut() += 1;
+                    Ok(OpenedInputBackend {
+                        backend: FakeBackend {
+                            active_backends: None,
+                            shutdowns: shutdowns.clone(),
+                            shutdown_outcome: *shutdown_outcome,
                         },
                         readiness: *readiness,
                     })
@@ -370,6 +495,15 @@ mod tests {
             writer_ready: true,
             watchers_ready: true,
             event_processing_ready: true,
+        }
+    }
+
+    fn incomplete_readiness() -> InputBackendReadiness {
+        InputBackendReadiness {
+            keyboard_open: true,
+            writer_ready: true,
+            watchers_ready: false,
+            event_processing_ready: false,
         }
     }
 
@@ -491,6 +625,7 @@ mod tests {
             outcome: FakeOutcome::Ok {
                 shutdowns: Rc::new(RefCell::new(0)),
                 readiness: ready_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);
@@ -509,6 +644,7 @@ mod tests {
             outcome: FakeOutcome::Ok {
                 shutdowns: Rc::new(RefCell::new(0)),
                 readiness: ready_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);
@@ -531,6 +667,7 @@ mod tests {
             outcome: FakeOutcome::Ok {
                 shutdowns: Rc::new(RefCell::new(0)),
                 readiness: ready_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);
@@ -548,6 +685,7 @@ mod tests {
             outcome: FakeOutcome::Ok {
                 shutdowns: Rc::new(RefCell::new(0)),
                 readiness: ready_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);
@@ -563,17 +701,13 @@ mod tests {
     }
 
     #[test]
-    fn try_recover_requires_full_readiness_and_shuts_down_partial_backend() {
+    fn incomplete_backend_with_clean_shutdown_schedules_retry() {
         let shutdowns = Rc::new(RefCell::new(0));
         let opener = FakeOpener {
             outcome: FakeOutcome::Ok {
                 shutdowns: shutdowns.clone(),
-                readiness: InputBackendReadiness {
-                    keyboard_open: true,
-                    writer_ready: true,
-                    watchers_ready: false,
-                    event_processing_ready: false,
-                },
+                readiness: incomplete_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);
@@ -585,6 +719,117 @@ mod tests {
         assert!(reopened.is_none());
         assert_eq!(lifecycle.state(), InputBackendState::WaitingForInputAccess);
         assert_eq!(*shutdowns.borrow(), 1);
+        assert!(lifecycle.retry_deadline().is_some());
+    }
+
+    #[test]
+    fn incomplete_backend_with_unresponsive_writer_returns_fatal_error() {
+        let shutdowns = Rc::new(RefCell::new(0));
+        let opener = FakeOpener {
+            outcome: FakeOutcome::Ok {
+                shutdowns: shutdowns.clone(),
+                readiness: incomplete_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+
+        let error = match lifecycle.try_recover(SharedModifierState::default(), Instant::now()) {
+            Err(error) => error,
+            Ok(_) => panic!("unresponsive partial backend must be fatal"),
+        };
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "backend-readiness",
+                ref trigger,
+            } if trigger == "input backend readiness incomplete"
+        ));
+        assert_eq!(*shutdowns.borrow(), 1);
+        assert!(lifecycle.retry_deadline().is_none());
+    }
+
+    #[test]
+    fn unresponsive_partial_backend_does_not_call_opener_again() {
+        let opens = Rc::new(RefCell::new(0));
+        let opener = FakeOpener {
+            outcome: FakeOutcome::OkCounted {
+                opens: Rc::clone(&opens),
+                shutdowns: Rc::new(RefCell::new(0)),
+                readiness: incomplete_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+        let now = Instant::now();
+
+        let first = lifecycle.try_recover(SharedModifierState::default(), now);
+        let second =
+            lifecycle.try_recover(SharedModifierState::default(), now + Duration::from_secs(5));
+
+        assert!(matches!(
+            first,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
+        ));
+        assert!(matches!(
+            second,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
+        ));
+        assert_eq!(*opens.borrow(), 1);
+    }
+
+    #[test]
+    fn post_activation_failure_preserves_original_error_after_clean_shutdown() {
+        let shutdowns = Rc::new(RefCell::new(0));
+        let mut backend = FakeBackend {
+            active_backends: None,
+            shutdowns: Rc::clone(&shutdowns),
+            shutdown_outcome: WriterShutdownOutcome::Stopped,
+        };
+
+        let error = shutdown_backend_after_error(
+            &mut backend,
+            SwitcherError::InputWorkerDisconnected {
+                worker: "selected-text-worker",
+            },
+            "backend-open",
+        );
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputWorkerDisconnected {
+                worker: "selected-text-worker"
+            }
+        ));
+        assert_eq!(*shutdowns.borrow(), 1);
+    }
+
+    #[test]
+    fn post_activation_failure_is_overridden_by_unresponsive_fail_stop() {
+        let mut backend = FakeBackend {
+            active_backends: None,
+            shutdowns: Rc::new(RefCell::new(0)),
+            shutdown_outcome: WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+        };
+
+        let error = shutdown_backend_after_error(
+            &mut backend,
+            SwitcherError::InputWorkerDisconnected {
+                worker: "selected-text-worker",
+            },
+            "backend-open",
+        );
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                timeout_ms: 1_000,
+                phase: "backend-open",
+                ref trigger,
+            } if trigger == "Input worker selected-text-worker is unavailable"
+        ));
     }
 
     #[test]
@@ -601,6 +846,7 @@ mod tests {
                     watchers_ready: false,
                     event_processing_ready: false,
                 },
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);
@@ -624,6 +870,7 @@ mod tests {
             outcome: FakeOutcome::Ok {
                 shutdowns: Rc::new(RefCell::new(0)),
                 readiness: ready_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
             },
         };
         let mut lifecycle = InputBackendLifecycle::new(opener);

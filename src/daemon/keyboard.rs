@@ -290,6 +290,7 @@ struct WriterTransactionControl {
     request_id: u64,
     deadline: Instant,
     state: Arc<AtomicU8>,
+    soft_cancel_requested: Arc<AtomicBool>,
     failure_request_id: Arc<AtomicU64>,
     stop_requested: Arc<AtomicBool>,
     terminal_gate: Arc<Mutex<()>>,
@@ -308,6 +309,14 @@ enum WriterCompletionPublication {
     Completed,
     Cancelled,
     ReceiverDisconnected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriterSoftCancelRequest {
+    Requested,
+    AlreadyRequested,
+    AlreadyCompleted,
+    Terminal,
 }
 
 impl WriterTransactionState {
@@ -360,6 +369,7 @@ impl WriterTransactionControl {
                 .checked_add(timeout)
                 .unwrap_or_else(Instant::now),
             state: Arc::new(AtomicU8::new(WriterTransactionState::Pending as u8)),
+            soft_cancel_requested: Arc::new(AtomicBool::new(false)),
             failure_request_id,
             stop_requested,
             terminal_gate,
@@ -381,6 +391,7 @@ impl WriterTransactionControl {
 
     fn is_cancelled(&self) -> bool {
         self.state() == WriterTransactionState::TimedOut
+            || self.soft_cancel_requested.load(Ordering::SeqCst)
             || self.stop_requested.load(Ordering::SeqCst)
             || self.failure_request_id.load(Ordering::SeqCst) != 0
     }
@@ -406,8 +417,40 @@ impl WriterTransactionControl {
             self.timed_out_error()
         } else if self.stop_requested.load(Ordering::SeqCst) {
             SwitcherError::VirtualKeyboardWriterDisconnected
+        } else if self.soft_cancel_requested.load(Ordering::SeqCst) {
+            SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+                request_id: self.request_id(),
+            }
         } else {
             self.timed_out_error()
+        }
+    }
+
+    fn request_soft_cancel(&self) -> WriterSoftCancelRequest {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop_requested.load(Ordering::SeqCst)
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+        {
+            return WriterSoftCancelRequest::Terminal;
+        }
+        match self.state() {
+            WriterTransactionState::Completed => {
+                return WriterSoftCancelRequest::AlreadyCompleted;
+            }
+            WriterTransactionState::TimedOut => return WriterSoftCancelRequest::Terminal,
+            WriterTransactionState::Pending => {}
+        }
+        if Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return WriterSoftCancelRequest::Terminal;
+        }
+        if self.soft_cancel_requested.swap(true, Ordering::SeqCst) {
+            WriterSoftCancelRequest::AlreadyRequested
+        } else {
+            WriterSoftCancelRequest::Requested
         }
     }
 
@@ -468,6 +511,9 @@ impl WriterTransactionControl {
             let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
             return WriterCompletionPublication::Cancelled;
         }
+        if self.soft_cancel_requested.load(Ordering::SeqCst) {
+            return WriterCompletionPublication::Cancelled;
+        }
         if !publish_reply() {
             return WriterCompletionPublication::ReceiverDisconnected;
         }
@@ -482,6 +528,48 @@ impl WriterTransactionControl {
             )
             .is_ok();
         debug_assert!(completed, "terminal gate must serialize completion");
+        if completed {
+            WriterCompletionPublication::Completed
+        } else {
+            WriterCompletionPublication::Cancelled
+        }
+    }
+
+    fn publish_soft_cancelled_with(
+        &self,
+        publish_reply: impl FnOnce() -> bool,
+    ) -> WriterCompletionPublication {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop_requested.load(Ordering::SeqCst)
+            || self.failure_request_id.load(Ordering::SeqCst) != 0
+            || self.state() != WriterTransactionState::Pending
+        {
+            return WriterCompletionPublication::Cancelled;
+        }
+        if Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return WriterCompletionPublication::Cancelled;
+        }
+        if !self.soft_cancel_requested.load(Ordering::SeqCst) {
+            return WriterCompletionPublication::Cancelled;
+        }
+        if !publish_reply() {
+            return WriterCompletionPublication::ReceiverDisconnected;
+        }
+
+        let completed = self
+            .state
+            .compare_exchange(
+                WriterTransactionState::Pending as u8,
+                WriterTransactionState::Completed as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok();
+        debug_assert!(completed, "terminal gate must serialize soft cancellation");
         if completed {
             WriterCompletionPublication::Completed
         } else {
@@ -518,6 +606,11 @@ impl WriterTransactionControl {
             let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
             return Err(self.timed_out_error());
         }
+        if self.soft_cancel_requested.load(Ordering::SeqCst) {
+            return Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled {
+                request_id: self.request_id(),
+            });
+        }
         Ok(())
     }
 
@@ -535,6 +628,35 @@ impl WriterTransactionControl {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.ensure_active_while_terminal_gate_is_held()
+    }
+
+    fn authorize_cleanup_mutation_start(&self) -> Result<(), SwitcherError> {
+        let _terminal_guard = self
+            .terminal_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.stop_requested.load(Ordering::SeqCst) {
+            return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+        }
+        if self.failure_request_id.load(Ordering::SeqCst) != 0 {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return Err(self.timed_out_error());
+        }
+        match self.state() {
+            WriterTransactionState::Pending => {}
+            WriterTransactionState::TimedOut => return Err(self.timed_out_error()),
+            WriterTransactionState::Completed => {
+                return Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: self.request_id(),
+                    reason: "transaction is already completed".to_string(),
+                });
+            }
+        }
+        if Instant::now() >= self.deadline {
+            let _ = self.try_mark_timed_out_while_terminal_gate_is_held();
+            return Err(self.timed_out_error());
+        }
+        Ok(())
     }
 
     fn try_request_stop_for_input_worker_loss(&self) -> bool {
@@ -7523,6 +7645,92 @@ mod tests {
         assert!(!mutation_started.get());
         assert_eq!(control.state(), WriterTransactionState::Completed);
         assert_eq!(failure.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn soft_cancel_wins_before_next_mutation_permit() {
+        let control = WriterTransactionControl::with_timeout_for_test(201, Duration::from_secs(1));
+
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+        assert!(matches!(
+            control.authorize_mutation_start(),
+            Err(SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 201 })
+        ));
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::AlreadyRequested
+        );
+    }
+
+    #[test]
+    fn completed_publication_wins_before_late_soft_cancel() {
+        let control = WriterTransactionControl::with_timeout_for_test(202, Duration::from_secs(1));
+
+        assert!(control.publish_completed());
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::AlreadyCompleted
+        );
+    }
+
+    #[test]
+    fn soft_cancelled_publication_completes_without_global_writer_failure() {
+        let control = WriterTransactionControl::with_timeout_for_test(203, Duration::from_secs(1));
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+        assert!(!control.publish_completed());
+        assert_eq!(control.state(), WriterTransactionState::Pending);
+        let mut published = false;
+
+        assert_eq!(
+            control.publish_soft_cancelled_with(|| {
+                published = true;
+                true
+            }),
+            WriterCompletionPublication::Completed
+        );
+        assert!(published);
+        assert_eq!(control.state(), WriterTransactionState::Completed);
+        assert_eq!(control.failure_request_id.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn soft_cancel_does_not_mask_later_global_stop() {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let control = WriterTransactionControl::new_with_writer_state(
+            204,
+            Duration::from_secs(1),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&stop_requested),
+            Arc::clone(&terminal_gate),
+        );
+        assert_eq!(
+            control.request_soft_cancel(),
+            WriterSoftCancelRequest::Requested
+        );
+        {
+            let _terminal_guard = terminal_gate.lock().unwrap();
+            stop_requested.store(true, Ordering::SeqCst);
+        }
+
+        assert!(matches!(
+            control.authorize_cleanup_mutation_start(),
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert_eq!(
+            control.publish_soft_cancelled_with(|| true),
+            WriterCompletionPublication::Cancelled
+        );
+        assert!(matches!(
+            control.cancellation_error(),
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
     }
 
     #[test]

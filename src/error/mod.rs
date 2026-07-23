@@ -133,8 +133,12 @@ pub enum SwitcherError {
     VirtualKeyboardWriterSaturated,
     #[error("Virtual keyboard writer transaction {request_id} exceeded its deadline")]
     VirtualKeyboardWriterTransactionTimedOut { request_id: u64 },
+    #[error("Virtual keyboard writer transaction {request_id} was cancelled")]
+    VirtualKeyboardWriterTransactionCancelled { request_id: u64 },
     #[error("Virtual keyboard writer transaction {request_id} failed after mutation: {reason}")]
     VirtualKeyboardWriterTransactionFailed { request_id: u64, reason: String },
+    #[error("Deferred physical input reached emergency capacity {limit}")]
+    DeferredInputCapacityExceeded { limit: usize },
     #[error(transparent)]
     InputWorkValidation(#[from] ValidationError),
     #[error(transparent)]

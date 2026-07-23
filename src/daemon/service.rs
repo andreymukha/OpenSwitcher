@@ -27,6 +27,7 @@ use crate::model::{
     HotkeyModifiers, HotkeySpec, LayoutSwitchCaptureState, SessionType, MAX_CORRECTION_KEYSTROKES,
 };
 use evdev::InputEventKind;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use zbus::blocking::Connection;
@@ -156,14 +157,92 @@ enum WriterHealthyBatchError<E> {
     Event(E),
 }
 
-enum WriterHealthyOperationError<E> {
-    Health(E),
+enum WriterHealthyFetchError<E> {
+    Health {
+        error: E,
+        accepted: VecDeque<DeferredInputEvent>,
+    },
     Operation(E),
 }
 
 enum CompletionBeforeWriterHealthError<E> {
     Completion(E),
     Health(E),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InputTailReconciliation {
+    reconciled: usize,
+    reason: &'static str,
+    #[cfg(test)]
+    sequence_ids: Vec<u64>,
+}
+
+fn reconcile_fetched_tail(
+    events: &mut VecDeque<DeferredInputEvent>,
+    reason: &'static str,
+) -> InputTailReconciliation {
+    let reconciled = events.len();
+    #[cfg(test)]
+    let sequence_ids = events.iter().map(|event| event.sequence_id).collect();
+    events.clear();
+    InputTailReconciliation {
+        reconciled,
+        reason,
+        #[cfg(test)]
+        sequence_ids,
+    }
+}
+
+fn log_fetched_tail_reconciliation(report: &InputTailReconciliation) {
+    if report.reconciled == 0 {
+        return;
+    }
+
+    eprintln!(
+        "OpenSwitcher: undelivered input tail reconciled: count={} reason={}",
+        report.reconciled, report.reason,
+    );
+    log_input_debug(
+        "input-tail-reconciliation",
+        &format!("reconciled={} reason={}", report.reconciled, report.reason,),
+    );
+}
+
+fn retain_fetched_tail_reconciliation(
+    pending: &mut Option<InputTailReconciliation>,
+    report: InputTailReconciliation,
+) {
+    if report.reconciled == 0 {
+        return;
+    }
+
+    if let Some(pending) = pending {
+        pending.reconciled = pending.reconciled.saturating_add(report.reconciled);
+        pending.reason = "multiple-terminal-input-tails";
+        #[cfg(test)]
+        pending.sequence_ids.extend(report.sequence_ids);
+    } else {
+        *pending = Some(report);
+    }
+}
+
+fn reconcile_and_retain_fetched_tail(
+    events: &mut VecDeque<DeferredInputEvent>,
+    pending: &mut Option<InputTailReconciliation>,
+    reason: &'static str,
+) {
+    let report = reconcile_fetched_tail(events, reason);
+    retain_fetched_tail_reconciliation(pending, report);
+}
+
+fn flush_retained_fetched_tail_reconciliation(
+    pending: &mut Option<InputTailReconciliation>,
+    publish: impl FnOnce(&InputTailReconciliation),
+) {
+    if let Some(report) = pending.take() {
+        publish(&report);
+    }
 }
 
 fn route_runtime_health_failure<E>(
@@ -210,35 +289,49 @@ where
     ensure_health(state).map_err(CompletionBeforeWriterHealthError::Health)
 }
 
-fn run_writer_healthy_operation<State, Output, E, Health, Operation>(
+fn run_writer_healthy_fetch<State, RawEvents, E, Health, Fetch, Accept>(
     state: &mut State,
     mut ensure_healthy: Health,
-    operation: Operation,
-) -> Result<Output, WriterHealthyOperationError<E>>
+    fetch: Fetch,
+    accept: Accept,
+) -> Result<VecDeque<DeferredInputEvent>, WriterHealthyFetchError<E>>
 where
     Health: FnMut(&mut State) -> Result<(), E>,
-    Operation: FnOnce(&mut State) -> Result<Output, E>,
+    Fetch: FnOnce(&mut State) -> Result<RawEvents, E>,
+    Accept: FnOnce(&mut State, RawEvents) -> VecDeque<DeferredInputEvent>,
 {
-    ensure_healthy(state).map_err(WriterHealthyOperationError::Health)?;
-    let operation_result = operation(state);
-    ensure_healthy(state).map_err(WriterHealthyOperationError::Health)?;
-    operation_result.map_err(WriterHealthyOperationError::Operation)
+    ensure_healthy(state).map_err(|error| WriterHealthyFetchError::Health {
+        error,
+        accepted: VecDeque::new(),
+    })?;
+    let accepted_result = fetch(state).map(|raw_events| accept(state, raw_events));
+    if let Err(error) = ensure_healthy(state) {
+        let accepted = match accepted_result {
+            Ok(accepted) => accepted,
+            Err(_) => VecDeque::new(),
+        };
+        return Err(WriterHealthyFetchError::Health { error, accepted });
+    }
+    accepted_result.map_err(WriterHealthyFetchError::Operation)
 }
 
-fn process_writer_healthy_batch<State, Events, Event, E, Health, Handle>(
+fn process_writer_healthy_batch<State, E, Health, Handle>(
     state: &mut State,
-    events: Events,
+    events: &mut VecDeque<DeferredInputEvent>,
     mut ensure_healthy: Health,
     mut handle_event: Handle,
 ) -> Result<(), WriterHealthyBatchError<E>>
 where
-    Events: IntoIterator<Item = Event>,
     Health: FnMut(&mut State) -> Result<(), E>,
-    Handle: FnMut(&mut State, Event) -> Result<(), E>,
+    Handle: FnMut(&mut State, DeferredInputEvent) -> Result<(), E>,
 {
-    for event in events {
+    while let Some(event) = events.front().copied() {
         ensure_healthy(state).map_err(WriterHealthyBatchError::Health)?;
         handle_event(state, event).map_err(WriterHealthyBatchError::Event)?;
+        let acknowledged = events
+            .pop_front()
+            .expect("peeked fetched input head must still be current");
+        debug_assert_eq!(acknowledged.sequence_id, event.sequence_id);
     }
     Ok(())
 }
@@ -260,6 +353,21 @@ where
 
     let shutdown_result = shutdown_backend();
     (state_change, shutdown_result)
+}
+
+fn shutdown_backend_then_reconcile<State, R, Shutdown, Reconcile>(
+    state: &mut State,
+    shutdown: Shutdown,
+    reconcile: Reconcile,
+) -> R
+where
+    R: Copy,
+    Shutdown: FnOnce(&mut State) -> R,
+    Reconcile: FnOnce(&mut State, R),
+{
+    let outcome = shutdown(state);
+    reconcile(state, outcome);
+    outcome
 }
 
 fn admit_input_backend_install<Backend>(
@@ -420,6 +528,42 @@ fn deferred_manual_current_word_flow_label(flow: &ManualCurrentWordFlow) -> &'st
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeferredBackendReconciliation {
+    phase: &'static str,
+    request_id: Option<u64>,
+    outcome: WriterShutdownOutcome,
+    accepted: u64,
+    acknowledged: u64,
+    reconciled: u64,
+    queued: usize,
+}
+
+fn reconcile_deferred_input_state_after_backend_shutdown(
+    ledger: &mut DeferredInputLedger,
+    flow: &mut ManualCurrentWordFlow,
+    outcome: WriterShutdownOutcome,
+) -> DeferredBackendReconciliation {
+    let phase = deferred_manual_current_word_flow_label(flow);
+    let request_id = match flow {
+        ManualCurrentWordFlow::InFlight { session }
+        | ManualCurrentWordFlow::CancelRequested { session }
+        | ManualCurrentWordFlow::DrainingDeferredInput { session } => Some(session.request_id),
+        ManualCurrentWordFlow::Idle => None,
+    };
+    let report = ledger.reconcile_all();
+    *flow = ManualCurrentWordFlow::Idle;
+    DeferredBackendReconciliation {
+        phase,
+        request_id,
+        outcome,
+        accepted: report.accepted,
+        acknowledged: report.acknowledged,
+        reconciled: report.reconciled,
+        queued: report.queued,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ManualFlowInvalidation {
     Idle,
     RequestCancellation { request_id: u64 },
@@ -527,6 +671,24 @@ fn take_next_nonzero_physical_sequence_id(next_sequence_id: &mut u64) -> u64 {
         *next_sequence_id = 1;
     }
     sequence_id
+}
+
+fn sequence_fetched_physical_input_events(
+    events: Vec<evdev::InputEvent>,
+    next_sequence_id: &mut u64,
+) -> VecDeque<DeferredInputEvent> {
+    let mut sequenced = VecDeque::new();
+    for event in events {
+        if let InputEventKind::Key(key) = event.kind() {
+            sequenced.push_back(DeferredInputEvent {
+                sequence_id: take_next_nonzero_physical_sequence_id(next_sequence_id),
+                key,
+                value: event.value(),
+                timestamp: event.timestamp(),
+            });
+        }
+    }
+    sequenced
 }
 
 fn should_restart_manual_current_word_after_drain(
@@ -1045,6 +1207,7 @@ pub struct DaemonService {
     manual_hotkey_latch: Option<ManualHotkeyLatch>,
     manual_current_word_flow: ManualCurrentWordFlow,
     deferred_input: DeferredInputLedger,
+    pending_input_tail_reconciliation: Option<InputTailReconciliation>,
     next_physical_sequence_id: u64,
     suppressed_separator_key: Option<evdev::Key>,
     layout_shortcut_latched: bool,
@@ -1077,6 +1240,7 @@ impl DaemonService {
             manual_hotkey_latch: None,
             manual_current_word_flow: ManualCurrentWordFlow::Idle,
             deferred_input: DeferredInputLedger::default(),
+            pending_input_tail_reconciliation: None,
             next_physical_sequence_id: 1,
             suppressed_separator_key: None,
             layout_shortcut_latched: false,
@@ -1107,7 +1271,7 @@ impl DaemonService {
             self.maybe_retry_input_backend()?;
 
             let fetch_timeout = bounded_capture_poll_timeout(self.event_fetch_timeout());
-            let fetch_result = run_writer_healthy_operation(
+            let fetch_result = run_writer_healthy_fetch(
                 self,
                 DaemonService::poll_manual_completion_and_ensure_input_backend_healthy,
                 |service| {
@@ -1118,25 +1282,44 @@ impl DaemonService {
                         Ok(Vec::new())
                     }
                 },
+                |service, raw_events| {
+                    sequence_fetched_physical_input_events(
+                        raw_events,
+                        &mut service.next_physical_sequence_id,
+                    )
+                },
             );
-            let events = match fetch_result {
+            let mut events = match fetch_result {
                 Ok(events) => events,
-                Err(WriterHealthyOperationError::Health(error)) => {
+                Err(WriterHealthyFetchError::Health {
+                    error,
+                    mut accepted,
+                }) => {
+                    reconcile_and_retain_fetched_tail(
+                        &mut accepted,
+                        &mut self.pending_input_tail_reconciliation,
+                        "post-fetch-writer-health",
+                    );
                     route_runtime_health_failure(error, |error| {
                         self.handle_runtime_input_failure(error)
                     })?;
                     continue 'event_loop;
                 }
-                Err(WriterHealthyOperationError::Operation(error)) => {
+                Err(WriterHealthyFetchError::Operation(error)) => {
                     log_input_debug("keyboard-read-error", &format!("error={error}"));
                     if self.handle_runtime_input_failure(&error)? {
-                        continue;
+                        continue 'event_loop;
                     }
                     return Err(error);
                 }
             };
 
             if let Err(error) = self.poll_layout_switch_capture_expiry() {
+                reconcile_and_retain_fetched_tail(
+                    &mut events,
+                    &mut self.pending_input_tail_reconciliation,
+                    "capture-expiry-before-input-dispatch",
+                );
                 log_input_debug("capture-expiry-poll-error", &format!("error={error}"));
                 return Err(error);
             }
@@ -1169,53 +1352,43 @@ impl DaemonService {
 
             let batch_result = process_writer_healthy_batch(
                 self,
-                events,
+                &mut events,
                 DaemonService::poll_manual_completion_and_ensure_input_backend_healthy,
                 |service, event| {
-                    if let InputEventKind::Key(key) = event.kind() {
-                        let event = service.sequence_physical_input_event(
-                            key,
-                            event.value(),
-                            event.timestamp(),
+                    if let Err(error) = service.handle_key_event(event, InputOrigin::Physical) {
+                        log_input_debug("event-handler-error", &format!("error={error}"));
+                        return Err(error);
+                    }
+                    processed_events += 1;
+                    if processed_events.is_multiple_of(EVENT_LOOP_HEARTBEAT_EVENTS)
+                        || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
+                    {
+                        let dbus_signal_drop_fields = service
+                            .dbus_signal_drop_counters
+                            .take_counts()
+                            .heartbeat_fields();
+                        if let Some(fields) = dbus_signal_drop_fields.as_deref() {
+                            log_layout_debug("dbus-signal-drop-summary", fields);
+                        }
+                        let dbus_signal_drop_fields = dbus_signal_drop_fields
+                            .map(|fields| format!(" {fields}"))
+                            .unwrap_or_default();
+                        log_input_debug(
+                            "event-loop-heartbeat",
+                            &format!(
+                                "events_processed={processed_events} selected_text_in_progress={} writer_alive={}{}",
+                                service
+                                    .selected_text_runner
+                                    .as_ref()
+                                    .is_some_and(SelectedTextJobRunner::is_in_progress),
+                                service
+                                    .keyboard
+                                    .as_ref()
+                                    .is_some_and(KeyboardController::is_writer_alive),
+                                dbus_signal_drop_fields,
+                            ),
                         );
-                        if let Err(error) = service.handle_key_event(event, InputOrigin::Physical) {
-                            log_input_debug(
-                                "event-handler-error",
-                                &format!("key={key:?} value={} error={error}", event.value),
-                            );
-                            return Err(error);
-                        }
-                        processed_events += 1;
-                        if processed_events.is_multiple_of(EVENT_LOOP_HEARTBEAT_EVENTS)
-                            || last_heartbeat.elapsed() >= EVENT_LOOP_HEARTBEAT_INTERVAL
-                        {
-                            let dbus_signal_drop_fields = service
-                                .dbus_signal_drop_counters
-                                .take_counts()
-                                .heartbeat_fields();
-                            if let Some(fields) = dbus_signal_drop_fields.as_deref() {
-                                log_layout_debug("dbus-signal-drop-summary", fields);
-                            }
-                            let dbus_signal_drop_fields = dbus_signal_drop_fields
-                                .map(|fields| format!(" {fields}"))
-                                .unwrap_or_default();
-                            log_input_debug(
-                                "event-loop-heartbeat",
-                                &format!(
-                                    "events_processed={processed_events} selected_text_in_progress={} writer_alive={}{}",
-                                    service
-                                        .selected_text_runner
-                                        .as_ref()
-                                        .is_some_and(SelectedTextJobRunner::is_in_progress),
-                                    service
-                                        .keyboard
-                                        .as_ref()
-                                        .is_some_and(KeyboardController::is_writer_alive),
-                                    dbus_signal_drop_fields,
-                                ),
-                            );
-                            last_heartbeat = Instant::now();
-                        }
+                        last_heartbeat = Instant::now();
                     }
                     Ok(())
                 },
@@ -1223,14 +1396,24 @@ impl DaemonService {
             match batch_result {
                 Ok(()) => {}
                 Err(WriterHealthyBatchError::Health(error)) => {
+                    reconcile_and_retain_fetched_tail(
+                        &mut events,
+                        &mut self.pending_input_tail_reconciliation,
+                        "between-events-writer-health",
+                    );
                     route_runtime_health_failure(error, |error| {
                         self.handle_runtime_input_failure(error)
                     })?;
                     continue 'event_loop;
                 }
                 Err(WriterHealthyBatchError::Event(error)) => {
+                    reconcile_and_retain_fetched_tail(
+                        &mut events,
+                        &mut self.pending_input_tail_reconciliation,
+                        "input-event-handler-error",
+                    );
                     if self.handle_runtime_input_failure(&error)? {
-                        continue 'event_loop;
+                        continue;
                     }
                     return Err(error);
                 }
@@ -1653,22 +1836,6 @@ impl DaemonService {
             }
         }
         Ok(())
-    }
-
-    fn sequence_physical_input_event(
-        &mut self,
-        key: evdev::Key,
-        value: i32,
-        timestamp: SystemTime,
-    ) -> DeferredInputEvent {
-        DeferredInputEvent {
-            sequence_id: take_next_nonzero_physical_sequence_id(
-                &mut self.next_physical_sequence_id,
-            ),
-            key,
-            value,
-            timestamp,
-        }
     }
 
     fn request_manual_current_word_retry_after_drain(&mut self, _key: evdev::Key) {
@@ -2893,18 +3060,69 @@ impl DaemonService {
         let reset_result = self.runtime.reset_layout_switch_capture_input_epoch();
         let (state_change, outcome) =
             reset_capture_epoch_then_shutdown_backend(reset_result, || {
-                // Drop selected-text transport clones before stopping the writer so the
-                // virtual keyboard shutdown is not held open by an idle helper worker.
-                self.selected_text_runner = None;
+                shutdown_backend_then_reconcile(
+                    self,
+                    |service| {
+                        // Drop selected-text transport clones before stopping the writer so the
+                        // virtual keyboard shutdown is not held open by an idle helper worker.
+                        service.selected_text_runner = None;
 
-                if let Some(mut keyboard) = self.keyboard.take() {
-                    keyboard.shutdown()
-                } else {
-                    WriterShutdownOutcome::Stopped
-                }
+                        if let Some(mut keyboard) = service.keyboard.take() {
+                            keyboard.shutdown()
+                        } else {
+                            WriterShutdownOutcome::Stopped
+                        }
+                    },
+                    |service, outcome| {
+                        flush_retained_fetched_tail_reconciliation(
+                            &mut service.pending_input_tail_reconciliation,
+                            log_fetched_tail_reconciliation,
+                        );
+                        service.reconcile_deferred_input_after_backend_shutdown(outcome);
+                    },
+                )
             });
         self.observe_layout_switch_capture_state_change(state_change);
         self.writer_shutdown_latch.observe(outcome)
+    }
+
+    fn reconcile_deferred_input_after_backend_shutdown(&mut self, outcome: WriterShutdownOutcome) {
+        let summary = reconcile_deferred_input_state_after_backend_shutdown(
+            &mut self.deferred_input,
+            &mut self.manual_current_word_flow,
+            outcome,
+        );
+        let request_id = summary
+            .request_id
+            .map(|request_id| request_id.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        if summary.reconciled > 0 {
+            eprintln!(
+                "OpenSwitcher: deferred input reconciled after backend shutdown: accepted={} acknowledged={} reconciled={} queued={} phase={} request_id={} outcome={:?}",
+                summary.accepted,
+                summary.acknowledged,
+                summary.reconciled,
+                summary.queued,
+                summary.phase,
+                request_id,
+                summary.outcome,
+            );
+        }
+        if summary.accepted > 0 || summary.phase != "idle" {
+            log_input_debug(
+                "deferred-input-terminal-reconciliation",
+                &format!(
+                    "accepted={} acknowledged={} reconciled={} queued={} phase={} request_id={} outcome={:?}",
+                    summary.accepted,
+                    summary.acknowledged,
+                    summary.reconciled,
+                    summary.queued,
+                    summary.phase,
+                    request_id,
+                    summary.outcome,
+                ),
+            );
+        }
     }
 
     // Transient input state reset / invalidation
@@ -3045,6 +3263,7 @@ mod tests {
     use crate::model::{SelectedTextHotkey, SessionType, UndoKey};
     use evdev::Key;
     use std::cell::Cell;
+    use std::collections::VecDeque;
 
     // Test helpers
 
@@ -3232,6 +3451,115 @@ mod tests {
             outcome,
             crate::daemon::keyboard::WriterShutdownOutcome::Stopped
         );
+    }
+
+    #[test]
+    fn deferred_reconciliation_runs_only_after_backend_shutdown_returns() {
+        for expected in [
+            WriterShutdownOutcome::Stopped,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+        ] {
+            let mut trace = Vec::new();
+            let outcome = shutdown_backend_then_reconcile(
+                &mut trace,
+                |trace| {
+                    trace.push("backend-shutdown");
+                    expected
+                },
+                |trace, observed| {
+                    assert_eq!(observed, expected);
+                    trace.push("reconciliation");
+                },
+            );
+
+            assert_eq!(outcome, expected);
+            assert_eq!(trace, vec!["backend-shutdown", "reconciliation"]);
+        }
+    }
+
+    #[test]
+    fn fetched_tail_is_retained_until_shutdown_then_flushed_exactly_once() {
+        #[derive(Default)]
+        struct State {
+            pending: Option<InputTailReconciliation>,
+            published: Vec<InputTailReconciliation>,
+            trace: Vec<&'static str>,
+        }
+
+        for expected in [
+            WriterShutdownOutcome::Stopped,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+        ] {
+            let mut state = State::default();
+            let mut fetched = VecDeque::from([
+                sequenced_deferred_event(711, Key::KEY_A, 1),
+                sequenced_deferred_event(712, Key::KEY_B, 1),
+            ]);
+            reconcile_and_retain_fetched_tail(
+                &mut fetched,
+                &mut state.pending,
+                "injected-terminal-tail",
+            );
+            assert!(fetched.is_empty());
+            assert_eq!(
+                state
+                    .pending
+                    .as_ref()
+                    .expect("tail must remain pending before shutdown")
+                    .sequence_ids,
+                vec![711, 712]
+            );
+
+            let outcome = shutdown_backend_then_reconcile(
+                &mut state,
+                |state| {
+                    state.trace.push("backend-shutdown");
+                    expected
+                },
+                |state, observed| {
+                    assert_eq!(observed, expected);
+                    state.trace.push("reconciliation");
+                    let pending = &mut state.pending;
+                    let published = &mut state.published;
+                    flush_retained_fetched_tail_reconciliation(pending, |report| {
+                        published.push(report.clone());
+                    });
+                },
+            );
+            assert_eq!(outcome, expected);
+            assert_eq!(
+                state.published[0].sequence_ids,
+                vec![711, 712],
+                "the complete accepted tail must be published after shutdown"
+            );
+            assert!(state.pending.is_none());
+
+            shutdown_backend_then_reconcile(
+                &mut state,
+                |state| {
+                    state.trace.push("backend-shutdown");
+                    expected
+                },
+                |state, _| {
+                    state.trace.push("reconciliation");
+                    let pending = &mut state.pending;
+                    let published = &mut state.published;
+                    flush_retained_fetched_tail_reconciliation(pending, |report| {
+                        published.push(report.clone());
+                    });
+                },
+            );
+            assert_eq!(state.published.len(), 1);
+            assert_eq!(
+                state.trace,
+                vec![
+                    "backend-shutdown",
+                    "reconciliation",
+                    "backend-shutdown",
+                    "reconciliation"
+                ]
+            );
+        }
     }
 
     #[test]
@@ -3567,21 +3895,32 @@ mod tests {
     }
 
     #[test]
-    fn writer_health_failure_after_fetch_stops_batch_before_first_event() {
+    fn post_fetch_health_failure_returns_the_whole_accepted_tail() {
         let mut handled = Vec::new();
+        let mut batch = VecDeque::from([
+            sequenced_deferred_event(401, Key::KEY_A, 1),
+            sequenced_deferred_event(402, Key::KEY_B, 1),
+        ]);
         let result = process_writer_healthy_batch(
             &mut handled,
-            [1, 2],
+            &mut batch,
             |_handled| {
                 Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 301 })
             },
             |handled, event| {
-                handled.push(event);
+                handled.push(event.sequence_id);
                 Ok::<(), SwitcherError>(())
             },
         );
 
         assert!(handled.is_empty());
+        assert_eq!(
+            batch
+                .iter()
+                .map(|event| event.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![401, 402]
+        );
         assert!(matches!(
             result,
             Err(WriterHealthyBatchError::Health(
@@ -3599,7 +3938,7 @@ mod tests {
         }
 
         let mut state = State::default();
-        let result = run_writer_healthy_operation(
+        let result = run_writer_healthy_fetch(
             &mut state,
             |state| {
                 state.trace.push("health");
@@ -3616,19 +3955,21 @@ mod tests {
                     "recoverable fetch failure",
                 )))
             },
+            |_state, _events| VecDeque::new(),
         );
 
         assert!(matches!(
             result,
-            Err(WriterHealthyOperationError::Health(
-                SwitcherError::VirtualKeyboardWriterDisconnected
-            ))
+            Err(WriterHealthyFetchError::Health {
+                error: SwitcherError::VirtualKeyboardWriterDisconnected,
+                accepted,
+            }) if accepted.is_empty()
         ));
         assert_eq!(state.trace, vec!["health", "fetch", "health"]);
     }
 
     #[test]
-    fn writer_health_failure_after_successful_fetch_discards_events() {
+    fn writer_health_failure_after_successful_fetch_reconciles_whole_accepted_tail() {
         #[derive(Default)]
         struct State {
             trace: Vec<&'static str>,
@@ -3636,7 +3977,7 @@ mod tests {
         }
 
         let mut state = State::default();
-        let result = run_writer_healthy_operation(
+        let result = run_writer_healthy_fetch(
             &mut state,
             |state| {
                 state.trace.push("health");
@@ -3649,17 +3990,30 @@ mod tests {
             },
             |state| {
                 state.trace.push("fetch");
-                Ok::<_, SwitcherError>(vec![1, 2])
+                Ok::<_, SwitcherError>(vec![
+                    sequenced_deferred_event(421, Key::KEY_A, 1),
+                    sequenced_deferred_event(422, Key::KEY_B, 0),
+                ])
+            },
+            |state, events| {
+                state.trace.push("accept");
+                events.into_iter().collect()
             },
         );
+        let mut batch = match result {
+            Err(WriterHealthyFetchError::Health {
+                error: SwitcherError::VirtualKeyboardWriterDisconnected,
+                accepted,
+            }) => accepted,
+            _ => panic!("post-fetch writer failure must return the accepted tail"),
+        };
+        let report = reconcile_fetched_tail(&mut batch, "post-fetch-health");
 
-        assert!(matches!(
-            result,
-            Err(WriterHealthyOperationError::Health(
-                SwitcherError::VirtualKeyboardWriterDisconnected
-            ))
-        ));
-        assert_eq!(state.trace, vec!["health", "fetch", "health"]);
+        assert_eq!(report.reconciled, 2);
+        assert_eq!(report.reason, "post-fetch-health");
+        assert_eq!(report.sequence_ids, vec![421, 422]);
+        assert!(batch.is_empty());
+        assert_eq!(state.trace, vec!["health", "fetch", "accept", "health"]);
     }
 
     #[test]
@@ -3730,14 +4084,14 @@ mod tests {
     }
 
     #[test]
-    fn post_operation_gate_polls_completion_before_health() {
+    fn fetch_gate_accepts_events_before_post_completion_and_health() {
         #[derive(Default)]
         struct State {
             trace: Vec<&'static str>,
         }
 
         let mut state = State::default();
-        let result = run_writer_healthy_operation(
+        let result = run_writer_healthy_fetch(
             &mut state,
             |state| match poll_completion_before_writer_health(
                 state,
@@ -3755,15 +4109,26 @@ mod tests {
                 | Err(CompletionBeforeWriterHealthError::Health(error)) => Err(error),
             },
             |state| {
-                state.trace.push("operation");
-                Ok::<_, SwitcherError>(())
+                state.trace.push("fetch");
+                Ok::<_, SwitcherError>(Vec::<DeferredInputEvent>::new())
+            },
+            |state, events| {
+                state.trace.push("accept");
+                events.into_iter().collect()
             },
         );
 
         assert!(result.is_ok());
         assert_eq!(
             state.trace,
-            vec!["completion", "health", "operation", "completion", "health"]
+            vec![
+                "completion",
+                "health",
+                "fetch",
+                "accept",
+                "completion",
+                "health"
+            ]
         );
     }
 
@@ -3775,9 +4140,13 @@ mod tests {
         }
 
         let mut state = State::default();
+        let mut batch = VecDeque::from([
+            sequenced_deferred_event(431, Key::KEY_A, 1),
+            sequenced_deferred_event(432, Key::KEY_B, 1),
+        ]);
         let result = process_writer_healthy_batch(
             &mut state,
-            ["event-1", "event-2"],
+            &mut batch,
             |state| match poll_completion_before_writer_health(
                 state,
                 |state| {
@@ -3794,12 +4163,17 @@ mod tests {
                 | Err(CompletionBeforeWriterHealthError::Health(error)) => Err(error),
             },
             |state, event| {
-                state.trace.push(event);
+                state.trace.push(match event.sequence_id {
+                    431 => "event-1",
+                    432 => "event-2",
+                    _ => "unexpected-event",
+                });
                 Ok::<(), SwitcherError>(())
             },
         );
 
         assert!(result.is_ok());
+        assert!(batch.is_empty());
         assert_eq!(
             state.trace,
             vec![
@@ -3814,12 +4188,17 @@ mod tests {
     }
 
     #[test]
-    fn writer_health_failure_between_events_stops_before_second_event() {
+    fn health_failure_between_events_keeps_only_unacknowledged_tail() {
         let mut handled = Vec::new();
         let mut health_checks = 0usize;
+        let mut batch = VecDeque::from([
+            sequenced_deferred_event(411, Key::KEY_A, 1),
+            sequenced_deferred_event(412, Key::KEY_B, 1),
+            sequenced_deferred_event(413, Key::KEY_C, 1),
+        ]);
         let result = process_writer_healthy_batch(
             &mut handled,
-            [1, 2, 3],
+            &mut batch,
             |_handled| {
                 health_checks += 1;
                 if health_checks == 2 {
@@ -3829,18 +4208,61 @@ mod tests {
                 }
             },
             |handled, event| {
-                handled.push(event);
+                handled.push(event.sequence_id);
                 Ok::<(), SwitcherError>(())
             },
         );
 
-        assert_eq!(handled, vec![1]);
+        assert_eq!(handled, vec![411]);
+        assert_eq!(
+            batch
+                .iter()
+                .map(|event| event.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![412, 413]
+        );
         assert!(matches!(
             result,
             Err(WriterHealthyBatchError::Health(
                 SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id: 302 }
             ))
         ));
+    }
+
+    #[test]
+    fn event_failure_keeps_current_event_and_unacknowledged_tail() {
+        let mut batch = VecDeque::from([
+            sequenced_deferred_event(441, Key::KEY_A, 1),
+            sequenced_deferred_event(442, Key::KEY_B, 1),
+        ]);
+        let result = process_writer_healthy_batch(
+            &mut (),
+            &mut batch,
+            |_| Ok::<(), SwitcherError>(()),
+            |_, event| {
+                Err(SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: event.sequence_id,
+                    reason: "injected event failure".to_string(),
+                })
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriterHealthyBatchError::Event(
+                SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                    request_id: 441,
+                    ..
+                }
+            ))
+        ));
+        assert_eq!(
+            batch
+                .iter()
+                .map(|event| event.sequence_id)
+                .collect::<Vec<_>>(),
+            vec![441, 442]
+        );
     }
 
     // Pending status / status publishing helpers
@@ -4818,6 +5240,96 @@ mod tests {
     }
 
     #[test]
+    fn backend_shutdown_reconciles_deferred_tail_and_resets_flow() {
+        let mut flow = ManualCurrentWordFlow::CancelRequested {
+            session: deferred_flow_session(901),
+        };
+        let mut ledger = DeferredInputLedger::default();
+        ledger.admit(sequenced_deferred_event(501, Key::KEY_A, 1));
+        ledger.admit(sequenced_deferred_event(502, Key::KEY_B, 1));
+        ledger.acknowledge(501).unwrap();
+
+        let summary = reconcile_deferred_input_state_after_backend_shutdown(
+            &mut ledger,
+            &mut flow,
+            WriterShutdownOutcome::Stopped,
+        );
+
+        assert_eq!(summary.phase, "cancel-requested");
+        assert_eq!(summary.request_id, Some(901));
+        assert_eq!(summary.outcome, WriterShutdownOutcome::Stopped);
+        assert_eq!(summary.accepted, 2);
+        assert_eq!(summary.acknowledged, 1);
+        assert_eq!(summary.reconciled, 1);
+        assert_eq!(summary.queued, 0);
+        assert!(ledger.is_empty());
+        assert!(matches!(flow, ManualCurrentWordFlow::Idle));
+
+        let repeated = reconcile_deferred_input_state_after_backend_shutdown(
+            &mut ledger,
+            &mut flow,
+            WriterShutdownOutcome::Stopped,
+        );
+        assert_eq!(repeated.accepted, 0);
+        assert_eq!(repeated.acknowledged, 0);
+        assert_eq!(repeated.reconciled, 0);
+        assert_eq!(repeated.queued, 0);
+        assert_eq!(repeated.phase, "idle");
+        assert_eq!(repeated.request_id, None);
+    }
+
+    #[test]
+    fn capacity_failure_accounts_for_fetched_and_deferred_tails_exactly_once() {
+        let mut ledger = DeferredInputLedger::with_limits(1, 2);
+        ledger.admit(sequenced_deferred_event(601, Key::KEY_A, 1));
+        ledger.admit(sequenced_deferred_event(602, Key::KEY_B, 1));
+        let mut fetched = VecDeque::from([
+            sequenced_deferred_event(603, Key::KEY_C, 1),
+            sequenced_deferred_event(604, Key::KEY_D, 1),
+        ]);
+
+        let result = process_writer_healthy_batch(
+            &mut ledger,
+            &mut fetched,
+            |_| Ok::<(), SwitcherError>(()),
+            |ledger, event| match ledger.admit(event) {
+                DeferredAdmission::CapacityExceeded { limit } => {
+                    Err(SwitcherError::DeferredInputCapacityExceeded { limit })
+                }
+                DeferredAdmission::Queued | DeferredAdmission::RequestCancellation => Ok(()),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(WriterHealthyBatchError::Event(
+                SwitcherError::DeferredInputCapacityExceeded { limit: 2 }
+            ))
+        ));
+        let mut owned_sequence_ids = ledger.sequence_ids_for_test();
+        let fetched_report =
+            reconcile_fetched_tail(&mut fetched, "deferred-input-capacity-exceeded");
+        owned_sequence_ids.extend(fetched_report.sequence_ids.iter().copied());
+        owned_sequence_ids.sort_unstable();
+        assert_eq!(owned_sequence_ids, vec![601, 602, 603, 604]);
+
+        let mut flow = ManualCurrentWordFlow::CancelRequested {
+            session: deferred_flow_session(902),
+        };
+        let deferred_report = reconcile_deferred_input_state_after_backend_shutdown(
+            &mut ledger,
+            &mut flow,
+            WriterShutdownOutcome::Stopped,
+        );
+        assert_eq!(fetched_report.reconciled, 2);
+        assert_eq!(deferred_report.accepted, 2);
+        assert_eq!(deferred_report.acknowledged, 0);
+        assert_eq!(deferred_report.reconciled, 2);
+        assert!(fetched.is_empty());
+        assert!(ledger.is_empty());
+    }
+
+    #[test]
     fn overflow_event_is_retained_and_requests_cancel_without_reset() {
         use crate::daemon::deferred_input::{DeferredAdmission, DeferredInputLedger};
 
@@ -4983,6 +5495,28 @@ mod tests {
 
         assert_eq!(take_next_nonzero_physical_sequence_id(&mut next), u64::MAX);
         assert_eq!(take_next_nonzero_physical_sequence_id(&mut next), 1);
+    }
+
+    #[test]
+    fn successful_fetch_sequences_every_key_before_dispatch_and_filters_metadata() {
+        let mut next = 701;
+        let events = vec![
+            evdev::InputEvent::new(evdev::EventType::MISC, 0, 17),
+            evdev::InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), 1),
+            evdev::InputEvent::new(evdev::EventType::SYNCHRONIZATION, 0, 0),
+            evdev::InputEvent::new(evdev::EventType::KEY, Key::KEY_A.code(), 0),
+        ];
+
+        let batch = sequence_fetched_physical_input_events(events, &mut next);
+
+        assert_eq!(
+            batch
+                .iter()
+                .map(|event| (event.sequence_id, event.key, event.value))
+                .collect::<Vec<_>>(),
+            vec![(701, Key::KEY_A, 1), (702, Key::KEY_A, 0)]
+        );
+        assert_eq!(next, 703);
     }
 
     #[test]

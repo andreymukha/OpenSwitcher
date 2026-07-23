@@ -51,7 +51,7 @@ impl Default for DeferredInputLedger {
 }
 
 impl DeferredInputLedger {
-    fn with_limits(soft_limit: usize, hard_limit: usize) -> Self {
+    pub(crate) fn with_limits(soft_limit: usize, hard_limit: usize) -> Self {
         debug_assert!(soft_limit < hard_limit);
         Self {
             queue: VecDeque::new(),

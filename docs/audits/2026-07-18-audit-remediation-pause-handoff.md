@@ -1,16 +1,48 @@
 # OpenSwitcher audit remediation: pause handoff
 
-- Дата остановки: 2026-07-18
-- Причина паузы: решение владельца остановить работы после двух суток аудита и
-  remediation из-за расхода времени и token budget
-- Рабочая ветка: `fix/audit-remediation`
-- Последний проверенный implementation commit: `2523d67`
-- Последний validation commit перед handoff: `444d25a`
+- Исходная дата остановки: 2026-07-18
+- Последнее обновление: 2026-07-23
+- Текущая ветка: `master`
+- Последний implementation/package commit: `ebf6303`
+- Последний writer validation commit: `6e39283`
 - Политика продолжения: ничего из backlog не начинать без новой прямой просьбы
   владельца
 - VM-лабораторию не удалять без отдельной прямой просьбы
 
-## Где остановились
+## Актуальная точка 2026-07-23
+
+После исходной паузы завершены ещё четыре связанных input-safety slice:
+
+1. Сброс контекста по настоящему клику с сохранением контекста при движении и
+   scroll; raw touch codes не считаются физической кнопкой.
+2. Обязательные input watcher переведены в fail-safe lifecycle; потеря worker
+   снимает grab и пересобирает backend.
+3. Исправлено владение `/dev/uinput` fd в vendored `uinput 0.1.3`.
+4. Virtual writer получил подтверждённый bounded shutdown. Новый backend нельзя
+   открыть рядом с неподтверждённо живым writer; при timeout процесс переходит
+   в необратимый typed fail-stop.
+
+Последний slice уже fast-forward слит в `master`. Validation report:
+
+- `docs/audits/2026-07-23-quiescent-writer-shutdown-validation.md`.
+
+Штатный путь проверен exact DEB в Mint/X11 и Ubuntu/Wayland: 20 paced
+stop/start циклов, функциональный smoke и по одному `/dev/uinput` fd. Полная
+локальная матрица: 634 base tests и 695 settings-ui tests.
+
+Главное ограничение последнего slice: production writer-specific hang
+injection не выполнялся. У stripped release-бинарника нельзя доказанно
+выделить только безымянный writer TID, а process-wide `SIGSTOP` не соответствует
+согласованному safety gate. Fail-stop подтверждён детерминированными
+fake-thread tests и review, но не полным runtime hang experiment.
+
+Сохранённые состояния лаборатории:
+
+- Mint profile установлен с `0.1.0-2` и остановлен после проверки;
+- Ubuntu profile установлен с `0.1.0-2` и остановлен после проверки;
+- disks, profiles, screenshots, QMP evidence и worktrees не удалялись.
+
+## Предыдущая точка 2026-07-18
 
 Завершён input runtime snapshot slice. Grab-critical input loop больше не ждёт
 configuration persistence, desktop commands или layout backend refresh;
@@ -37,24 +69,20 @@ configuration persistence, desktop commands или layout backend refresh;
 
 ## Последний проверенный Debian package
 
-- package identity: `open-switcher 0.1.0-1`, `amd64`;
+- package identity: `open-switcher 0.1.0-2`, `amd64`;
 - canonical source artifact:
-  `.worktrees/audit-remediation/dist/packages/open-switcher_0.1.0-1_amd64.deb`;
+  `.worktrees/quiescent-writer-shutdown/dist/packages/open-switcher_0.1.0-2_amd64.deb`;
 - удобная копия для host install:
-  `dist/packages/open-switcher_0.1.0-1_amd64.deb`;
-- размер: `3 091 644` bytes;
+  `dist/packages/open-switcher_0.1.0-2_amd64.deb`;
+- размер: `3 027 178` bytes;
 - SHA-256:
-  `1ceeaa5e9bddaaf4308080f26bb80e05516962bee8537f8e23f870e18c2d742c`;
+  `6dc7ccb8ca3a1f326475072ec1a2b001f9595d135ace4431e56cf08ffdaf3acd`;
 - packaged daemon SHA-256:
-  `01fe4439f37f384d6bc0ae59f8358caccdb041bbf77caefa69c153e88892fd8a`.
+  `e83f3ec06570be36c4ebc3d7bb5bed9109af0a0344ada7939af99f4b0d9b1129`.
 
-После сборки менялась только документация; diff от `2523d67` до handoff не
-содержит изменений `src`, Cargo, packaging, scripts или `manage.sh`. Поэтому
-повторная сборка того же binary payload не требуется.
-
-Package прошёл 561 base tests, 622 settings-ui tests, 11 D-Bus integration
-tests и package shell checks. Тот же daemon hash был установлен и проверен в
-Ubuntu 24.04/GNOME/Wayland и Linux Mint 22.2/Cinnamon/X11.
+Package прошёл 634 base tests, 695 settings-ui tests, vendored uinput tests,
+оба all-target checks и package shell checks. Тот же daemon hash установлен и
+проверен в Ubuntu 24.04/GNOME/Wayland и Linux Mint/Cinnamon/X11.
 
 ## Host transition с developer install
 
@@ -104,21 +132,20 @@ Debian package штатно выполнит trigger, установит package
 
 Работы сознательно отложены:
 
-1. cancellation/deadline и recovery зависшего layout child без restart daemon;
-2. снижение стоимости 300 ms Cinnamon polling или event-driven observation;
-3. writer shutdown ACK и запрет late synthetic mutation после stop;
-4. deferred queue conservation/reconciliation oracle;
-5. failure-at-every-step synthetic correction replay;
-6. ACL/multi-seat boundary;
-7. clipboard/selected-text failure paths;
-8. active Debian package upgrade/remove lifecycle;
-9. расширенная runtime campaign: hot-unplug/replug, frozen display/backend,
+1. conservation/reconciliation для deferred physical events;
+2. operation-wide synthetic key ledger и failure-at-operation-N;
+3. transactional clipboard/selected-text safety;
+4. package upgrade/remove и seat/ACL boundary;
+5. отдельный диагностический writer fault seam и production hang injection;
+6. расширенная runtime campaign: hot-unplug/replug, suspend/resume,
    kill/power-loss timing и hardware acceptance.
 
 ## Как продолжать позже
 
-1. Открыть этот handoff и последний H-01 validation report.
-2. Проверить `git status` и HEAD ветки `fix/audit-remediation`.
+1. Открыть этот handoff и
+   `docs/audits/2026-07-23-quiescent-writer-shutdown-validation.md`.
+2. Проверить `git status` и HEAD `master`; пользовательские untracked audit/VM
+   документы в основном worktree не удалять и не включать в случайный commit.
 3. Не пересобирать VM-лабораторию; использовать сохранённые Ubuntu и Mint
    profiles по необходимости.
 4. Выбрать один связный safety slice, написать отдельную spec/plan и только

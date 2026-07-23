@@ -1,3 +1,12 @@
+open-switcher (0.1.0-3) unstable; urgency=high
+
+  * Preserve and acknowledge deferred physical input only after the virtual
+    keyboard writer has completed the corresponding mutation.
+  * On Cinnamon/X11, hold the text tail after a deferred focus-switch chord
+    until the active target changes or the bounded fail-open deadline expires.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Fri, 24 Jul 2026 00:44:29 +0300
+
 open-switcher (0.1.0-2) unstable; urgency=high
 
   * Require acknowledged virtual keyboard writer shutdown before backend

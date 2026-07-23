@@ -41,6 +41,7 @@ const TRANSACTION_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const TRANSACTION_BACKEND_GRACE: Duration = Duration::from_secs(1);
 const MAX_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5);
 const SHORTCUT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1);
+const DEFERRED_FORWARD_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1);
 const TRANSACTION_SLEEP_QUANTUM: Duration = Duration::from_millis(5);
 const WRITER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_WORKER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -259,6 +260,10 @@ enum WriterFastCommand {
 }
 
 enum WriterTransactionKind {
+    ForwardDeferredEvent {
+        key: Key,
+        value: i32,
+    },
     ApplyCorrection {
         plan: CorrectionPlan,
         config: RuntimeConfigSnapshot,
@@ -838,6 +843,9 @@ impl WriterTransactionControl {
 impl WriterTransactionKind {
     fn execution_timeout(&self) -> Result<Duration, SwitcherError> {
         match self {
+            WriterTransactionKind::ForwardDeferredEvent { .. } => {
+                Ok(DEFERRED_FORWARD_TRANSACTION_TIMEOUT)
+            }
             WriterTransactionKind::ApplyCorrection { plan, config, .. } => {
                 correction_transaction_timeout(plan, config, true)
             }
@@ -1459,6 +1467,16 @@ impl KeyboardController {
 
     pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
         self.virtual_device.handle().forward_event(key, value)
+    }
+
+    pub(crate) fn forward_deferred_event(
+        &mut self,
+        key: Key,
+        value: i32,
+    ) -> Result<(), SwitcherError> {
+        self.virtual_device
+            .handle()
+            .forward_deferred_event(key, value)
     }
 
     pub fn type_separator(&mut self, key: Key) -> Result<(), SwitcherError> {
@@ -2665,6 +2683,25 @@ impl VirtualKeyboardHandle {
     fn forward_event(&self, key: Key, value: i32) -> Result<(), SwitcherError> {
         self.ensure_alive()?;
         self.send_fast_command(WriterFastCommand::ForwardEvent { key, value })
+    }
+
+    fn forward_deferred_event(&self, key: Key, value: i32) -> Result<(), SwitcherError> {
+        self.run_transaction(WriterTransactionKind::ForwardDeferredEvent { key, value })
+            .map(|_| ())
+    }
+
+    #[cfg(test)]
+    fn forward_deferred_event_with_timeout(
+        &self,
+        key: Key,
+        value: i32,
+        timeout: Duration,
+    ) -> Result<(), SwitcherError> {
+        self.run_transaction_with_timeout(
+            WriterTransactionKind::ForwardDeferredEvent { key, value },
+            timeout,
+        )
+        .map(|_| ())
     }
 
     fn type_separator(&self, key: Key) -> Result<(), SwitcherError> {
@@ -5083,6 +5120,26 @@ fn finish_fast_separator_replay(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeferredForwardMutation {
+    Write { key: Key, value: i32 },
+    Synchronize,
+}
+
+fn run_deferred_forward_mutation_with(
+    control: &WriterTransactionControl,
+    key: Key,
+    value: i32,
+    mut mutate: impl FnMut(DeferredForwardMutation) -> Result<(), SwitcherError>,
+) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+    control.authorize_mutation_start()?;
+    mutate(DeferredForwardMutation::Write { key, value })?;
+    mutate(DeferredForwardMutation::Synchronize)?;
+    Ok(CorrectionExecutionOutcome {
+        layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+    })
+}
+
 fn run_virtual_keyboard_writer_loop(
     mut device: uinput::Device,
     command_rx: mpsc::Receiver<WriterCommand>,
@@ -5230,6 +5287,27 @@ fn run_virtual_keyboard_writer_loop(
                         reply,
                     } => {
                         let result = control.ensure_active().and_then(|_| match kind {
+                            WriterTransactionKind::ForwardDeferredEvent { key, value } => {
+                                run_deferred_forward_mutation_with(
+                                    &control,
+                                    key,
+                                    value,
+                                    |mutation| match mutation {
+                                        DeferredForwardMutation::Write { key, value } => {
+                                            device.write(
+                                                INPUT_EVENT_KEYBOARD,
+                                                key.code() as i32,
+                                                value,
+                                            )?;
+                                            Ok(())
+                                        }
+                                        DeferredForwardMutation::Synchronize => {
+                                            device.synchronize()?;
+                                            Ok(())
+                                        }
+                                    },
+                                )
+                            }
                             WriterTransactionKind::ApplyCorrection {
                                 plan,
                                 config,
@@ -8371,6 +8449,186 @@ mod tests {
             error,
             SwitcherError::VirtualKeyboardWriterDisconnected
         ));
+    }
+
+    #[test]
+    fn deferred_forward_returns_only_after_writer_completion_is_published() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let caller_handle = handle.clone();
+        let (caller_done_tx, caller_done_rx) = mpsc::channel();
+        let caller = thread::spawn(move || {
+            let result = caller_handle.forward_deferred_event(Key::KEY_1, 1);
+            caller_done_tx
+                .send(())
+                .expect("caller completion should be observable");
+            result
+        });
+
+        let command = command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("deferred forward transaction should be queued");
+        let (control, reply) = match command {
+            WriterCommand::Transaction(WriterTransaction::Execute {
+                control,
+                kind: WriterTransactionKind::ForwardDeferredEvent { key, value },
+                reply,
+            }) => {
+                assert_eq!(key, Key::KEY_1);
+                assert_eq!(value, 1);
+                (control, reply)
+            }
+            _ => panic!("expected deferred forward transaction"),
+        };
+
+        assert!(
+            matches!(
+                caller_done_rx.recv_timeout(Duration::from_millis(20)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "caller must remain blocked until writer publishes completion"
+        );
+        publish_writer_transaction_result(
+            &control,
+            reply,
+            Ok(CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+            }),
+        )
+        .expect("successful deferred forward should publish");
+
+        assert!(caller.join().expect("caller should finish").is_ok());
+        caller_done_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("caller completion should be published");
+    }
+
+    #[test]
+    fn deferred_forward_timeout_retains_transaction_failure_and_blocks_later_mutations() {
+        let (handle, command_rx) = test_writer_handle(WRITER_QUEUE_CAPACITY, true);
+        let caller_handle = handle.clone();
+        let caller = thread::spawn(move || {
+            caller_handle.forward_deferred_event_with_timeout(
+                Key::KEY_1,
+                1,
+                Duration::from_millis(25),
+            )
+        });
+
+        let command = command_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("deferred forward transaction should be queued");
+        let (request_id, _held_reply) = match command {
+            WriterCommand::Transaction(WriterTransaction::Execute {
+                control,
+                kind: WriterTransactionKind::ForwardDeferredEvent { key, value },
+                reply,
+            }) => {
+                assert_eq!(key, Key::KEY_1);
+                assert_eq!(value, 1);
+                (control.request_id(), reply)
+            }
+            _ => panic!("expected deferred forward transaction"),
+        };
+
+        let error = caller.join().expect("caller should return").unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                request_id: timed_out
+            } if timed_out == request_id
+        ));
+        assert_eq!(handle.transaction_failure_request_id(), Some(request_id));
+        assert!(!handle.is_alive());
+        assert!(matches!(
+            handle.forward_event(Key::KEY_2, 1),
+            Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
+                request_id: blocked
+            }) if blocked == request_id
+        ));
+    }
+
+    #[test]
+    fn deferred_forward_publishes_success_only_after_write_and_synchronize() {
+        let control = WriterTransactionControl::with_timeout_for_test(601, Duration::from_secs(1));
+        let mut trace = Vec::new();
+
+        let outcome = run_deferred_forward_mutation_with(&control, Key::KEY_1, 1, |mutation| {
+            trace.push(mutation);
+            Ok(())
+        })
+        .expect("write and synchronize should succeed");
+
+        assert_eq!(
+            trace,
+            vec![
+                DeferredForwardMutation::Write {
+                    key: Key::KEY_1,
+                    value: 1,
+                },
+                DeferredForwardMutation::Synchronize,
+            ]
+        );
+        assert_eq!(
+            outcome,
+            CorrectionExecutionOutcome {
+                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+            }
+        );
+    }
+
+    #[test]
+    fn deferred_forward_write_error_skips_synchronize() {
+        let control = WriterTransactionControl::with_timeout_for_test(602, Duration::from_secs(1));
+        let mut trace = Vec::new();
+
+        let error = run_deferred_forward_mutation_with(&control, Key::KEY_1, 1, |mutation| {
+            trace.push(mutation);
+            Err(SwitcherError::Io(io::Error::other("write failed")))
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SwitcherError::Io(ref source) if source.to_string() == "write failed")
+        );
+        assert_eq!(
+            trace,
+            vec![DeferredForwardMutation::Write {
+                key: Key::KEY_1,
+                value: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn deferred_forward_synchronize_error_is_not_success() {
+        let control = WriterTransactionControl::with_timeout_for_test(603, Duration::from_secs(1));
+        let mut trace = Vec::new();
+
+        let error = run_deferred_forward_mutation_with(&control, Key::KEY_1, 1, |mutation| {
+            trace.push(mutation);
+            match mutation {
+                DeferredForwardMutation::Write { .. } => Ok(()),
+                DeferredForwardMutation::Synchronize => {
+                    Err(SwitcherError::Io(io::Error::other("sync failed")))
+                }
+            }
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, SwitcherError::Io(ref source) if source.to_string() == "sync failed")
+        );
+        assert_eq!(
+            trace,
+            vec![
+                DeferredForwardMutation::Write {
+                    key: Key::KEY_1,
+                    value: 1,
+                },
+                DeferredForwardMutation::Synchronize,
+            ]
+        );
     }
 
     #[test]

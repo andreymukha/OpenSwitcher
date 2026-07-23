@@ -428,6 +428,12 @@ mod tests {
             readiness: InputBackendReadiness,
             shutdown_outcome: WriterShutdownOutcome,
         },
+        FailStopCounted {
+            opens: Rc<RefCell<usize>>,
+            timeout_ms: u64,
+            phase: &'static str,
+            trigger: &'static str,
+        },
         KeyboardAccessDenied,
     }
 
@@ -487,6 +493,19 @@ mod tests {
                             shutdown_outcome: *shutdown_outcome,
                         },
                         readiness: *readiness,
+                    })
+                }
+                FakeOutcome::FailStopCounted {
+                    opens,
+                    timeout_ms,
+                    phase,
+                    trigger,
+                } => {
+                    *opens.borrow_mut() += 1;
+                    Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                        timeout_ms: *timeout_ms,
+                        phase,
+                        trigger: (*trigger).to_string(),
                     })
                 }
                 FakeOutcome::KeyboardAccessDenied => Err(SwitcherError::KeyboardAccessDenied {
@@ -786,6 +805,72 @@ mod tests {
             Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
         ));
         assert_eq!(*opens.borrow(), 1);
+    }
+
+    #[test]
+    fn late_writer_exit_does_not_enable_same_process_recovery() {
+        let opens = Rc::new(RefCell::new(0));
+        let opener = FakeOpener {
+            outcome: FakeOutcome::OkCounted {
+                opens: Rc::clone(&opens),
+                shutdowns: Rc::new(RefCell::new(0)),
+                readiness: incomplete_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+        let now = Instant::now();
+
+        let first = lifecycle.try_recover(SharedModifierState::default(), now);
+        // A stale late readiness/exit observation must not clear the absorbing
+        // process fail-stop or permit another opener call in this process.
+        lifecycle.mark_backend_ready(ready_readiness());
+        let after_late_exit =
+            lifecycle.try_recover(SharedModifierState::default(), now + Duration::from_secs(5));
+
+        assert!(matches!(
+            first,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
+        ));
+        assert!(matches!(
+            after_late_exit,
+            Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. })
+        ));
+        assert_eq!(*opens.borrow(), 1);
+        assert!(lifecycle.retry_deadline().is_none());
+    }
+
+    #[test]
+    fn partial_open_fail_stop_is_latched_without_second_opener_call() {
+        let opens = Rc::new(RefCell::new(0));
+        let opener = FakeOpener {
+            outcome: FakeOutcome::FailStopCounted {
+                opens: Rc::clone(&opens),
+                timeout_ms: 777,
+                phase: "keyboard-prepare-pointer-watcher",
+                trigger: "injected partial initialization failure",
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+        let now = Instant::now();
+
+        let first = lifecycle.try_recover(SharedModifierState::default(), now);
+        lifecycle.mark_backend_ready(ready_readiness());
+        let repeated =
+            lifecycle.try_recover(SharedModifierState::default(), now + Duration::from_secs(5));
+
+        for result in [first, repeated] {
+            assert!(matches!(
+                result,
+                Err(SwitcherError::VirtualKeyboardWriterShutdownUnresponsive {
+                    timeout_ms: 777,
+                    phase: "keyboard-prepare-pointer-watcher",
+                    ref trigger,
+                }) if trigger == "injected partial initialization failure"
+            ));
+        }
+        assert_eq!(*opens.borrow(), 1);
+        assert!(lifecycle.retry_deadline().is_none());
     }
 
     #[test]

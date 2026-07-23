@@ -743,7 +743,7 @@ enum CorrectionReplayStrategy {
 
 struct GrabbedKeyboardDevice {
     path: PathBuf,
-    device: Device,
+    device: Option<Device>,
     grabbed: bool,
 }
 
@@ -1254,7 +1254,10 @@ impl KeyboardController {
         }
 
         if let Err(error) = self.real_device.release_grab() {
-            log_input_debug("grab-release-error", &format!("error={error}"));
+            log_input_debug(
+                "grab-release-error",
+                &format!("action=close-fd-before-writer-wait error={error}"),
+            );
         } else {
             log_input_debug("grab-released", "keyboard grab released during shutdown");
         }
@@ -1451,18 +1454,39 @@ impl Drop for KeyboardController {
 
 // Real keyboard device
 
+fn release_grab_or_close_device<T, E>(
+    device: &mut Option<T>,
+    grabbed: &mut bool,
+    release: impl FnOnce(&mut T) -> Result<(), E>,
+) -> Result<(), E> {
+    if !*grabbed {
+        return Ok(());
+    }
+
+    let Some(open_device) = device.as_mut() else {
+        *grabbed = false;
+        return Ok(());
+    };
+    let result = release(open_device);
+    *grabbed = false;
+    if result.is_err() {
+        drop(device.take());
+    }
+    result
+}
+
 impl GrabbedKeyboardDevice {
     fn open(path: PathBuf) -> Result<Self, SwitcherError> {
         let device = Device::open(&path).map_err(|error| map_keyboard_open_error(&path, error))?;
         Ok(Self {
             path,
-            device,
+            device: Some(device),
             grabbed: false,
         })
     }
 
     fn name(&self) -> Option<&str> {
-        self.device.name()
+        self.device.as_ref().and_then(Device::name)
     }
 
     fn grab(&mut self) -> Result<(), SwitcherError> {
@@ -1471,6 +1495,10 @@ impl GrabbedKeyboardDevice {
         }
 
         self.device
+            .as_mut()
+            .ok_or(SwitcherError::InputWorkerDisconnected {
+                worker: "keyboard-device",
+            })?
             .grab()
             .map_err(|error| map_keyboard_open_error(&self.path, error))?;
         self.grabbed = true;
@@ -1482,15 +1510,20 @@ impl GrabbedKeyboardDevice {
             return Ok(());
         }
 
-        self.device
-            .ungrab()
-            .map_err(|error| map_keyboard_open_error(&self.path, error))?;
-        self.grabbed = false;
-        Ok(())
+        let path = self.path.clone();
+        release_grab_or_close_device(&mut self.device, &mut self.grabbed, |device| {
+            device
+                .ungrab()
+                .map_err(|error| map_keyboard_open_error(&path, error))
+        })
     }
 
     fn fetch_events(&mut self) -> Result<Vec<InputEvent>, SwitcherError> {
         self.device
+            .as_mut()
+            .ok_or(SwitcherError::InputWorkerDisconnected {
+                worker: "keyboard-device",
+            })?
             .fetch_events()
             .map(|events| events.collect())
             .map_err(|error| map_keyboard_open_error(&self.path, error))
@@ -1500,7 +1533,13 @@ impl GrabbedKeyboardDevice {
         &mut self,
         timeout: Duration,
     ) -> Result<Vec<InputEvent>, SwitcherError> {
-        if !wait_for_device_input(&self.device, timeout)? {
+        let device = self
+            .device
+            .as_ref()
+            .ok_or(SwitcherError::InputWorkerDisconnected {
+                worker: "keyboard-device",
+            })?;
+        if !wait_for_device_input(device, timeout)? {
             return Ok(Vec::new());
         }
 
@@ -1509,13 +1548,17 @@ impl GrabbedKeyboardDevice {
 
     fn caps_lock_active(&self) -> Result<bool, SwitcherError> {
         self.device
+            .as_ref()
+            .ok_or(SwitcherError::InputWorkerDisconnected {
+                worker: "keyboard-device",
+            })?
             .get_led_state()
             .map(|state| state.contains(LedType::LED_CAPSL))
             .map_err(|error| map_keyboard_open_error(&self.path, error))
     }
 
     fn is_ready(&self) -> bool {
-        self.grabbed
+        self.grabbed && self.device.is_some()
     }
 }
 
@@ -1525,16 +1568,15 @@ impl Drop for GrabbedKeyboardDevice {
             return;
         }
 
-        match self.device.ungrab() {
+        match self.release_grab() {
             Ok(()) => log_input_debug("grab-released", "keyboard grab released in Drop"),
             Err(error) => {
                 log_input_debug(
                     "grab-release-error",
-                    &format!("during_drop=true error={error}"),
+                    &format!("during_drop=true action=close-fd error={error}"),
                 );
             }
         }
-        self.grabbed = false;
     }
 }
 
@@ -6151,6 +6193,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_ungrab_closes_device_before_shutdown_waits() {
+        struct CloseProbe(Arc<AtomicBool>);
+
+        impl Drop for CloseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut device = Some(CloseProbe(Arc::clone(&closed)));
+        let mut grabbed = true;
+
+        let result = release_grab_or_close_device(&mut device, &mut grabbed, |_| {
+            Err::<(), _>("injected ungrab failure")
+        });
+
+        assert_eq!(result, Err("injected ungrab failure"));
+        assert!(!grabbed);
+        assert!(device.is_none());
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn successful_ungrab_keeps_open_device_available_until_controller_drop() {
+        let mut device = Some(41_u8);
+        let mut grabbed = true;
+
+        let result = release_grab_or_close_device(&mut device, &mut grabbed, |value| {
+            assert_eq!(*value, 41);
+            Ok::<(), &str>(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert!(!grabbed);
+        assert_eq!(device, Some(41));
+    }
+
+    #[test]
     fn keyboard_shutdown_joins_watchers_only_after_writer_stopped() {
         let mut phases = Vec::new();
 
@@ -6347,6 +6428,30 @@ mod tests {
     }
 
     #[test]
+    fn stop_before_mutation_permit_prevents_backend_call() {
+        let failure = AtomicU64::new(0);
+        let stop_requested = AtomicBool::new(false);
+        let terminal_gate = Mutex::new(());
+        {
+            let _guard = terminal_gate.lock().unwrap();
+            stop_requested.store(true, Ordering::SeqCst);
+        }
+        let backend_calls = Cell::new(0);
+
+        let result = authorize_writer_mutation_start(&failure, &stop_requested, &terminal_gate)
+            .and_then(|_| {
+                backend_calls.set(backend_calls.get() + 1);
+                Ok(())
+            });
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert_eq!(backend_calls.get(), 0);
+    }
+
+    #[test]
     fn writer_stop_returns_when_shutdown_queue_is_full() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         command_tx
@@ -6401,6 +6506,8 @@ mod tests {
     fn writer_stop_handles_disconnected_shutdown_receiver() {
         let (command_tx, command_rx) = mpsc::sync_channel(1);
         drop(command_rx);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let alive = Arc::new(AtomicBool::new(true));
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
@@ -6410,8 +6517,12 @@ mod tests {
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
             },
-            join_handle: None,
-            exit_rx: mpsc::channel().1,
+            join_handle: Some(thread::spawn(move || {
+                run_writer_thread_with_exit_notification((), exit_tx, |_| {
+                    release_rx.recv().unwrap();
+                });
+            })),
+            exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
             completion_rx: mpsc::channel().1,
@@ -6419,12 +6530,20 @@ mod tests {
             pending_manual_current_word: None,
         };
 
-        writer.stop();
+        let outcome = writer.stop_with_timeout(Duration::from_millis(10));
 
+        assert_eq!(
+            outcome,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 10 }
+        );
+        assert!(writer.join_handle.is_some());
         assert!(
             !alive.load(Ordering::SeqCst),
             "writer must stop advertising itself as alive even when shutdown cannot be sent"
         );
+
+        release_tx.send(()).unwrap();
+        writer.join_handle.take().unwrap().join().unwrap();
     }
 
     #[test]
@@ -6470,6 +6589,96 @@ mod tests {
             .join_handle
             .take()
             .expect("timed-out writer handle must remain owned")
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn admitted_mutation_keeps_shutdown_unresponsive_until_thread_exit() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let (mutation_admitted_tx, mutation_admitted_rx) = mpsc::channel();
+        let (release_backend_tx, release_backend_rx) = mpsc::channel::<()>();
+        let alive = Arc::new(AtomicBool::new(true));
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(AtomicU64::new(0));
+        let terminal_gate = Arc::new(Mutex::new(()));
+        let worker_stop_requested = Arc::clone(&stop_requested);
+        let worker_failure = Arc::clone(&failure);
+        let worker_terminal_gate = Arc::clone(&terminal_gate);
+        let join_handle = thread::spawn(move || {
+            let _keep_receiver_alive = command_rx;
+            run_writer_thread_with_exit_notification((), exit_tx, |_| {
+                authorize_writer_mutation_start(
+                    &worker_failure,
+                    &worker_stop_requested,
+                    &worker_terminal_gate,
+                )
+                .unwrap();
+                mutation_admitted_tx.send(()).unwrap();
+                release_backend_rx.recv().unwrap();
+            });
+        });
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive,
+                stop_requested,
+                transaction_failure_request_id: failure,
+                transaction_terminal_gate: terminal_gate,
+            },
+            join_handle: Some(join_handle),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        mutation_admitted_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("fake backend mutation must be admitted before shutdown");
+        let mut phases = Vec::new();
+
+        let outcome = run_keyboard_shutdown_sequence(|phase| {
+            phases.push(phase);
+            match phase {
+                KeyboardShutdownPhase::RequestWriterStop => {
+                    writer.request_stop();
+                    None
+                }
+                KeyboardShutdownPhase::ReleaseGrab => None,
+                KeyboardShutdownPhase::FinishWriterStop => {
+                    Some(writer.finish_stop_with_timeout(Duration::from_millis(10)))
+                }
+                KeyboardShutdownPhase::StopAndJoinWatchers
+                | KeyboardShutdownPhase::DetachWatchers => None,
+            }
+        });
+
+        assert_eq!(
+            outcome,
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 10 }
+        );
+        assert_eq!(
+            phases,
+            vec![
+                KeyboardShutdownPhase::RequestWriterStop,
+                KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::FinishWriterStop,
+                KeyboardShutdownPhase::DetachWatchers,
+            ]
+        );
+        assert!(matches!(
+            writer.exit_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_backend_tx.send(()).unwrap();
+        writer
+            .join_handle
+            .take()
+            .expect("late writer handle must remain available for test cleanup")
             .join()
             .unwrap();
     }
@@ -6551,6 +6760,61 @@ mod tests {
             writer.join_handle.is_none(),
             "successful shutdown must join and consume the writer handle"
         );
+    }
+
+    #[test]
+    fn writer_error_exit_is_joined_as_stopped() {
+        let (handle, command_rx) = test_writer_handle(1, true);
+        drop(command_rx);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let join_handle = thread::spawn(move || {
+            let _: Result<(), SwitcherError> =
+                run_writer_thread_with_exit_notification((), exit_tx, |_| {
+                    Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+                });
+        });
+        let mut writer = VirtualKeyboardWriter {
+            handle,
+            join_handle: Some(join_handle),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let outcome = writer.stop_with_timeout(Duration::from_millis(250));
+
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
+        assert!(writer.join_handle.is_none());
+    }
+
+    #[test]
+    fn writer_panic_exit_is_joined_as_stopped() {
+        let (handle, command_rx) = test_writer_handle(1, true);
+        drop(command_rx);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let join_handle = thread::spawn(move || {
+            run_writer_thread_with_exit_notification((), exit_tx, |_| {
+                panic!("injected writer panic")
+            });
+        });
+        let mut writer = VirtualKeyboardWriter {
+            handle,
+            join_handle: Some(join_handle),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+
+        let outcome = writer.stop_with_timeout(Duration::from_millis(250));
+
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
+        assert!(writer.join_handle.is_none());
     }
 
     #[test]
@@ -6688,6 +6952,57 @@ mod tests {
         if let Some(handle) = writer.join_handle.take() {
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn writer_drop_after_unresponsive_is_nonblocking_and_does_not_retry_join() {
+        let (command_tx, command_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (worker_done_tx, worker_done_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let mut writer = VirtualKeyboardWriter {
+            handle: VirtualKeyboardHandle {
+                command_tx,
+                alive: Arc::new(AtomicBool::new(true)),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
+                transaction_terminal_gate: Arc::new(Mutex::new(())),
+            },
+            join_handle: Some(thread::spawn(move || {
+                let _keep_receiver_alive = command_rx;
+                run_writer_thread_with_exit_notification((), exit_tx, |_| {
+                    release_rx.recv().unwrap();
+                });
+                worker_done_tx.send(()).unwrap();
+            })),
+            exit_rx,
+            shutdown_started_at: None,
+            shutdown_outcome: None,
+            completion_rx: mpsc::channel().1,
+            next_request_id: 1,
+            pending_manual_current_word: None,
+        };
+        assert_eq!(
+            writer.stop_with_timeout(Duration::from_millis(10)),
+            WriterShutdownOutcome::Unresponsive { timeout_ms: 10 }
+        );
+        let (drop_done_tx, drop_done_rx) = mpsc::channel();
+        let dropper = thread::spawn(move || {
+            drop(writer);
+            drop_done_tx.send(()).unwrap();
+        });
+
+        if let Err(error) = drop_done_rx.recv_timeout(Duration::from_millis(100)) {
+            release_tx.send(()).unwrap();
+            dropper.join().unwrap();
+            panic!("latched unresponsive Drop must not wait or retry the join: {error:?}");
+        }
+
+        release_tx.send(()).unwrap();
+        worker_done_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("detached fake writer must exit after test cleanup release");
+        dropper.join().unwrap();
     }
 
     #[test]

@@ -3119,6 +3119,32 @@ mod tests {
     }
 
     #[test]
+    fn drop_does_not_retry_or_mask_latched_unresponsive() {
+        let mut latch = WriterShutdownLatch::default();
+        let mut backend_slot = Some(
+            crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+        );
+        let mut backend_shutdown_calls = 0;
+        let mut shutdown_slot = || match backend_slot.take() {
+            Some(outcome) => {
+                backend_shutdown_calls += 1;
+                outcome
+            }
+            None => crate::daemon::keyboard::WriterShutdownOutcome::Stopped,
+        };
+
+        let first = latch.observe(shutdown_slot());
+        let drop_outcome = latch.observe(shutdown_slot());
+
+        assert_eq!(backend_shutdown_calls, 1);
+        assert_eq!(first, drop_outcome);
+        assert_eq!(
+            drop_outcome,
+            crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 }
+        );
+    }
+
+    #[test]
     fn capture_routing_suppress_has_no_modifier_or_forward_side_effect() {
         let mut modifiers = ModifierState::default();
         let shared_modifiers = SharedModifierState::default();

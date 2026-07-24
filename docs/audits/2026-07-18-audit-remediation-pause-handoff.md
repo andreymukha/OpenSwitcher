@@ -1,13 +1,50 @@
 # OpenSwitcher audit remediation: pause handoff
 
 - Исходная дата остановки: 2026-07-18
-- Последнее обновление: 2026-07-23
+- Последнее обновление: 2026-07-24
 - Текущая ветка: `master`
-- Последний implementation/package commit: `ebf6303`
-- Последний writer validation commit: `6e39283`
+- Последний implementation/package commit: `a73bad8`
+- Последний validation commit: `bf19ae6`
 - Политика продолжения: ничего из backlog не начинать без новой прямой просьбы
   владельца
 - VM-лабораторию не удалять без отдельной прямой просьбы
+
+## Актуальная точка 2026-07-24
+
+Завершён deferred input conservation slice. Теперь события, уже принятые
+daemon после физического grab, учитываются до подтверждения writer после
+`write + synchronize`; неподтверждённый остаток согласуется при пересборке
+backend. Для X11 добавлен generation barrier, не позволяющий допечатать
+отложенный текст в окно, сменившееся во время коррекции.
+
+Итоговый validation report:
+
+- `docs/audits/2026-07-24-deferred-input-conservation-validation.md`.
+
+Локальная матрица на итоговом commit:
+
+- 711 base library tests;
+- 772 settings-ui library tests;
+- 11 D-Bus integration tests;
+- all-target check, all-feature clippy, package shell tests, rustfmt и
+  `git diff --check`.
+
+Exact package `0.1.0-3` проверен в Linux Mint/Cinnamon/X11 и
+Ubuntu/GNOME/Wayland. В обоих профилях выполнено по 10 stop/start циклов:
+grab каждый раз освобождался после stop и возвращался после start, daemon
+завершал цикл с `Result=success` без restart и предупреждений.
+
+Приняты как Low и не требуют дальнейшего углубления два искусственных
+миллисекундных сценария: повторный double-Tab примерно через 2 ms в Cinnamon
+может потерять 1–2 символа, а Wayland tail примерно через 2 ms может остаться
+в исходной раскладке. Ни один сценарий не оставляет grab или модификатор,
+не останавливает daemon и не блокирует управление. Реалистичные paced-сценарии
+в обоих профилях проходят.
+
+Сохранённые состояния лаборатории:
+
+- оба VM-профиля установлены с `0.1.0-3` и остановлены после проверки;
+- disks, profiles, logs, screenshots, QMP evidence и worktrees не удалялись.
 
 ## Актуальная точка 2026-07-23
 
@@ -69,20 +106,21 @@ configuration persistence, desktop commands или layout backend refresh;
 
 ## Последний проверенный Debian package
 
-- package identity: `open-switcher 0.1.0-2`, `amd64`;
+- package identity: `open-switcher 0.1.0-3`, `amd64`;
 - canonical source artifact:
-  `.worktrees/quiescent-writer-shutdown/dist/packages/open-switcher_0.1.0-2_amd64.deb`;
+  `.worktrees/deferred-input-conservation/dist/packages/open-switcher_0.1.0-3_amd64.deb`;
 - удобная копия для host install:
-  `dist/packages/open-switcher_0.1.0-2_amd64.deb`;
-- размер: `3 027 178` bytes;
+  `dist/packages/open-switcher_0.1.0-3_amd64.deb`;
+- размер: `3 052 026` bytes;
 - SHA-256:
-  `6dc7ccb8ca3a1f326475072ec1a2b001f9595d135ace4431e56cf08ffdaf3acd`;
+  `9f18df63a32f551ecd790fd03796578ab7057d2cfba5417570877c57aa6b8b0c`;
 - packaged daemon SHA-256:
-  `e83f3ec06570be36c4ebc3d7bb5bed9109af0a0344ada7939af99f4b0d9b1129`.
+  `1adbdf1753740cafa9d7126c6fe333560e3541113ae4030298402f069badcb4e`.
 
-Package прошёл 634 base tests, 695 settings-ui tests, vendored uinput tests,
-оба all-target checks и package shell checks. Тот же daemon hash установлен и
-проверен в Ubuntu 24.04/GNOME/Wayland и Linux Mint/Cinnamon/X11.
+Package прошёл 711 base tests, 772 settings-ui tests, 11 D-Bus integration
+tests, all-target check, all-feature clippy и package shell checks. Тот же
+daemon hash установлен и проверен в Ubuntu 24.04/GNOME/Wayland и Linux
+Mint/Cinnamon/X11.
 
 ## Host transition с developer install
 
@@ -132,18 +170,17 @@ Debian package штатно выполнит trigger, установит package
 
 Работы сознательно отложены:
 
-1. conservation/reconciliation для deferred physical events;
-2. operation-wide synthetic key ledger и failure-at-operation-N;
-3. transactional clipboard/selected-text safety;
-4. package upgrade/remove и seat/ACL boundary;
-5. отдельный диагностический writer fault seam и production hang injection;
-6. расширенная runtime campaign: hot-unplug/replug, suspend/resume,
+1. operation-wide synthetic key ledger и failure-at-operation-N;
+2. transactional clipboard/selected-text safety;
+3. package upgrade/remove и seat/ACL boundary;
+4. отдельный диагностический writer fault seam и production hang injection;
+5. расширенная runtime campaign: hot-unplug/replug, suspend/resume,
    kill/power-loss timing и hardware acceptance.
 
 ## Как продолжать позже
 
 1. Открыть этот handoff и
-   `docs/audits/2026-07-23-quiescent-writer-shutdown-validation.md`.
+   `docs/audits/2026-07-24-deferred-input-conservation-validation.md`.
 2. Проверить `git status` и HEAD `master`; пользовательские untracked audit/VM
    документы в основном worktree не удалять и не включать в случайный commit.
 3. Не пересобирать VM-лабораторию; использовать сохранённые Ubuntu и Mint

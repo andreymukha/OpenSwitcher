@@ -6135,6 +6135,80 @@ mod tests {
     }
 
     #[test]
+    fn cinnamon_xtest_shifted_stroke_normal_trace_is_frozen() {
+        let mut replay = FakeCinnamonX11XtestReplay::default();
+        let plan = CorrectionPlan {
+            buffer: vec![crate::daemon::switch_logic::Keystroke {
+                key: Key::KEY_G,
+                shift: true,
+                caps_lock: false,
+            }],
+            extra_backspaces: 0,
+        };
+
+        run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &plan,
+            &test_runtime_config_snapshot(),
+            ModifierState::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            replay.calls,
+            [
+                "prepare",
+                "down:KEY_BACKSPACE",
+                "up:KEY_BACKSPACE",
+                "down:KEY_LEFTSHIFT",
+                "down:KEY_G",
+                "up:KEY_G",
+                "up:KEY_LEFTSHIFT",
+            ]
+        );
+    }
+
+    #[test]
+    fn cinnamon_xtest_physical_shift_release_restore_trace_is_frozen() {
+        let mut replay = FakeCinnamonX11XtestReplay::default();
+        let plan = CorrectionPlan {
+            buffer: vec![crate::daemon::switch_logic::Keystroke {
+                key: Key::KEY_G,
+                shift: false,
+                caps_lock: false,
+            }],
+            extra_backspaces: 0,
+        };
+        let modifiers = ModifierState {
+            left_shift: true,
+            ..ModifierState::default()
+        };
+
+        run_cinnamon_x11_xtest_correction(
+            &mut replay,
+            &plan,
+            &test_runtime_config_snapshot(),
+            modifiers,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            replay.calls,
+            [
+                "prepare",
+                "up:KEY_LEFTSHIFT",
+                "down:KEY_BACKSPACE",
+                "up:KEY_BACKSPACE",
+                "down:KEY_G",
+                "up:KEY_G",
+                "down:KEY_LEFTSHIFT",
+            ]
+        );
+    }
+
+    #[test]
     fn cinnamon_xkb_target_group_toggles_an_exact_pair() {
         assert_eq!(cinnamon_xkb_target_group(2, 0).unwrap(), 1);
         assert_eq!(cinnamon_xkb_target_group(2, 1).unwrap(), 0);

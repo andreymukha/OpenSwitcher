@@ -1,3 +1,6 @@
+use super::client::{
+    EmergencyRelease, GuardianClient, GuardianMutationDeadline, GUARDIAN_EMERGENCY_DEADLINE,
+};
 use super::protocol::{
     decode_frame, encode_frame, Message, MutationDeadlineNs, ProtocolSession, ReleaseDeadline,
     Request, Response, Sequence, ServerEpoch, SessionId,
@@ -5,7 +8,8 @@ use super::protocol::{
 use super::seqpacket::Seqpacket;
 use super::service::{monotonic_now_ns, run_connection, X11ServerIdentity, XtestExecutor};
 use crate::daemon::synthetic_input::{InputGeneration, OperationId, TerminalProof};
-use crate::error::InputSafetyError;
+use crate::error::{InputSafetyError, SwitcherError};
+use evdev::Key;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -146,7 +150,78 @@ fn wait_forever() -> ! {
     }
 }
 
+struct ProcessFakeEmergency {
+    epoch: ServerEpoch,
+    trace: PathBuf,
+}
+
+impl EmergencyRelease for ProcessFakeEmergency {
+    fn server_epoch(&self) -> ServerEpoch {
+        self.epoch
+    }
+
+    fn release_token(
+        &mut self,
+        token: super::protocol::PreparedToken,
+    ) -> Result<(), SwitcherError> {
+        append_trace(&self.trace, &format!("emergency-up:{}", token.x11_keycode));
+        Ok(())
+    }
+
+    fn synchronize(&mut self) -> Result<(), SwitcherError> {
+        append_trace(&self.trace, "emergency-sync");
+        Ok(())
+    }
+}
+
+fn run_daemon_guardian_sigkill_role(trace: &Path) {
+    let connection = inherited_connection();
+    let mut client =
+        GuardianClient::from_test_connection(connection, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+    let epoch = client.ready().epoch;
+    client
+        .arm_emergency(ProcessFakeEmergency {
+            epoch,
+            trace: trace.to_path_buf(),
+        })
+        .unwrap();
+    let deadline =
+        GuardianMutationDeadline::from_instant(Instant::now() + Duration::from_secs(2)).unwrap();
+    let token = client
+        .prepare_key(OperationId(1), Key::KEY_A, deadline)
+        .unwrap();
+    if client.execute_down(OperationId(1), token, deadline).is_ok() {
+        let _ = client.synchronize(OperationId(1), deadline);
+    }
+
+    let health = client.health();
+    let health_deadline = Instant::now() + PROCESS_TIMEOUT;
+    while !health.is_failed() && Instant::now() < health_deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        health.is_failed(),
+        "daemon surrogate did not observe guardian loss"
+    );
+
+    // This trace point stands for KeyboardController releasing EVIOCGRAB.
+    // EmergencyCoordinator itself cannot start the worker before this call.
+    append_trace(trace, "grab-released");
+    let proof = client
+        .emergency_coordinator()
+        .start_pending_release()
+        .unwrap()
+        .wait(GUARDIAN_EMERGENCY_DEADLINE);
+    append_trace(trace, &format!("daemon-emergency-terminal:{proof:?}"));
+    panic!("intentional daemon fail-stop after guardian loss");
+}
+
 fn run_daemon_role(scenario: &str, trace: &Path) {
+    if scenario == "guardian-sigkill" {
+        run_daemon_guardian_sigkill_role(trace);
+        return;
+    }
     let connection = inherited_connection();
     let deadline = MutationDeadlineNs(monotonic_now_ns().unwrap() + 4_000_000_000);
     send_request(
@@ -369,6 +444,14 @@ impl ProcessFixture {
         let _ = daemon.wait().unwrap();
     }
 
+    fn kill_guardian(&mut self) {
+        let guardian = self.guardian.as_mut().unwrap();
+        if guardian.try_wait().unwrap().is_none() {
+            guardian.kill().unwrap();
+        }
+        let _ = guardian.wait().unwrap();
+    }
+
     fn wait_daemon(&mut self) -> ExitStatus {
         self.daemon.as_mut().unwrap().wait().unwrap()
     }
@@ -386,6 +469,28 @@ impl ProcessFixture {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    fn wait_daemon_bounded(&mut self) -> ExitStatus {
+        let deadline = Instant::now() + PROCESS_TIMEOUT;
+        loop {
+            if let Some(status) = self.daemon.as_mut().unwrap().try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon surrogate did not exit; trace:\n{}",
+                self.trace_text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn trace_before(&self, first: &str, second: &str) -> bool {
+        let text = self.trace_text();
+        let first = text.lines().position(|line| line == first);
+        let second = text.lines().position(|line| line == second);
+        matches!((first, second), (Some(first), Some(second)) if first < second)
     }
 }
 
@@ -462,4 +567,27 @@ fn cleanup_failure_reports_unreconciled_and_does_not_claim_stopped() {
     fixture.wait_for_trace_prefix("guardian-terminal:PeerEof:unreconciled:1");
     assert!(fixture.wait_guardian().success());
     assert!(!fixture.trace_text().contains("Stopped"));
+}
+
+#[test]
+fn sigkill_guardian_after_down_starts_emergency_only_after_ungrab_signal() {
+    let mut fixture = ProcessFixture::spawn("guardian-sigkill");
+    fixture.wait_for_trace("down:38");
+    fixture.kill_guardian();
+    fixture.wait_for_trace("grab-released");
+    fixture.wait_for_trace("emergency-up:38");
+
+    assert!(fixture.trace_before("grab-released", "emergency-up:38"));
+    assert!(!fixture.wait_daemon_bounded().success());
+    assert_eq!(
+        fixture
+            .trace_text()
+            .lines()
+            .filter(|line| *line == "down:38")
+            .count(),
+        1
+    );
+    assert!(fixture
+        .trace_text()
+        .contains("daemon-emergency-terminal:Reconciled"));
 }

@@ -22,6 +22,14 @@ pub enum InputSafetyError {
         "Synthetic input operation {operation_id} could not be reconciled ({remaining} pending)"
     )]
     Reconciliation { operation_id: u64, remaining: usize },
+    #[error("XTEST guardian is unavailable: {context}")]
+    GuardianUnavailable { context: &'static str },
+    #[error("XTEST guardian request for operation {operation_id} exceeded its local deadline")]
+    GuardianRequestTimedOut { operation_id: u64 },
+    #[error("XTEST guardian rejected the session: {context}")]
+    GuardianProtocol { context: &'static str },
+    #[error("XTEST guardian emergency cleanup exceeded its deadline ({remaining} pending)")]
+    GuardianEmergencyTimedOut { remaining: usize },
     #[error("XTEST guardian frame size {actual} exceeds the limit {maximum}")]
     OversizedFrame { actual: usize, maximum: usize },
 }

@@ -1,3 +1,4 @@
+pub(crate) mod client;
 #[cfg(test)]
 mod process_tests;
 pub(crate) mod protocol;

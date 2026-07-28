@@ -317,6 +317,20 @@ mod tests {
     }
 
     #[test]
+    fn guardian_failure_requires_process_restart() {
+        let unavailable = SwitcherError::InputSafety(InputSafetyError::GuardianUnavailable {
+            context: "test guardian loss",
+        });
+        let unreconciled =
+            SwitcherError::InputSafety(InputSafetyError::GuardianEmergencyTimedOut {
+                remaining: 1,
+            });
+
+        assert!(!unavailable.is_recoverable_input_error());
+        assert!(!unreconciled.is_recoverable_input_error());
+    }
+
+    #[test]
     fn keyboard_access_denied_has_linux_input_setup_hint() {
         let error = SwitcherError::KeyboardAccessDenied {
             path: PathBuf::from("/dev/input/event4"),

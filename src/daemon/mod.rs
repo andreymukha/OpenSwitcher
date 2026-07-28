@@ -12,6 +12,7 @@ pub mod switch_logic;
 pub(crate) mod synthetic_input;
 pub(crate) mod uinput_synthetic;
 pub(crate) mod x11_wait;
+pub(crate) mod xtest_guardian;
 
 use crate::config::default_config_path;
 use crate::dbus::{CaptureOwnerMonitor, OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};

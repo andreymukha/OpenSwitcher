@@ -43,7 +43,7 @@ impl<T> PendingTransfer<T> {
         }
     }
 
-    pub(crate) fn commit(
+    fn commit(
         mut self,
         adopt: impl FnOnce(&T) -> Result<(), SwitcherError>,
     ) -> Result<(), SwitcherError> {
@@ -242,7 +242,7 @@ impl<T: Clone + Eq> SyntheticKeyLedger<T> {
         Ok(())
     }
 
-    pub(crate) fn transfer(&mut self, press_id: PressId) -> Result<T, SwitcherError> {
+    fn transfer(&mut self, press_id: PressId) -> Result<T, SwitcherError> {
         if self.terminal {
             return Err(crate::error::InputSafetyError::Invariant {
                 context: "transfer after terminal state",
@@ -392,6 +392,187 @@ impl PhysicalRestorePlan {
 
     fn snapshot(&self) -> Vec<Key> {
         self.temporarily_released.clone()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct InputGeneration(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PhysicalSequence(pub(crate) u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionModifierState {
+    OwnedDown,
+    TemporarilyReleased,
+    RestoringPossiblyDown,
+}
+
+pub(crate) struct PhysicalReleaseCommit {
+    pub(crate) generation: InputGeneration,
+    pub(crate) sequence: PhysicalSequence,
+    pub(crate) key: Key,
+}
+
+struct SessionModifierDebt<T> {
+    key: Key,
+    token: T,
+    state: SessionModifierState,
+}
+
+pub(crate) struct SessionModifierLedger<T> {
+    generation: InputGeneration,
+    last_release_sequence: u64,
+    entries: Vec<SessionModifierDebt<T>>,
+}
+
+impl<T> SessionModifierLedger<T> {
+    pub(crate) fn new(generation: InputGeneration) -> Self {
+        Self {
+            generation,
+            last_release_sequence: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn adopt_restored(&mut self, key: Key, token: T) -> Result<(), SwitcherError> {
+        if modifier_bit(key).is_none() {
+            return Err(self.protocol_error("session debt requires a modifier key"));
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            if entry.state != SessionModifierState::RestoringPossiblyDown {
+                return Err(self
+                    .protocol_error("restored modifier already has an incompatible session debt"));
+            }
+            entry.token = token;
+            entry.state = SessionModifierState::OwnedDown;
+            return Ok(());
+        }
+        self.entries.push(SessionModifierDebt {
+            key,
+            token,
+            state: SessionModifierState::OwnedDown,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn mark_temporarily_released(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.transition(
+            key,
+            SessionModifierState::OwnedDown,
+            SessionModifierState::TemporarilyReleased,
+            "only an owned-down modifier can be temporarily released",
+        )
+    }
+
+    pub(crate) fn mark_restoring(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.transition(
+            key,
+            SessionModifierState::TemporarilyReleased,
+            SessionModifierState::RestoringPossiblyDown,
+            "only a temporarily released modifier can begin restoring",
+        )
+    }
+
+    pub(crate) fn mark_owned_down(&mut self, key: Key) -> Result<(), SwitcherError> {
+        self.transition(
+            key,
+            SessionModifierState::RestoringPossiblyDown,
+            SessionModifierState::OwnedDown,
+            "only a restoring modifier can become owned-down",
+        )
+    }
+
+    pub(crate) fn commit_physical_release(
+        &mut self,
+        commit: PhysicalReleaseCommit,
+    ) -> Result<Option<T>, SwitcherError> {
+        if commit.generation != self.generation {
+            return Err(self.protocol_error("physical release generation does not match"));
+        }
+        if commit.sequence.0 <= self.last_release_sequence {
+            return Err(self.protocol_error("physical release sequence is stale"));
+        }
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.key == commit.key)
+        else {
+            self.last_release_sequence = commit.sequence.0;
+            return Ok(None);
+        };
+        if self.entries[index].state != SessionModifierState::OwnedDown {
+            return Err(self.protocol_error(
+                "physical release cannot commit an in-flight modifier transition",
+            ));
+        }
+        self.last_release_sequence = commit.sequence.0;
+        Ok(Some(self.entries.remove(index).token))
+    }
+
+    pub(crate) fn contains(&self, key: Key) -> bool {
+        self.entries.iter().any(|entry| entry.key == key)
+    }
+
+    pub(crate) fn state(&self, key: Key) -> Option<SessionModifierState> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.state)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn transition(
+        &mut self,
+        key: Key,
+        expected: SessionModifierState,
+        next: SessionModifierState,
+        context: &'static str,
+    ) -> Result<(), SwitcherError> {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) else {
+            return Err(self.protocol_error("modifier has no session debt"));
+        };
+        if entry.state != expected {
+            return Err(self.protocol_error(context));
+        }
+        entry.state = next;
+        Ok(())
+    }
+
+    fn protocol_error(&self, context: &'static str) -> SwitcherError {
+        crate::error::InputSafetyError::SessionModifierProtocolViolation {
+            generation: self.generation.0,
+            context,
+        }
+        .into()
+    }
+}
+
+impl<T: Clone> SessionModifierLedger<T> {
+    pub(crate) fn release_only_snapshot(&self) -> Vec<T> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.state,
+                    SessionModifierState::OwnedDown | SessionModifierState::RestoringPossiblyDown
+                )
+            })
+            .map(|entry| entry.token.clone())
+            .collect()
+    }
+}
+
+impl<T: Clone> RestoredModifierTarget<T> for SessionModifierLedger<T> {
+    fn adopt_restored(
+        &mut self,
+        key: Key,
+        transfer: PendingTransfer<T>,
+    ) -> Result<(), SwitcherError> {
+        transfer.commit(|token| self.adopt_restored(key, token.clone()))
     }
 }
 
@@ -1952,5 +2133,307 @@ mod tests {
             assert_eq!(report.proof, TerminalProof::Reconciled, "{expire_at:?}");
             assert!(!latch.is_failed(), "{expire_at:?}");
         }
+    }
+
+    #[test]
+    fn session_modifier_physical_release_requires_matching_generation_and_sequence() {
+        let token = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(19));
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, token.clone())
+            .unwrap();
+
+        assert!(ledger
+            .commit_physical_release(PhysicalReleaseCommit {
+                generation: InputGeneration(18),
+                sequence: PhysicalSequence(91),
+                key: Key::KEY_LEFTSHIFT,
+            })
+            .is_err());
+        assert!(ledger.contains(Key::KEY_LEFTSHIFT));
+
+        assert_eq!(
+            ledger
+                .commit_physical_release(PhysicalReleaseCommit {
+                    generation: InputGeneration(19),
+                    sequence: PhysicalSequence(92),
+                    key: Key::KEY_LEFTSHIFT,
+                })
+                .unwrap(),
+            Some(token),
+        );
+        assert!(!ledger.contains(Key::KEY_LEFTSHIFT));
+    }
+
+    #[test]
+    fn repeated_correction_while_modifier_is_held_preserves_one_session_debt() {
+        let mut ledger = SessionModifierLedger::new(InputGeneration(20));
+        ledger
+            .adopt_restored(
+                Key::KEY_LEFTSHIFT,
+                FakeToken {
+                    key: Key::KEY_LEFTSHIFT,
+                },
+            )
+            .unwrap();
+
+        ledger
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        ledger.mark_restoring(Key::KEY_LEFTSHIFT).unwrap();
+        ledger.mark_owned_down(Key::KEY_LEFTSHIFT).unwrap();
+
+        assert_eq!(
+            ledger.state(Key::KEY_LEFTSHIFT),
+            Some(SessionModifierState::OwnedDown),
+        );
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn session_modifier_release_only_snapshot_excludes_temporarily_released() {
+        let owned = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let temporarily_released = FakeToken {
+            key: Key::KEY_RIGHTCTRL,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(21));
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, owned.clone())
+            .unwrap();
+        ledger
+            .adopt_restored(Key::KEY_RIGHTCTRL, temporarily_released)
+            .unwrap();
+        ledger
+            .mark_temporarily_released(Key::KEY_RIGHTCTRL)
+            .unwrap();
+
+        assert_eq!(ledger.release_only_snapshot(), [owned]);
+    }
+
+    #[test]
+    fn stale_release_ack_preserves_owned_session_debt() {
+        let token = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(22));
+        assert_eq!(
+            ledger
+                .commit_physical_release(PhysicalReleaseCommit {
+                    generation: InputGeneration(22),
+                    sequence: PhysicalSequence(100),
+                    key: Key::KEY_A,
+                })
+                .unwrap(),
+            None
+        );
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, token.clone())
+            .unwrap();
+
+        assert!(ledger
+            .commit_physical_release(PhysicalReleaseCommit {
+                generation: InputGeneration(22),
+                sequence: PhysicalSequence(100),
+                key: Key::KEY_LEFTSHIFT,
+            })
+            .is_err());
+        assert_eq!(ledger.release_only_snapshot(), [token]);
+    }
+
+    #[test]
+    fn second_session_press_for_same_key_is_rejected_until_release_commit() {
+        let original = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let duplicate = FakeToken {
+            key: Key::KEY_RIGHTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(23));
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, original.clone())
+            .unwrap();
+
+        assert!(ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, duplicate)
+            .is_err());
+        assert_eq!(ledger.release_only_snapshot(), [original]);
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn session_ledger_is_the_only_consumer_of_restored_pending_transfer() {
+        let fallback = Arc::new(Mutex::new(Vec::new()));
+        let token = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let transfer = PendingTransfer::new(token.clone(), fallback.clone());
+        let mut ledger = SessionModifierLedger::new(InputGeneration(24));
+
+        RestoredModifierTarget::adopt_restored(&mut ledger, Key::KEY_LEFTSHIFT, transfer).unwrap();
+
+        assert_eq!(ledger.release_only_snapshot(), [token]);
+        assert!(fallback.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejected_duplicate_transfer_returns_new_token_to_release_only_fallback() {
+        let fallback = Arc::new(Mutex::new(Vec::new()));
+        let original = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let duplicate = FakeToken {
+            key: Key::KEY_RIGHTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(25));
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, original.clone())
+            .unwrap();
+        let transfer = PendingTransfer::new(duplicate.clone(), fallback.clone());
+
+        assert!(
+            RestoredModifierTarget::adopt_restored(&mut ledger, Key::KEY_LEFTSHIFT, transfer,)
+                .is_err()
+        );
+
+        assert_eq!(ledger.release_only_snapshot(), [original]);
+        assert_eq!(*fallback.lock().unwrap(), [duplicate]);
+    }
+
+    #[test]
+    fn session_ledger_rejects_non_modifier_debt() {
+        let mut ledger = SessionModifierLedger::new(InputGeneration(26));
+
+        let error = ledger
+            .adopt_restored(Key::KEY_A, FakeToken { key: Key::KEY_A })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputSafety(InputSafetyError::SessionModifierProtocolViolation {
+                generation: 26,
+                context: "session debt requires a modifier key",
+            })
+        ));
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[test]
+    fn restored_transfer_replaces_token_only_from_restoring_state() {
+        let fallback = Arc::new(Mutex::new(Vec::new()));
+        let replacement = FakeToken {
+            key: Key::KEY_RIGHTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(27));
+        ledger
+            .adopt_restored(
+                Key::KEY_LEFTSHIFT,
+                FakeToken {
+                    key: Key::KEY_LEFTSHIFT,
+                },
+            )
+            .unwrap();
+        ledger
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        ledger.mark_restoring(Key::KEY_LEFTSHIFT).unwrap();
+
+        RestoredModifierTarget::adopt_restored(
+            &mut ledger,
+            Key::KEY_LEFTSHIFT,
+            PendingTransfer::new(replacement.clone(), fallback.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ledger.state(Key::KEY_LEFTSHIFT),
+            Some(SessionModifierState::OwnedDown)
+        );
+        assert_eq!(ledger.release_only_snapshot(), [replacement]);
+        assert!(fallback.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restoring_session_debt_is_included_in_daemon_death_snapshot() {
+        let token = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(28));
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, token.clone())
+            .unwrap();
+        ledger
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        ledger.mark_restoring(Key::KEY_LEFTSHIFT).unwrap();
+
+        assert_eq!(ledger.release_only_snapshot(), [token]);
+    }
+
+    #[test]
+    fn physical_release_cannot_commit_during_session_transition() {
+        let token = FakeToken {
+            key: Key::KEY_LEFTSHIFT,
+        };
+        let mut ledger = SessionModifierLedger::new(InputGeneration(29));
+        ledger
+            .adopt_restored(Key::KEY_LEFTSHIFT, token.clone())
+            .unwrap();
+        ledger
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .unwrap();
+
+        assert!(ledger
+            .commit_physical_release(PhysicalReleaseCommit {
+                generation: InputGeneration(29),
+                sequence: PhysicalSequence(1),
+                key: Key::KEY_LEFTSHIFT,
+            })
+            .is_err());
+        assert_eq!(
+            ledger.state(Key::KEY_LEFTSHIFT),
+            Some(SessionModifierState::TemporarilyReleased)
+        );
+        assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn invalid_session_modifier_transitions_preserve_current_state() {
+        let mut ledger = SessionModifierLedger::new(InputGeneration(30));
+        ledger
+            .adopt_restored(
+                Key::KEY_LEFTSHIFT,
+                FakeToken {
+                    key: Key::KEY_LEFTSHIFT,
+                },
+            )
+            .unwrap();
+
+        assert!(ledger.mark_restoring(Key::KEY_LEFTSHIFT).is_err());
+        assert_eq!(
+            ledger.state(Key::KEY_LEFTSHIFT),
+            Some(SessionModifierState::OwnedDown)
+        );
+
+        ledger
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        assert!(ledger.mark_owned_down(Key::KEY_LEFTSHIFT).is_err());
+        assert_eq!(
+            ledger.state(Key::KEY_LEFTSHIFT),
+            Some(SessionModifierState::TemporarilyReleased)
+        );
+
+        ledger.mark_restoring(Key::KEY_LEFTSHIFT).unwrap();
+        assert!(ledger
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .is_err());
+        assert_eq!(
+            ledger.state(Key::KEY_LEFTSHIFT),
+            Some(SessionModifierState::RestoringPossiblyDown)
+        );
     }
 }

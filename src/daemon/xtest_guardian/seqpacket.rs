@@ -98,6 +98,19 @@ impl Seqpacket {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) unsafe fn from_inherited_test_fd(raw_fd: RawFd) -> Result<Self, SwitcherError> {
+        let fd = OwnedFd::from_raw_fd(raw_fd);
+        set_close_on_exec(fd.as_raw_fd())?;
+        enable_sender_credentials(fd.as_raw_fd())?;
+        Ok(Self {
+            fd,
+            receive_authentication: ReceiveAuthentication::SenderCredentials {
+                own_executable: executable_identity(Path::new("/proc/self/exe"))?,
+            },
+        })
+    }
+
     pub(crate) fn send_frame(&self, frame: &[u8]) -> Result<(), SwitcherError> {
         if frame.len() > MAX_FRAME_BYTES {
             return Err(oversized_frame(frame.len()));

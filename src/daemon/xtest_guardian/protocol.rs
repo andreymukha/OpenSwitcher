@@ -813,6 +813,7 @@ pub(crate) fn response_matches(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TrackedTokenState {
     Prepared,
+    AttemptingDown,
     PossiblyDown,
     PhysicalDebt(InputGeneration),
 }
@@ -886,6 +887,20 @@ impl ProtocolState {
             terminal: false,
             cleanup_deadline: None,
         })
+    }
+
+    pub(crate) fn ready_after_handshake(
+        session: ProtocolSession,
+        handshake_sequence: Sequence,
+    ) -> Result<Self, SwitcherError> {
+        if handshake_sequence.0 == 0 {
+            return Err(protocol_error(
+                "XTEST guardian handshake sequence must be nonzero",
+            ));
+        }
+        let mut state = Self::ready(session)?;
+        state.last_sequence = handshake_sequence.0;
+        Ok(state)
     }
 
     pub(crate) fn accept(
@@ -1002,6 +1017,34 @@ impl ProtocolState {
         Ok(())
     }
 
+    pub(crate) fn record_down_attempt(&mut self, token_id: u64) -> Result<(), SwitcherError> {
+        let Some(pending) = self.pending_sync else {
+            return Err(protocol_error(
+                "XTEST guardian down attempt has no matching request",
+            ));
+        };
+        if pending.kind != PendingSyncKind::Down
+            || pending.token_id != token_id
+            || pending.request_accepted
+        {
+            return Err(protocol_error(
+                "XTEST guardian down attempt does not match request",
+            ));
+        }
+        let tracked = self
+            .tokens
+            .iter_mut()
+            .find(|tracked| tracked.token.token_id == token_id)
+            .ok_or_else(|| protocol_error("XTEST guardian down attempt lost its token"))?;
+        if tracked.state != TrackedTokenState::AttemptingDown {
+            return Err(protocol_error(
+                "XTEST guardian down attempt token is not attempting",
+            ));
+        }
+        tracked.state = TrackedTokenState::PossiblyDown;
+        Ok(())
+    }
+
     pub(crate) fn complete_synchronize(&mut self, token_id: u64) -> Result<(), SwitcherError> {
         let Some(pending) = self.pending_sync else {
             return Err(protocol_error(
@@ -1035,8 +1078,44 @@ impl ProtocolState {
             .count()
     }
 
+    pub(crate) fn session(&self) -> ProtocolSession {
+        self.session
+    }
+
     pub(crate) fn is_terminal(&self) -> bool {
         self.terminal
+    }
+
+    pub(crate) fn begin_terminal(&mut self) {
+        self.terminal = true;
+        self.pending_prepare = None;
+        self.pending_sync = None;
+        self.tokens
+            .retain(|tracked| tracked.state != TrackedTokenState::Prepared);
+    }
+
+    pub(crate) fn cleanup_tokens_reverse(&self) -> Vec<PreparedToken> {
+        self.tokens
+            .iter()
+            .rev()
+            .filter(|tracked| tracked.state != TrackedTokenState::Prepared)
+            .map(|tracked| tracked.token)
+            .collect()
+    }
+
+    pub(crate) fn acknowledge_cleanup_release(
+        &mut self,
+        token_id: u64,
+    ) -> Result<(), SwitcherError> {
+        let index = self
+            .tokens
+            .iter()
+            .position(|tracked| {
+                tracked.token.token_id == token_id && tracked.state != TrackedTokenState::Prepared
+            })
+            .ok_or_else(|| protocol_error("XTEST guardian cleanup lost its token"))?;
+        self.tokens.remove(index);
+        Ok(())
     }
 
     fn accept_prepare(
@@ -1104,7 +1183,7 @@ impl ProtocolState {
             ));
         }
 
-        self.tokens[index].state = TrackedTokenState::PossiblyDown;
+        self.tokens[index].state = TrackedTokenState::AttemptingDown;
         self.pending_sync = Some(PendingSync {
             operation,
             token_id: token.token_id,
@@ -1133,6 +1212,11 @@ impl ProtocolState {
             TrackedTokenState::Prepared => {
                 return Err(protocol_error(
                     "XTEST guardian cannot release a token that was never down",
+                ));
+            }
+            TrackedTokenState::AttemptingDown => {
+                return Err(protocol_error(
+                    "XTEST guardian cannot release a down still in flight",
                 ));
             }
             TrackedTokenState::PossiblyDown if self.tokens[index].operation != operation => {
@@ -1181,6 +1265,18 @@ impl ProtocolState {
             return Err(protocol_error(
                 "XTEST guardian synchronize does not match mutation",
             ));
+        }
+        if pending.kind == PendingSyncKind::Down {
+            let tracked = self
+                .tokens
+                .iter()
+                .find(|tracked| tracked.token.token_id == token_id)
+                .ok_or_else(|| protocol_error("XTEST guardian synchronize lost its token"))?;
+            if tracked.state != TrackedTokenState::PossiblyDown {
+                return Err(protocol_error(
+                    "XTEST guardian down did not finish before synchronize",
+                ));
+            }
         }
         let starts_terminal = self.validate_release_deadline(operation, deadline, now_ns)?;
 
@@ -1771,6 +1867,7 @@ mod tests {
                 NOW_NS,
             )
             .unwrap();
+        state.record_down_attempt(1).unwrap();
         state
             .accept(
                 Sequence(3),
@@ -1862,6 +1959,7 @@ mod tests {
                 NOW_NS,
             )
             .unwrap();
+        state.record_down_attempt(1).unwrap();
         state
             .accept(
                 Sequence(3),
@@ -1965,6 +2063,7 @@ mod tests {
                     NOW_NS,
                 )
                 .unwrap();
+            debt_state.record_down_attempt(token_id).unwrap();
             sequence += 1;
             debt_state
                 .accept(
@@ -2035,6 +2134,7 @@ mod tests {
                 NOW_NS,
             )
             .unwrap();
+        state.record_down_attempt(1).unwrap();
         state
             .accept(
                 Sequence(3),

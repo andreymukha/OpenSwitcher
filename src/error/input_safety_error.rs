@@ -22,4 +22,6 @@ pub enum InputSafetyError {
         "Synthetic input operation {operation_id} could not be reconciled ({remaining} pending)"
     )]
     Reconciliation { operation_id: u64, remaining: usize },
+    #[error("XTEST guardian frame size {actual} exceeds the limit {maximum}")]
+    OversizedFrame { actual: usize, maximum: usize },
 }

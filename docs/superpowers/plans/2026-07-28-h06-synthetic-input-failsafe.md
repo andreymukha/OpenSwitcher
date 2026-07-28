@@ -56,7 +56,7 @@ guardian без удержания физического `EVIOCGRAB`.
 - `src/daemon/xtest_guardian/protocol.rs` — ручной bounded wire codec и
   protocol state/sequence validation.
 - `src/daemon/xtest_guardian/seqpacket.rs` — `SOCK_SEQPACKET`, socket
-  activation, `SO_PEERCRED` и проверка inode packaged binary.
+  activation, `SO_PEERCRED`/`SCM_CREDENTIALS` и проверка inode packaged binary.
 - `src/daemon/xtest_guardian/x11.rs` — authoritative XTEST executor, X11 epoch
   marker и release-only emergency connection.
 - `src/daemon/xtest_guardian/service.rs` — guardian session loop,
@@ -1300,7 +1300,7 @@ nix = { version = "0.26.4", default-features = false, features = [
 
 - [ ] **Шаг 4: реализовать frame-safe wrapper**
 
-Использовать `nix::sys::socket::{socket, connect, accept4, send, recv,
+Использовать `nix::sys::socket::{socket, connect, accept4, send, recvmsg,
 getsockopt}` с `SockType::SeqPacket` и `SOCK_CLOEXEC`. Receive buffer имеет
 `MAX_FRAME_BYTES + 1`; результат больше `MAX_FRAME_BYTES` всегда rejected.
 Partial send считается terminal transport error.
@@ -1320,12 +1320,22 @@ AF_UNIX
 После принятия fd удалить `LISTEN_PID`, `LISTEN_FDS`, `LISTEN_FDNAMES` из
 process environment и установить `FD_CLOEXEC`.
 
-- [ ] **Шаг 6: проверять обе стороны через `SO_PEERCRED`**
+- [ ] **Шаг 6: проверять обе стороны через kernel credentials**
 
-Guardian и daemon требуют текущий UID и сравнивают `(st_dev, st_ino)`
-`/proc/<peer-pid>/exe` со своим `/proc/self/exe`. Это запрещает смешать старый
-guardian и новый daemon во время package update даже при одинаковой protocol
-version.
+Guardian проверяет подключившийся daemon через `SO_PEERCRED`: текущий UID и
+`(st_dev, st_ino)` `/proc/<peer-pid>/exe` должны совпасть с
+`/proc/self/exe`. На стороне daemon нельзя использовать ту же проверку
+симметрично: при systemd socket activation `SO_PEERCRED` у клиента указывает на
+процесс, вызвавший `listen(2)`, то есть на user manager, а не на guardian,
+который позднее вызвал `accept(2)`.
+
+Поэтому daemon включает `SO_PASSCRED` до `connect(2)`, проверяет UID владельца
+listener через `SO_PEERCRED`, а фактический UID, PID и inode guardian проверяет
+по добавленному ядром `SCM_CREDENTIALS` каждого непустого response frame.
+Отсутствующие, усечённые, повторные или неожиданные ancillary data считаются
+terminal transport error; полученные через `SCM_RIGHTS` descriptors немедленно
+закрываются. Это сохраняет запрет смешивать старый guardian и новый daemon при
+package update даже при одинаковой protocol version.
 
 - [ ] **Шаг 7: выполнить transport tests и compile check**
 

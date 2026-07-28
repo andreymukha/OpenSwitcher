@@ -322,9 +322,20 @@ Socket создаётся user manager внутри `$XDG_RUNTIME_DIR`:
 - каталог с mode `0700`;
 - socket с mode `0600`;
 - `RemoveOnStop=yes`;
-- peer проверяется через `SO_PEERCRED`;
+- guardian проверяет daemon через `SO_PEERCRED`, а daemon проверяет фактические
+  response sender credentials через `SO_PASSCRED` + `SCM_CREDENTIALS`;
 - сетевой listener, D-Bus name и persistent файл вне runtime directory не
   создаются.
+
+Асимметрия обязательна для socket activation. Согласно локальной
+документации `unix(7)`, `SO_PEERCRED` возвращает credentials, действовавшие при
+`connect(2)`, `listen(2)` или `socketpair(2)`. Поэтому на клиентской стороне
+socket-activated соединения он идентифицирует user manager, создавший listener,
+а не guardian, который позднее вызвал `accept(2)`. Daemon включает
+`SO_PASSCRED` до подключения и для каждого непустого ответа требует добавленный
+ядром `SCM_CREDENTIALS`; UID и `(st_dev, st_ino)` фактического sender
+сравниваются с текущим packaged binary. Guardian до чтения первого request
+проверяет UID и тот же executable identity daemon через `SO_PEERCRED`.
 
 Guardian обслуживает одну versioned daemon session, очищает ledger при
 disconnect и завершается. Socket unit остаётся доступным для следующей

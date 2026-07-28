@@ -32,17 +32,17 @@ cargo test --release --locked --lib \
 git diff --check
 ```
 
-- [ ] Зафиксировать checkpoint отдельным коммитом.
+- [x] Зафиксировать checkpoint отдельным коммитом (`881c8f2`).
 
 ### Задача 2: Один раз собрать и проверить candidate DEB
 
-- [ ] Запустить вне restricted sandbox:
+- [x] Запустить вне restricted sandbox:
 
 ```bash
 ./manage.sh package deb
 ```
 
-- [ ] Вычислить один точный путь без wildcard и сохранить SHA-256:
+- [x] Вычислить один точный путь без wildcard и сохранить SHA-256:
 
 ```bash
 package="$(dpkg-parsechangelog -S Source)"
@@ -54,28 +54,43 @@ sha256sum "$CANDIDATE_DEB"
 dpkg-deb -f "$CANDIDATE_DEB" Package Version Architecture
 ```
 
-- [ ] В одном временном каталоге проверить binary, systemd units, maintainer
+- [x] В одном временном каталоге проверить binary, systemd units, maintainer
   scripts, stop helper и hidden guardian mode.
-- [ ] Проверить extracted units через временный `SYSTEMD_UNIT_PATH`.
+- [x] Проверить extracted units через временный `SYSTEMD_UNIT_PATH`.
 
 ### Задача 3: Обычный package-first smoke в Mint
 
-- [ ] Запустить только сохранённую `mint-installed` VM.
-- [ ] Передать exact candidate DEB и сверить SHA-256 в guest.
-- [ ] Установить DEB, проверить daemon/tray и отсутствие failed user units.
+- [x] Запустить только сохранённую `mint-installed` VM.
+- [x] Передать exact candidate DEB и сверить SHA-256 в guest.
+- [x] Установить exact DEB и сверить установленные binary с распакованным
+  пакетом.
+- [ ] Проверить daemon/tray и отсутствие failed user units.
+  **Заблокировано подтверждённым дефектом:** `open-switcher-xtest-guardian`
+  получает `EACCES` при проверке `/proc/<daemon-pid>/exe` под
+  `PrivateDevices=yes`, после чего daemon теряет writer и прекращает
+  перезапускаться.
 - [ ] Реалистично проверить:
   - обычный ввод;
   - ручную коррекцию последнего слова через F12;
   - переключение раскладки;
   - исправление двух заглавных;
   - исправление случайного Caps Lock.
+  **Не выполнялось:** обычный smoke невозможен, пока guardian не запускается.
 - [ ] Не совмещать ввод с искусственными сменами фокуса и не выполнять
   аварийные сценарии этого этапа.
 
 ### Задача 4: Зафиксировать результат и остановиться
 
-- [ ] Сохранить компактный текстовый evidence: commit, DEB path/SHA-256,
+- [x] Сохранить компактный текстовый evidence: commit, DEB path/SHA-256,
   package checks и результаты пяти smoke-сценариев.
-- [ ] Корректно выключить Mint VM, не удаляя overlay или laboratory.
-- [ ] Записать точку продолжения: два H-06 fault-injection сценария в Mint.
-- [ ] Остановить работу независимо от оставшегося времени.
+- [x] Корректно выключить Mint VM, не удаляя overlay или laboratory.
+- [x] Записать точку продолжения: сначала исправление обнаруженного blocker,
+  затем повтор обычного smoke; два H-06 fault-injection сценария остаются
+  отдельным следующим этапом.
+- [x] Остановить работу независимо от оставшегося времени.
+
+## Результат этапа
+
+Этап остановлен по правилу отказа после подтверждения функционального
+дефекта. Подробности сохранены в
+`docs/audits/2026-07-29-h06-stage-1-package-mint-smoke.md`.

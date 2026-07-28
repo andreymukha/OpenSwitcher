@@ -1920,7 +1920,7 @@ git commit -m "feat: require guardian before Cinnamon input grab"
 - Изменить: `src/daemon/mod.rs:138-222`
 - Тест: эти три модуля
 
-- [ ] **Шаг 1: написать sequence/commit tests**
+- [x] **Шаг 1: написать sequence/commit tests**
 
 ```rust
 #[test]
@@ -1953,7 +1953,7 @@ fn lost_release_commit_ack_forbids_next_press_of_same_modifier() {
 }
 ```
 
-- [ ] **Шаг 2: проверить RED**
+- [x] **Шаг 2: проверить RED**
 
 ```bash
 cargo test --locked --lib physical_release_ -- --test-threads=1
@@ -1962,7 +1962,7 @@ cargo test --locked --lib lost_release_commit_ -- --test-threads=1
 
 Ожидается: tests падают, потому что `sequence_id` пока теряется.
 
-- [ ] **Шаг 3: сохранять event identity во всех routing ветвях**
+- [x] **Шаг 3: сохранять event identity во всех routing ветвях**
 
 `handle_key_event` сохраняет:
 
@@ -1978,7 +1978,7 @@ closures и fast/deferred writer commands получают identity целико
 создавать новый sequence при retry; deferred ledger владеет исходным id до
 полного ACK.
 
-- [ ] **Шаг 4: выполнить XTEST physical release commit**
+- [x] **Шаг 4: выполнить XTEST physical release commit**
 
 После uinput `write + synchronize` writer:
 
@@ -1991,7 +1991,7 @@ closures и fast/deferred writer commands получают identity целико
 Lost/mismatched ACK закрывает terminal gate. Следующий command, включая press
 того же key, не dispatch-ится.
 
-- [ ] **Шаг 5: добавить shutdown phase между ungrab и wait**
+- [x] **Шаг 5: добавить shutdown phase между ungrab и wait**
 
 ```rust
 enum KeyboardShutdownPhase {
@@ -2015,14 +2015,14 @@ writer/device teardown
 watchers join либо detach
 ```
 
-- [ ] **Шаг 6: публиковать proof уничтожения uinput только после Drop device**
+- [x] **Шаг 6: публиковать proof уничтожения uinput только после Drop device**
 
 `WriterExitReport` отправляется после выхода closure, владеющей
 `uinput::Device`. Только там разрешён
 `OwnerGenerationDestroyed { generation }`. Transaction completion до teardown
 не может использовать этот proof.
 
-- [ ] **Шаг 7: сохранять primary и cleanup error раздельно**
+- [x] **Шаг 7: сохранять primary и cleanup error раздельно**
 
 `WriterTerminalReport` содержит:
 
@@ -2040,7 +2040,7 @@ struct WriterTerminalReport {
 reconciliation причины не теряются, но report также без downcast принимает
 uinput I/O, transaction timeout/cancel и исходную daemon error.
 
-- [ ] **Шаг 8: выполнить lifecycle tests**
+- [x] **Шаг 8: выполнить lifecycle tests**
 
 ```bash
 cargo test --locked --lib guardian_failure_releases_grab_before_emergency_wait -- --test-threads=1
@@ -2052,7 +2052,7 @@ cargo test --locked --lib unresponsive_writer_forbids_second_backend_install -- 
 Ожидается: порядок ungrab/emergency доказан, stale ACK не проходит, in-process
 reopen после guardian failure отсутствует.
 
-- [ ] **Шаг 9: зафиксировать physical-debt integration**
+- [x] **Шаг 9: зафиксировать physical-debt integration**
 
 ```bash
 git add src/daemon/service.rs src/daemon/keyboard.rs src/daemon/mod.rs

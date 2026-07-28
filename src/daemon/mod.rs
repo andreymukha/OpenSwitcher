@@ -18,7 +18,7 @@ use crate::config::default_config_path;
 use crate::dbus::{CaptureOwnerMonitor, OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
 use crate::system::is_dev_runtime_mode;
-use keyboard::{log_input_debug, WriterShutdownOutcome};
+use keyboard::{log_input_debug, WriterShutdownOutcome, WriterTerminalReport};
 use runtime::{log_layout_debug, BackendSyncResult, ConfigService, RuntimeState};
 use service::DaemonService;
 use std::panic::{self, AssertUnwindSafe};
@@ -107,7 +107,7 @@ pub fn run() -> Result<(), SwitcherError> {
                 (Err(SwitcherError::DaemonPanicked), Some(reason))
             }
         };
-    finalize_daemon_run_with_postmortem(
+    let result = finalize_daemon_run_with_postmortem(
         result,
         || service.shutdown(),
         |mode| shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode),
@@ -116,7 +116,8 @@ pub fn run() -> Result<(), SwitcherError> {
                 eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
             }
         },
-    )
+    );
+    resolve_daemon_result_after_writer_report(result, service.take_writer_terminal_report())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -224,6 +225,87 @@ fn resolve_daemon_result_after_shutdown(
     }
 }
 
+fn resolve_daemon_result_after_writer_report(
+    result: Result<(), SwitcherError>,
+    report: Option<WriterTerminalReport>,
+) -> Result<(), SwitcherError> {
+    let Some(mut report) = report else {
+        return result;
+    };
+    log_writer_terminal_report(&report);
+
+    match result {
+        Err(SwitcherError::VirtualKeyboardWriterDisconnected) => {
+            if let Some(primary) = report.primary.take() {
+                Err(primary)
+            } else {
+                Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+            }
+        }
+        Err(primary) => Err(primary),
+        Ok(()) => {
+            if let Some(primary) = report.primary.take() {
+                return Err(primary);
+            }
+            if let Some(cleanup) = report.cleanup.take() {
+                return Err(cleanup);
+            }
+            match report.proof {
+                synthetic_input::TerminalProof::Unreconciled { remaining } => {
+                    Err(crate::error::InputSafetyError::Reconciliation {
+                        operation_id: 0,
+                        remaining,
+                    }
+                    .into())
+                }
+                synthetic_input::TerminalProof::Reconciled
+                | synthetic_input::TerminalProof::OwnerGenerationDestroyed { .. } => Ok(()),
+            }
+        }
+    }
+}
+
+fn log_writer_terminal_report(report: &WriterTerminalReport) {
+    let primary = report
+        .primary
+        .as_ref()
+        .map(writer_terminal_error_category)
+        .unwrap_or("none");
+    let cleanup = report
+        .cleanup
+        .as_ref()
+        .map(writer_terminal_error_category)
+        .unwrap_or("none");
+    let proof = match report.proof {
+        synthetic_input::TerminalProof::Reconciled => "reconciled".to_owned(),
+        synthetic_input::TerminalProof::OwnerGenerationDestroyed { .. } => {
+            "owner-generation-destroyed".to_owned()
+        }
+        synthetic_input::TerminalProof::Unreconciled { remaining } => {
+            format!("unreconciled remaining={remaining}")
+        }
+    };
+    log_input_debug(
+        "writer-terminal-report",
+        &format!("primary={primary} cleanup={cleanup} proof={proof}"),
+    );
+}
+
+fn writer_terminal_error_category(error: &SwitcherError) -> &'static str {
+    match error {
+        SwitcherError::InputSafety(_) => "input-safety",
+        SwitcherError::UInput(_) | SwitcherError::Io(_) => "input-io",
+        SwitcherError::VirtualKeyboardWriterDisconnected
+        | SwitcherError::VirtualKeyboardWriterStartupTimedOut { .. }
+        | SwitcherError::VirtualKeyboardWriterShutdownUnresponsive { .. }
+        | SwitcherError::VirtualKeyboardWriterSaturated
+        | SwitcherError::VirtualKeyboardWriterTransactionTimedOut { .. }
+        | SwitcherError::VirtualKeyboardWriterTransactionCancelled { .. }
+        | SwitcherError::VirtualKeyboardWriterTransactionFailed { .. } => "writer-lifecycle",
+        _ => "daemon",
+    }
+}
+
 fn start_dbus_endpoint(
     runtime: Arc<RuntimeState>,
     service_name: &str,
@@ -316,6 +398,85 @@ mod tests {
 
         assert!(matches!(result, Err(SwitcherError::KeyboardNotFound)));
         assert_eq!(*phases.borrow(), vec!["release-input", "join-monitor"]);
+    }
+
+    #[test]
+    fn writer_cleanup_does_not_mask_primary_daemon_error() {
+        let report = crate::daemon::keyboard::WriterTerminalReport {
+            primary: None,
+            cleanup: Some(
+                crate::error::InputSafetyError::Reconciliation {
+                    operation_id: 7,
+                    remaining: 2,
+                }
+                .into(),
+            ),
+            proof: crate::daemon::synthetic_input::TerminalProof::Unreconciled { remaining: 2 },
+        };
+
+        let result = resolve_daemon_result_after_writer_report(
+            Err(SwitcherError::KeyboardNotFound),
+            Some(report),
+        );
+
+        assert!(matches!(result, Err(SwitcherError::KeyboardNotFound)));
+    }
+
+    #[test]
+    fn detailed_writer_primary_replaces_generic_disconnect() {
+        let report = crate::daemon::keyboard::WriterTerminalReport {
+            primary: Some(
+                crate::error::InputSafetyError::Invariant {
+                    context: "writer test failure",
+                }
+                .into(),
+            ),
+            cleanup: None,
+            proof: crate::daemon::synthetic_input::TerminalProof::OwnerGenerationDestroyed {
+                generation: 12,
+            },
+        };
+
+        let result = resolve_daemon_result_after_writer_report(
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected),
+            Some(report),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputSafety(
+                crate::error::InputSafetyError::Invariant {
+                    context: "writer test failure",
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn writer_cleanup_is_returned_after_clean_daemon_result() {
+        let report = crate::daemon::keyboard::WriterTerminalReport {
+            primary: None,
+            cleanup: Some(
+                crate::error::InputSafetyError::Reconciliation {
+                    operation_id: 11,
+                    remaining: 1,
+                }
+                .into(),
+            ),
+            proof: crate::daemon::synthetic_input::TerminalProof::Unreconciled { remaining: 1 },
+        };
+
+        let result = resolve_daemon_result_after_writer_report(Ok(()), Some(report));
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputSafety(
+                crate::error::InputSafetyError::Reconciliation {
+                    operation_id: 11,
+                    remaining: 1,
+                }
+            ))
+        ));
     }
 
     #[test]

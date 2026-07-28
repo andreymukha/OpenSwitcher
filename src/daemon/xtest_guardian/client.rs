@@ -8,7 +8,7 @@ use super::service::{monotonic_now_ns, X11ServerIdentity};
 use super::x11::EmergencyX11Releaser;
 use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
 use crate::daemon::synthetic_input::{
-    InputGeneration, OperationId, SyntheticKeySink, TerminalProof,
+    InputGeneration, OperationId, PhysicalSequence, SyntheticKeySink, TerminalProof,
 };
 use crate::error::{InputSafetyError, SwitcherError};
 use evdev::Key;
@@ -330,6 +330,17 @@ impl EmergencyCoordinator {
     }
 
     pub(crate) fn start_pending_release(&self) -> Result<EmergencyJob, SwitcherError> {
+        self.start_pending_release_if_needed()?.ok_or_else(|| {
+            InputSafetyError::GuardianProtocol {
+                context: "emergency release was started outside pending state",
+            }
+            .into()
+        })
+    }
+
+    pub(crate) fn start_pending_release_if_needed(
+        &self,
+    ) -> Result<Option<EmergencyJob>, SwitcherError> {
         let mut state = self
             .state
             .lock()
@@ -344,18 +355,15 @@ impl EmergencyCoordinator {
         } = previous
         else {
             *state = previous;
-            return Err(InputSafetyError::GuardianProtocol {
-                context: "emergency release was started outside pending state",
-            }
-            .into());
+            return Ok(None);
         };
         let remaining = mirrored.len();
         if remaining == 0 {
             *state = EmergencyState::Finished(TerminalProof::Reconciled);
-            return Ok(EmergencyJob::completed(
+            return Ok(Some(EmergencyJob::completed(
                 self.clone(),
                 TerminalProof::Reconciled,
-            ));
+            )));
         }
         *state = EmergencyState::Running { remaining };
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -383,11 +391,11 @@ impl EmergencyCoordinator {
             *state = EmergencyState::Finished(TerminalProof::Unreconciled { remaining });
             return Err(SwitcherError::Io(error));
         }
-        Ok(EmergencyJob {
+        Ok(Some(EmergencyJob {
             coordinator: self.clone(),
             result: EmergencyJobResult::Pending(result_rx),
             initial_remaining: remaining,
-        })
+        }))
     }
 
     fn finish_job(&self, proof: TerminalProof) {
@@ -959,6 +967,54 @@ impl GuardianClient {
                 Err(self
                     .fail_protocol("TransferToPhysicalDebt response is not matching TransferAck"))
             }
+        }
+    }
+
+    pub(crate) fn commit_physical_release(
+        &mut self,
+        sequence: PhysicalSequence,
+        token: PreparedToken,
+        input_generation: InputGeneration,
+        deadline: GuardianMutationDeadline,
+    ) -> Result<(), SwitcherError> {
+        self.ensure_no_pending_mutation()?;
+        self.validate_token_identity(token)?;
+        if sequence.0 == 0 {
+            return Err(self.fail_protocol("XTEST physical release sequence must be nonzero"));
+        }
+        if input_generation.0 == 0 {
+            return Err(self.fail_protocol("XTEST physical release generation must be nonzero"));
+        }
+        if !self.emergency.contains_possible(token) {
+            return Err(self.fail_protocol(
+                "XTEST physical release commit has no matching possible-down mirror",
+            ));
+        }
+        let response = self.broker.submit(
+            Request::PhysicalReleaseCommitted {
+                sequence,
+                token,
+                input_generation,
+                deadline: deadline.wire,
+            },
+            deadline.local,
+            false,
+        )?;
+        match response {
+            Response::ReleaseCommitAck {
+                sequence: response_sequence,
+                token_id,
+            } if response_sequence == sequence && token_id == token.token_id => {
+                if let Err(error) = self.emergency.remove_reconciled(token) {
+                    self.broker.failure.fail(health_error_for(&error));
+                    self.broker.wake();
+                    return Err(error);
+                }
+                Ok(())
+            }
+            _ => Err(self.fail_protocol(
+                "PhysicalReleaseCommitted response is not matching ReleaseCommitAck",
+            )),
         }
     }
 
@@ -1571,6 +1627,7 @@ mod tests {
         FailAfterExecuteDown,
         StallAfterExecuteDown,
         CloseAfterReady,
+        CloseAfterPhysicalReleaseCommit,
         UnreconciledOnCancel,
     }
 
@@ -1621,6 +1678,10 @@ mod tests {
 
         fn close_after_ready() -> Self {
             Self::spawn(RecordingBehavior::CloseAfterReady)
+        }
+
+        fn close_after_physical_release_commit() -> Self {
+            Self::spawn(RecordingBehavior::CloseAfterPhysicalReleaseCommit)
         }
 
         fn stall_after_receiving_execute_down() -> Self {
@@ -1724,10 +1785,18 @@ mod tests {
                         },
                         Request::PhysicalReleaseCommitted {
                             sequence, token, ..
-                        } => Response::ReleaseCommitAck {
-                            sequence,
-                            token_id: token.token_id,
-                        },
+                        } => {
+                            if matches!(
+                                behavior,
+                                RecordingBehavior::CloseAfterPhysicalReleaseCommit
+                            ) {
+                                break;
+                            }
+                            Response::ReleaseCommitAck {
+                                sequence,
+                                token_id: token.token_id,
+                            }
+                        }
                     };
                     let frame =
                         encode_frame(decoded.sequence, &Message::Response(response)).unwrap();
@@ -1951,6 +2020,54 @@ mod tests {
     }
 
     #[test]
+    fn lost_release_commit_ack_forbids_next_press_of_same_modifier() {
+        let fixture = RecordingGuardian::close_after_physical_release_commit();
+        let coordinator =
+            EmergencyCoordinator::for_test(fixture.identity(), fixture.emergency_trace());
+        let mut client =
+            GuardianClient::from_test_transport(fixture.client_transport(), coordinator.clone())
+                .unwrap();
+        let deadline = GuardianMutationDeadline::for_test(Duration::from_secs(1));
+        let token = client
+            .prepare_key(OperationId(15), Key::KEY_LEFTSHIFT, deadline)
+            .unwrap();
+        client
+            .execute_down(OperationId(15), token, deadline)
+            .unwrap();
+        client.synchronize(OperationId(15), deadline).unwrap();
+        client
+            .transfer_to_physical_debt(OperationId(15), token, InputGeneration(7), deadline)
+            .unwrap();
+
+        assert!(client
+            .commit_physical_release(PhysicalSequence(8), token, InputGeneration(7), deadline,)
+            .is_err());
+        assert!(client.health().is_failed());
+        assert_eq!(coordinator.possible_tokens(), vec![token]);
+
+        let prepare_count = fixture
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| matches!(request, Request::PrepareKey { .. }))
+            .count();
+        assert!(client
+            .prepare_key(OperationId(16), Key::KEY_LEFTSHIFT, deadline)
+            .is_err());
+        assert_eq!(
+            fixture
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| matches!(request, Request::PrepareKey { .. }))
+                .count(),
+            prepare_count,
+        );
+    }
+
+    #[test]
     fn guardian_runtime_success_accepts_final_idempotent_synchronize() {
         let fixture = RecordingGuardian::ready();
         let coordinator =
@@ -2119,6 +2236,26 @@ mod tests {
         assert_eq!(second_debt.len(), 1);
         assert_ne!(second_debt, first_debt);
         assert!(runtime.has_session_modifier(Key::KEY_LEFTSHIFT));
+
+        runtime
+            .commit_physical_release(
+                PhysicalSequence(44),
+                Key::KEY_LEFTSHIFT,
+                GuardianMutationDeadline::for_test(Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        assert!(!runtime.has_session_modifier(Key::KEY_LEFTSHIFT));
+        assert!(coordinator.possible_tokens().is_empty());
+        assert!(matches!(
+            fixture.requests.lock().unwrap().last(),
+            Some(Request::PhysicalReleaseCommitted {
+                sequence: PhysicalSequence(44),
+                input_generation: InputGeneration(7),
+                token,
+                ..
+            }) if *token == second_debt[0]
+        ));
     }
 
     #[test]

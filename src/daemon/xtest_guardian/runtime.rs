@@ -3,8 +3,9 @@ use super::client::{
 };
 use super::protocol::{PreparedToken, MAX_PREPARED_TOKENS};
 use crate::daemon::synthetic_input::{
-    InputGeneration, OperationId, PendingTransfer, RestoredModifierTarget, SessionModifierLedger,
-    SessionModifierState, SyntheticFailureLatch, SyntheticKeySink, TerminalProof,
+    InputGeneration, OperationId, PendingTransfer, PhysicalReleaseCommit, PhysicalSequence,
+    RestoredModifierTarget, SessionModifierLedger, SessionModifierState, SyntheticFailureLatch,
+    SyntheticKeySink, TerminalProof,
 };
 use crate::error::{InputSafetyError, SwitcherError};
 use evdev::Key;
@@ -53,6 +54,47 @@ impl GuardianSyntheticRuntime {
 
     pub(crate) fn has_session_modifier(&self, key: Key) -> bool {
         self.session_modifiers.borrow().contains(key)
+    }
+
+    pub(crate) fn commit_physical_release(
+        &mut self,
+        sequence: PhysicalSequence,
+        key: Key,
+        deadline: GuardianMutationDeadline,
+    ) -> Result<Option<PreparedToken>, SwitcherError> {
+        let commit = PhysicalReleaseCommit {
+            generation: self.generation,
+            sequence,
+            key,
+        };
+        let candidate = self
+            .session_modifiers
+            .borrow()
+            .preview_physical_release(&commit)?;
+        let Some(token) = candidate else {
+            return self
+                .session_modifiers
+                .borrow_mut()
+                .commit_physical_release(commit);
+        };
+
+        self.client.borrow_mut().commit_physical_release(
+            sequence,
+            token,
+            self.generation,
+            deadline,
+        )?;
+        let committed = self
+            .session_modifiers
+            .borrow_mut()
+            .commit_physical_release(commit)?;
+        if committed != Some(token) {
+            return Err(self
+                .client
+                .borrow()
+                .fail_protocol("XTEST physical release local ledger commit does not match ACK"));
+        }
+        Ok(committed)
     }
 
     pub(crate) fn prepare_operation(

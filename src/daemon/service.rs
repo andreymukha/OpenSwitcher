@@ -12,7 +12,7 @@ use crate::daemon::keyboard::{
     log_input_debug, resolve_error_after_writer_shutdown, CorrectionLayoutSwitchOutcome,
     KeyboardController, ManualCurrentWordCompletion, ManualCurrentWordOutcome,
     ManualCurrentWordStartOutcome, ModifierState, SharedModifierState, WriterShutdownOutcome,
-    INPUT_EVENT_WAIT_TIMEOUT,
+    WriterTerminalReport, INPUT_EVENT_WAIT_TIMEOUT,
 };
 use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
@@ -598,6 +598,7 @@ fn recover_runtime_failure_after_backend_shutdown<State>(
     error: &SwitcherError,
     recoverable: bool,
     shutdown_backend: impl FnOnce(&mut State) -> WriterShutdownOutcome,
+    terminal_cleanup_succeeded: impl FnOnce(&State) -> bool,
     commit_recovery: impl FnOnce(&mut State),
 ) -> Result<bool, SwitcherError> {
     if !recoverable {
@@ -606,6 +607,9 @@ fn recover_runtime_failure_after_backend_shutdown<State>(
 
     match shutdown_backend(state) {
         WriterShutdownOutcome::Stopped => {
+            if !terminal_cleanup_succeeded(state) {
+                return Ok(false);
+            }
             commit_recovery(state);
             Ok(true)
         }
@@ -1527,6 +1531,7 @@ pub struct DaemonService {
     signal_publisher: DbusSignalPublisher,
     input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
     writer_shutdown_latch: WriterShutdownLatch,
+    writer_terminal_report: Option<WriterTerminalReport>,
     keyboard: Option<KeyboardController>,
     modifiers: ModifierState,
     shared_modifiers: SharedModifierState,
@@ -1560,6 +1565,7 @@ impl DaemonService {
             signal_publisher,
             input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
             writer_shutdown_latch: WriterShutdownLatch::default(),
+            writer_terminal_report: None,
             keyboard: None,
             modifiers: ModifierState::default(),
             shared_modifiers,
@@ -1766,6 +1772,10 @@ impl DaemonService {
     pub fn shutdown(&mut self) -> WriterShutdownOutcome {
         log_input_debug("event-loop-stop", "daemon input loop stopping");
         self.drop_active_input_backend()
+    }
+
+    pub(crate) fn take_writer_terminal_report(&mut self) -> Option<WriterTerminalReport> {
+        self.writer_terminal_report.take()
     }
 
     fn event_fetch_timeout(&self) -> Duration {
@@ -3471,6 +3481,21 @@ impl DaemonService {
             recoverable,
             DaemonService::drop_active_input_backend,
             |service| {
+                let succeeded = service
+                    .writer_terminal_report
+                    .as_ref()
+                    .map_or(true, |report| {
+                        !writer_terminal_report_requires_fail_stop(report)
+                    });
+                if !succeeded {
+                    log_input_debug(
+                        "runtime-recovery-terminal-cleanup-failed",
+                        "action=fail-stop",
+                    );
+                }
+                succeeded
+            },
+            |service| {
                 service.reset_transient_input_state("input-backend-unavailable");
                 let transitioned = service.input_backend.record_runtime_failure(error, now);
                 debug_assert!(transitioned);
@@ -3490,7 +3515,11 @@ impl DaemonService {
                         service.selected_text_runner = None;
 
                         if let Some(mut keyboard) = service.keyboard.take() {
-                            keyboard.shutdown()
+                            let outcome = keyboard.shutdown();
+                            if let Some(report) = keyboard.take_writer_terminal_report() {
+                                service.writer_terminal_report = Some(report);
+                            }
+                            outcome
                         } else {
                             WriterShutdownOutcome::Stopped
                         }
@@ -3614,6 +3643,15 @@ impl DaemonService {
             CurrentLayoutState::Unknown { .. } => AppLayoutKind::Unknown,
         }
     }
+}
+
+fn writer_terminal_report_requires_fail_stop(report: &WriterTerminalReport) -> bool {
+    report.primary.is_some()
+        || report.cleanup.is_some()
+        || matches!(
+            report.proof,
+            crate::daemon::synthetic_input::TerminalProof::Unreconciled { .. }
+        )
 }
 
 fn selected_text_hotkey_matches(
@@ -4038,6 +4076,7 @@ mod tests {
                 state.trace.push("shutdown");
                 crate::daemon::keyboard::WriterShutdownOutcome::Stopped
             },
+            |_| true,
             |state| {
                 state.trace.push("recovering");
                 state.recovering = true;
@@ -4061,6 +4100,7 @@ mod tests {
             &error,
             true,
             |_| crate::daemon::keyboard::WriterShutdownOutcome::Unresponsive { timeout_ms: 1_000 },
+            |_| true,
             |recovery_committed| *recovery_committed = true,
         );
 
@@ -4072,6 +4112,27 @@ mod tests {
                 ref trigger,
             }) if trigger == "Input worker pointer-watcher is unavailable"
         ));
+        assert!(!recovery_committed);
+    }
+
+    #[test]
+    fn runtime_recovery_is_not_committed_after_terminal_cleanup_failure() {
+        let mut recovery_committed = false;
+        let error = SwitcherError::InputWorkerDisconnected {
+            worker: "pointer-watcher",
+        };
+
+        let recovered = recover_runtime_failure_after_backend_shutdown(
+            &mut recovery_committed,
+            &error,
+            true,
+            |_| crate::daemon::keyboard::WriterShutdownOutcome::Stopped,
+            |_| false,
+            |recovery_committed| *recovery_committed = true,
+        )
+        .unwrap();
+
+        assert!(!recovered);
         assert!(!recovery_committed);
     }
 

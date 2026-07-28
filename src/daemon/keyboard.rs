@@ -12,7 +12,8 @@ use crate::daemon::uinput_synthetic::{
 };
 use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
 use crate::daemon::xtest_guardian::client::{
-    EmergencyCoordinator, GuardianClient, GuardianHealth, GuardianMutationDeadline, GuardianReady,
+    EmergencyCoordinator, EmergencyJob, GuardianClient, GuardianHealth, GuardianMutationDeadline,
+    GuardianReady, GUARDIAN_EMERGENCY_DEADLINE,
 };
 use crate::daemon::xtest_guardian::runtime::{
     GuardianPlanStep, GuardianSessionModifierTarget, GuardianSyntheticRuntime,
@@ -121,6 +122,7 @@ impl InputBackendReadiness {
 enum KeyboardShutdownPhase {
     RequestWriterStop,
     ReleaseGrab,
+    StartPendingEmergencyRelease,
     FinishWriterStop,
     StopAndJoinWatchers,
     DetachWatchers,
@@ -131,6 +133,7 @@ fn run_keyboard_shutdown_sequence(
 ) -> WriterShutdownOutcome {
     let _ = run_phase(KeyboardShutdownPhase::RequestWriterStop);
     let _ = run_phase(KeyboardShutdownPhase::ReleaseGrab);
+    let _ = run_phase(KeyboardShutdownPhase::StartPendingEmergencyRelease);
     let outcome = run_phase(KeyboardShutdownPhase::FinishWriterStop)
         .expect("writer shutdown phase must return an outcome");
     let watcher_phase = match outcome {
@@ -185,37 +188,128 @@ struct VirtualKeyboardHandle {
     stop_requested: Arc<AtomicBool>,
     transaction_failure_request_id: Arc<AtomicU64>,
     transaction_terminal_gate: Arc<Mutex<()>>,
-    guardian_health: Arc<Mutex<Option<GuardianHealth>>>,
+    guardian_health: Arc<Mutex<Option<GuardianRuntimeHandle>>>,
+}
+
+#[derive(Clone)]
+struct GuardianRuntimeHandle {
+    health: GuardianHealth,
+    emergency: EmergencyCoordinator,
 }
 
 struct VirtualKeyboardWriter {
     handle: VirtualKeyboardHandle,
     join_handle: Option<JoinHandle<()>>,
-    exit_rx: mpsc::Receiver<()>,
+    exit_rx: mpsc::Receiver<WriterTerminalReport>,
     shutdown_started_at: Option<Instant>,
     shutdown_outcome: Option<WriterShutdownOutcome>,
+    terminal_report: Option<WriterTerminalReport>,
     completion_rx: mpsc::Receiver<ManualCurrentWordCompletion>,
     next_request_id: u64,
     pending_manual_current_word: Option<PendingManualCurrentWordTransaction>,
 }
 
-struct WriterExitNotifier {
-    exit_tx: mpsc::SyncSender<()>,
+#[derive(Debug)]
+pub(crate) struct WriterTerminalReport {
+    pub(crate) primary: Option<SwitcherError>,
+    pub(crate) cleanup: Option<SwitcherError>,
+    pub(crate) proof: TerminalProof,
 }
 
-impl Drop for WriterExitNotifier {
-    fn drop(&mut self) {
-        let _ = self.exit_tx.try_send(());
+impl WriterTerminalReport {
+    #[cfg(test)]
+    fn notification_only() -> Self {
+        Self {
+            primary: None,
+            cleanup: None,
+            proof: TerminalProof::Reconciled,
+        }
     }
 }
 
+fn record_emergency_terminal_proof(report: &mut WriterTerminalReport, proof: TerminalProof) {
+    match proof {
+        TerminalProof::Reconciled => {}
+        TerminalProof::Unreconciled { remaining } => {
+            if report.cleanup.is_none() {
+                report.cleanup = Some(
+                    InputSafetyError::Reconciliation {
+                        operation_id: 0,
+                        remaining,
+                    }
+                    .into(),
+                );
+            }
+            report.proof = TerminalProof::Unreconciled { remaining };
+        }
+        TerminalProof::OwnerGenerationDestroyed { .. } => {
+            if report.cleanup.is_none() {
+                report.cleanup = Some(
+                    InputSafetyError::Invariant {
+                        context: "XTEST emergency returned an owner-generation proof",
+                    }
+                    .into(),
+                );
+            }
+            report.proof = TerminalProof::Unreconciled { remaining: 0 };
+        }
+    }
+}
+
+fn record_emergency_cleanup_failure(
+    report: &mut WriterTerminalReport,
+    error: SwitcherError,
+    proof: TerminalProof,
+) {
+    if report.cleanup.is_none() {
+        report.cleanup = Some(error);
+    }
+    record_emergency_terminal_proof(report, proof);
+}
+
+struct EmergencyStartFailure {
+    error: SwitcherError,
+    proof: TerminalProof,
+}
+
+#[cfg(test)]
+struct WriterExitNotifier {
+    exit_tx: mpsc::SyncSender<WriterTerminalReport>,
+}
+
+#[cfg(test)]
+impl Drop for WriterExitNotifier {
+    fn drop(&mut self) {
+        let _ = self
+            .exit_tx
+            .try_send(WriterTerminalReport::notification_only());
+    }
+}
+
+#[cfg(test)]
 fn run_writer_thread_with_exit_notification<T, R>(
     owned_device: T,
-    exit_tx: mpsc::SyncSender<()>,
+    exit_tx: mpsc::SyncSender<WriterTerminalReport>,
     run: impl FnOnce(T) -> R,
 ) -> R {
     let _exit_notifier = WriterExitNotifier { exit_tx };
     run(owned_device)
+}
+
+fn run_writer_thread_with_terminal_report<T>(
+    owned_device: T,
+    generation: InputGeneration,
+    exit_tx: mpsc::SyncSender<WriterTerminalReport>,
+    run: impl FnOnce(T) -> (Option<SwitcherError>, Option<SwitcherError>),
+) {
+    let (primary, cleanup) = run(owned_device);
+    let _ = exit_tx.try_send(WriterTerminalReport {
+        primary,
+        cleanup,
+        proof: TerminalProof::OwnerGenerationDestroyed {
+            generation: generation.0,
+        },
+    });
 }
 
 struct PendingManualCurrentWordTransaction {
@@ -1476,6 +1570,9 @@ impl KeyboardController {
     }
 
     pub(crate) fn shutdown(&mut self) -> WriterShutdownOutcome {
+        let mut emergency_job = None;
+        let mut emergency_started = false;
+        let mut emergency_start_failure = None;
         run_keyboard_shutdown_sequence(|phase| match phase {
             KeyboardShutdownPhase::RequestWriterStop => {
                 self.virtual_device.request_stop();
@@ -1485,7 +1582,40 @@ impl KeyboardController {
                 self.release_grab_best_effort();
                 None
             }
-            KeyboardShutdownPhase::FinishWriterStop => Some(self.virtual_device.finish_stop()),
+            KeyboardShutdownPhase::StartPendingEmergencyRelease => {
+                match self.virtual_device.start_pending_emergency_release() {
+                    Ok(job) => {
+                        emergency_job = job;
+                        emergency_started = emergency_job.is_some();
+                    }
+                    Err(failure) => emergency_start_failure = Some(failure),
+                }
+                None
+            }
+            KeyboardShutdownPhase::FinishWriterStop => {
+                let emergency_proof = self
+                    .virtual_device
+                    .finish_pending_emergency_release(emergency_job.take());
+                let outcome = self.virtual_device.finish_stop();
+                self.virtual_device.record_emergency_proof(emergency_proof);
+                self.virtual_device
+                    .record_emergency_start_failure(emergency_start_failure.take());
+                if !emergency_started {
+                    let late_job = match self.virtual_device.start_pending_emergency_release() {
+                        Ok(job) => job,
+                        Err(failure) => {
+                            self.virtual_device
+                                .record_emergency_start_failure(Some(failure));
+                            None
+                        }
+                    };
+                    let late_proof = self
+                        .virtual_device
+                        .finish_pending_emergency_release(late_job);
+                    self.virtual_device.record_emergency_proof(late_proof);
+                }
+                Some(outcome)
+            }
             KeyboardShutdownPhase::StopAndJoinWatchers => {
                 self.pointer_watcher.stop_and_join();
                 self.input_target_watcher.stop_and_join();
@@ -1497,6 +1627,10 @@ impl KeyboardController {
                 None
             }
         })
+    }
+
+    pub(crate) fn take_writer_terminal_report(&mut self) -> Option<WriterTerminalReport> {
+        self.virtual_device.take_terminal_report()
     }
 
     pub(crate) fn forward_event(
@@ -2260,7 +2394,7 @@ impl VirtualKeyboardWriter {
         let worker_ready_alive = Arc::clone(&alive);
 
         let join_handle = thread::spawn(move || {
-            run_writer_thread_with_exit_notification(device, exit_tx, |device| {
+            run_writer_thread_with_terminal_report(device, generation, exit_tx, |device| {
                 log_input_debug("writer-start", "virtual keyboard writer thread started");
                 let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_virtual_keyboard_writer_loop(
@@ -2281,10 +2415,12 @@ impl VirtualKeyboardWriter {
                 match loop_result {
                     Ok(Ok(())) => {
                         log_input_debug("writer-stop", "virtual keyboard writer thread stopped");
+                        (None, None)
                     }
                     Ok(Err(error)) => {
                         log_input_debug("writer-error", &format!("error={error}"));
                         eprintln!("[input] Ошибка writer path виртуальной клавиатуры: {error}");
+                        (Some(error), None)
                     }
                     Err(payload) => {
                         let reason = if let Some(text) = payload.downcast_ref::<&str>() {
@@ -2298,6 +2434,15 @@ impl VirtualKeyboardWriter {
                         eprintln!(
                             "[input] Writer path виртуальной клавиатуры аварийно завершился: {reason}"
                         );
+                        (
+                            Some(
+                                InputSafetyError::Invariant {
+                                    context: "virtual keyboard writer panicked",
+                                }
+                                .into(),
+                            ),
+                            None,
+                        )
                     }
                 }
             });
@@ -2316,6 +2461,7 @@ impl VirtualKeyboardWriter {
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -2326,6 +2472,75 @@ impl VirtualKeyboardWriter {
             WRITER_SHUTDOWN_ACK_TIMEOUT,
         )?;
         Ok(writer)
+    }
+
+    fn start_pending_emergency_release(
+        &self,
+    ) -> Result<Option<EmergencyJob>, EmergencyStartFailure> {
+        let guardian = self
+            .handle
+            .guardian_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(guardian) = guardian else {
+            return Ok(None);
+        };
+        match guardian.emergency.start_pending_release_if_needed() {
+            Ok(job) => Ok(job),
+            Err(error) => {
+                let proof = guardian.emergency.terminal_proof();
+                log_input_debug(
+                    "guardian-emergency-start-error",
+                    &format!("action=fail-stop proof={proof:?}"),
+                );
+                Err(EmergencyStartFailure { error, proof })
+            }
+        }
+    }
+
+    fn finish_pending_emergency_release(&self, job: Option<EmergencyJob>) -> Option<TerminalProof> {
+        let Some(job) = job else {
+            return None;
+        };
+        let proof = job.wait(GUARDIAN_EMERGENCY_DEADLINE);
+        log_input_debug("guardian-emergency-terminal", &format!("proof={proof:?}"));
+        Some(proof)
+    }
+
+    fn record_emergency_proof(&mut self, proof: Option<TerminalProof>) {
+        let Some(proof) = proof else {
+            return;
+        };
+        let Some(report) = self.terminal_report.as_mut() else {
+            log_input_debug(
+                "guardian-emergency-report-missing",
+                &format!("proof={proof:?} writer_outcome={:?}", self.shutdown_outcome),
+            );
+            return;
+        };
+        record_emergency_terminal_proof(report, proof);
+    }
+
+    fn record_emergency_start_failure(&mut self, failure: Option<EmergencyStartFailure>) {
+        let Some(failure) = failure else {
+            return;
+        };
+        let Some(report) = self.terminal_report.as_mut() else {
+            log_input_debug(
+                "guardian-emergency-start-report-missing",
+                &format!(
+                    "proof={:?} writer_outcome={:?}",
+                    failure.proof, self.shutdown_outcome
+                ),
+            );
+            return;
+        };
+        record_emergency_cleanup_failure(report, failure.error, failure.proof);
+    }
+
+    fn take_terminal_report(&mut self) -> Option<WriterTerminalReport> {
+        self.terminal_report.take()
     }
 
     fn handle(&self) -> VirtualKeyboardHandle {
@@ -2463,6 +2678,11 @@ impl VirtualKeyboardWriter {
                     .take()
                     .expect("finished writer handle must still be owned");
                 let _ = join_handle.join();
+                if self.terminal_report.is_none() {
+                    if let Ok(report) = self.exit_rx.try_recv() {
+                        self.terminal_report = Some(report);
+                    }
+                }
                 self.shutdown_outcome = Some(WriterShutdownOutcome::Stopped);
                 return WriterShutdownOutcome::Stopped;
             }
@@ -2492,7 +2712,10 @@ impl VirtualKeyboardWriter {
 
             let remaining = deadline.saturating_duration_since(now);
             match self.exit_rx.recv_timeout(remaining) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(report) => {
+                    self.terminal_report = Some(report);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     thread::park_timeout(remaining.min(Duration::from_millis(1)));
                 }
@@ -2734,7 +2957,7 @@ impl VirtualKeyboardHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .and_then(GuardianHealth::error)
+            .and_then(|guardian| guardian.health.error())
         {
             return Some(error.into());
         }
@@ -4087,6 +4310,20 @@ impl CinnamonGuardianReplay {
 
     fn emergency_coordinator(&self) -> EmergencyCoordinator {
         self.guardian.emergency_coordinator()
+    }
+
+    fn commit_physical_release(
+        &mut self,
+        sequence: PhysicalSequence,
+        key: Key,
+    ) -> Result<(), SwitcherError> {
+        let local_deadline = Instant::now()
+            .checked_add(DEFERRED_FORWARD_TRANSACTION_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        let deadline = GuardianMutationDeadline::from_instant(local_deadline)?;
+        self.guardian
+            .commit_physical_release(sequence, key, deadline)
+            .map(|_| ())
     }
 
     fn run_correction(
@@ -5642,6 +5879,20 @@ fn run_deferred_forward_mutation_with(
     })
 }
 
+fn forward_physical_event_with_commit<R: UinputRawSink>(
+    device: &mut UinputSyntheticRuntime<R>,
+    sequence: PhysicalSequence,
+    key: Key,
+    value: i32,
+    commit_guardian_release: impl FnOnce(PhysicalSequence, Key) -> Result<(), SwitcherError>,
+) -> Result<(), SwitcherError> {
+    let _ = device.forward_physical(sequence, key, value)?;
+    if value == 0 {
+        commit_guardian_release(sequence, key)?;
+    }
+    Ok(())
+}
+
 fn run_virtual_keyboard_writer_loop(
     device: uinput::Device,
     generation: crate::daemon::synthetic_input::InputGeneration,
@@ -5650,7 +5901,7 @@ fn run_virtual_keyboard_writer_loop(
     failure_request_id: Arc<AtomicU64>,
     stop_requested: Arc<AtomicBool>,
     terminal_gate: Arc<Mutex<()>>,
-    guardian_health: Arc<Mutex<Option<GuardianHealth>>>,
+    guardian_health: Arc<Mutex<Option<GuardianRuntimeHandle>>>,
     writer_alive: Arc<AtomicBool>,
     ready_tx: mpsc::SyncSender<()>,
 ) -> Result<(), SwitcherError> {
@@ -5662,7 +5913,10 @@ fn run_virtual_keyboard_writer_loop(
     if let CinnamonX11XtestRuntime::Available(replay) = &cinnamon_x11_xtest {
         *guardian_health
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(replay.health());
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(GuardianRuntimeHandle {
+            health: replay.health(),
+            emergency: replay.emergency_coordinator(),
+        });
     }
 
     run_writer_command_loop_with_stop(
@@ -5685,7 +5939,18 @@ fn run_virtual_keyboard_writer_loop(
                             &stop_requested,
                             &terminal_gate,
                         )?;
-                        let _ = device.forward_physical(sequence, key, value)?;
+                        forward_physical_event_with_commit(
+                            &mut device,
+                            sequence,
+                            key,
+                            value,
+                            |sequence, key| match &mut cinnamon_x11_xtest {
+                                CinnamonX11XtestRuntime::Available(replay) => {
+                                    replay.commit_physical_release(sequence, key)
+                                }
+                                CinnamonX11XtestRuntime::NotSelected => Ok(()),
+                            },
+                        )?;
                     }
                     WriterFastCommand::TypeSeparator { key } => {
                         log_input_debug("type-separator-execute", &format!("key={key:?}"));
@@ -5820,7 +6085,18 @@ fn run_virtual_keyboard_writer_loop(
                                 value,
                             } => {
                                 control.authorize_mutation_start()?;
-                                let _ = device.forward_physical(sequence, key, value)?;
+                                forward_physical_event_with_commit(
+                                    &mut device,
+                                    sequence,
+                                    key,
+                                    value,
+                                    |sequence, key| match &mut cinnamon_x11_xtest {
+                                        CinnamonX11XtestRuntime::Available(replay) => {
+                                            replay.commit_physical_release(sequence, key)
+                                        }
+                                        CinnamonX11XtestRuntime::NotSelected => Ok(()),
+                                    },
+                                )?;
                                 Ok(CorrectionExecutionOutcome {
                                     layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
                                 })
@@ -6765,11 +7041,12 @@ mod tests {
         *handle
             .guardian_health
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
-            GuardianHealth::failed_for_test(InputSafetyError::GuardianUnavailable {
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(GuardianRuntimeHandle {
+            health: GuardianHealth::failed_for_test(InputSafetyError::GuardianUnavailable {
                 context: "test guardian failed",
             }),
-        );
+            emergency: EmergencyCoordinator::new(),
+        });
 
         assert!(matches!(
             handle.health_error(),
@@ -8574,8 +8851,45 @@ mod tests {
             vec![
                 KeyboardShutdownPhase::RequestWriterStop,
                 KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::StartPendingEmergencyRelease,
                 KeyboardShutdownPhase::FinishWriterStop,
                 KeyboardShutdownPhase::StopAndJoinWatchers,
+            ]
+        );
+    }
+
+    #[test]
+    fn guardian_failure_releases_grab_before_emergency_wait() {
+        let mut trace = Vec::new();
+
+        let outcome = run_keyboard_shutdown_sequence(|phase| {
+            match phase {
+                KeyboardShutdownPhase::RequestWriterStop => trace.push("terminal-gate"),
+                KeyboardShutdownPhase::ReleaseGrab => trace.push("release-grab"),
+                KeyboardShutdownPhase::StartPendingEmergencyRelease => {
+                    trace.push("emergency-start")
+                }
+                KeyboardShutdownPhase::FinishWriterStop => {
+                    trace.push("emergency-wait");
+                    trace.push("writer-finish");
+                    return Some(WriterShutdownOutcome::Stopped);
+                }
+                KeyboardShutdownPhase::StopAndJoinWatchers => trace.push("watchers-join"),
+                KeyboardShutdownPhase::DetachWatchers => trace.push("watchers-detach"),
+            }
+            None
+        });
+
+        assert_eq!(outcome, WriterShutdownOutcome::Stopped);
+        assert_eq!(
+            trace,
+            [
+                "terminal-gate",
+                "release-grab",
+                "emergency-start",
+                "emergency-wait",
+                "writer-finish",
+                "watchers-join",
             ]
         );
     }
@@ -8637,6 +8951,7 @@ mod tests {
             vec![
                 KeyboardShutdownPhase::RequestWriterStop,
                 KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::StartPendingEmergencyRelease,
                 KeyboardShutdownPhase::FinishWriterStop,
                 KeyboardShutdownPhase::StopAndJoinWatchers,
             ]
@@ -8666,6 +8981,7 @@ mod tests {
             vec![
                 KeyboardShutdownPhase::RequestWriterStop,
                 KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::StartPendingEmergencyRelease,
                 KeyboardShutdownPhase::FinishWriterStop,
                 KeyboardShutdownPhase::DetachWatchers,
             ]
@@ -8742,6 +9058,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -8789,6 +9106,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -8864,6 +9182,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -8917,6 +9236,7 @@ mod tests {
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -8956,11 +9276,12 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
                 let _ = release_rx.recv();
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9025,6 +9346,7 @@ mod tests {
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9042,6 +9364,7 @@ mod tests {
                     None
                 }
                 KeyboardShutdownPhase::ReleaseGrab => None,
+                KeyboardShutdownPhase::StartPendingEmergencyRelease => None,
                 KeyboardShutdownPhase::FinishWriterStop => {
                     Some(writer.finish_stop_with_timeout(Duration::from_millis(10)))
                 }
@@ -9059,6 +9382,7 @@ mod tests {
             vec![
                 KeyboardShutdownPhase::RequestWriterStop,
                 KeyboardShutdownPhase::ReleaseGrab,
+                KeyboardShutdownPhase::StartPendingEmergencyRelease,
                 KeyboardShutdownPhase::FinishWriterStop,
                 KeyboardShutdownPhase::DetachWatchers,
             ]
@@ -9094,11 +9418,12 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
                 let _ = release_rx.recv();
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9139,11 +9464,12 @@ mod tests {
                 while !worker_stop_requested.load(Ordering::SeqCst) {
                     thread::yield_now();
                 }
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9175,6 +9501,7 @@ mod tests {
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9202,6 +9529,7 @@ mod tests {
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9238,11 +9566,12 @@ mod tests {
                 while !worker_stop_requested.load(Ordering::SeqCst) {
                     thread::yield_now();
                 }
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9276,11 +9605,12 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _keep_full_queue = command_rx;
                 let _ = release_rx.recv();
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9319,11 +9649,12 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
                 let _ = release_rx.recv();
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9378,6 +9709,7 @@ mod tests {
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9447,6 +9779,99 @@ mod tests {
     }
 
     #[test]
+    fn writer_terminal_report_follows_owned_device_drop_and_proves_generation() {
+        struct DropTrace(Arc<Mutex<Vec<&'static str>>>);
+
+        impl Drop for DropTrace {
+            fn drop(&mut self) {
+                self.0.lock().unwrap().push("owned-device-drop");
+            }
+        }
+
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let worker_trace = Arc::clone(&trace);
+        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            run_writer_thread_with_terminal_report(
+                DropTrace(Arc::clone(&worker_trace)),
+                InputGeneration(91),
+                exit_tx,
+                |_owned_device| {
+                    worker_trace.lock().unwrap().push("loop-return");
+                    (None, None)
+                },
+            );
+        });
+
+        let report = exit_rx
+            .recv_timeout(Duration::from_millis(250))
+            .expect("writer must publish its terminal report");
+        trace.lock().unwrap().push("terminal-report");
+        worker.join().expect("writer thread should join");
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["loop-return", "owned-device-drop", "terminal-report"]
+        );
+        assert!(report.primary.is_none());
+        assert!(report.cleanup.is_none());
+        assert_eq!(
+            report.proof,
+            TerminalProof::OwnerGenerationDestroyed { generation: 91 }
+        );
+    }
+
+    #[test]
+    fn emergency_cleanup_error_does_not_replace_writer_primary_error() {
+        let mut report = WriterTerminalReport {
+            primary: Some(SwitcherError::VirtualKeyboardWriterDisconnected),
+            cleanup: None,
+            proof: TerminalProof::Reconciled,
+        };
+
+        record_emergency_terminal_proof(&mut report, TerminalProof::Unreconciled { remaining: 2 });
+
+        assert!(matches!(
+            report.primary,
+            Some(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert!(matches!(
+            report.cleanup,
+            Some(SwitcherError::InputSafety(
+                InputSafetyError::Reconciliation {
+                    operation_id: 0,
+                    remaining: 2,
+                }
+            ))
+        ));
+        assert_eq!(report.proof, TerminalProof::Unreconciled { remaining: 2 });
+    }
+
+    #[test]
+    fn emergency_start_error_is_kept_as_cleanup_cause_with_unreconciled_proof() {
+        let mut report = WriterTerminalReport {
+            primary: Some(SwitcherError::VirtualKeyboardWriterDisconnected),
+            cleanup: None,
+            proof: TerminalProof::OwnerGenerationDestroyed { generation: 5 },
+        };
+
+        record_emergency_cleanup_failure(
+            &mut report,
+            SwitcherError::Io(io::Error::other("emergency worker did not start")),
+            TerminalProof::Unreconciled { remaining: 3 },
+        );
+
+        assert!(matches!(
+            report.primary,
+            Some(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert!(
+            matches!(report.cleanup, Some(SwitcherError::Io(ref error)) if error.to_string() == "emergency worker did not start")
+        );
+        assert_eq!(report.proof, TerminalProof::Unreconciled { remaining: 3 });
+    }
+
+    #[test]
     fn writer_exit_notification_follows_owned_device_drop_during_unwind() {
         struct DropTrace(Arc<AtomicBool>);
 
@@ -9496,11 +9921,12 @@ mod tests {
             },
             join_handle: Some(thread::spawn(move || {
                 drop(command_rx);
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9543,11 +9969,12 @@ mod tests {
             join_handle: Some(thread::spawn(move || {
                 let _keep_channels_alive = command_rx;
                 let _ = release_rx.recv();
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9597,11 +10024,12 @@ mod tests {
                     thread::yield_now();
                 }
                 let _ = ready_tx.send(());
-                let _ = exit_tx.try_send(());
+                let _ = exit_tx.try_send(WriterTerminalReport::notification_only());
             })),
             exit_rx,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx: mpsc::channel().1,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -9797,6 +10225,85 @@ mod tests {
             CorrectionExecutionOutcome {
                 layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
             }
+        );
+    }
+
+    #[test]
+    fn deferred_physical_release_commits_guardian_only_after_uinput_write_and_sync() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(trace.clone()),
+            ..Default::default()
+        };
+        let mut runtime = UinputSyntheticRuntime::new(raw, InputGeneration(77)).unwrap();
+
+        forward_physical_event_with_commit(
+            &mut runtime,
+            PhysicalSequence(77),
+            Key::KEY_LEFTSHIFT,
+            0,
+            |sequence, key| {
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(format!("guardian-release-commit:{}:{key:?}", sequence.0));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                "key:KEY_LEFTSHIFT:0",
+                "sync",
+                "guardian-release-commit:77:KEY_LEFTSHIFT",
+            ]
+        );
+    }
+
+    #[test]
+    fn failed_guardian_release_commit_forbids_following_physical_press() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(trace.clone()),
+            ..Default::default()
+        };
+        let mut runtime = UinputSyntheticRuntime::new(raw, InputGeneration(78)).unwrap();
+        let failed = Arc::new(AtomicBool::new(false));
+
+        let error = forward_physical_event_with_commit(
+            &mut runtime,
+            PhysicalSequence(8),
+            Key::KEY_LEFTSHIFT,
+            0,
+            |_, _| {
+                failed.store(true, Ordering::SeqCst);
+                Err(SwitcherError::Io(io::Error::other(
+                    "release commit ACK lost",
+                )))
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SwitcherError::Io(ref source) if source.to_string() == "release commit ACK lost")
+        );
+
+        if !failed.load(Ordering::SeqCst) {
+            forward_physical_event_with_commit(
+                &mut runtime,
+                PhysicalSequence(9),
+                Key::KEY_LEFTSHIFT,
+                1,
+                |_, _| Ok(()),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["key:KEY_LEFTSHIFT:0", "sync"],
+            "caller fail-stop must prevent dispatch of the queued next press",
         );
     }
 
@@ -11296,6 +11803,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11366,6 +11874,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11413,6 +11922,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11474,6 +11984,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11544,6 +12055,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11616,6 +12128,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11904,6 +12417,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11950,6 +12464,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -11994,6 +12509,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 1,
             pending_manual_current_word: None,
@@ -12033,6 +12549,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 222,
             pending_manual_current_word: Some(PendingManualCurrentWordTransaction {
@@ -12077,6 +12594,7 @@ mod tests {
             exit_rx: mpsc::channel().1,
             shutdown_started_at: None,
             shutdown_outcome: None,
+            terminal_report: None,
             completion_rx,
             next_request_id: 7,
             pending_manual_current_word: None,

@@ -595,6 +595,15 @@ impl<T> SessionModifierLedger<T> {
         &mut self,
         commit: PhysicalReleaseCommit,
     ) -> Result<Option<T>, SwitcherError> {
+        let index = self.validate_physical_release(&commit)?;
+        self.last_release_sequence = commit.sequence.0;
+        Ok(index.map(|index| self.entries.remove(index).token))
+    }
+
+    fn validate_physical_release(
+        &self,
+        commit: &PhysicalReleaseCommit,
+    ) -> Result<Option<usize>, SwitcherError> {
         if commit.generation != self.generation {
             return Err(self.protocol_error("physical release generation does not match"));
         }
@@ -606,7 +615,6 @@ impl<T> SessionModifierLedger<T> {
             .iter()
             .position(|entry| entry.key == commit.key)
         else {
-            self.last_release_sequence = commit.sequence.0;
             return Ok(None);
         };
         if self.entries[index].state != SessionModifierState::OwnedDown {
@@ -614,8 +622,7 @@ impl<T> SessionModifierLedger<T> {
                 "physical release cannot commit an in-flight modifier transition",
             ));
         }
-        self.last_release_sequence = commit.sequence.0;
-        Ok(Some(self.entries.remove(index).token))
+        Ok(Some(index))
     }
 
     pub(crate) fn contains(&self, key: Key) -> bool {
@@ -673,6 +680,15 @@ impl<T> SessionModifierLedger<T> {
 }
 
 impl<T: Clone> SessionModifierLedger<T> {
+    pub(crate) fn preview_physical_release(
+        &self,
+        commit: &PhysicalReleaseCommit,
+    ) -> Result<Option<T>, SwitcherError> {
+        Ok(self
+            .validate_physical_release(commit)?
+            .map(|index| self.entries[index].token.clone()))
+    }
+
     pub(crate) fn token_for_key(&self, key: Key) -> Option<T> {
         self.entries
             .iter()

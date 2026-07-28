@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenSwitcher XTEST guardian
+
+[Service]
+Type=exec
+ExecStart=open-switcher-daemon --internal-xtest-guardian-v1
+Restart=no
+KillMode=control-group
+TimeoutStopSec=7s
+UMask=0077
+NoNewPrivileges=yes
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX

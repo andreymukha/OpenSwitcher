@@ -1,5 +1,7 @@
 [Unit]
 Description=OpenSwitcher daemon
+Wants=open-switcher-xtest-guardian.socket
+After=open-switcher-xtest-guardian.socket
 
 [Service]
 ExecStart=/usr/bin/open-switcher-daemon

@@ -48,10 +48,14 @@ SYSTEMD_BIN_DIR="${OPEN_SWITCHER_SYSTEMD_BINDIR:-$HOME/.local/bin}"
 
 DAEMON_UNIT="open-switcher-daemon.service"
 TRAY_UNIT="open-switcher-tray.service"
+GUARDIAN_SOCKET_UNIT="open-switcher-xtest-guardian.socket"
+GUARDIAN_SERVICE_UNIT="open-switcher-xtest-guardian.service"
 DESKTOP_FILE="open-switcher.desktop"
 
 DAEMON_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$DAEMON_UNIT"
 TRAY_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$TRAY_UNIT"
+GUARDIAN_SOCKET_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$GUARDIAN_SOCKET_UNIT"
+GUARDIAN_SERVICE_UNIT_SOURCE="$SCRIPT_DIR/dist/systemd/$GUARDIAN_SERVICE_UNIT"
 DESKTOP_FILE_SOURCE="$SCRIPT_DIR/dist/$DESKTOP_FILE"
 ICON_SOURCE="$SCRIPT_DIR/dist/icons/hicolor/512x512/apps/open-switcher.png"
 
@@ -659,6 +663,8 @@ install_systemd_runtime() {
 
     ensure_dist_file "$DAEMON_UNIT_SOURCE"
     ensure_dist_file "$TRAY_UNIT_SOURCE"
+    ensure_dist_file "$GUARDIAN_SOCKET_UNIT_SOURCE"
+    ensure_dist_file "$GUARDIAN_SERVICE_UNIT_SOURCE"
     ensure_dist_file "$DESKTOP_FILE_SOURCE"
     ensure_dist_file "$ICON_SOURCE"
     ensure_systemd_command
@@ -680,6 +686,14 @@ install_systemd_runtime() {
         "$SYSTEMD_UNIT_DIR/$TRAY_UNIT" \
         '^ExecStart=open-switcher-tray$' \
         "ExecStart=$INSTALLED_TRAY_BIN"
+    install -m 0644 \
+        "$GUARDIAN_SOCKET_UNIT_SOURCE" \
+        "$SYSTEMD_UNIT_DIR/$GUARDIAN_SOCKET_UNIT"
+    install_rewritten_file \
+        "$GUARDIAN_SERVICE_UNIT_SOURCE" \
+        "$SYSTEMD_UNIT_DIR/$GUARDIAN_SERVICE_UNIT" \
+        '^ExecStart=open-switcher-daemon --internal-xtest-guardian-v1$' \
+        "ExecStart=$INSTALLED_DAEMON_BIN --internal-xtest-guardian-v1"
     install_rewritten_file \
         "$DESKTOP_FILE_SOURCE" \
         "$APPLICATIONS_DIR/$DESKTOP_FILE" \
@@ -707,7 +721,11 @@ install_systemd_runtime() {
 
 show_systemd_status() {
     local unit active enabled autostart
-    for unit in "$DAEMON_UNIT" "$TRAY_UNIT"; do
+    for unit in \
+        "$DAEMON_UNIT" \
+        "$TRAY_UNIT" \
+        "$GUARDIAN_SOCKET_UNIT" \
+        "$GUARDIAN_SERVICE_UNIT"; do
         active="$(run_systemctl_user is-active "$unit" 2>/dev/null || true)"
         enabled="$(run_systemctl_user is-enabled "$unit" 2>/dev/null || true)"
         [[ -n "$active" ]] || active="unknown"
@@ -731,8 +749,21 @@ show_systemd_logs() {
         tray)
             run_journalctl_user -u "$TRAY_UNIT" -n 40 --no-pager
             ;;
+        guardian)
+            run_journalctl_user \
+                -u "$GUARDIAN_SOCKET_UNIT" \
+                -u "$GUARDIAN_SERVICE_UNIT" \
+                -n 40 \
+                --no-pager
+            ;;
         all)
-            run_journalctl_user -u "$DAEMON_UNIT" -u "$TRAY_UNIT" -n 60 --no-pager
+            run_journalctl_user \
+                -u "$DAEMON_UNIT" \
+                -u "$TRAY_UNIT" \
+                -u "$GUARDIAN_SOCKET_UNIT" \
+                -u "$GUARDIAN_SERVICE_UNIT" \
+                -n 60 \
+                --no-pager
             ;;
         *)
             echo "Неизвестный компонент для systemd logs: $target" >&2
@@ -763,10 +794,10 @@ dev-команды:
 systemd-команды:
   systemd install       Установить user units, desktop entry, autostart fallback и бинарники в ~/.local
   systemd start         Запустить $DAEMON_UNIT и $TRAY_UNIT
-  systemd stop          Остановить $TRAY_UNIT и $DAEMON_UNIT
-  systemd restart       Перезапустить $DAEMON_UNIT и $TRAY_UNIT
+  systemd stop          Последовательно остановить tray, daemon и XTEST guardian
+  systemd restart       Безопасно остановить runtime и снова запустить daemon/tray
   systemd status        Показать active/enabled статус user units
-  systemd logs [name]   Показать journalctl-логи: daemon | tray | all
+  systemd logs [name]   Показать journalctl-логи: daemon | tray | guardian | all
   systemd enable        Включить автозапуск user units и XDG fallback
   systemd disable       Выключить автозапуск user units и XDG fallback
 
@@ -830,6 +861,48 @@ run_dev_command() {
     esac
 }
 
+wait_for_systemd_guardian_inactive() {
+    ensure_dbus_address
+    ensure_systemd_command
+    command -v timeout >/dev/null 2>&1 || return 0
+
+    # Переменные внутри строки раскрывает дочерний shell с тем же user bus.
+    # shellcheck disable=SC2016
+    timeout --signal=KILL 7s sh -c '
+        while :; do
+            state="$(
+                systemctl --user show \
+                    --property=ActiveState \
+                    --value \
+                    open-switcher-xtest-guardian.service \
+                    2>/dev/null
+            )" || exit 0
+            case "$state" in
+                active|activating|deactivating|reloading)
+                    sleep 0.1
+                    ;;
+                *)
+                    exit 0
+                    ;;
+            esac
+        done
+    ' || true
+}
+
+stop_systemd_runtime() {
+    run_systemctl_user stop "$TRAY_UNIT" || true
+    run_systemctl_user stop "$DAEMON_UNIT" || true
+    wait_for_systemd_guardian_inactive
+    run_systemctl_user stop "$GUARDIAN_SOCKET_UNIT" || true
+    run_systemctl_user stop "$GUARDIAN_SERVICE_UNIT" || true
+    run_systemctl_user daemon-reload || true
+}
+
+start_systemd_runtime() {
+    run_systemctl_user start "$DAEMON_UNIT"
+    run_systemctl_user start "$TRAY_UNIT"
+}
+
 run_systemd_command() {
     local command="${1:-}"
     local arg="${2:-}"
@@ -839,16 +912,14 @@ run_systemd_command() {
         install_systemd_runtime
         ;;
     start)
-        run_systemctl_user start "$DAEMON_UNIT"
-        run_systemctl_user start "$TRAY_UNIT"
+        start_systemd_runtime
         ;;
     stop)
-        run_systemctl_user stop "$TRAY_UNIT" || true
-        run_systemctl_user stop "$DAEMON_UNIT" || true
+        stop_systemd_runtime
         ;;
     restart)
-        run_systemctl_user restart "$DAEMON_UNIT"
-        run_systemctl_user restart "$TRAY_UNIT"
+        stop_systemd_runtime
+        start_systemd_runtime
         ;;
     status)
         show_systemd_status

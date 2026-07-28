@@ -18,22 +18,26 @@ remove_legacy_global_user_enablement() {
     fi
 }
 
-if [ "$1" = "configure" ]; then
+case "${1:-}" in
+configure|abort-upgrade|abort-remove|abort-deconfigure)
     remove_legacy_global_user_enablement
 
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm control --reload-rules || true
-        udevadm trigger --subsystem-match=input --action=change || true
-        udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
-    fi
+    if [ "${1:-}" = "configure" ]; then
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload-rules || true
+            udevadm trigger --subsystem-match=input --action=change || true
+            udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
+        fi
 
-    if [ -x /usr/lib/open-switcher/open-switcher-input-acl-bridge ]; then
-        /usr/lib/open-switcher/open-switcher-input-acl-bridge || true
+        if [ -x /usr/lib/open-switcher/open-switcher-input-acl-bridge ]; then
+            /usr/lib/open-switcher/open-switcher-input-acl-bridge || true
+        fi
     fi
 
     if [ -x /usr/lib/open-switcher/open-switcher-user-session-start ]; then
         /usr/lib/open-switcher/open-switcher-user-session-start || true
     fi
-fi
+    ;;
+esac
 
 exit 0

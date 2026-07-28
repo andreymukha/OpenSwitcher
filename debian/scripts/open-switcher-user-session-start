@@ -100,6 +100,7 @@ start_for_session() {
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
         systemctl --user daemon-reload || true
 
+    # Guardian socket не включается отдельно: его поднимает daemon через Wants=.
     runuser -u "$user" -- env \
         "XDG_RUNTIME_DIR=/run/user/$uid" \
         "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \

@@ -1,0 +1,11 @@
+[Unit]
+Description=OpenSwitcher XTEST guardian socket
+
+[Socket]
+ListenSequentialPacket=%t/open-switcher/xtest-guardian.sock
+Accept=no
+Backlog=1
+DirectoryMode=0700
+SocketMode=0600
+RemoveOnStop=yes
+FileDescriptorName=xtest-guardian

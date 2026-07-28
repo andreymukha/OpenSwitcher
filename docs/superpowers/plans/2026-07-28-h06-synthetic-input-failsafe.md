@@ -2202,7 +2202,7 @@ git commit -m "feat: add guarded XTEST service entrypoint"
 - Изменить: `tests/debian_package_scripts_test.sh`
 - Изменить: `tests/manage_package_deb_test.sh`
 
-- [ ] **Шаг 1: написать failing static package tests**
+- [x] **Шаг 1: написать failing static package tests**
 
 Добавить assertions:
 
@@ -2223,7 +2223,7 @@ assert_contains "$prerm" "failed-upgrade"
 tray, daemon, bounded guardian wait, guardian socket, guardian service,
 daemon-reload.
 
-- [ ] **Шаг 2: проверить RED**
+- [x] **Шаг 2: проверить RED**
 
 ```bash
 bash tests/debian_package_scripts_test.sh
@@ -2232,7 +2232,7 @@ bash tests/manage_package_deb_test.sh
 
 Ожидается: FAIL на отсутствующих guardian units/lifecycle.
 
-- [ ] **Шаг 3: создать socket unit в обеих копиях**
+- [x] **Шаг 3: создать socket unit в обеих копиях**
 
 ```ini
 [Unit]
@@ -2250,7 +2250,7 @@ FileDescriptorName=xtest-guardian
 
 У socket нет `[Install]`: его поднимает daemon через `Wants=`.
 
-- [ ] **Шаг 4: создать service unit в обеих копиях**
+- [x] **Шаг 4: создать service unit в обеих копиях**
 
 Debian:
 
@@ -2281,7 +2281,7 @@ ExecStart=open-switcher-daemon --internal-xtest-guardian-v1
 из задачи 14 обязан подтвердить p99 cleanup менее 500ms; иначе unit timeout не
 увеличивать автоматически, а исправить зависшую cleanup-ветвь.
 
-- [ ] **Шаг 5: связать daemon только с socket**
+- [x] **Шаг 5: связать daemon только с socket**
 
 Добавить в Debian/dist daemon unit:
 
@@ -2294,7 +2294,7 @@ After=open-switcher-xtest-guardian.socket
 
 Не добавлять `PartOf=`, `BindsTo=` или dependency на guardian service.
 
-- [ ] **Шаг 6: подключить debhelper ровно один раз**
+- [x] **Шаг 6: подключить debhelper ровно один раз**
 
 ```make
 override_dh_installsystemduser:
@@ -2305,7 +2305,7 @@ override_dh_installsystemduser:
 
 Не вызывать helper отдельно для `.socket`/`.service`.
 
-- [ ] **Шаг 7: закрыть первый upgrade со старой версии**
+- [x] **Шаг 7: закрыть первый upgrade со старой версии**
 
 Новый `preinst` на `upgrade` вызывает уже установленный
 `/usr/lib/open-switcher/open-switcher-user-session-stop`, если он существует,
@@ -2332,7 +2332,7 @@ failed-upgrade
 `postinst` на `configure`, а также корректные abort-сценарии, вызывает
 session-start после `daemon-reload`.
 
-- [ ] **Шаг 8: реализовать последовательный stop для каждого user manager**
+- [x] **Шаг 8: реализовать последовательный stop для каждого user manager**
 
 Не передавать несколько units одному `systemctl stop`. Для каждого уникального
 локального UID с `class=user`, X11/Wayland session и `/run/user/$uid/bus`:
@@ -2350,14 +2350,14 @@ Stop helper дедуплицирует UID и не ограничивается 
 локальная сессия тоже может иметь живой user manager/guardian. Start helper
 остаётся ограниченным active graphical session.
 
-- [ ] **Шаг 9: обновить `manage.sh` без расхождения с package policy**
+- [x] **Шаг 9: обновить `manage.sh` без расхождения с package policy**
 
 Dev install копирует обе guardian units. Переписывая `ExecStart`, он сохраняет
 `--internal-xtest-guardian-v1`. `dev/systemd stop|restart` соблюдает тот же
 daemon-before-guardian порядок. Удаление dev units не затрагивает packaged units
 и не удаляет VM laboratory.
 
-- [ ] **Шаг 10: проверить shell syntax и static tests**
+- [x] **Шаг 10: проверить shell syntax и static tests**
 
 ```bash
 bash -n \
@@ -2372,23 +2372,25 @@ bash tests/manage_package_deb_test.sh
 
 Ожидается: shell syntax и package policy tests проходят.
 
-- [ ] **Шаг 11: проверить units через временный search path**
+- [x] **Шаг 11: проверить units через временный search path**
 
 ```bash
 tmp="$(mktemp -d)"
 cp dist/systemd/open-switcher-daemon.service "$tmp/"
 cp dist/systemd/open-switcher-xtest-guardian.socket "$tmp/"
 cp dist/systemd/open-switcher-xtest-guardian.service "$tmp/"
-SYSTEMD_UNIT_PATH="$tmp" systemd-analyze --user verify \
+SYSTEMD_UNIT_PATH="$tmp:" systemd-analyze --user verify \
   open-switcher-daemon.service \
   open-switcher-xtest-guardian.socket \
   open-switcher-xtest-guardian.service
 ```
 
-Ожидается: exit `0`, ошибок unit dependency/директив нет. Временный каталог
-после проверки удалить; VM lab не затрагивается.
+Завершающий `:` сохраняет стандартные systemd search paths для базовых user
+units, а временный каталог ставит первым. Ожидается: exit `0`, ошибок unit
+dependency/директив нет. Временный каталог после проверки удалить; VM lab не
+затрагивается.
 
-- [ ] **Шаг 12: зафиксировать packaging**
+- [x] **Шаг 12: зафиксировать packaging**
 
 ```bash
 git add debian dist/systemd manage.sh tests/debian_package_scripts_test.sh tests/manage_package_deb_test.sh

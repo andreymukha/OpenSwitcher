@@ -46,3 +46,4 @@ execute_after_dh_install:
 override_dh_installsystemduser:
 	dh_installsystemduser --no-enable --name=open-switcher-daemon
 	dh_installsystemduser --no-enable --name=open-switcher-tray
+	dh_installsystemduser --no-enable --name=open-switcher-xtest-guardian

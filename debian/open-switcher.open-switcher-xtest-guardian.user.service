@@ -9,5 +9,4 @@ KillMode=control-group
 TimeoutStopSec=7s
 UMask=0077
 NoNewPrivileges=yes
-PrivateDevices=yes
 RestrictAddressFamilies=AF_UNIX

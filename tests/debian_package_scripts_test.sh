@@ -222,10 +222,12 @@ test_package_installs_isolated_xtest_guardian_units() {
         "ExecStart=/usr/bin/open-switcher-daemon --internal-xtest-guardian-v1"
     assert_contains "$dist_service" \
         "ExecStart=open-switcher-daemon --internal-xtest-guardian-v1"
-    assert_contains "$debian_service" "TimeoutStopSec=7s"
-    assert_contains "$debian_service" "NoNewPrivileges=yes"
-    assert_contains "$debian_service" "PrivateDevices=yes"
-    assert_contains "$debian_service" "RestrictAddressFamilies=AF_UNIX"
+    for service_unit in "$debian_service" "$dist_service"; do
+        assert_contains "$service_unit" "TimeoutStopSec=7s"
+        assert_contains "$service_unit" "NoNewPrivileges=yes"
+        assert_not_contains "$service_unit" "PrivateDevices=yes"
+        assert_contains "$service_unit" "RestrictAddressFamilies=AF_UNIX"
+    done
     assert_contains "$rules" \
         "dh_installsystemduser --no-enable --name=open-switcher-xtest-guardian"
     assert_count "$rules" \

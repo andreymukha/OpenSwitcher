@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum InputSafetyError {
+    #[error("OpenSwitcher was started with an invalid internal entrypoint")]
+    InvalidEntrypoint,
     #[error("Synthetic input safety invariant failed: {context}")]
     Invariant { context: &'static str },
     #[error("Synthetic input operation {operation_id} violated its protocol: {context}")]

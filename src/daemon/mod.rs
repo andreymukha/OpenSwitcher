@@ -29,6 +29,11 @@ use zbus::blocking::ConnectionBuilder;
 
 const TRAY_SERVICE_NAME: &str = "org.oswitch.tray";
 
+#[doc(hidden)]
+pub fn run_internal_xtest_guardian_v1() -> Result<(), SwitcherError> {
+    xtest_guardian::run_internal_v1()
+}
+
 struct SessionBusTrayPresenceProbe {
     connection: Connection,
 }

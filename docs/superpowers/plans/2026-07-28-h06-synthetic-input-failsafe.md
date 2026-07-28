@@ -2069,7 +2069,7 @@ git commit -m "feat: reconcile restored modifiers after physical release"
 - Тест: `src/main.rs`
 - Тест: `src/daemon/xtest_guardian/service.rs`
 
-- [ ] **Шаг 1: написать argument/activation tests**
+- [x] **Шаг 1: написать argument/activation tests**
 
 ```rust
 #[test]
@@ -2105,7 +2105,7 @@ fn extra_or_unknown_arguments_are_rejected() {
 }
 ```
 
-- [ ] **Шаг 2: проверить RED**
+- [x] **Шаг 2: проверить RED**
 
 ```bash
 cargo test --locked --bin open-switcher entrypoint -- --test-threads=1
@@ -2113,7 +2113,7 @@ cargo test --locked --bin open-switcher entrypoint -- --test-threads=1
 
 Ожидается: compile failure.
 
-- [ ] **Шаг 3: реализовать строгий dispatcher**
+- [x] **Шаг 3: реализовать строгий dispatcher**
 
 ```rust
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2143,7 +2143,7 @@ fn select_entrypoint(
 и лишь затем открывает X11. Linux input setup hints для internal mode не
 печатаются.
 
-- [ ] **Шаг 4: реализовать signal wakeup**
+- [x] **Шаг 4: реализовать signal wakeup**
 
 Только hidden process блокирует `SIGTERM`/`SIGINT` через
 `nix::sys::signal::pthread_sigmask`, запускает один `SigSet::wait()` thread и
@@ -2152,7 +2152,7 @@ fn select_entrypoint(
 
 Normal daemon signal semantics этим кодом не меняются.
 
-- [ ] **Шаг 5: проверить shutdown ordering**
+- [x] **Шаг 5: проверить shutdown ordering**
 
 ```rust
 #[test]
@@ -2165,7 +2165,7 @@ fn sigterm_path_drains_before_guardian_process_returns() {
 }
 ```
 
-- [ ] **Шаг 6: выполнить entrypoint/service tests**
+- [x] **Шаг 6: выполнить entrypoint/service tests**
 
 ```bash
 cargo test --locked --bin open-switcher entrypoint -- --test-threads=1
@@ -2175,7 +2175,7 @@ cargo test --locked --lib sigterm_path_drains -- --test-threads=1
 Ожидается: exact argument работает только с activation fixture; manual internal
 mode не достигает X11.
 
-- [ ] **Шаг 7: зафиксировать entrypoint**
+- [x] **Шаг 7: зафиксировать entrypoint**
 
 ```bash
 git add src/main.rs src/daemon/xtest_guardian

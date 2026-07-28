@@ -6,8 +6,11 @@ use crate::daemon::xtest_guardian::protocol::{
 };
 use crate::daemon::xtest_guardian::seqpacket::Seqpacket;
 use crate::error::{InputSafetyError, SwitcherError};
+use nix::errno::Errno;
+use nix::poll::{poll, PollFd, PollFlags};
 use nix::sys::time::TimeValLike;
 use nix::time::{clock_gettime, ClockId};
+use std::os::fd::{AsRawFd, RawFd};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X11ServerIdentity {
@@ -28,7 +31,7 @@ pub(crate) trait XtestExecutor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StopReason {
     PeerEof,
-    Sigterm,
+    Signal,
     ProtocolViolation,
     BackendFailure,
     Requested,
@@ -264,26 +267,46 @@ impl<'a, E: XtestExecutor> GuardianSession<'a, E> {
     pub(crate) fn finish_with_clock(
         &mut self,
         reason: StopReason,
+        clock: impl FnMut() -> u64,
+    ) -> TerminalProof {
+        self.finish_with_clock_and_observer(reason, clock, || {})
+    }
+
+    fn finish_with_clock_and_observer(
+        &mut self,
+        reason: StopReason,
         mut clock: impl FnMut() -> u64,
+        on_terminal: impl FnOnce(),
     ) -> TerminalProof {
         if let Some(record) = &self.terminal {
             return record.proof.clone();
         }
         let deadline = clock().saturating_add(MAX_RELEASE_CLEANUP_NS);
-        self.finish_until_with_clock(reason, deadline, clock)
+        self.finish_until_with_clock_and_observer(reason, deadline, clock, on_terminal)
     }
 
     fn finish_until_with_clock(
         &mut self,
         reason: StopReason,
         deadline_ns: u64,
+        clock: impl FnMut() -> u64,
+    ) -> TerminalProof {
+        self.finish_until_with_clock_and_observer(reason, deadline_ns, clock, || {})
+    }
+
+    fn finish_until_with_clock_and_observer(
+        &mut self,
+        reason: StopReason,
+        deadline_ns: u64,
         mut clock: impl FnMut() -> u64,
+        on_terminal: impl FnOnce(),
     ) -> TerminalProof {
         if let Some(record) = &self.terminal {
             return record.proof.clone();
         }
 
         self.protocol.begin_terminal();
+        on_terminal();
         for token in self.protocol.cleanup_tokens_reverse() {
             if clock() >= deadline_ns {
                 break;
@@ -348,7 +371,72 @@ pub(crate) fn run_connection<E: XtestExecutor>(
     protocol_session: ProtocolSession,
     executor: &mut E,
 ) -> Result<TerminalRecord, SwitcherError> {
-    let frame = connection.recv_frame()?;
+    run_connection_with_receiver(
+        connection,
+        protocol_session,
+        executor,
+        || connection.recv_frame().map(ConnectionEvent::Frame),
+        || {},
+    )
+}
+
+pub(crate) fn run_connection_until_signal<E: XtestExecutor>(
+    connection: &Seqpacket,
+    protocol_session: ProtocolSession,
+    executor: &mut E,
+    stop_fd: RawFd,
+) -> Result<TerminalRecord, SwitcherError> {
+    run_connection_until_signal_with_observer(
+        connection,
+        protocol_session,
+        executor,
+        stop_fd,
+        || {},
+    )
+}
+
+fn run_connection_until_signal_with_observer<E: XtestExecutor>(
+    connection: &Seqpacket,
+    protocol_session: ProtocolSession,
+    executor: &mut E,
+    stop_fd: RawFd,
+    on_signal_terminal: impl FnMut(),
+) -> Result<TerminalRecord, SwitcherError> {
+    run_connection_with_receiver(
+        connection,
+        protocol_session,
+        executor,
+        || match wait_for_guardian_io_or_stop(connection.as_raw_fd(), stop_fd)? {
+            GuardianWaitOutcome::DataReady => connection.recv_frame().map(ConnectionEvent::Frame),
+            GuardianWaitOutcome::StopRequested => Ok(ConnectionEvent::Signal),
+            GuardianWaitOutcome::DataClosed => Ok(ConnectionEvent::Frame(Vec::new())),
+        },
+        on_signal_terminal,
+    )
+}
+
+enum ConnectionEvent {
+    Frame(Vec<u8>),
+    Signal,
+}
+
+fn run_connection_with_receiver<E: XtestExecutor>(
+    connection: &Seqpacket,
+    protocol_session: ProtocolSession,
+    executor: &mut E,
+    mut receive_event: impl FnMut() -> Result<ConnectionEvent, SwitcherError>,
+    mut on_signal_terminal: impl FnMut(),
+) -> Result<TerminalRecord, SwitcherError> {
+    let frame = match receive_event()? {
+        ConnectionEvent::Frame(frame) => frame,
+        ConnectionEvent::Signal => {
+            on_signal_terminal();
+            return Ok(TerminalRecord {
+                reason: StopReason::Signal,
+                proof: TerminalProof::Reconciled,
+            });
+        }
+    };
     if frame.is_empty() {
         return Err(SwitcherError::input_safety(
             "XTEST guardian peer closed before handshake",
@@ -384,8 +472,15 @@ pub(crate) fn run_connection<E: XtestExecutor>(
     send_response(connection, decoded.sequence, session.ready_response())?;
 
     loop {
-        let frame = match connection.recv_frame() {
-            Ok(frame) => frame,
+        let frame = match receive_event() {
+            Ok(ConnectionEvent::Frame(frame)) => frame,
+            Ok(ConnectionEvent::Signal) => {
+                return Ok(finish_record_with_observer(
+                    &mut session,
+                    StopReason::Signal,
+                    || on_signal_terminal(),
+                ));
+            }
             Err(_) => return Ok(finish_record(&mut session, StopReason::PeerEof)),
         };
         if frame.is_empty() {
@@ -433,11 +528,71 @@ pub(crate) fn run_connection<E: XtestExecutor>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuardianWaitOutcome {
+    DataReady,
+    StopRequested,
+    DataClosed,
+}
+
+pub(super) fn wait_for_guardian_io_or_stop(
+    data_fd: RawFd,
+    stop_fd: RawFd,
+) -> Result<GuardianWaitOutcome, SwitcherError> {
+    let mut fds = [
+        PollFd::new(data_fd, PollFlags::POLLIN),
+        PollFd::new(stop_fd, PollFlags::POLLIN),
+    ];
+    let stop_events =
+        PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL;
+    let data_closed = PollFlags::POLLHUP | PollFlags::POLLERR | PollFlags::POLLNVAL;
+
+    loop {
+        match poll(&mut fds, -1) {
+            Ok(_) => {}
+            Err(Errno::EINTR) => continue,
+            Err(error) => {
+                return Err(std::io::Error::from_raw_os_error(error as i32).into());
+            }
+        }
+
+        let stop_revents = fds[1].revents().unwrap_or_else(PollFlags::empty);
+        if stop_revents.intersects(stop_events) {
+            return Ok(GuardianWaitOutcome::StopRequested);
+        }
+
+        let data_revents = fds[0].revents().unwrap_or_else(PollFlags::empty);
+        if data_revents.contains(PollFlags::POLLIN) {
+            return Ok(GuardianWaitOutcome::DataReady);
+        }
+        if data_revents.intersects(data_closed) {
+            return Ok(GuardianWaitOutcome::DataClosed);
+        }
+    }
+}
+
 fn finish_record<E: XtestExecutor>(
     session: &mut GuardianSession<'_, E>,
     reason: StopReason,
 ) -> TerminalRecord {
     session.finish_with_clock(reason, monotonic_now_ns_or_zero);
+    session
+        .terminal_record()
+        .cloned()
+        .unwrap_or_else(|| TerminalRecord {
+            reason,
+            proof: TerminalProof::Unreconciled {
+                remaining: session.debt_count(),
+            },
+        })
+}
+
+fn finish_record_with_observer<E: XtestExecutor>(
+    session: &mut GuardianSession<'_, E>,
+    reason: StopReason,
+    on_terminal: impl FnOnce(),
+) -> TerminalRecord {
+    session.finish_with_clock_and_observer(reason, monotonic_now_ns_or_zero, on_terminal);
     session
         .terminal_record()
         .cloned()
@@ -1026,5 +1181,147 @@ mod tests {
             }
         );
         assert!(server_thread.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn sigterm_path_drains_before_guardian_process_returns() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::sync::{Arc, Mutex};
+
+        struct TracedExecutor {
+            inner: FakeXtestExecutor,
+            trace: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl XtestExecutor for TracedExecutor {
+            fn server_identity(&self) -> &X11ServerIdentity {
+                self.inner.server_identity()
+            }
+
+            fn prepare_key(
+                &mut self,
+                evdev_code: u16,
+            ) -> Result<(u8, ServerEpoch), InputSafetyError> {
+                self.inner.prepare_key(evdev_code)
+            }
+
+            fn key_down(&mut self, keycode: u8) -> Result<(), InputSafetyError> {
+                self.inner.key_down(keycode)
+            }
+
+            fn key_up(&mut self, keycode: u8) -> Result<(), InputSafetyError> {
+                self.trace.lock().unwrap().push("key-up");
+                self.inner.key_up(keycode)
+            }
+
+            fn synchronize(&mut self) -> Result<(), InputSafetyError> {
+                self.trace.lock().unwrap().push("round-trip");
+                self.inner.synchronize()
+            }
+        }
+
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let server_trace = Arc::clone(&trace);
+        let (client, server) = Seqpacket::pair().unwrap();
+        let (stop_reader, mut stop_writer) = UnixStream::pair().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut executor = TracedExecutor {
+                inner: FakeXtestExecutor::default(),
+                trace: Arc::clone(&server_trace),
+            };
+            let observer_trace = Arc::clone(&server_trace);
+            let record = run_connection_until_signal_with_observer(
+                &server,
+                test_session(),
+                &mut executor,
+                stop_reader.as_raw_fd(),
+                || observer_trace.lock().unwrap().push("terminal-gate"),
+            )
+            .unwrap();
+            server_trace.lock().unwrap().push("return");
+            (record, executor)
+        });
+        let now = monotonic_now_ns().unwrap();
+        let deadline = MutationDeadlineNs(now + 1_000_000_000);
+
+        send_request(
+            &client,
+            1,
+            Request::Hello {
+                daemon_nonce: [0x44; 16],
+                deadline,
+            },
+        );
+        assert!(matches!(receive_response(&client), Response::Ready { .. }));
+        send_request(
+            &client,
+            2,
+            Request::PrepareKey {
+                operation: OperationId(1),
+                evdev_code: 30,
+                deadline,
+            },
+        );
+        let Response::Prepared { token, .. } = receive_response(&client) else {
+            panic!("expected prepared response");
+        };
+        send_request(
+            &client,
+            3,
+            Request::ExecuteDown {
+                operation: OperationId(1),
+                token,
+                deadline,
+            },
+        );
+        assert!(matches!(
+            receive_response(&client),
+            Response::DownAck { .. }
+        ));
+        send_request(
+            &client,
+            4,
+            Request::Synchronize {
+                operation: OperationId(1),
+                token_id: token.token_id,
+                deadline: ReleaseDeadline::Mutation(deadline),
+            },
+        );
+        assert!(matches!(
+            receive_response(&client),
+            Response::SyncAck { .. }
+        ));
+        trace.lock().unwrap().clear();
+        trace.lock().unwrap().push("signal");
+        stop_writer.write_all(&[1]).unwrap();
+
+        let (record, executor) = server_thread.join().unwrap();
+        assert_eq!(record.reason, StopReason::Signal);
+        assert_eq!(record.proof, TerminalProof::Reconciled);
+        assert_eq!(executor.inner.release_attempts, [token.x11_keycode]);
+        assert_eq!(
+            *trace.lock().unwrap(),
+            ["signal", "terminal-gate", "key-up", "round-trip", "return",]
+        );
+    }
+
+    #[test]
+    fn signal_wakeup_wins_when_transport_and_stop_are_both_ready() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (data_reader, mut data_writer) = UnixStream::pair().unwrap();
+        let (stop_reader, mut stop_writer) = UnixStream::pair().unwrap();
+        data_writer.write_all(&[1]).unwrap();
+        stop_writer.write_all(&[1]).unwrap();
+
+        assert_eq!(
+            wait_for_guardian_io_or_stop(data_reader.as_raw_fd(), stop_reader.as_raw_fd(),)
+                .unwrap(),
+            GuardianWaitOutcome::StopRequested,
+        );
     }
 }

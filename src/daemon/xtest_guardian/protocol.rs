@@ -1209,9 +1209,9 @@ impl ProtocolState {
         }
         let index = self.find_token(token)?;
         match self.tokens[index].state {
-            TrackedTokenState::Prepared => {
+            TrackedTokenState::Prepared if self.tokens[index].operation != operation => {
                 return Err(protocol_error(
-                    "XTEST guardian cannot release a token that was never down",
+                    "XTEST guardian physical release operation does not own prepared token",
                 ));
             }
             TrackedTokenState::AttemptingDown => {
@@ -1224,7 +1224,9 @@ impl ProtocolState {
                     "XTEST guardian release operation does not own token",
                 ));
             }
-            TrackedTokenState::PossiblyDown | TrackedTokenState::PhysicalDebt(_) => {}
+            TrackedTokenState::Prepared
+            | TrackedTokenState::PossiblyDown
+            | TrackedTokenState::PhysicalDebt(_) => {}
         }
         let starts_terminal = self.validate_release_deadline(operation, deadline, now_ns)?;
 
@@ -1997,6 +1999,60 @@ mod tests {
             )
             .is_err());
         assert_eq!(state.debt_count(), 1);
+    }
+
+    #[test]
+    fn prepared_token_can_authorize_physical_key_up_without_synthetic_down() {
+        let mut state = ProtocolState::ready(test_session()).unwrap();
+        state
+            .accept(
+                Sequence(1),
+                &Request::PrepareKey {
+                    operation: OperationId(1),
+                    evdev_code: 42,
+                    deadline: mutation_deadline(),
+                },
+                NOW_NS,
+            )
+            .unwrap();
+        state.record_prepared(OperationId(1), token(1, 42)).unwrap();
+
+        state
+            .accept(
+                Sequence(2),
+                &Request::KeyUp {
+                    operation: OperationId(1),
+                    token: token(1, 42),
+                    deadline: ReleaseDeadline::Mutation(mutation_deadline()),
+                },
+                NOW_NS,
+            )
+            .unwrap();
+        state
+            .accept(
+                Sequence(3),
+                &Request::Synchronize {
+                    operation: OperationId(1),
+                    token_id: 1,
+                    deadline: ReleaseDeadline::Mutation(mutation_deadline()),
+                },
+                NOW_NS,
+            )
+            .unwrap();
+        state.complete_synchronize(1).unwrap();
+
+        assert_eq!(state.debt_count(), 0);
+        state
+            .accept(
+                Sequence(4),
+                &Request::PrepareKey {
+                    operation: OperationId(2),
+                    evdev_code: 30,
+                    deadline: mutation_deadline(),
+                },
+                NOW_NS,
+            )
+            .unwrap();
     }
 
     #[test]

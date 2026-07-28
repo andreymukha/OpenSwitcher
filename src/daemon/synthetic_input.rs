@@ -43,7 +43,7 @@ impl<T> PendingTransfer<T> {
         }
     }
 
-    fn commit(
+    pub(crate) fn commit(
         mut self,
         adopt: impl FnOnce(&T) -> Result<(), SwitcherError>,
     ) -> Result<(), SwitcherError> {
@@ -543,7 +543,7 @@ impl<T> SessionModifierLedger<T> {
         }
     }
 
-    fn adopt_restored(&mut self, key: Key, token: T) -> Result<(), SwitcherError> {
+    pub(crate) fn adopt_restored(&mut self, key: Key, token: T) -> Result<(), SwitcherError> {
         if modifier_bit(key).is_none() {
             return Err(self.protocol_error("session debt requires a modifier key"));
         }
@@ -673,6 +673,13 @@ impl<T> SessionModifierLedger<T> {
 }
 
 impl<T: Clone> SessionModifierLedger<T> {
+    pub(crate) fn token_for_key(&self, key: Key) -> Option<T> {
+        self.entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .map(|entry| entry.token.clone())
+    }
+
     pub(crate) fn release_only_snapshot(&self) -> Vec<T> {
         self.entries
             .iter()

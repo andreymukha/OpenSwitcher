@@ -2,7 +2,7 @@ use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::daemon::synthetic_input::{
-    FrozenPhysicalSnapshot, OperationControl, OperationId, OperationOutcome,
+    FrozenPhysicalSnapshot, InputGeneration, OperationControl, OperationId, OperationOutcome,
     OperationTerminalReport, PhysicalSequence, PressId, RestoreDownMode, SyntheticKeySink,
     SyntheticOperation, TerminalProof,
 };
@@ -11,10 +11,14 @@ use crate::daemon::uinput_synthetic::{
     UinputSyntheticSink,
 };
 use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
-use crate::daemon::xtest_guardian::service::{X11ServerIdentity, XtestExecutor};
-use crate::daemon::xtest_guardian::x11::{
-    verify_external_x11_connection, EmergencyX11Releaser, GuardianX11Executor,
+use crate::daemon::xtest_guardian::client::{
+    EmergencyCoordinator, GuardianClient, GuardianHealth, GuardianMutationDeadline, GuardianReady,
 };
+use crate::daemon::xtest_guardian::runtime::{
+    GuardianPlanStep, GuardianSessionModifierTarget, GuardianSyntheticRuntime,
+};
+use crate::daemon::xtest_guardian::service::X11ServerIdentity;
+use crate::daemon::xtest_guardian::x11::{verify_external_x11_connection, EmergencyX11Releaser};
 use crate::error::{InputSafetyError, SwitcherError};
 use crate::model::{
     DesktopEnvironment, DistroKind, HotkeyTrigger, LayoutSwitchCombo, SessionType, SystemContext,
@@ -63,6 +67,8 @@ const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const WRITER_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(1);
 const CINNAMON_XKB_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
 const CINNAMON_XKB_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
+const XTEST_GUARDIAN_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(4);
+const XTEST_GUARDIAN_SOCKET_RELATIVE_PATH: &str = "open-switcher/xtest-guardian.sock";
 static NEXT_WRITER_TRANSACTION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_writer_transaction_request_id() -> u64 {
@@ -179,6 +185,7 @@ struct VirtualKeyboardHandle {
     stop_requested: Arc<AtomicBool>,
     transaction_failure_request_id: Arc<AtomicU64>,
     transaction_terminal_gate: Arc<Mutex<()>>,
+    guardian_health: Arc<Mutex<Option<GuardianHealth>>>,
 }
 
 struct VirtualKeyboardWriter {
@@ -2244,10 +2251,12 @@ impl VirtualKeyboardWriter {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let transaction_failure_request_id = Arc::new(AtomicU64::new(0));
         let transaction_terminal_gate = Arc::new(Mutex::new(()));
+        let guardian_health = Arc::new(Mutex::new(None));
         let worker_alive = Arc::clone(&alive);
         let worker_stop_requested = Arc::clone(&stop_requested);
         let worker_transaction_failure_request_id = Arc::clone(&transaction_failure_request_id);
         let worker_transaction_terminal_gate = Arc::clone(&transaction_terminal_gate);
+        let worker_guardian_health = Arc::clone(&guardian_health);
         let worker_ready_alive = Arc::clone(&alive);
 
         let join_handle = thread::spawn(move || {
@@ -2262,6 +2271,7 @@ impl VirtualKeyboardWriter {
                         worker_transaction_failure_request_id,
                         worker_stop_requested,
                         worker_transaction_terminal_gate,
+                        worker_guardian_health,
                         worker_ready_alive,
                         ready_tx,
                     )
@@ -2300,6 +2310,7 @@ impl VirtualKeyboardWriter {
                 stop_requested,
                 transaction_failure_request_id,
                 transaction_terminal_gate,
+                guardian_health,
             },
             join_handle: Some(join_handle),
             exit_rx,
@@ -2697,7 +2708,7 @@ impl Drop for VirtualKeyboardWriter {
 
 impl VirtualKeyboardHandle {
     fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::SeqCst) && self.transaction_failure_request_id().is_none()
+        self.health_error().is_none()
     }
 
     fn transaction_failure_request_id(&self) -> Option<u64> {
@@ -2717,6 +2728,15 @@ impl VirtualKeyboardHandle {
     fn health_error(&self) -> Option<SwitcherError> {
         if let Some(request_id) = self.transaction_failure_request_id() {
             return Some(SwitcherError::VirtualKeyboardWriterTransactionTimedOut { request_id });
+        }
+        if let Some(error) = self
+            .guardian_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(GuardianHealth::error)
+        {
+            return Some(error.into());
         }
         if !self.alive.load(Ordering::SeqCst) {
             return Some(SwitcherError::VirtualKeyboardWriterDisconnected);
@@ -3551,6 +3571,7 @@ fn sleep_for_transaction(
     }
 }
 
+#[cfg(test)]
 fn finish_failed_operation_after_cleanup(
     error: SwitcherError,
     cleanup_result: Result<(), SwitcherError>,
@@ -3711,6 +3732,7 @@ fn is_case_sensitive_letter_key(key: Key) -> bool {
     )
 }
 
+#[cfg(test)]
 struct XtestKeyDownAttempt {
     // Once emit has started, its matching key-up is exception-safe cleanup for
     // that exact attempt. Before that point no synthetic release is permitted.
@@ -3718,6 +3740,7 @@ struct XtestKeyDownAttempt {
     result: Result<(), SwitcherError>,
 }
 
+#[cfg(test)]
 trait CinnamonX11XtestReplay {
     fn prepare_for_layout_correction(
         &mut self,
@@ -3734,20 +3757,19 @@ trait CinnamonX11XtestReplay {
 
 enum CinnamonX11XtestRuntime {
     NotSelected,
-    Unavailable(String),
-    Available(Box<CinnamonX11XtestReplayer>),
+    Available(Box<CinnamonGuardianReplay>),
 }
 
-struct CinnamonX11XtestReplayer {
+struct CinnamonGuardianReplay {
     xkb: CinnamonXkbController,
-    xtest: GuardianX11Executor,
-    _emergency: EmergencyX11Releaser,
+    guardian: GuardianSyntheticRuntime,
 }
 
 struct CinnamonXkbController {
     x11: x11rb::rust_connection::RustConnection,
 }
 
+#[cfg(test)]
 fn validate_cinnamon_plan_keycodes_with(
     plan: &CorrectionPlan,
     control: Option<&WriterTransactionControl>,
@@ -3792,16 +3814,29 @@ fn cinnamon_xkb_target_group(num_groups: u8, current_group: u8) -> Result<u8, Sw
 }
 
 impl CinnamonXkbController {
-    fn connect_and_verify(identity: &X11ServerIdentity) -> Result<Self, SwitcherError> {
+    fn connect_and_verify_guardian(
+        ready: &GuardianReady,
+    ) -> Result<(Self, X11ServerIdentity), SwitcherError> {
+        use x11rb::connection::Connection as _;
+
         let (x11, screen_number) = x11rb::connect(None)
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-        verify_external_x11_connection(&x11, screen_number, identity)?;
+        let root = x11
+            .setup()
+            .roots
+            .get(screen_number)
+            .ok_or(InputSafetyError::GuardianProtocol {
+                context: "daemon XKB connection has no selected X11 screen",
+            })?
+            .root;
+        let identity = ready.server_identity(root)?;
+        verify_external_x11_connection(&x11, screen_number, &identity)?;
         use x11rb::protocol::xkb::ConnectionExt as _;
         x11.xkb_use_extension(1, 0)
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
             .reply()
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-        Ok(Self { x11 })
+        Ok((Self { x11 }, identity))
     }
 
     fn num_xkb_groups(
@@ -3891,134 +3926,298 @@ impl CinnamonXkbController {
     }
 }
 
-impl CinnamonX11XtestReplayer {
-    fn new() -> Result<Self, SwitcherError> {
-        let xtest = GuardianX11Executor::connect_and_establish()?;
-        let identity = xtest.server_identity().clone();
-        let xkb = CinnamonXkbController::connect_and_verify(&identity)?;
-        let emergency = EmergencyX11Releaser::connect_and_verify(identity)?;
-        Ok(Self {
-            xkb,
-            xtest,
-            _emergency: emergency,
-        })
+fn xtest_guardian_socket_path() -> Result<PathBuf, SwitcherError> {
+    let runtime_dir =
+        env::var_os("XDG_RUNTIME_DIR").ok_or(InputSafetyError::GuardianUnavailable {
+            context: "XDG_RUNTIME_DIR is unavailable for the guardian socket",
+        })?;
+    let runtime_dir = PathBuf::from(runtime_dir);
+    if !runtime_dir.is_absolute() {
+        return Err(InputSafetyError::GuardianProtocol {
+            context: "XDG_RUNTIME_DIR for the guardian socket must be absolute",
+        }
+        .into());
+    }
+    Ok(runtime_dir.join(XTEST_GUARDIAN_SOCKET_RELATIVE_PATH))
+}
+
+fn guardian_correction_plan_steps(
+    plan: &CorrectionPlan,
+    modifiers: ModifierState,
+) -> Vec<GuardianPlanStep> {
+    let frozen_keys = pressed_modifier_keys(modifiers);
+    let mut steps = Vec::with_capacity(
+        frozen_keys.len().saturating_mul(2)
+            + plan.buffer.len().saturating_mul(2)
+            + plan.extra_backspaces,
+    );
+    steps.extend(
+        frozen_keys
+            .iter()
+            .rev()
+            .copied()
+            .map(GuardianPlanStep::PhysicalRelease),
+    );
+    steps.extend(std::iter::repeat_n(
+        GuardianPlanStep::Prepared(Key::KEY_BACKSPACE),
+        plan.buffer.len() + plan.extra_backspaces,
+    ));
+    for stroke in &plan.buffer {
+        if replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active()) {
+            steps.push(GuardianPlanStep::Prepared(Key::KEY_LEFTSHIFT));
+        }
+        steps.push(GuardianPlanStep::Prepared(stroke.key));
+    }
+    steps.extend(frozen_keys.iter().copied().map(GuardianPlanStep::Prepared));
+    steps
+}
+
+fn guardian_operation_context(
+    control: Option<&WriterTransactionControl>,
+) -> (OperationId, Instant, OperationControl) {
+    match control {
+        Some(control) => (
+            OperationId(control.request_id()),
+            control.deadline,
+            synthetic_operation_control(Some(control)),
+        ),
+        None => {
+            let deadline = Instant::now()
+                .checked_add(SHORTCUT_TRANSACTION_TIMEOUT)
+                .unwrap_or_else(Instant::now);
+            (
+                OperationId(next_writer_transaction_request_id()),
+                deadline,
+                OperationControl::new(deadline, Arc::new(AtomicBool::new(false))),
+            )
+        }
+    }
+}
+
+fn temporarily_release_guardian_modifiers<S: SyntheticKeySink>(
+    operation: &mut SyntheticOperation<'_, S>,
+    session_modifiers: &mut GuardianSessionModifierTarget<'_>,
+    frozen_keys: &[Key],
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    for key in frozen_keys.iter().rev().copied() {
+        authorize_transaction_mutation(control)?;
+        let had_session_debt = session_modifiers.contains(key);
+        let release_result = operation.temporarily_release_physical_modifier(key);
+        if had_session_debt && operation.has_planned_modifier_restore(key) {
+            session_modifiers.mark_temporarily_released(key)?;
+        }
+        release_result?;
+    }
+    Ok(())
+}
+
+fn finish_guardian_synthetic_operation<S, R, T>(
+    operation: SyntheticOperation<'_, S>,
+    session_modifiers: &mut R,
+    operation_id: OperationId,
+    execution: Result<T, SwitcherError>,
+    writer_control: Option<&WriterTransactionControl>,
+) -> Result<T, SwitcherError>
+where
+    S: SyntheticKeySink,
+    R: crate::daemon::synthetic_input::RestoredModifierTarget<S::Token>,
+{
+    let execution = execution.map_err(|error| map_synthetic_control_error(error, writer_control));
+    match execution {
+        Ok(value) => {
+            let report = operation.finish_success(session_modifiers);
+            match (&report.outcome, &report.proof) {
+                (OperationOutcome::Success, TerminalProof::Reconciled) => Ok(value),
+                (OperationOutcome::SoftCancelled, TerminalProof::Reconciled) => {
+                    Err(map_synthetic_control_error(
+                        InputSafetyError::OperationCancelled {
+                            operation_id: operation_id.0,
+                        }
+                        .into(),
+                        writer_control,
+                    ))
+                }
+                _ => Err(terminal_report_error(operation_id, report)),
+            }
+        }
+        Err(error) if is_matching_soft_cancel(&error, writer_control) => {
+            let report = operation.finish_soft_cancel(session_modifiers);
+            if report.outcome == OperationOutcome::SoftCancelled
+                && report.proof == TerminalProof::Reconciled
+            {
+                Err(error)
+            } else {
+                Err(terminal_report_error(operation_id, report))
+            }
+        }
+        Err(error) => {
+            let report = operation.finish_hard_failure(error);
+            Err(terminal_report_error(operation_id, report))
+        }
+    }
+}
+
+impl CinnamonGuardianReplay {
+    fn new(generation: InputGeneration) -> Result<Self, SwitcherError> {
+        let handshake_deadline = Instant::now()
+            .checked_add(XTEST_GUARDIAN_HANDSHAKE_TIMEOUT)
+            .ok_or(InputSafetyError::GuardianProtocol {
+                context: "guardian handshake deadline overflowed",
+            })?;
+        initialize_cinnamon_guardian_components(
+            || GuardianClient::connect(&xtest_guardian_socket_path()?, handshake_deadline),
+            |client| CinnamonXkbController::connect_and_verify_guardian(client.ready()),
+            |client, identity| {
+                let emergency = EmergencyX11Releaser::connect_and_verify(identity)?;
+                client.arm_emergency(emergency)
+            },
+            |client, xkb| {
+                Ok(Self {
+                    xkb,
+                    guardian: GuardianSyntheticRuntime::new(client, generation)?,
+                })
+            },
+        )
     }
 
-    fn validate_plan_keycodes(
+    fn health(&self) -> GuardianHealth {
+        self.guardian.health()
+    }
+
+    fn emergency_coordinator(&self) -> EmergencyCoordinator {
+        self.guardian.emergency_coordinator()
+    }
+
+    fn run_correction(
         &mut self,
         plan: &CorrectionPlan,
+        config: &RuntimeConfigSnapshot,
+        modifiers: ModifierState,
         control: Option<&WriterTransactionControl>,
-    ) -> Result<(), SwitcherError> {
-        validate_cinnamon_plan_keycodes_with(plan, control, |key| {
-            self.validate_keycode(key, control).map(|_| ())
-        })
-    }
+    ) -> Result<CorrectionExecutionOutcome, SwitcherError> {
+        ensure_transaction_active(control)?;
+        let target_group = self.xkb.target_xkb_group(control)?;
+        ensure_transaction_active(control)?;
+        let steps = guardian_correction_plan_steps(plan, modifiers);
+        let frozen_keys = pressed_modifier_keys(modifiers);
+        let frozen_physical = FrozenPhysicalSnapshot::from_pressed_modifiers(
+            frozen_keys.iter().copied(),
+            modifiers.is_caps_lock_active(),
+        )?;
+        let (operation_id, local_deadline, operation_control) = guardian_operation_context(control);
+        let deadline = GuardianMutationDeadline::from_instant(local_deadline)?;
+        let Self { xkb, guardian } = self;
+        let (mut sink, mut session_modifiers, failure_latch) =
+            guardian.prepare_operation(operation_id, deadline, steps)?;
+        ensure_transaction_active(control)?;
+        let mut operation = SyntheticOperation::new(
+            operation_id,
+            &mut sink,
+            operation_control,
+            frozen_physical,
+            failure_latch,
+        );
 
-    fn validate_keycode(
-        &mut self,
-        key: Key,
-        control: Option<&WriterTransactionControl>,
-    ) -> Result<u8, SwitcherError> {
-        run_checked_external_call(control, || {
-            self.xtest
-                .prepare_key(key.code())
-                .map(|(keycode, _)| keycode)
-                .map_err(Into::into)
-        })
-    }
+        let execution = xkb
+            .activate_and_verify_group(target_group, control)
+            .and_then(|_| {
+                temporarily_release_guardian_modifiers(
+                    &mut operation,
+                    &mut session_modifiers,
+                    &frozen_keys,
+                    control,
+                )
+            })
+            .and_then(|_| {
+                for _ in 0..(plan.buffer.len() + plan.extra_backspaces) {
+                    replay_synthetic_stroke(
+                        &mut operation,
+                        Key::KEY_BACKSPACE,
+                        false,
+                        Duration::from_millis(config.backspace_ms),
+                        control,
+                    )?;
+                }
+                for stroke in &plan.buffer {
+                    replay_synthetic_stroke(
+                        &mut operation,
+                        stroke.key,
+                        replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active()),
+                        Duration::from_millis(config.typing_ms),
+                        control,
+                    )?;
+                }
+                Ok(CorrectionExecutionOutcome {
+                    layout_switch: CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest,
+                })
+            });
 
-    fn emit_fake_key(&mut self, keycode: u8, pressed: bool) -> Result<(), SwitcherError> {
-        if pressed {
-            self.xtest.key_down(keycode).map_err(Into::into)
-        } else {
-            self.xtest.key_up(keycode).map_err(Into::into)
-        }
-    }
-
-    fn fake_key_attempt(
-        &mut self,
-        key: Key,
-        pressed: bool,
-        control: Option<&WriterTransactionControl>,
-        failure_request_id: Option<&AtomicU64>,
-        stop_requested: Option<&AtomicBool>,
-        terminal_gate: Option<&Mutex<()>>,
-    ) -> XtestKeyDownAttempt {
-        match validate_xtest_key_before_mutation(
-            key,
+        finish_guardian_synthetic_operation(
+            operation,
+            &mut session_modifiers,
+            operation_id,
+            execution,
             control,
-            failure_request_id,
-            stop_requested,
-            terminal_gate,
-            |key| self.validate_keycode(key, control),
-        ) {
-            Ok(keycode) => XtestKeyDownAttempt {
-                mutation_attempted: true,
-                result: self.emit_fake_key(keycode, pressed),
-            },
-            Err(error) => XtestKeyDownAttempt {
-                mutation_attempted: false,
-                result: Err(error),
-            },
-        }
-    }
-
-    fn fake_key(
-        &mut self,
-        key: Key,
-        pressed: bool,
-        control: Option<&WriterTransactionControl>,
-        failure_request_id: Option<&AtomicU64>,
-        stop_requested: Option<&AtomicBool>,
-        terminal_gate: Option<&Mutex<()>>,
-    ) -> Result<(), SwitcherError> {
-        self.fake_key_attempt(
-            key,
-            pressed,
-            control,
-            failure_request_id,
-            stop_requested,
-            terminal_gate,
-        )
-        .result
-    }
-
-    fn fake_key_down_attempt(
-        &mut self,
-        key: Key,
-        control: Option<&WriterTransactionControl>,
-        failure_request_id: Option<&AtomicU64>,
-        stop_requested: Option<&AtomicBool>,
-        terminal_gate: Option<&Mutex<()>>,
-    ) -> XtestKeyDownAttempt {
-        self.fake_key_attempt(
-            key,
-            true,
-            control,
-            failure_request_id,
-            stop_requested,
-            terminal_gate,
         )
     }
 
     fn type_key(
         &mut self,
         key: Key,
-        failure_request_id: &AtomicU64,
-        stop_requested: &AtomicBool,
-        terminal_gate: &Mutex<()>,
+        failure_request_id: &Arc<AtomicU64>,
+        stop_requested: &Arc<AtomicBool>,
+        terminal_gate: &Arc<Mutex<()>>,
     ) -> Result<(), SwitcherError> {
-        let key_down_attempt = self.fake_key_down_attempt(
-            key,
-            None,
-            Some(failure_request_id),
-            Some(stop_requested),
-            Some(terminal_gate),
+        let local_deadline = Instant::now()
+            .checked_add(SHORTCUT_TRANSACTION_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        let operation_id = OperationId(next_writer_transaction_request_id());
+        let deadline = GuardianMutationDeadline::from_instant(local_deadline)?;
+        let operation_control =
+            OperationControl::new(local_deadline, Arc::new(AtomicBool::new(false)))
+                .with_cancellation_source(stop_requested.clone())
+                .with_failure_source(failure_request_id.clone());
+        let (mut sink, mut session_modifiers, failure_latch) = self.guardian.prepare_operation(
+            operation_id,
+            deadline,
+            [GuardianPlanStep::Prepared(key)],
+        )?;
+        let mut operation = SyntheticOperation::new(
+            operation_id,
+            &mut sink,
+            operation_control,
+            FrozenPhysicalSnapshot::default(),
+            failure_latch,
         );
-        finish_fast_xtest_tap_attempt(key_down_attempt, || self.key_up(key))
+        let execution =
+            authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)
+                .and_then(|_| {
+                    replay_synthetic_stroke(&mut operation, key, false, Duration::ZERO, None)
+                });
+        finish_guardian_synthetic_operation(
+            operation,
+            &mut session_modifiers,
+            operation_id,
+            execution,
+            None,
+        )
     }
 }
 
+fn initialize_cinnamon_guardian_components<G, X, I, R>(
+    connect_guardian: impl FnOnce() -> Result<G, SwitcherError>,
+    verify_xkb: impl FnOnce(&G) -> Result<(X, I), SwitcherError>,
+    verify_and_arm_emergency: impl FnOnce(&G, I) -> Result<(), SwitcherError>,
+    build_runtime: impl FnOnce(G, X) -> Result<R, SwitcherError>,
+) -> Result<R, SwitcherError> {
+    let guardian = connect_guardian()?;
+    let (xkb, identity) = verify_xkb(&guardian)?;
+    verify_and_arm_emergency(&guardian, identity)?;
+    build_runtime(guardian, xkb)
+}
+
+#[cfg(test)]
 fn validate_xtest_key_before_mutation(
     key: Key,
     control: Option<&WriterTransactionControl>,
@@ -4052,6 +4251,7 @@ fn validate_xtest_key_before_mutation(
     Ok(keycode)
 }
 
+#[cfg(test)]
 fn validate_and_emit_xtest_key_attempt(
     key: Key,
     control: Option<&WriterTransactionControl>,
@@ -4104,33 +4304,6 @@ fn validate_and_emit_xtest_key(
     .result
 }
 
-impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
-    fn prepare_for_layout_correction(
-        &mut self,
-        plan: &CorrectionPlan,
-        control: Option<&WriterTransactionControl>,
-    ) -> Result<(), SwitcherError> {
-        ensure_transaction_active(control)?;
-        self.validate_plan_keycodes(plan, control)?;
-        ensure_transaction_active(control)?;
-        let target_group = self.xkb.target_xkb_group(control)?;
-        ensure_transaction_active(control)?;
-        self.xkb.activate_and_verify_group(target_group, control)
-    }
-
-    fn key_down_attempt(
-        &mut self,
-        key: Key,
-        control: Option<&WriterTransactionControl>,
-    ) -> XtestKeyDownAttempt {
-        self.fake_key_down_attempt(key, control, None, None, None)
-    }
-
-    fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
-        self.fake_key(key, false, None, None, None, None)
-    }
-}
-
 fn select_correction_replay_strategy(
     context: SystemContext,
     switch_layout: bool,
@@ -4153,6 +4326,7 @@ fn select_correction_replay_strategy(
     }
 }
 
+#[cfg(test)]
 fn release_modifiers_xtest(
     replay: &mut dyn CinnamonX11XtestReplay,
     modifiers: ModifierState,
@@ -4165,6 +4339,7 @@ fn release_modifiers_xtest(
     active_result
 }
 
+#[cfg(test)]
 fn release_xtest_modifiers_exhaustively(
     replay: &mut dyn CinnamonX11XtestReplay,
     modifiers: ModifierState,
@@ -4183,6 +4358,7 @@ fn release_xtest_modifiers_exhaustively(
     }
 }
 
+#[cfg(test)]
 fn restore_modifiers_xtest(
     replay: &mut dyn CinnamonX11XtestReplay,
     modifiers: ModifierState,
@@ -4207,6 +4383,7 @@ fn restore_modifiers_xtest(
     Ok(())
 }
 
+#[cfg(test)]
 fn xtest_key_down_exception_safe(
     replay: &mut dyn CinnamonX11XtestReplay,
     key: Key,
@@ -4225,6 +4402,7 @@ fn xtest_key_down_exception_safe(
     }
 }
 
+#[cfg(test)]
 fn release_xtest_keys_best_effort(
     replay: &mut dyn CinnamonX11XtestReplay,
     keys: &[Key],
@@ -4272,6 +4450,7 @@ fn pressed_modifier_keys(modifiers: ModifierState) -> Vec<Key> {
     keys
 }
 
+#[cfg(test)]
 fn xtest_key_tap(
     replay: &mut dyn CinnamonX11XtestReplay,
     key: Key,
@@ -4288,6 +4467,7 @@ fn xtest_key_tap(
     )
 }
 
+#[cfg(test)]
 fn complete_xtest_tap_attempt(
     key_down_attempt: XtestKeyDownAttempt,
     transition_wait: impl FnOnce() -> Result<(), SwitcherError>,
@@ -4305,6 +4485,7 @@ fn complete_xtest_tap_attempt(
     final_wait()
 }
 
+#[cfg(test)]
 fn finish_fast_xtest_tap_attempt(
     key_down_attempt: XtestKeyDownAttempt,
     key_up: impl FnOnce() -> Result<(), SwitcherError>,
@@ -4320,6 +4501,7 @@ fn finish_fast_xtest_tap_attempt(
     )
 }
 
+#[cfg(test)]
 fn replay_xtest_stroke(
     replay: &mut dyn CinnamonX11XtestReplay,
     key: Key,
@@ -4345,6 +4527,7 @@ fn replay_xtest_stroke(
     }
 }
 
+#[cfg(test)]
 fn run_cinnamon_x11_xtest_correction(
     replay: &mut dyn CinnamonX11XtestReplay,
     plan: &CorrectionPlan,
@@ -4391,20 +4574,23 @@ fn detect_current_system_context() -> SystemContext {
     })
 }
 
-fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11XtestRuntime {
+fn initialize_cinnamon_x11_xtest_runtime(
+    context: SystemContext,
+    generation: InputGeneration,
+) -> Result<CinnamonX11XtestRuntime, SwitcherError> {
     if select_correction_replay_strategy(context, true, true)
         != CorrectionReplayStrategy::CinnamonXkbXtest
     {
-        return CinnamonX11XtestRuntime::NotSelected;
+        return Ok(CinnamonX11XtestRuntime::NotSelected);
     }
 
-    match CinnamonX11XtestReplayer::new() {
+    match CinnamonGuardianReplay::new(generation) {
         Ok(replayer) => {
             log_input_debug(
                 "correction-replay-strategy",
                 "session_type=x11 desktop=cinnamon strategy=cinnamon-xkb-xtest result=ready",
             );
-            CinnamonX11XtestRuntime::Available(Box::new(replayer))
+            Ok(CinnamonX11XtestRuntime::Available(Box::new(replayer)))
         }
         Err(error) => {
             log_input_debug(
@@ -4413,7 +4599,7 @@ fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11X
                     "session_type=x11 desktop=cinnamon strategy=cinnamon-xkb-xtest result=unavailable error={error}"
                 ),
             );
-            CinnamonX11XtestRuntime::Unavailable(error.to_string())
+            Err(error)
         }
     }
 }
@@ -4460,6 +4646,7 @@ fn release_uinput_stroke_keys(
     }
 }
 
+#[cfg(test)]
 fn all_modifier_keys() -> Vec<Key> {
     pressed_modifier_keys(ModifierState {
         left_shift: true,
@@ -4474,6 +4661,7 @@ fn all_modifier_keys() -> Vec<Key> {
     })
 }
 
+#[cfg(test)]
 fn retain_first_cleanup_error(
     first_error: &mut Option<SwitcherError>,
     result: Result<(), SwitcherError>,
@@ -4557,12 +4745,14 @@ fn normalize_uinput_modifiers_after_soft_cancel_if_needed(
     normalize_uinput_modifiers_after_soft_cancel(sink, frozen, control)
 }
 
+#[cfg(test)]
 fn release_xtest_cleanup_keys_best_effort(replay: &mut dyn CinnamonX11XtestReplay, keys: &[Key]) {
     for key in keys.iter().rev() {
         let _ = replay.key_up(*key);
     }
 }
 
+#[cfg(test)]
 fn normalize_xtest_modifiers_after_soft_cancel(
     replay: &mut dyn CinnamonX11XtestReplay,
     frozen: ModifierState,
@@ -4598,6 +4788,7 @@ fn normalize_xtest_modifiers_after_soft_cancel(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize_xtest_modifiers_after_soft_cancel_if_needed(
     replay: &mut dyn CinnamonX11XtestReplay,
     frozen: ModifierState,
@@ -4812,7 +5003,7 @@ fn terminal_report_error(
         }
         .into(),
         _ => InputSafetyError::Invariant {
-            context: "uinput operation published an invalid terminal report",
+            context: "synthetic operation published an invalid terminal report",
         }
         .into(),
     }
@@ -5097,38 +5288,12 @@ fn run_correction<R: UinputRawSink>(
                     "correction-layout-switch",
                     "strategy=cinnamon-xkb-xtest phase=prepare",
                 );
-                let result = run_cinnamon_x11_xtest_correction(
-                    replay.as_mut(),
-                    plan,
-                    config,
-                    modifiers,
-                    control,
-                );
-                let outcome = match result {
-                    Err(error) if is_matching_soft_cancel(&error, control) => {
-                        normalize_xtest_modifiers_after_soft_cancel_if_needed(
-                            replay.as_mut(),
-                            modifiers,
-                            control.expect("matching soft cancel requires transaction control"),
-                        )?;
-                        return Err(error);
-                    }
-                    result => result?,
-                };
+                let outcome = replay.run_correction(plan, config, modifiers, control)?;
                 log_input_debug(
                     "correction-layout-switch",
                     "strategy=cinnamon-xkb-xtest result=ok",
                 );
                 return Ok(outcome);
-            }
-            CinnamonX11XtestRuntime::Unavailable(reason) => {
-                log_input_debug(
-                    "correction-layout-switch",
-                    &format!("strategy=cinnamon-xkb-xtest result=error reason={reason}"),
-                );
-                return Err(SwitcherError::Io(io::Error::other(format!(
-                    "cinnamon-xkb-xtest-before-mutation: {reason}"
-                ))));
             }
             CinnamonX11XtestRuntime::NotSelected => {}
         }
@@ -5485,6 +5650,7 @@ fn run_virtual_keyboard_writer_loop(
     failure_request_id: Arc<AtomicU64>,
     stop_requested: Arc<AtomicBool>,
     terminal_gate: Arc<Mutex<()>>,
+    guardian_health: Arc<Mutex<Option<GuardianHealth>>>,
     writer_alive: Arc<AtomicBool>,
     ready_tx: mpsc::SyncSender<()>,
 ) -> Result<(), SwitcherError> {
@@ -5492,7 +5658,12 @@ fn run_virtual_keyboard_writer_loop(
     let context = detect_current_system_context();
     let mut x11_switcher =
         initialize_x11_switcher_for_session(context.session_type, X11LayoutSwitcher::new);
-    let mut cinnamon_x11_xtest = initialize_cinnamon_x11_xtest_runtime(context);
+    let mut cinnamon_x11_xtest = initialize_cinnamon_x11_xtest_runtime(context, generation)?;
+    if let CinnamonX11XtestRuntime::Available(replay) = &cinnamon_x11_xtest {
+        *guardian_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(replay.health());
+    }
 
     run_writer_command_loop_with_stop(
         command_rx,
@@ -5545,15 +5716,6 @@ fn run_virtual_keyboard_writer_loop(
                                     }
                                 }
                                 Some(result)
-                            }
-                            CinnamonX11XtestRuntime::Unavailable(reason) => {
-                                log_input_debug(
-                                "type-separator-execute",
-                                &format!(
-                                    "key={key:?} strategy=cinnamon-xkb-xtest result=unavailable fallback=uinput reason={reason}"
-                                    ),
-                                );
-                                None
                             }
                             CinnamonX11XtestRuntime::NotSelected => None,
                         };
@@ -5752,7 +5914,7 @@ mod tests {
     use super::*;
     use crate::model::{default_manual_correction_hotkey, default_selected_text_hotkey};
     use crate::model::{DesktopEnvironment, DistroKind, SystemContext};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::io;
     use std::path::Path;
@@ -5796,6 +5958,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             command_rx,
         )
@@ -6499,6 +6662,123 @@ mod tests {
         );
 
         assert_eq!(strategy, CorrectionReplayStrategy::CinnamonXkbXtest);
+    }
+
+    #[test]
+    fn cinnamon_writer_is_not_ready_until_guardian_and_both_x11_connections_are_verified() {
+        let trace = RefCell::new(Vec::new());
+        let runtime = initialize_cinnamon_guardian_components(
+            || {
+                trace.borrow_mut().push("guardian-ready");
+                Ok::<_, SwitcherError>("guardian")
+            },
+            |_| {
+                trace.borrow_mut().push("xkb-verified");
+                Ok::<_, SwitcherError>(("xkb", "identity"))
+            },
+            |_, _| {
+                trace.borrow_mut().push("emergency-verified");
+                Ok::<_, SwitcherError>(())
+            },
+            |_, _| {
+                trace.borrow_mut().push("writer-runtime-ready");
+                Ok::<_, SwitcherError>("runtime")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(runtime, "runtime");
+        assert_eq!(
+            *trace.borrow(),
+            [
+                "guardian-ready",
+                "xkb-verified",
+                "emergency-verified",
+                "writer-runtime-ready",
+            ]
+        );
+    }
+
+    #[test]
+    fn guardian_startup_failure_never_builds_writer_runtime() {
+        let trace = RefCell::new(Vec::new());
+        let result: Result<(), SwitcherError> = initialize_cinnamon_guardian_components(
+            || -> Result<&'static str, SwitcherError> {
+                trace.borrow_mut().push("guardian-connect");
+                Err(InputSafetyError::GuardianUnavailable {
+                    context: "test guardian unavailable",
+                }
+                .into())
+            },
+            |_: &&'static str| -> Result<(&'static str, &'static str), SwitcherError> {
+                panic!("XKB verification must not run after guardian failure")
+            },
+            |_: &&'static str, _: &'static str| -> Result<(), SwitcherError> {
+                panic!("emergency verification must not run after guardian failure")
+            },
+            |_: &'static str, _: &'static str| {
+                trace.borrow_mut().push("writer-runtime-ready");
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputSafety(
+                InputSafetyError::GuardianUnavailable { .. }
+            ))
+        ));
+        assert_eq!(*trace.borrow(), ["guardian-connect"]);
+    }
+
+    #[test]
+    fn guardian_correction_plan_preflights_exact_physical_and_shifted_trace() {
+        let plan = CorrectionPlan {
+            buffer: vec![crate::daemon::switch_logic::Keystroke {
+                key: Key::KEY_G,
+                shift: true,
+                caps_lock: false,
+            }],
+            extra_backspaces: 1,
+        };
+        let modifiers = ModifierState {
+            left_shift: true,
+            ..ModifierState::default()
+        };
+
+        assert_eq!(
+            guardian_correction_plan_steps(&plan, modifiers),
+            [
+                GuardianPlanStep::PhysicalRelease(Key::KEY_LEFTSHIFT),
+                GuardianPlanStep::Prepared(Key::KEY_BACKSPACE),
+                GuardianPlanStep::Prepared(Key::KEY_BACKSPACE),
+                GuardianPlanStep::Prepared(Key::KEY_LEFTSHIFT),
+                GuardianPlanStep::Prepared(Key::KEY_G),
+                GuardianPlanStep::Prepared(Key::KEY_LEFTSHIFT),
+            ]
+        );
+    }
+
+    #[test]
+    fn guardian_health_failure_precedes_generic_writer_disconnect() {
+        let (handle, _command_rx) = test_writer_handle(1, false);
+        *handle
+            .guardian_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
+            GuardianHealth::failed_for_test(InputSafetyError::GuardianUnavailable {
+                context: "test guardian failed",
+            }),
+        );
+
+        assert!(matches!(
+            handle.health_error(),
+            Some(SwitcherError::InputSafety(
+                InputSafetyError::GuardianUnavailable {
+                    context: "test guardian failed"
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -8453,6 +8733,7 @@ mod tests {
                 stop_requested: Arc::clone(&stop_requested),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -8502,6 +8783,7 @@ mod tests {
                 stop_requested: Arc::clone(&stop_requested),
                 transaction_failure_request_id: Arc::clone(&failure),
                 transaction_terminal_gate: Arc::clone(&terminal_gate),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -8576,6 +8858,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(|| {})),
             exit_rx: mpsc::channel().1,
@@ -8624,6 +8907,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 run_writer_thread_with_exit_notification((), exit_tx, |_| {
@@ -8667,6 +8951,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -8734,6 +9019,7 @@ mod tests {
                 stop_requested,
                 transaction_failure_request_id: failure,
                 transaction_terminal_gate: terminal_gate,
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(join_handle),
             exit_rx,
@@ -8803,6 +9089,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -8845,6 +9132,7 @@ mod tests {
                 stop_requested,
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -8943,6 +9231,7 @@ mod tests {
                 stop_requested,
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_full_queue = command_rx;
@@ -8982,6 +9271,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_full_queue = command_rx;
@@ -9024,6 +9314,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -9075,6 +9366,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_receiver_alive = command_rx;
@@ -9200,6 +9492,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 drop(command_rx);
@@ -9245,6 +9538,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_channels_alive = command_rx;
@@ -9295,6 +9589,7 @@ mod tests {
                 stop_requested,
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _keep_command_receiver_alive = command_rx;
@@ -10354,7 +10649,7 @@ mod tests {
     }
 
     #[test]
-    fn available_xtest_separator_runtime_error_does_not_fallback_or_dispatch_next_command() {
+    fn available_guardian_separator_runtime_error_does_not_fallback_or_dispatch_next_command() {
         let failure = AtomicU64::new(0);
         let (command_tx, command_rx) = mpsc::channel();
         for key in [Key::KEY_SPACE, Key::KEY_ENTER] {
@@ -10995,6 +11290,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11064,6 +11360,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11110,6 +11407,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11170,6 +11468,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11239,6 +11538,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11310,6 +11610,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11595,6 +11896,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 let _ = command_rx.recv();
@@ -11637,6 +11939,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: Some(thread::spawn(move || {
                 while worker_alive.load(Ordering::SeqCst) {
@@ -11685,6 +11988,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11723,6 +12027,7 @@ mod tests {
                 stop_requested,
                 transaction_failure_request_id: failure_request_id,
                 transaction_terminal_gate: terminal_gate,
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,
@@ -11766,6 +12071,7 @@ mod tests {
                 stop_requested: Arc::new(AtomicBool::new(false)),
                 transaction_failure_request_id: Arc::new(AtomicU64::new(0)),
                 transaction_terminal_gate: Arc::new(Mutex::new(())),
+                guardian_health: Arc::new(Mutex::new(None)),
             },
             join_handle: None,
             exit_rx: mpsc::channel().1,

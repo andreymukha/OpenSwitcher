@@ -7,7 +7,9 @@ use super::seqpacket::Seqpacket;
 use super::service::{monotonic_now_ns, X11ServerIdentity};
 use super::x11::EmergencyX11Releaser;
 use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
-use crate::daemon::synthetic_input::{OperationId, SyntheticKeySink, TerminalProof};
+use crate::daemon::synthetic_input::{
+    InputGeneration, OperationId, SyntheticKeySink, TerminalProof,
+};
 use crate::error::{InputSafetyError, SwitcherError};
 use evdev::Key;
 use std::collections::VecDeque;
@@ -126,6 +128,13 @@ impl GuardianHealth {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failed_for_test(error: InputSafetyError) -> Self {
+        let health = Self::new();
+        health.fail(error);
+        health
     }
 }
 
@@ -903,6 +912,56 @@ impl GuardianClient {
         }
     }
 
+    pub(crate) fn synchronize_if_pending(
+        &mut self,
+        operation: OperationId,
+        deadline: GuardianMutationDeadline,
+    ) -> Result<(), SwitcherError> {
+        if self.pending_mutation.is_none() {
+            return Ok(());
+        }
+        self.synchronize(operation, deadline)
+    }
+
+    pub(crate) fn transfer_to_physical_debt(
+        &mut self,
+        operation: OperationId,
+        token: PreparedToken,
+        input_generation: InputGeneration,
+        deadline: GuardianMutationDeadline,
+    ) -> Result<(), SwitcherError> {
+        self.ensure_no_pending_mutation()?;
+        self.validate_token_identity(token)?;
+        if input_generation.0 == 0 {
+            return Err(self.fail_protocol("XTEST physical debt generation must be nonzero"));
+        }
+        if !self.emergency.contains_possible(token) {
+            return Err(self.fail_protocol(
+                "XTEST physical debt transfer has no matching possible-down mirror",
+            ));
+        }
+        let response = self.broker.submit(
+            Request::TransferToPhysicalDebt {
+                operation,
+                token,
+                input_generation,
+                deadline: deadline.wire,
+            },
+            deadline.local,
+            false,
+        )?;
+        match response {
+            Response::TransferAck {
+                operation: response_operation,
+                token_id,
+            } if response_operation == operation && token_id == token.token_id => Ok(()),
+            _ => {
+                Err(self
+                    .fail_protocol("TransferToPhysicalDebt response is not matching TransferAck"))
+            }
+        }
+    }
+
     fn ensure_no_pending_mutation(&self) -> Result<(), SwitcherError> {
         if self.pending_mutation.is_some() {
             return Err(self.fail_protocol("previous XTEST mutation must be synchronized first"));
@@ -961,11 +1020,27 @@ impl GuardianClient {
             .clear();
     }
 
-    fn fail_protocol(&self, context: &'static str) -> SwitcherError {
+    pub(crate) fn fail_protocol(&self, context: &'static str) -> SwitcherError {
         let error = InputSafetyError::GuardianProtocol { context };
         self.broker.failure.fail(error.clone());
         self.broker.wake();
         error.into()
+    }
+
+    pub(crate) fn operation_terminal_proof(
+        &self,
+        operation: OperationId,
+        remaining_debt: usize,
+    ) -> TerminalProof {
+        if !self.health().is_failed()
+            && remaining_debt == 0
+            && !self.has_any_prepared()
+            && self.pending_mutation.is_none()
+        {
+            TerminalProof::Reconciled
+        } else {
+            self.cancel_and_drain(operation)
+        }
     }
 
     pub(crate) fn cancel_and_drain(&self, operation: OperationId) -> TerminalProof {
@@ -1064,19 +1139,13 @@ impl SyntheticKeySink for GuardianSyntheticSink<'_> {
     }
 
     fn synchronize(&mut self) -> Result<(), SwitcherError> {
-        self.client.synchronize(self.operation, self.deadline)
+        self.client
+            .synchronize_if_pending(self.operation, self.deadline)
     }
 
     fn terminal_proof(&self, remaining_debt: usize) -> TerminalProof {
-        if !self.client.health().is_failed()
-            && remaining_debt == 0
-            && !self.client.has_any_prepared()
-            && self.client.pending_mutation.is_none()
-        {
-            TerminalProof::Reconciled
-        } else {
-            self.client.cancel_and_drain(self.operation)
-        }
+        self.client
+            .operation_terminal_proof(self.operation, remaining_debt)
     }
 }
 
@@ -1482,11 +1551,15 @@ fn health_error_for(error: &SwitcherError) -> InputSafetyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::synthetic_input::{OperationId, TerminalProof};
+    use crate::daemon::synthetic_input::{
+        FrozenPhysicalSnapshot, InputGeneration, OperationControl, OperationId, OperationOutcome,
+        SyntheticOperation, TerminalProof,
+    };
     use crate::daemon::xtest_guardian::protocol::{
         decode_frame, encode_frame, Message, PreparedToken, Request, Response, ServerEpoch,
         SessionId,
     };
+    use crate::daemon::xtest_guardian::runtime::{GuardianPlanStep, GuardianSyntheticRuntime};
     use evdev::Key;
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -1840,6 +1913,212 @@ mod tests {
 
         client.synchronize(OperationId(3), deadline).unwrap();
         assert_eq!(coordinator.possible_tokens(), vec![first]);
+    }
+
+    #[test]
+    fn physical_debt_transfer_keeps_exact_token_in_emergency_mirror() {
+        let fixture = RecordingGuardian::ready();
+        let coordinator =
+            EmergencyCoordinator::for_test(fixture.identity(), fixture.emergency_trace());
+        let mut client =
+            GuardianClient::from_test_transport(fixture.client_transport(), coordinator.clone())
+                .unwrap();
+        let deadline = GuardianMutationDeadline::for_test(Duration::from_secs(1));
+        let token = client
+            .prepare_key(OperationId(11), Key::KEY_LEFTSHIFT, deadline)
+            .unwrap();
+        client
+            .execute_down(OperationId(11), token, deadline)
+            .unwrap();
+        client.synchronize(OperationId(11), deadline).unwrap();
+
+        client
+            .transfer_to_physical_debt(OperationId(11), token, InputGeneration(7), deadline)
+            .unwrap();
+
+        assert_eq!(coordinator.possible_tokens(), vec![token]);
+        assert!(fixture.requests.lock().unwrap().iter().any(|request| {
+            matches!(
+                request,
+                Request::TransferToPhysicalDebt {
+                    operation: OperationId(11),
+                    token: candidate,
+                    input_generation: InputGeneration(7),
+                    ..
+                } if *candidate == token
+            )
+        }));
+    }
+
+    #[test]
+    fn guardian_runtime_success_accepts_final_idempotent_synchronize() {
+        let fixture = RecordingGuardian::ready();
+        let coordinator =
+            EmergencyCoordinator::for_test(fixture.identity(), fixture.emergency_trace());
+        let client =
+            GuardianClient::from_test_transport(fixture.client_transport(), coordinator).unwrap();
+        let mut runtime = GuardianSyntheticRuntime::new(client, InputGeneration(7)).unwrap();
+        let operation_id = OperationId(12);
+        let local_deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = GuardianMutationDeadline::for_test(Duration::from_secs(1));
+        let (mut sink, mut session_modifiers, failure_latch) = runtime
+            .prepare_operation(
+                operation_id,
+                deadline,
+                [GuardianPlanStep::Prepared(Key::KEY_A)],
+            )
+            .unwrap();
+        let mut operation = SyntheticOperation::new(
+            operation_id,
+            &mut sink,
+            OperationControl::new(local_deadline, Arc::new(AtomicBool::new(false))),
+            FrozenPhysicalSnapshot::default(),
+            failure_latch,
+        );
+
+        let press = operation.press(Key::KEY_A).unwrap();
+        operation.release(press).unwrap();
+        let report = operation.finish_success(&mut session_modifiers);
+
+        assert_eq!(report.outcome, OperationOutcome::Success);
+        assert_eq!(report.proof, TerminalProof::Reconciled);
+        assert!(report.cleanup.is_none());
+    }
+
+    #[test]
+    fn guardian_runtime_preflights_and_reconciles_physical_shift_trace() {
+        let fixture = RecordingGuardian::ready();
+        let coordinator =
+            EmergencyCoordinator::for_test(fixture.identity(), fixture.emergency_trace());
+        let client =
+            GuardianClient::from_test_transport(fixture.client_transport(), coordinator.clone())
+                .unwrap();
+        let mut runtime = GuardianSyntheticRuntime::new(client, InputGeneration(7)).unwrap();
+        let operation_id = OperationId(13);
+        let local_deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = GuardianMutationDeadline::for_test(Duration::from_secs(1));
+        let plan = [
+            GuardianPlanStep::PhysicalRelease(Key::KEY_LEFTSHIFT),
+            GuardianPlanStep::Prepared(Key::KEY_BACKSPACE),
+            GuardianPlanStep::Prepared(Key::KEY_LEFTSHIFT),
+            GuardianPlanStep::Prepared(Key::KEY_G),
+            GuardianPlanStep::Prepared(Key::KEY_LEFTSHIFT),
+        ];
+        let (mut sink, mut session_modifiers, failure_latch) = runtime
+            .prepare_operation(operation_id, deadline, plan)
+            .unwrap();
+        let mut operation = SyntheticOperation::new(
+            operation_id,
+            &mut sink,
+            OperationControl::new(local_deadline, Arc::new(AtomicBool::new(false))),
+            FrozenPhysicalSnapshot::from_pressed_modifiers([Key::KEY_LEFTSHIFT], false).unwrap(),
+            failure_latch,
+        );
+
+        operation
+            .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        let backspace = operation.press(Key::KEY_BACKSPACE).unwrap();
+        operation.release(backspace).unwrap();
+        let shift = operation.press(Key::KEY_LEFTSHIFT).unwrap();
+        let letter = operation.press(Key::KEY_G).unwrap();
+        operation.release(letter).unwrap();
+        operation.release(shift).unwrap();
+        let report = operation.finish_success(&mut session_modifiers);
+
+        assert_eq!(report.outcome, OperationOutcome::Success);
+        assert_eq!(report.proof, TerminalProof::Reconciled);
+        assert!(report.cleanup.is_none());
+
+        let requests = fixture.requests.lock().unwrap();
+        let prepared_codes: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::PrepareKey { evdev_code, .. } => Some(*evdev_code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prepared_codes,
+            [
+                Key::KEY_LEFTSHIFT.code(),
+                Key::KEY_BACKSPACE.code(),
+                Key::KEY_LEFTSHIFT.code(),
+                Key::KEY_G.code(),
+                Key::KEY_LEFTSHIFT.code(),
+            ]
+        );
+        let last_prepare = requests
+            .iter()
+            .rposition(|request| matches!(request, Request::PrepareKey { .. }))
+            .unwrap();
+        let first_mutation = requests
+            .iter()
+            .position(|request| {
+                matches!(request, Request::ExecuteDown { .. } | Request::KeyUp { .. })
+            })
+            .unwrap();
+        assert!(last_prepare < first_mutation);
+        assert!(matches!(
+            requests.get(first_mutation),
+            Some(Request::KeyUp { token, .. })
+                if token.evdev_code == Key::KEY_LEFTSHIFT.code()
+        ));
+        assert!(matches!(
+            requests.last(),
+            Some(Request::TransferToPhysicalDebt {
+                input_generation: InputGeneration(7),
+                token,
+                ..
+            }) if token.evdev_code == Key::KEY_LEFTSHIFT.code()
+        ));
+        drop(requests);
+        let first_debt = coordinator.possible_tokens();
+        assert_eq!(first_debt.len(), 1);
+        drop(session_modifiers);
+        drop(sink);
+        assert!(runtime.has_session_modifier(Key::KEY_LEFTSHIFT));
+
+        let operation_id = OperationId(14);
+        let local_deadline = Instant::now() + Duration::from_secs(1);
+        let deadline = GuardianMutationDeadline::for_test(Duration::from_secs(1));
+        let (mut sink, mut session_modifiers, failure_latch) = runtime
+            .prepare_operation(
+                operation_id,
+                deadline,
+                [
+                    GuardianPlanStep::PhysicalRelease(Key::KEY_LEFTSHIFT),
+                    GuardianPlanStep::Prepared(Key::KEY_H),
+                    GuardianPlanStep::Prepared(Key::KEY_LEFTSHIFT),
+                ],
+            )
+            .unwrap();
+        let mut operation = SyntheticOperation::new(
+            operation_id,
+            &mut sink,
+            OperationControl::new(local_deadline, Arc::new(AtomicBool::new(false))),
+            FrozenPhysicalSnapshot::from_pressed_modifiers([Key::KEY_LEFTSHIFT], false).unwrap(),
+            failure_latch,
+        );
+        operation
+            .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        session_modifiers
+            .mark_temporarily_released(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        let letter = operation.press(Key::KEY_H).unwrap();
+        operation.release(letter).unwrap();
+        let report = operation.finish_success(&mut session_modifiers);
+
+        assert_eq!(report.outcome, OperationOutcome::Success);
+        assert_eq!(report.proof, TerminalProof::Reconciled);
+        assert!(report.cleanup.is_none());
+        drop(session_modifiers);
+        drop(sink);
+        let second_debt = coordinator.possible_tokens();
+        assert_eq!(second_debt.len(), 1);
+        assert_ne!(second_debt, first_debt);
+        assert!(runtime.has_session_modifier(Key::KEY_LEFTSHIFT));
     }
 
     #[test]

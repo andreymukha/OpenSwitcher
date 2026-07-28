@@ -1,9 +1,11 @@
 pub mod config_error;
 pub mod dbus_error;
+pub mod input_safety_error;
 pub mod ui_error;
 
 pub use config_error::ConfigError;
 pub use dbus_error::DbusError;
+pub use input_safety_error::InputSafetyError;
 pub use ui_error::{SettingsClientError, UiError};
 
 use std::path::PathBuf;
@@ -142,6 +144,8 @@ pub enum SwitcherError {
     #[error(transparent)]
     InputWorkValidation(#[from] ValidationError),
     #[error(transparent)]
+    InputSafety(#[from] InputSafetyError),
+    #[error(transparent)]
     Ui(#[from] UiError),
     #[error("Keyboard device was not found")]
     KeyboardNotFound,
@@ -207,6 +211,10 @@ pub enum ServiceManagerError {
 }
 
 impl SwitcherError {
+    pub(crate) fn input_safety(context: &'static str) -> Self {
+        InputSafetyError::Invariant { context }.into()
+    }
+
     pub fn is_recoverable_input_error(&self) -> bool {
         match self {
             SwitcherError::KeyboardNotFound
@@ -253,6 +261,18 @@ impl SwitcherError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_safety_helper_creates_typed_invariant_without_payload_data() {
+        let error = SwitcherError::input_safety("test invariant");
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputSafety(InputSafetyError::Invariant {
+                context: "test invariant",
+            })
+        ));
+    }
 
     #[test]
     fn keyboard_access_denied_is_recoverable_input_error() {

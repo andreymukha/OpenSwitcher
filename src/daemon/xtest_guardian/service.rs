@@ -699,9 +699,10 @@ mod tests {
     use crate::daemon::synthetic_input::{InputGeneration, OperationId, TerminalProof};
     use crate::daemon::xtest_guardian::protocol::{
         MutationDeadlineNs, PreparedToken, ProtocolSession, ReleaseDeadline, Request, Response,
-        Sequence, ServerEpoch, SessionId, MAX_RELEASE_CLEANUP_NS,
+        Sequence, ServerEpoch, SessionId, MAX_ACTIVE_DEBTS, MAX_RELEASE_CLEANUP_NS,
     };
     use crate::error::InputSafetyError;
+    use std::time::{Duration, Instant};
 
     const NOW_NS: u64 = 10_000_000_000;
     const DEADLINE: MutationDeadlineNs = MutationDeadlineNs(NOW_NS + 1_000_000);
@@ -862,6 +863,64 @@ mod tests {
         apply_down(&mut session, &mut sequence, OperationId(1), 30);
         apply_down(&mut session, &mut sequence, OperationId(1), 42);
         session
+    }
+
+    #[test]
+    #[ignore = "release-mode cleanup budget measurement"]
+    fn guardian_cleanup_latency_for_maximum_debt() {
+        const RUNS: usize = 200;
+        let mut samples_us = Vec::with_capacity(RUNS);
+
+        for _ in 0..RUNS {
+            let mut executor = FakeXtestExecutor {
+                identity: test_identity(),
+                ..FakeXtestExecutor::default()
+            };
+            let mut session = GuardianSession::ready(test_session(), &mut executor).unwrap();
+            let mut sequence = 1;
+            for index in 0..MAX_ACTIVE_DEBTS {
+                apply_down(
+                    &mut session,
+                    &mut sequence,
+                    OperationId(1),
+                    30 + index as u16,
+                );
+            }
+
+            let started_at = Instant::now();
+            let proof = session.finish_with_clock(StopReason::Requested, monotonic_now_ns_or_zero);
+            let elapsed = started_at.elapsed();
+
+            assert_eq!(proof, TerminalProof::Reconciled);
+            assert_eq!(session.debt_count(), 0);
+            assert_eq!(
+                session.executor_ref().release_attempts.len(),
+                MAX_ACTIVE_DEBTS
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "maximum-debt cleanup exceeded 1s: {elapsed:?}"
+            );
+            samples_us.push(elapsed.as_micros());
+        }
+
+        samples_us.sort_unstable();
+        let percentile = |percent: usize| {
+            let rank = (samples_us.len() * percent).div_ceil(100);
+            samples_us[rank.saturating_sub(1)]
+        };
+        let p50 = percentile(50);
+        let p95 = percentile(95);
+        let p99 = percentile(99);
+        let maximum = *samples_us.last().unwrap();
+        println!(
+            "guardian cleanup latency: runs={RUNS} debt={MAX_ACTIVE_DEBTS} \
+             p50={p50}us p95={p95}us p99={p99}us max={maximum}us"
+        );
+        assert!(
+            p99 < Duration::from_millis(500).as_micros(),
+            "maximum-debt cleanup p99 exceeded 500ms: {p99}us"
+        );
     }
 
     #[test]

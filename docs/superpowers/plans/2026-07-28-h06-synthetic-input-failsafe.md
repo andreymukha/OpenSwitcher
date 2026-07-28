@@ -2404,7 +2404,7 @@ git commit -m "feat: package isolated XTEST guardian service"
 - Создать: `examples/h06_x11_vm_probe.rs`
 - Тест: `examples/h06_x11_vm_probe.rs`
 
-- [ ] **Шаг 1: написать pure tests guard/trace classifier**
+- [x] **Шаг 1: написать pure tests guard/trace classifier**
 
 ```rust
 #[cfg(test)]
@@ -2437,7 +2437,7 @@ mod tests {
 }
 ```
 
-- [ ] **Шаг 2: проверить RED**
+- [x] **Шаг 2: проверить RED**
 
 ```bash
 cargo test --locked --example h06_x11_vm_probe
@@ -2445,21 +2445,23 @@ cargo test --locked --example h06_x11_vm_probe
 
 Ожидается: compile failure.
 
-- [ ] **Шаг 3: реализовать обязательную VM boundary**
+- [x] **Шаг 3: реализовать обязательную VM boundary**
 
 Probe требует одновременно:
 
 ```text
 --confirm-openswitcher-vm-lab
 /etc/openswitcher-lab-guest — regular root-owned file
-/sys/class/dmi/id/product_name содержит QEMU/KVM
+DMI identity (`product_name` или `sys_vendor`) содержит QEMU/KVM
 target PID принадлежит текущему UID
 /proc/<pid>/exe basename == open-switcher-daemon
 ```
 
 До прохождения всех проверок он не открывает X11 и не посылает сигнал.
+Проверяются оба DMI-поля, потому что стандартный Q35 обычно сообщает
+`Standard PC ...` в `product_name`, а `QEMU` — в `sys_vendor`.
 
-- [ ] **Шаг 4: реализовать три режима**
+- [x] **Шаг 4: реализовать три режима**
 
 ```text
 observe --target-keycode N --output FILE
@@ -2475,7 +2477,7 @@ assert-key-up --target-keycode N --timeout-ms 2000 --output FILE
 Probe не создаёт input device и сам не вводит клавиши; физический guest input
 поступает через QEMU.
 
-- [ ] **Шаг 5: выполнить example tests/check**
+- [x] **Шаг 5: выполнить example tests/check**
 
 ```bash
 cargo test --locked --example h06_x11_vm_probe
@@ -2484,7 +2486,7 @@ cargo check --locked --example h06_x11_vm_probe
 
 Ожидается: pure tests проходят, host boundary не позволяет signal.
 
-- [ ] **Шаг 6: зафиксировать probe**
+- [x] **Шаг 6: зафиксировать probe**
 
 ```bash
 git add examples/h06_x11_vm_probe.rs

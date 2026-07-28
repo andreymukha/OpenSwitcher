@@ -10,6 +10,7 @@ pub mod selected_text;
 pub mod service;
 pub mod switch_logic;
 pub(crate) mod synthetic_input;
+pub(crate) mod uinput_synthetic;
 pub(crate) mod x11_wait;
 
 use crate::config::default_config_path;

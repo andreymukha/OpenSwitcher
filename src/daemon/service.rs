@@ -20,6 +20,7 @@ use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
     should_switch, CorrectionPlan, Keystroke,
 };
+use crate::daemon::synthetic_input::PhysicalSequence;
 use crate::dbus::{DbusSignalEvent, DbusSignalPublisher};
 use crate::error::{CaptureError, SwitcherError};
 use crate::layout_backend::{legacy_current_layout_bool, AppLayoutKind, CurrentLayoutState};
@@ -114,12 +115,15 @@ fn forwarding_mode_for_origin(origin: InputOrigin) -> InputForwardingMode {
 fn forward_event_for_origin(
     keyboard: &mut KeyboardController,
     origin: InputOrigin,
+    sequence: PhysicalSequence,
     key: evdev::Key,
     value: i32,
 ) -> Result<(), SwitcherError> {
     match forwarding_mode_for_origin(origin) {
-        InputForwardingMode::Fast => keyboard.forward_event(key, value),
-        InputForwardingMode::AcknowledgedDeferred => keyboard.forward_deferred_event(key, value),
+        InputForwardingMode::Fast => keyboard.forward_event(sequence, key, value),
+        InputForwardingMode::AcknowledgedDeferred => {
+            keyboard.forward_deferred_event(sequence, key, value)
+        }
     }
 }
 
@@ -1867,6 +1871,7 @@ impl DaemonService {
 
     fn route_layout_switch_capture_event(
         &mut self,
+        sequence: PhysicalSequence,
         key: evdev::Key,
         value: i32,
     ) -> Result<CaptureRoutingControl, SwitcherError> {
@@ -1886,7 +1891,7 @@ impl DaemonService {
                 keyboard
                     .as_mut()
                     .ok_or(SwitcherError::KeyboardNotFound)?
-                    .forward_event(key, value)
+                    .forward_event(sequence, key, value)
             },
         )
     }
@@ -2248,11 +2253,12 @@ impl DaemonService {
         origin: InputOrigin,
     ) -> Result<(), SwitcherError> {
         let DeferredInputEvent {
+            sequence_id,
             key,
             value,
             timestamp: event_timestamp,
-            ..
         } = event;
+        let sequence = PhysicalSequence(sequence_id);
         self.adopt_input_snapshot_nonblocking();
 
         if self.suppressed_hotkey_key == Some(key) {
@@ -2351,7 +2357,8 @@ impl DaemonService {
         }
 
         if should_route_capture_before_manual_current_word(origin)
-            && self.route_layout_switch_capture_event(key, value)? == CaptureRoutingControl::Return
+            && self.route_layout_switch_capture_event(sequence, key, value)?
+                == CaptureRoutingControl::Return
         {
             return Ok(());
         }
@@ -2505,7 +2512,8 @@ impl DaemonService {
         }
 
         if value == 0 {
-            let result = forward_event_for_origin(self.keyboard_mut()?, origin, key, value);
+            let result =
+                forward_event_for_origin(self.keyboard_mut()?, origin, sequence, key, value);
             if result.is_ok() {
                 self.maybe_run_pending_selected_text_switch()?;
             }
@@ -2607,7 +2615,7 @@ impl DaemonService {
                         &mut self.current_word_correction_state,
                         &mut self.manual_hotkey_latch,
                         WordTrackingEvent::Boundary,
-                        || forward_event_for_origin(keyboard, origin, key, value),
+                        || forward_event_for_origin(keyboard, origin, sequence, key, value),
                     )?;
                     return Ok(());
                 }
@@ -2621,7 +2629,13 @@ impl DaemonService {
                     self.word_context.word_before_cursor = self.buffer.clone();
                     self.word_context.followed_by_separator = true;
                     self.buffer.clear();
-                    return forward_event_for_origin(self.keyboard_mut()?, origin, key, value);
+                    return forward_event_for_origin(
+                        self.keyboard_mut()?,
+                        origin,
+                        sequence,
+                        key,
+                        value,
+                    );
                 }
                 let now = Instant::now();
                 let epoch = self.runtime.input_layout_epoch();
@@ -2646,6 +2660,7 @@ impl DaemonService {
                             return forward_event_for_origin(
                                 self.keyboard_mut()?,
                                 origin,
+                                sequence,
                                 key,
                                 value,
                             );
@@ -2759,7 +2774,7 @@ impl DaemonService {
                 self.word_context.followed_by_separator = true;
                 self.buffer.clear();
                 self.word_buffer_overflowed = false;
-                forward_event_for_origin(self.keyboard_mut()?, origin, key, value)
+                forward_event_for_origin(self.keyboard_mut()?, origin, sequence, key, value)
             }
             evdev::Key::KEY_ENTER | evdev::Key::KEY_TAB => {
                 if should_commit_manually_corrected_current_word(
@@ -2769,7 +2784,13 @@ impl DaemonService {
                 ) {
                     self.current_word_correction_state = CurrentWordCorrectionState::Raw;
                     self.invalidate_word_context();
-                    return forward_event_for_origin(self.keyboard_mut()?, origin, key, value);
+                    return forward_event_for_origin(
+                        self.keyboard_mut()?,
+                        origin,
+                        sequence,
+                        key,
+                        value,
+                    );
                 }
                 let now = Instant::now();
                 let epoch = self.runtime.input_layout_epoch();
@@ -2790,6 +2811,7 @@ impl DaemonService {
                             return forward_event_for_origin(
                                 self.keyboard_mut()?,
                                 origin,
+                                sequence,
                                 key,
                                 value,
                             );
@@ -2838,7 +2860,7 @@ impl DaemonService {
                     return Ok(());
                 }
                 self.invalidate_word_context();
-                forward_event_for_origin(self.keyboard_mut()?, origin, key, value)
+                forward_event_for_origin(self.keyboard_mut()?, origin, sequence, key, value)
             }
             evdev::Key::KEY_BACKSPACE => {
                 let keyboard = self
@@ -2852,7 +2874,7 @@ impl DaemonService {
                     &mut self.current_word_correction_state,
                     &mut self.manual_hotkey_latch,
                     WordTrackingEvent::Backspace,
-                    || forward_event_for_origin(keyboard, origin, key, value),
+                    || forward_event_for_origin(keyboard, origin, sequence, key, value),
                 )?;
                 Ok(())
             }
@@ -2880,7 +2902,7 @@ impl DaemonService {
                         &mut self.current_word_correction_state,
                         &mut self.manual_hotkey_latch,
                         WordTrackingEvent::PlainCharacter(current_stroke),
-                        || forward_event_for_origin(keyboard, origin, key, value),
+                        || forward_event_for_origin(keyboard, origin, sequence, key, value),
                     )?;
                     if update.overflow_started {
                         log_input_debug(
@@ -2896,7 +2918,8 @@ impl DaemonService {
                 } else if !is_modifier(key) {
                     self.invalidate_word_context();
                 }
-                let result = forward_event_for_origin(self.keyboard_mut()?, origin, key, value);
+                let result =
+                    forward_event_for_origin(self.keyboard_mut()?, origin, sequence, key, value);
                 if result.is_ok() {
                     self.maybe_run_pending_selected_text_switch()?;
                 }

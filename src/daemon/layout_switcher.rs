@@ -1,6 +1,7 @@
 use crate::error::SwitcherError;
 use crate::model::{LayoutSwitchCombo, SessionType};
 use std::cell::Cell;
+#[cfg(test)]
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,12 +75,14 @@ impl<'a> LayoutSwitchHooks<'a> {
     }
 }
 
+#[cfg(test)]
 trait UinputLayoutSink {
     fn press_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError>;
     fn release_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError>;
     fn synchronize_keys(&mut self) -> Result<(), SwitcherError>;
 }
 
+#[cfg(test)]
 impl UinputLayoutSink for uinput::Device {
     fn press_key(&mut self, key: &uinput::event::keyboard::Key) -> Result<(), SwitcherError> {
         self.press(key).map_err(Into::into)
@@ -94,12 +97,14 @@ impl UinputLayoutSink for uinput::Device {
     }
 }
 
+#[cfg(test)]
 pub struct UinputLayoutSwitcher<'a> {
     device: &'a mut uinput::Device,
     delay_ms: u64,
     delay_waiter: Option<&'a dyn Fn(Duration) -> Result<(), SwitcherError>>,
 }
 
+#[cfg(test)]
 impl<'a> UinputLayoutSwitcher<'a> {
     pub fn new(device: &'a mut uinput::Device, delay_ms: u64) -> Self {
         Self {
@@ -153,6 +158,7 @@ impl<'a> UinputLayoutSwitcher<'a> {
     }
 }
 
+#[cfg(test)]
 fn release_uinput_layout_keys(
     sink: &mut dyn UinputLayoutSink,
     pressed: &[&uinput::event::keyboard::Key],
@@ -176,6 +182,7 @@ fn release_uinput_layout_keys(
     }
 }
 
+#[cfg(test)]
 fn finish_uinput_layout_failure_after_cleanup(
     error: SwitcherError,
     cleanup_result: Result<(), SwitcherError>,
@@ -189,6 +196,7 @@ fn finish_uinput_layout_failure_after_cleanup(
     Err(error)
 }
 
+#[cfg(test)]
 fn execute_uinput_layout_switch_sequence(
     sink: &mut dyn UinputLayoutSink,
     combo: LayoutSwitchCombo,
@@ -223,6 +231,7 @@ fn execute_uinput_layout_switch_sequence(
     }
 }
 
+#[cfg(test)]
 impl<'a> LayoutSwitcher for UinputLayoutSwitcher<'a> {
     fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
         let delay = Duration::from_millis(self.delay_ms);

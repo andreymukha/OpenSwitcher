@@ -1,8 +1,17 @@
 use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
 use crate::daemon::runtime::RuntimeConfigSnapshot;
 use crate::daemon::switch_logic::CorrectionPlan;
+use crate::daemon::synthetic_input::{
+    FrozenPhysicalSnapshot, OperationControl, OperationId, OperationOutcome,
+    OperationTerminalReport, PhysicalSequence, PressId, RestoreDownMode, SyntheticKeySink,
+    SyntheticOperation, TerminalProof,
+};
+use crate::daemon::uinput_synthetic::{
+    allocate_input_generation, UinputRawSink, UinputSessionModifierTarget, UinputSyntheticRuntime,
+    UinputSyntheticSink,
+};
 use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
-use crate::error::SwitcherError;
+use crate::error::{InputSafetyError, SwitcherError};
 use crate::model::{
     DesktopEnvironment, DistroKind, HotkeyTrigger, LayoutSwitchCombo, SessionType, SystemContext,
     UndoKey,
@@ -22,6 +31,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use std::{net::Shutdown, os::unix::net::UnixStream};
 
+#[cfg(test)]
 const INPUT_EVENT_KEYBOARD: i32 = 0x01;
 const MODIFIER_SYNC_DELAY_MS: u64 = 20;
 const LAYOUT_SWITCH_DELAY_MS: u64 = 20;
@@ -255,12 +265,19 @@ enum WriterCommand {
 
 #[derive(Clone)]
 enum WriterFastCommand {
-    ForwardEvent { key: Key, value: i32 },
-    TypeSeparator { key: Key },
+    ForwardEvent {
+        sequence: PhysicalSequence,
+        key: Key,
+        value: i32,
+    },
+    TypeSeparator {
+        key: Key,
+    },
 }
 
 enum WriterTransactionKind {
     ForwardDeferredEvent {
+        sequence: PhysicalSequence,
         key: Key,
         value: i32,
     },
@@ -1472,18 +1489,26 @@ impl KeyboardController {
         })
     }
 
-    pub fn forward_event(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
-        self.virtual_device.handle().forward_event(key, value)
-    }
-
-    pub(crate) fn forward_deferred_event(
+    pub(crate) fn forward_event(
         &mut self,
+        sequence: PhysicalSequence,
         key: Key,
         value: i32,
     ) -> Result<(), SwitcherError> {
         self.virtual_device
             .handle()
-            .forward_deferred_event(key, value)
+            .forward_event(sequence, key, value)
+    }
+
+    pub(crate) fn forward_deferred_event(
+        &mut self,
+        sequence: PhysicalSequence,
+        key: Key,
+        value: i32,
+    ) -> Result<(), SwitcherError> {
+        self.virtual_device
+            .handle()
+            .forward_deferred_event(sequence, key, value)
     }
 
     pub fn type_separator(&mut self, key: Key) -> Result<(), SwitcherError> {
@@ -2207,6 +2232,7 @@ where
 impl VirtualKeyboardWriter {
     fn new(name: &str) -> Result<Self, SwitcherError> {
         let device = create_virtual_keyboard(name)?;
+        let generation = allocate_input_generation()?;
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
@@ -2227,6 +2253,7 @@ impl VirtualKeyboardWriter {
                 let loop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_virtual_keyboard_writer_loop(
                         device,
+                        generation,
                         command_rx,
                         completion_tx,
                         worker_transaction_failure_request_id,
@@ -2694,25 +2721,48 @@ impl VirtualKeyboardHandle {
         None
     }
 
-    fn forward_event(&self, key: Key, value: i32) -> Result<(), SwitcherError> {
+    fn forward_event(
+        &self,
+        sequence: PhysicalSequence,
+        key: Key,
+        value: i32,
+    ) -> Result<(), SwitcherError> {
         self.ensure_alive()?;
-        self.send_fast_command(WriterFastCommand::ForwardEvent { key, value })
+        self.send_fast_command(WriterFastCommand::ForwardEvent {
+            sequence,
+            key,
+            value,
+        })
     }
 
-    fn forward_deferred_event(&self, key: Key, value: i32) -> Result<(), SwitcherError> {
-        self.run_transaction(WriterTransactionKind::ForwardDeferredEvent { key, value })
-            .map(|_| ())
+    fn forward_deferred_event(
+        &self,
+        sequence: PhysicalSequence,
+        key: Key,
+        value: i32,
+    ) -> Result<(), SwitcherError> {
+        self.run_transaction(WriterTransactionKind::ForwardDeferredEvent {
+            sequence,
+            key,
+            value,
+        })
+        .map(|_| ())
     }
 
     #[cfg(test)]
     fn forward_deferred_event_with_timeout(
         &self,
+        sequence: PhysicalSequence,
         key: Key,
         value: i32,
         timeout: Duration,
     ) -> Result<(), SwitcherError> {
         self.run_transaction_with_timeout(
-            WriterTransactionKind::ForwardDeferredEvent { key, value },
+            WriterTransactionKind::ForwardDeferredEvent {
+                sequence,
+                key,
+                value,
+            },
             timeout,
         )
         .map(|_| ())
@@ -3509,45 +3559,7 @@ fn finish_failed_operation_after_cleanup(
     Err(error)
 }
 
-fn release_modifiers(
-    device: &mut uinput::Device,
-    modifiers: ModifierState,
-    control: Option<&WriterTransactionControl>,
-) -> Result<(), SwitcherError> {
-    authorize_transaction_mutation(control)?;
-    release_uinput_modifiers_exhaustively(device, modifiers)?;
-    sleep_for_transaction(control, Duration::from_millis(MODIFIER_SYNC_DELAY_MS))?;
-    Ok(())
-}
-
-fn restore_modifiers(
-    device: &mut uinput::Device,
-    modifiers: ModifierState,
-    control: Option<&WriterTransactionControl>,
-) -> Result<(), SwitcherError> {
-    let mut restored = Vec::new();
-    for key in pressed_uinput_modifier_keys(modifiers) {
-        if let Err(error) = authorize_transaction_mutation(control) {
-            let cleanup_result = release_uinput_keys_best_effort(device, &restored);
-            return finish_failed_operation_after_cleanup(error, cleanup_result, control);
-        }
-        if let Err(error) = device.press(&key) {
-            let cleanup_result = release_uinput_keys_best_effort(device, &restored);
-            return finish_failed_operation_after_cleanup(error.into(), cleanup_result, control);
-        }
-        restored.push(key);
-    }
-    if let Err(error) = device.synchronize() {
-        let cleanup_result = release_uinput_keys_best_effort(device, &restored);
-        return finish_failed_operation_after_cleanup(error.into(), cleanup_result, control);
-    }
-    if let Err(error) = ensure_transaction_active(control) {
-        let cleanup_result = release_uinput_keys_best_effort(device, &restored);
-        return finish_failed_operation_after_cleanup(error, cleanup_result, control);
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn pressed_uinput_modifier_keys(modifiers: ModifierState) -> Vec<uinput::event::keyboard::Key> {
     use uinput::event::keyboard::Key;
 
@@ -3579,29 +3591,7 @@ fn pressed_uinput_modifier_keys(modifiers: ModifierState) -> Vec<uinput::event::
     keys
 }
 
-fn release_uinput_keys_best_effort(
-    device: &mut uinput::Device,
-    keys: &[uinput::event::keyboard::Key],
-) -> Result<(), SwitcherError> {
-    let mut first_error = None;
-    for key in keys.iter().rev() {
-        if let Err(error) = device.release(key) {
-            if first_error.is_none() {
-                first_error = Some(error.into());
-            }
-        }
-    }
-    if let Err(error) = device.synchronize() {
-        if first_error.is_none() {
-            first_error = Some(error.into());
-        }
-    }
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
+#[cfg(test)]
 trait UinputShortcutSink {
     fn release_shortcut_key(
         &mut self,
@@ -3610,6 +3600,7 @@ trait UinputShortcutSink {
     fn synchronize_shortcut_keys(&mut self) -> Result<(), SwitcherError>;
 }
 
+#[cfg(test)]
 impl UinputShortcutSink for uinput::Device {
     fn release_shortcut_key(
         &mut self,
@@ -3623,6 +3614,7 @@ impl UinputShortcutSink for uinput::Device {
     }
 }
 
+#[cfg(test)]
 fn release_uinput_modifiers_exhaustively(
     device: &mut dyn UinputShortcutSink,
     modifiers: ModifierState,
@@ -3632,54 +3624,7 @@ fn release_uinput_modifiers_exhaustively(
     release_shortcut_keys(device, None, &pressed)
 }
 
-fn run_shortcut(
-    device: &mut uinput::Device,
-    modifiers: ModifierState,
-    shortcut_modifiers: &[uinput::event::keyboard::Key],
-    trigger_key: Option<&uinput::event::keyboard::Key>,
-    control: Option<&WriterTransactionControl>,
-) -> Result<(), SwitcherError> {
-    release_modifiers(device, modifiers, control)?;
-
-    let mut pressed_shortcut_modifiers = Vec::new();
-    for modifier in shortcut_modifiers {
-        if let Err(error) = authorize_transaction_mutation(control) {
-            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
-            return Err(error);
-        }
-        if let Err(error) = device.press(modifier) {
-            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
-            return Err(error.into());
-        }
-        pressed_shortcut_modifiers.push(modifier);
-    }
-
-    let mut trigger_pressed = None;
-    if let Some(key) = trigger_key {
-        if let Err(error) = authorize_transaction_mutation(control) {
-            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
-            return Err(error);
-        }
-        if let Err(error) = device.press(key) {
-            release_shortcut_keys_best_effort(device, None, &pressed_shortcut_modifiers);
-            return Err(error.into());
-        }
-        trigger_pressed = Some(key);
-    }
-
-    if let Err(error) = device.synchronize() {
-        release_shortcut_keys_best_effort(device, trigger_pressed, &pressed_shortcut_modifiers);
-        return Err(error.into());
-    }
-    let wait_result = sleep_for_transaction(control, Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
-    let cleanup_result =
-        release_shortcut_keys(device, trigger_pressed, &pressed_shortcut_modifiers);
-    wait_result?;
-    cleanup_result?;
-    restore_modifiers(device, modifiers, control)?;
-    Ok(())
-}
-
+#[cfg(test)]
 fn release_shortcut_keys(
     device: &mut dyn UinputShortcutSink,
     trigger_pressed: Option<&uinput::event::keyboard::Key>,
@@ -3709,17 +3654,8 @@ fn release_shortcut_keys(
     }
 }
 
-fn release_shortcut_keys_best_effort(
-    device: &mut dyn UinputShortcutSink,
-    trigger_pressed: Option<&uinput::event::keyboard::Key>,
-    pressed_shortcut_modifiers: &[&uinput::event::keyboard::Key],
-) {
-    let _ = release_shortcut_keys(device, trigger_pressed, pressed_shortcut_modifiers);
-}
-
 use crate::daemon::layout_switcher::{
-    LayoutSwitchHooks, LayoutSwitchStrategy, LayoutSwitcher, UinputLayoutSwitcher,
-    X11LayoutSwitcher,
+    LayoutSwitchHooks, LayoutSwitchStrategy, LayoutSwitcher, X11LayoutSwitcher,
 };
 
 fn replay_shift_for_stroke(
@@ -4474,11 +4410,13 @@ fn initialize_cinnamon_x11_xtest_runtime(context: SystemContext) -> CinnamonX11X
     }
 }
 
+#[cfg(test)]
 trait UinputStrokeSink {
     fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError>;
     fn synchronize_keys(&mut self) -> Result<(), SwitcherError>;
 }
 
+#[cfg(test)]
 impl UinputStrokeSink for uinput::Device {
     fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
         self.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)
@@ -4490,6 +4428,7 @@ impl UinputStrokeSink for uinput::Device {
     }
 }
 
+#[cfg(test)]
 fn release_uinput_stroke_keys(
     sink: &mut dyn UinputStrokeSink,
     pressed: &[Key],
@@ -4538,6 +4477,7 @@ fn retain_first_cleanup_error(
     }
 }
 
+#[cfg(test)]
 fn release_uinput_cleanup_keys_best_effort(
     sink: &mut dyn UinputStrokeSink,
     keys: &[Key],
@@ -4553,6 +4493,7 @@ fn release_uinput_cleanup_keys_best_effort(
     }
 }
 
+#[cfg(test)]
 fn normalize_uinput_modifiers_after_soft_cancel(
     sink: &mut dyn UinputStrokeSink,
     frozen: ModifierState,
@@ -4596,6 +4537,7 @@ fn normalize_uinput_modifiers_after_soft_cancel(
     Ok(())
 }
 
+#[cfg(test)]
 fn normalize_uinput_modifiers_after_soft_cancel_if_needed(
     sink: &mut dyn UinputStrokeSink,
     frozen: ModifierState,
@@ -4672,6 +4614,7 @@ fn is_matching_soft_cancel(
     )
 }
 
+#[cfg(test)]
 fn replay_uinput_stroke(
     sink: &mut dyn UinputStrokeSink,
     key: Key,
@@ -4720,6 +4663,369 @@ fn replay_uinput_stroke(
     sleep_for_transaction(control, typing_delay)
 }
 
+fn release_synthetic_presses<S: SyntheticKeySink>(
+    operation: &mut SyntheticOperation<'_, S>,
+    pressed: &[PressId],
+) -> Result<(), SwitcherError> {
+    let mut first_error = None;
+    for press in pressed.iter().rev() {
+        if let Err(error) = operation.release(*press) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn replay_synthetic_stroke<S: SyntheticKeySink>(
+    operation: &mut SyntheticOperation<'_, S>,
+    key: Key,
+    effective_shift: bool,
+    typing_delay: Duration,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    let mut pressed = Vec::with_capacity(2);
+
+    if effective_shift {
+        authorize_transaction_mutation(control)?;
+        let shift = operation.press(Key::KEY_LEFTSHIFT)?;
+        pressed.push(shift);
+        if let Err(error) = sleep_for_transaction(control, Duration::from_millis(1)) {
+            let _ = release_synthetic_presses(operation, &pressed);
+            return Err(error);
+        }
+    }
+
+    if let Err(error) = authorize_transaction_mutation(control) {
+        let _ = release_synthetic_presses(operation, &pressed);
+        return Err(error);
+    }
+    let key_press = match operation.press(key) {
+        Ok(press) => press,
+        Err(error) => {
+            let _ = release_synthetic_presses(operation, &pressed);
+            return Err(error);
+        }
+    };
+    pressed.push(key_press);
+
+    let transition_wait = sleep_for_transaction(control, Duration::from_millis(2));
+    let release_result = release_synthetic_presses(operation, &pressed);
+    transition_wait?;
+    release_result?;
+    sleep_for_transaction(control, typing_delay)
+}
+
+fn pressed_uinput_modifier_evdev_keys(modifiers: ModifierState) -> Vec<Key> {
+    let mut keys = Vec::new();
+    if modifiers.left_shift {
+        keys.push(Key::KEY_LEFTSHIFT);
+    }
+    if modifiers.right_shift {
+        keys.push(Key::KEY_RIGHTSHIFT);
+    }
+    if modifiers.left_ctrl {
+        keys.push(Key::KEY_LEFTCTRL);
+    }
+    if modifiers.right_ctrl {
+        keys.push(Key::KEY_RIGHTCTRL);
+    }
+    if modifiers.left_alt {
+        keys.push(Key::KEY_LEFTALT);
+    }
+    if modifiers.right_alt {
+        keys.push(Key::KEY_RIGHTALT);
+    }
+    if modifiers.left_meta {
+        keys.push(Key::KEY_LEFTMETA);
+    }
+    if modifiers.right_meta {
+        keys.push(Key::KEY_RIGHTMETA);
+    }
+    keys
+}
+
+fn temporarily_release_uinput_modifiers<S: SyntheticKeySink>(
+    operation: &mut SyntheticOperation<'_, S>,
+    session_modifiers: &mut UinputSessionModifierTarget<'_>,
+    frozen_keys: &[Key],
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    for key in frozen_keys.iter().rev().copied() {
+        authorize_transaction_mutation(control)?;
+        let had_session_debt = session_modifiers.contains(key);
+        let release_result = operation.temporarily_release_physical_modifier(key);
+        if had_session_debt && operation.has_planned_modifier_restore(key) {
+            session_modifiers.mark_temporarily_released(key)?;
+        }
+        release_result?;
+    }
+    sleep_for_transaction(control, Duration::from_millis(MODIFIER_SYNC_DELAY_MS))
+}
+
+fn map_synthetic_control_error(
+    error: SwitcherError,
+    control: Option<&WriterTransactionControl>,
+) -> SwitcherError {
+    if matches!(
+        error,
+        SwitcherError::InputSafety(
+            InputSafetyError::OperationCancelled { .. }
+                | InputSafetyError::OperationTimedOut { .. }
+        )
+    ) {
+        if let Some(control) = control {
+            if let Err(writer_error) = control.ensure_active() {
+                return writer_error;
+            }
+        }
+    }
+    error
+}
+
+fn terminal_report_error(
+    operation_id: OperationId,
+    report: OperationTerminalReport,
+) -> SwitcherError {
+    if let Some(primary) = report.primary {
+        return primary;
+    }
+    if let Some(cleanup) = report.cleanup {
+        return cleanup;
+    }
+    match report.proof {
+        TerminalProof::Unreconciled { remaining } => InputSafetyError::Reconciliation {
+            operation_id: operation_id.0,
+            remaining,
+        }
+        .into(),
+        _ => InputSafetyError::Invariant {
+            context: "uinput operation published an invalid terminal report",
+        }
+        .into(),
+    }
+}
+
+fn run_uinput_synthetic_operation<R, T, F>(
+    runtime: &mut UinputSyntheticRuntime<R>,
+    operation_id: OperationId,
+    operation_control: OperationControl,
+    modifiers: ModifierState,
+    release_physical_modifiers: bool,
+    writer_control: Option<&WriterTransactionControl>,
+    execute: F,
+) -> Result<T, SwitcherError>
+where
+    R: UinputRawSink,
+    F: FnOnce(&mut SyntheticOperation<'_, UinputSyntheticSink<'_>>) -> Result<T, SwitcherError>,
+{
+    let frozen_keys = pressed_uinput_modifier_evdev_keys(modifiers);
+    let frozen_physical = FrozenPhysicalSnapshot::from_pressed_modifiers(
+        frozen_keys.iter().copied(),
+        modifiers.is_caps_lock_active(),
+    )?;
+    let (mut sink, mut session_modifiers, failure_latch) = runtime.operation_parts();
+    let mut operation = SyntheticOperation::new(
+        operation_id,
+        &mut sink,
+        operation_control,
+        frozen_physical,
+        failure_latch,
+    );
+
+    let execution = if release_physical_modifiers {
+        temporarily_release_uinput_modifiers(
+            &mut operation,
+            &mut session_modifiers,
+            &frozen_keys,
+            writer_control,
+        )
+        .and_then(|_| execute(&mut operation))
+    } else {
+        execute(&mut operation)
+    }
+    .map_err(|error| map_synthetic_control_error(error, writer_control));
+
+    match execution {
+        Ok(value) => {
+            let report = operation.finish_success(&mut session_modifiers);
+            match (&report.outcome, &report.proof) {
+                (OperationOutcome::Success, TerminalProof::Reconciled) => Ok(value),
+                (OperationOutcome::SoftCancelled, TerminalProof::Reconciled) => {
+                    Err(map_synthetic_control_error(
+                        InputSafetyError::OperationCancelled {
+                            operation_id: operation_id.0,
+                        }
+                        .into(),
+                        writer_control,
+                    ))
+                }
+                _ => Err(terminal_report_error(operation_id, report)),
+            }
+        }
+        Err(error) if is_matching_soft_cancel(&error, writer_control) => {
+            let report = operation.finish_soft_cancel(&mut session_modifiers);
+            if report.outcome == OperationOutcome::SoftCancelled
+                && report.proof == TerminalProof::Reconciled
+            {
+                Err(error)
+            } else {
+                Err(terminal_report_error(operation_id, report))
+            }
+        }
+        Err(error) => {
+            let report = operation.finish_hard_failure(error);
+            Err(terminal_report_error(operation_id, report))
+        }
+    }
+}
+
+fn synthetic_operation_control(control: Option<&WriterTransactionControl>) -> OperationControl {
+    match control {
+        Some(control) => {
+            let restore_control = control.clone();
+            OperationControl::new(control.deadline, control.soft_cancel_requested.clone())
+                .with_cancellation_source(control.stop_requested.clone())
+                .with_failure_source(control.failure_request_id.clone())
+                .with_restore_down_authorizer(Arc::new(move |mode| match mode {
+                    RestoreDownMode::SuccessCleanup => {
+                        restore_control.authorize_cleanup_mutation_start()
+                    }
+                    RestoreDownMode::SoftCancelCleanup => {
+                        restore_control.authorize_cleanup_mutation_start()
+                    }
+                }))
+        }
+        None => OperationControl::new(
+            Instant::now()
+                .checked_add(SHORTCUT_TRANSACTION_TIMEOUT)
+                .unwrap_or_else(Instant::now),
+            Arc::new(AtomicBool::new(false)),
+        ),
+    }
+}
+
+fn run_uinput_shortcut<R: UinputRawSink>(
+    runtime: &mut UinputSyntheticRuntime<R>,
+    modifiers: ModifierState,
+    shortcut_modifiers: &[Key],
+    trigger_key: Option<Key>,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    let operation_id = OperationId(
+        control
+            .map(WriterTransactionControl::request_id)
+            .unwrap_or_else(next_writer_transaction_request_id),
+    );
+    run_uinput_synthetic_operation(
+        runtime,
+        operation_id,
+        synthetic_operation_control(control),
+        modifiers,
+        true,
+        control,
+        |operation| {
+            let mut pressed =
+                Vec::with_capacity(shortcut_modifiers.len() + usize::from(trigger_key.is_some()));
+            for key in shortcut_modifiers.iter().copied().chain(trigger_key) {
+                authorize_transaction_mutation(control)?;
+                pressed.push(operation.press(key)?);
+            }
+
+            let wait_result =
+                sleep_for_transaction(control, Duration::from_millis(LAYOUT_SWITCH_DELAY_MS));
+            let release_result = release_synthetic_presses(operation, &pressed);
+            wait_result?;
+            release_result
+        },
+    )
+}
+
+fn synthetic_layout_combo_sequence(combo: LayoutSwitchCombo) -> (&'static [Key], Option<Key>) {
+    static CTRL_SHIFT: [Key; 2] = [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT];
+    static ALT_SHIFT: [Key; 2] = [Key::KEY_LEFTALT, Key::KEY_LEFTSHIFT];
+    static CTRL_SPACE: [Key; 1] = [Key::KEY_LEFTCTRL];
+    static SUPER_SPACE: [Key; 1] = [Key::KEY_LEFTMETA];
+    static LEFT_CTRL_LEFT_SHIFT: [Key; 2] = [Key::KEY_LEFTCTRL, Key::KEY_LEFTSHIFT];
+    static RIGHT_CTRL_RIGHT_SHIFT: [Key; 2] = [Key::KEY_RIGHTCTRL, Key::KEY_RIGHTSHIFT];
+    static LEFT_ALT_LEFT_SHIFT: [Key; 2] = [Key::KEY_LEFTALT, Key::KEY_LEFTSHIFT];
+    static RIGHT_ALT_RIGHT_SHIFT: [Key; 2] = [Key::KEY_RIGHTALT, Key::KEY_RIGHTSHIFT];
+    static CAPS_LOCK: [Key; 1] = [Key::KEY_CAPSLOCK];
+
+    match combo {
+        LayoutSwitchCombo::CtrlShift => (&CTRL_SHIFT, None),
+        LayoutSwitchCombo::AltShift => (&ALT_SHIFT, None),
+        LayoutSwitchCombo::CtrlSpace => (&CTRL_SPACE, Some(Key::KEY_SPACE)),
+        LayoutSwitchCombo::SuperSpace => (&SUPER_SPACE, Some(Key::KEY_SPACE)),
+        LayoutSwitchCombo::LeftCtrlLeftShift => (&LEFT_CTRL_LEFT_SHIFT, None),
+        LayoutSwitchCombo::RightCtrlRightShift => (&RIGHT_CTRL_RIGHT_SHIFT, None),
+        LayoutSwitchCombo::LeftAltLeftShift => (&LEFT_ALT_LEFT_SHIFT, None),
+        LayoutSwitchCombo::RightAltRightShift => (&RIGHT_ALT_RIGHT_SHIFT, None),
+        LayoutSwitchCombo::CapsLock => (&CAPS_LOCK, None),
+    }
+}
+
+fn replay_synthetic_layout_combo<S: SyntheticKeySink>(
+    operation: &mut SyntheticOperation<'_, S>,
+    combo: LayoutSwitchCombo,
+    delay_ms: u64,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    let (modifiers, trigger_key) = synthetic_layout_combo_sequence(combo);
+    let mut pressed = Vec::with_capacity(modifiers.len() + usize::from(trigger_key.is_some()));
+    for key in modifiers.iter().copied().chain(trigger_key) {
+        if let Err(error) = authorize_transaction_mutation(control) {
+            let _ = release_synthetic_presses(operation, &pressed);
+            return Err(error);
+        }
+        match operation.press(key) {
+            Ok(press) => pressed.push(press),
+            Err(error) => {
+                let _ = release_synthetic_presses(operation, &pressed);
+                return Err(error);
+            }
+        }
+    }
+
+    let wait_result = sleep_for_transaction(control, Duration::from_millis(delay_ms));
+    let release_result = release_synthetic_presses(operation, &pressed);
+    wait_result?;
+    release_result
+}
+
+struct UinputLedgerLayoutSwitcher<'operation, 'sink, 'control, S: SyntheticKeySink> {
+    operation: &'operation mut SyntheticOperation<'sink, S>,
+    delay_ms: u64,
+    control: Option<&'control WriterTransactionControl>,
+}
+
+impl<'operation, 'sink, 'control, S: SyntheticKeySink>
+    UinputLedgerLayoutSwitcher<'operation, 'sink, 'control, S>
+{
+    fn new(
+        operation: &'operation mut SyntheticOperation<'sink, S>,
+        delay_ms: u64,
+        control: Option<&'control WriterTransactionControl>,
+    ) -> Self {
+        Self {
+            operation,
+            delay_ms,
+            control,
+        }
+    }
+}
+
+impl<S: SyntheticKeySink> LayoutSwitcher for UinputLedgerLayoutSwitcher<'_, '_, '_, S> {
+    fn switch_layout(&mut self, combo: LayoutSwitchCombo) -> Result<(), SwitcherError> {
+        replay_synthetic_layout_combo(self.operation, combo, self.delay_ms, self.control)
+    }
+}
+
+#[cfg(test)]
 fn replay_uinput_backspaces(
     sink: &mut dyn UinputStrokeSink,
     count: usize,
@@ -4732,8 +5038,26 @@ fn replay_uinput_backspaces(
     Ok(())
 }
 
-fn run_correction(
-    device: &mut uinput::Device,
+fn replay_synthetic_backspaces<S: SyntheticKeySink>(
+    operation: &mut SyntheticOperation<'_, S>,
+    count: usize,
+    backspace_delay: Duration,
+    control: Option<&WriterTransactionControl>,
+) -> Result<(), SwitcherError> {
+    for _ in 0..count {
+        replay_synthetic_stroke(
+            operation,
+            Key::KEY_BACKSPACE,
+            false,
+            backspace_delay,
+            control,
+        )?;
+    }
+    Ok(())
+}
+
+fn run_correction<R: UinputRawSink>(
+    device: &mut UinputSyntheticRuntime<R>,
     plan: &CorrectionPlan,
     config: &RuntimeConfigSnapshot,
     modifiers: ModifierState,
@@ -4802,109 +5126,100 @@ fn run_correction(
         }
     }
 
-    let result = (|| {
-        release_modifiers(device, modifiers, control)?;
-        replay_uinput_backspaces(
-            device,
-            plan.buffer.len() + plan.extra_backspaces,
-            Duration::from_millis(config.backspace_ms),
-            control,
-        )?;
+    let operation_id = OperationId(
+        control
+            .map(WriterTransactionControl::request_id)
+            .unwrap_or_else(next_writer_transaction_request_id),
+    );
+    run_uinput_synthetic_operation(
+        device,
+        operation_id,
+        synthetic_operation_control(control),
+        modifiers,
+        true,
+        control,
+        |operation| {
+            replay_synthetic_backspaces(
+                operation,
+                plan.buffer.len() + plan.extra_backspaces,
+                Duration::from_millis(config.backspace_ms),
+                control,
+            )?;
 
-        let layout_switch = if switch_layout {
-            if x11_switcher.is_some() {
-                log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=x11 hold_ms={}",
-                        config.layout_switch_combo, config.layout_delay_ms
-                    ),
-                );
-            } else {
-                log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=uinput hold_ms={}",
-                        config.layout_switch_combo, config.layout_delay_ms
-                    ),
-                );
-            }
-
-            let layout_waiter = |duration: Duration| {
-                if duration.is_zero() {
-                    authorize_transaction_mutation(control)
+            let layout_switch = if switch_layout {
+                if x11_switcher.is_some() {
+                    log_input_debug(
+                        "correction-layout-switch",
+                        &format!(
+                            "combo={:?} strategy=x11 hold_ms={}",
+                            config.layout_switch_combo, config.layout_delay_ms
+                        ),
+                    );
                 } else {
-                    sleep_for_transaction(control, duration)
+                    log_input_debug(
+                        "correction-layout-switch",
+                        &format!(
+                            "combo={:?} strategy=uinput hold_ms={}",
+                            config.layout_switch_combo, config.layout_delay_ms
+                        ),
+                    );
                 }
+
+                let mut uinput_switcher =
+                    UinputLedgerLayoutSwitcher::new(operation, config.layout_delay_ms, control);
+                let x11 = x11_switcher
+                    .as_mut()
+                    .map(|switcher| switcher as &mut dyn LayoutSwitcher);
+                ensure_transaction_active(control)?;
+                let outcome = switch_layout_with_fallback(
+                    x11,
+                    &mut uinput_switcher,
+                    config.layout_switch_combo,
+                    control,
+                )?;
+                ensure_transaction_active(control)?;
+                match outcome {
+                    CorrectionLayoutSwitchOutcome::AppliedX11 => log_input_debug(
+                        "correction-layout-switch",
+                        &format!(
+                            "combo={:?} strategy=x11 result=ok",
+                            config.layout_switch_combo
+                        ),
+                    ),
+                    CorrectionLayoutSwitchOutcome::AppliedUinput => log_input_debug(
+                        "correction-layout-switch",
+                        &format!(
+                            "combo={:?} strategy=uinput result=ok hold_ms={}",
+                            config.layout_switch_combo, config.layout_delay_ms
+                        ),
+                    ),
+                    CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest => log_input_debug(
+                        "correction-layout-switch",
+                        "strategy=cinnamon-xkb-xtest result=ok",
+                    ),
+                    CorrectionLayoutSwitchOutcome::NotNeeded => {}
+                }
+                sleep_for_transaction(control, Duration::from_millis(config.layout_delay_ms))?;
+                outcome
+            } else {
+                CorrectionLayoutSwitchOutcome::NotNeeded
             };
-            let mut uinput_switcher = UinputLayoutSwitcher::new_with_waiter(
-                device,
-                config.layout_delay_ms,
-                &layout_waiter,
-            );
-            let x11 = x11_switcher
-                .as_mut()
-                .map(|switcher| switcher as &mut dyn LayoutSwitcher);
-            ensure_transaction_active(control)?;
-            let outcome = switch_layout_with_fallback(
-                x11,
-                &mut uinput_switcher,
-                config.layout_switch_combo,
-                control,
-            )?;
-            ensure_transaction_active(control)?;
-            match outcome {
-                CorrectionLayoutSwitchOutcome::AppliedX11 => log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=x11 result=ok",
-                        config.layout_switch_combo
-                    ),
-                ),
-                CorrectionLayoutSwitchOutcome::AppliedUinput => log_input_debug(
-                    "correction-layout-switch",
-                    &format!(
-                        "combo={:?} strategy=uinput result=ok hold_ms={}",
-                        config.layout_switch_combo, config.layout_delay_ms
-                    ),
-                ),
-                CorrectionLayoutSwitchOutcome::AppliedCinnamonXkbXtest => log_input_debug(
-                    "correction-layout-switch",
-                    "strategy=cinnamon-xkb-xtest result=ok",
-                ),
-                CorrectionLayoutSwitchOutcome::NotNeeded => {}
+
+            for stroke in &plan.buffer {
+                let effective_shift =
+                    replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
+                replay_synthetic_stroke(
+                    operation,
+                    stroke.key,
+                    effective_shift,
+                    Duration::from_millis(config.typing_ms),
+                    control,
+                )?;
             }
-            sleep_for_transaction(control, Duration::from_millis(config.layout_delay_ms))?;
-            outcome
-        } else {
-            CorrectionLayoutSwitchOutcome::NotNeeded
-        };
 
-        for stroke in &plan.buffer {
-            let effective_shift = replay_shift_for_stroke(stroke, modifiers.is_caps_lock_active());
-            replay_uinput_stroke(
-                device,
-                stroke.key,
-                effective_shift,
-                Duration::from_millis(config.typing_ms),
-                control,
-            )?;
-        }
-
-        restore_modifiers(device, modifiers, control)?;
-        Ok(CorrectionExecutionOutcome { layout_switch })
-    })();
-    match result {
-        Err(error) if is_matching_soft_cancel(&error, control) => {
-            normalize_uinput_modifiers_after_soft_cancel_if_needed(
-                device,
-                modifiers,
-                control.expect("matching soft cancel requires transaction control"),
-            )?;
-            Err(error)
-        }
-        result => result,
-    }
+            Ok(CorrectionExecutionOutcome { layout_switch })
+        },
+    )
 }
 
 fn switch_layout_with_fallback(
@@ -5155,7 +5470,8 @@ fn run_deferred_forward_mutation_with(
 }
 
 fn run_virtual_keyboard_writer_loop(
-    mut device: uinput::Device,
+    device: uinput::Device,
+    generation: crate::daemon::synthetic_input::InputGeneration,
     command_rx: mpsc::Receiver<WriterCommand>,
     completion_tx: mpsc::Sender<ManualCurrentWordCompletion>,
     failure_request_id: Arc<AtomicU64>,
@@ -5164,6 +5480,7 @@ fn run_virtual_keyboard_writer_loop(
     writer_alive: Arc<AtomicBool>,
     ready_tx: mpsc::SyncSender<()>,
 ) -> Result<(), SwitcherError> {
+    let mut device = UinputSyntheticRuntime::new(device, generation)?;
     let context = detect_current_system_context();
     let mut x11_switcher =
         initialize_x11_switcher_for_session(context.session_type, X11LayoutSwitcher::new);
@@ -5179,14 +5496,17 @@ fn run_virtual_keyboard_writer_loop(
             match command {
                 WriterCommand::Shutdown => unreachable!("shutdown handled before circuit breaker"),
                 WriterCommand::Fast(command) => match command {
-                    WriterFastCommand::ForwardEvent { key, value } => {
+                    WriterFastCommand::ForwardEvent {
+                        sequence,
+                        key,
+                        value,
+                    } => {
                         authorize_writer_mutation_start(
                             &failure_request_id,
                             &stop_requested,
                             &terminal_gate,
                         )?;
-                        device.write(INPUT_EVENT_KEYBOARD, key.code() as i32, value)?;
-                        device.synchronize()?;
+                        let _ = device.forward_physical(sequence, key, value)?;
                     }
                     WriterFastCommand::TypeSeparator { key } => {
                         log_input_debug("type-separator-execute", &format!("key={key:?}"));
@@ -5235,7 +5555,30 @@ fn run_virtual_keyboard_writer_loop(
                                 &stop_requested,
                                 &terminal_gate,
                             )?;
-                            replay_uinput_stroke(&mut device, key, false, Duration::ZERO, None)
+                            run_uinput_synthetic_operation(
+                                &mut device,
+                                OperationId(next_writer_transaction_request_id()),
+                                OperationControl::new(
+                                    Instant::now()
+                                        .checked_add(SHORTCUT_TRANSACTION_TIMEOUT)
+                                        .unwrap_or_else(Instant::now),
+                                    Arc::new(AtomicBool::new(false)),
+                                )
+                                .with_cancellation_source(stop_requested.clone())
+                                .with_failure_source(failure_request_id.clone()),
+                                ModifierState::default(),
+                                false,
+                                None,
+                                |operation| {
+                                    replay_synthetic_stroke(
+                                        operation,
+                                        key,
+                                        false,
+                                        Duration::ZERO,
+                                        None,
+                                    )
+                                },
+                            )
                         })?;
                     }
                 },
@@ -5301,26 +5644,16 @@ fn run_virtual_keyboard_writer_loop(
                         reply,
                     } => {
                         let result = control.ensure_active().and_then(|_| match kind {
-                            WriterTransactionKind::ForwardDeferredEvent { key, value } => {
-                                run_deferred_forward_mutation_with(
-                                    &control,
-                                    key,
-                                    value,
-                                    |mutation| match mutation {
-                                        DeferredForwardMutation::Write { key, value } => {
-                                            device.write(
-                                                INPUT_EVENT_KEYBOARD,
-                                                key.code() as i32,
-                                                value,
-                                            )?;
-                                            Ok(())
-                                        }
-                                        DeferredForwardMutation::Synchronize => {
-                                            device.synchronize()?;
-                                            Ok(())
-                                        }
-                                    },
-                                )
+                            WriterTransactionKind::ForwardDeferredEvent {
+                                sequence,
+                                key,
+                                value,
+                            } => {
+                                control.authorize_mutation_start()?;
+                                let _ = device.forward_physical(sequence, key, value)?;
+                                Ok(CorrectionExecutionOutcome {
+                                    layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                                })
                             }
                             WriterTransactionKind::ApplyCorrection {
                                 plan,
@@ -5350,26 +5683,34 @@ fn run_virtual_keyboard_writer_loop(
                                 false,
                                 Some(&control),
                             ),
-                            WriterTransactionKind::CopyShortcut { modifiers } => run_shortcut(
-                                &mut device,
-                                modifiers,
-                                &[uinput::event::keyboard::Key::LeftControl],
-                                Some(&uinput::event::keyboard::Key::C),
-                                Some(&control),
-                            )
-                            .map(|_| CorrectionExecutionOutcome {
-                                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
-                            }),
-                            WriterTransactionKind::PasteShortcut { modifiers } => run_shortcut(
-                                &mut device,
-                                modifiers,
-                                &[uinput::event::keyboard::Key::LeftControl],
-                                Some(&uinput::event::keyboard::Key::V),
-                                Some(&control),
-                            )
-                            .map(|_| CorrectionExecutionOutcome {
-                                layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
-                            }),
+                            WriterTransactionKind::CopyShortcut { modifiers } => {
+                                run_uinput_shortcut(
+                                    &mut device,
+                                    modifiers,
+                                    &[Key::KEY_LEFTCTRL],
+                                    Some(Key::KEY_C),
+                                    Some(&control),
+                                )
+                                .map(|_| {
+                                    CorrectionExecutionOutcome {
+                                        layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                                    }
+                                })
+                            }
+                            WriterTransactionKind::PasteShortcut { modifiers } => {
+                                run_uinput_shortcut(
+                                    &mut device,
+                                    modifiers,
+                                    &[Key::KEY_LEFTCTRL],
+                                    Some(Key::KEY_V),
+                                    Some(&control),
+                                )
+                                .map(|_| {
+                                    CorrectionExecutionOutcome {
+                                        layout_switch: CorrectionLayoutSwitchOutcome::NotNeeded,
+                                    }
+                                })
+                            }
                         });
                         let result = match result {
                             Ok(outcome) => control.ensure_active().map(|_| outcome),
@@ -5923,6 +6264,7 @@ mod tests {
     #[derive(Default)]
     struct FakeUinputStrokeSink {
         events: Vec<String>,
+        shared_events: Option<Arc<Mutex<Vec<String>>>>,
         cancel_on_sync: Option<WriterTransactionControl>,
         soft_cancel_on_sync: Option<WriterTransactionControl>,
         fail_write_on_call: Option<usize>,
@@ -5934,7 +6276,11 @@ mod tests {
     impl UinputStrokeSink for FakeUinputStrokeSink {
         fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
             self.write_calls += 1;
-            self.events.push(format!("key:{key:?}:{value}"));
+            let event = format!("key:{key:?}:{value}");
+            self.events.push(event.clone());
+            if let Some(shared_events) = &self.shared_events {
+                shared_events.lock().unwrap().push(event);
+            }
             if self.fail_write_on_call == Some(self.write_calls) {
                 Err(SwitcherError::Io(io::Error::other(
                     "stroke key write failed",
@@ -5947,6 +6293,9 @@ mod tests {
         fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
             self.sync_calls += 1;
             self.events.push("sync".to_string());
+            if let Some(shared_events) = &self.shared_events {
+                shared_events.lock().unwrap().push("sync".to_string());
+            }
             if let Some(control) = self.cancel_on_sync.take() {
                 let _ = control.mark_timed_out();
             }
@@ -5957,6 +6306,16 @@ mod tests {
                 return Err(SwitcherError::Io(io::Error::other("stroke sync failed")));
             }
             Ok(())
+        }
+    }
+
+    impl UinputRawSink for FakeUinputStrokeSink {
+        fn write_key(&mut self, key: Key, value: i32) -> Result<(), SwitcherError> {
+            UinputStrokeSink::write_key(self, key, value)
+        }
+
+        fn synchronize_keys(&mut self) -> Result<(), SwitcherError> {
+            UinputStrokeSink::synchronize_keys(self)
         }
     }
 
@@ -7060,6 +7419,466 @@ mod tests {
             sink.events,
             vec!["key:KEY_LEFTSHIFT:1", "sync", "key:KEY_LEFTSHIFT:0", "sync",]
         );
+    }
+
+    #[test]
+    fn ledger_shifted_typing_cancellation_releases_shift_before_finalization() {
+        let control = WriterTransactionControl::with_timeout_for_test(230, Duration::from_secs(1));
+        let raw = FakeUinputStrokeSink {
+            cancel_on_sync: Some(control.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(31))
+                .unwrap();
+        let (mut sink, session_modifiers, latch) = runtime.operation_parts();
+        let mut operation = SyntheticOperation::new(
+            OperationId(230),
+            &mut sink,
+            OperationControl::new(control.deadline, control.soft_cancel_requested.clone())
+                .with_cancellation_source(control.stop_requested.clone()),
+            FrozenPhysicalSnapshot::default(),
+            latch,
+        );
+
+        let error = replay_synthetic_stroke(
+            &mut operation,
+            Key::KEY_A,
+            true,
+            Duration::ZERO,
+            Some(&control),
+        )
+        .unwrap_err();
+        let report = operation.finish_hard_failure(error);
+
+        assert_eq!(report.outcome, OperationOutcome::HardFailed);
+        assert_eq!(report.proof, TerminalProof::Reconciled);
+        assert!(session_modifiers.release_only_snapshot().is_empty());
+    }
+
+    #[test]
+    fn uinput_operation_wrapper_finalizes_a_successful_tap_through_the_ledger() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(32))
+                .unwrap();
+
+        run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(231),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            ModifierState::default(),
+            false,
+            None,
+            |operation| replay_synthetic_stroke(operation, Key::KEY_A, false, Duration::ZERO, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *shared_events.lock().unwrap(),
+            ["key:KEY_A:1", "sync", "key:KEY_A:0", "sync", "sync",]
+        );
+    }
+
+    #[test]
+    fn uinput_shortcut_holds_every_key_until_the_existing_delay_then_releases_in_reverse() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(33))
+                .unwrap();
+        let control = WriterTransactionControl::with_timeout_for_test(232, Duration::from_secs(1));
+
+        run_uinput_shortcut(
+            &mut runtime,
+            ModifierState::default(),
+            &[Key::KEY_LEFTCTRL],
+            Some(Key::KEY_C),
+            Some(&control),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *shared_events.lock().unwrap(),
+            [
+                "key:KEY_LEFTCTRL:1",
+                "sync",
+                "key:KEY_C:1",
+                "sync",
+                "key:KEY_C:0",
+                "sync",
+                "key:KEY_LEFTCTRL:0",
+                "sync",
+                "sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn uinput_layout_combo_uses_the_same_operation_ledger() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(34))
+                .unwrap();
+
+        run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(233),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            ModifierState::default(),
+            false,
+            None,
+            |operation| {
+                replay_synthetic_layout_combo(operation, LayoutSwitchCombo::CtrlSpace, 0, None)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            *shared_events.lock().unwrap(),
+            [
+                "key:KEY_LEFTCTRL:1",
+                "sync",
+                "key:KEY_SPACE:1",
+                "sync",
+                "key:KEY_SPACE:0",
+                "sync",
+                "key:KEY_LEFTCTRL:0",
+                "sync",
+                "sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn uinput_backspaces_share_one_operation_and_leave_no_debt() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(35))
+                .unwrap();
+
+        run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(234),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            ModifierState::default(),
+            false,
+            None,
+            |operation| replay_synthetic_backspaces(operation, 2, Duration::ZERO, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *shared_events.lock().unwrap(),
+            [
+                "key:KEY_BACKSPACE:1",
+                "sync",
+                "key:KEY_BACKSPACE:0",
+                "sync",
+                "key:KEY_BACKSPACE:1",
+                "sync",
+                "key:KEY_BACKSPACE:0",
+                "sync",
+                "sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn repeated_uinput_operation_replaces_one_held_modifier_debt_until_physical_release() {
+        let raw = FakeUinputStrokeSink::default();
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(36))
+                .unwrap();
+        let modifiers = ModifierState {
+            left_shift: true,
+            ..ModifierState::default()
+        };
+
+        for operation_id in [235, 236] {
+            run_uinput_synthetic_operation(
+                &mut runtime,
+                OperationId(operation_id),
+                OperationControl::new(
+                    Instant::now() + Duration::from_secs(1),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+                modifiers,
+                true,
+                None,
+                |_operation| Ok(()),
+            )
+            .unwrap();
+        }
+
+        let released = runtime
+            .forward_physical(PhysicalSequence(1), Key::KEY_LEFTSHIFT, 0)
+            .unwrap()
+            .expect("held modifier debt must survive until physical release");
+        assert_eq!(released.generation.0, 36);
+    }
+
+    #[test]
+    fn synthetic_modifier_down_is_rejected_until_owned_session_release_is_committed() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(41))
+                .unwrap();
+        let held_ctrl = ModifierState {
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+
+        run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(242),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            held_ctrl,
+            true,
+            None,
+            |_operation| Ok(()),
+        )
+        .unwrap();
+        let baseline_len = shared_events.lock().unwrap().len();
+
+        let error = run_uinput_shortcut(
+            &mut runtime,
+            ModifierState::default(),
+            &[Key::KEY_LEFTCTRL],
+            Some(Key::KEY_C),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::InputSafety(InputSafetyError::SessionModifierProtocolViolation {
+                generation: 41,
+                ..
+            })
+        ));
+        assert!(
+            !shared_events.lock().unwrap()[baseline_len..]
+                .iter()
+                .any(|event| event == "key:KEY_LEFTCTRL:1"),
+            "a second synthetic Ctrl down must not cross an owned session debt"
+        );
+    }
+
+    #[test]
+    fn uinput_modifier_restore_preserves_the_frozen_order_after_reverse_release() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(38))
+                .unwrap();
+        let modifiers = ModifierState {
+            left_shift: true,
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+
+        run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(238),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            modifiers,
+            true,
+            None,
+            |_operation| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *shared_events.lock().unwrap(),
+            [
+                "key:KEY_LEFTCTRL:0",
+                "sync",
+                "key:KEY_LEFTSHIFT:0",
+                "sync",
+                "key:KEY_LEFTSHIFT:1",
+                "sync",
+                "key:KEY_LEFTCTRL:1",
+                "sync",
+                "sync",
+            ]
+        );
+    }
+
+    #[test]
+    fn uinput_restore_down_is_not_started_after_writer_terminal_completion() {
+        let shared_events = Arc::new(Mutex::new(Vec::new()));
+        let raw = FakeUinputStrokeSink {
+            shared_events: Some(shared_events.clone()),
+            ..Default::default()
+        };
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(39))
+                .unwrap();
+        let control = WriterTransactionControl::with_timeout_for_test(239, Duration::from_secs(1));
+        let modifiers = ModifierState {
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+
+        let error = run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(239),
+            synthetic_operation_control(Some(&control)),
+            modifiers,
+            true,
+            Some(&control),
+            |_operation| {
+                assert!(control.publish_completed());
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionFailed {
+                request_id: 239,
+                ..
+            }
+        ));
+        assert_eq!(
+            *shared_events.lock().unwrap(),
+            ["key:KEY_LEFTCTRL:0", "sync", "sync"]
+        );
+    }
+
+    #[test]
+    fn refused_first_restore_keeps_all_unattempted_session_modifiers_released() {
+        let raw = FakeUinputStrokeSink::default();
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(40))
+                .unwrap();
+        let modifiers = ModifierState {
+            left_shift: true,
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+        run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(240),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            modifiers,
+            true,
+            None,
+            |_operation| Ok(()),
+        )
+        .unwrap();
+
+        let error = run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(241),
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .with_restore_down_authorizer(Arc::new(|_mode| {
+                Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+            })),
+            modifiers,
+            true,
+            None,
+            |_operation| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterDisconnected
+        ));
+        let (_sink, session_modifiers, _latch) = runtime.operation_parts();
+        assert_eq!(
+            session_modifiers.state(Key::KEY_LEFTSHIFT),
+            Some(crate::daemon::synthetic_input::SessionModifierState::TemporarilyReleased)
+        );
+        assert_eq!(
+            session_modifiers.state(Key::KEY_LEFTCTRL),
+            Some(crate::daemon::synthetic_input::SessionModifierState::TemporarilyReleased)
+        );
+    }
+
+    #[test]
+    fn uinput_soft_cancel_restores_the_frozen_held_modifier_before_returning() {
+        let raw = FakeUinputStrokeSink::default();
+        let mut runtime =
+            UinputSyntheticRuntime::new(raw, crate::daemon::synthetic_input::InputGeneration(37))
+                .unwrap();
+        let control = WriterTransactionControl::with_timeout_for_test(237, Duration::from_secs(1));
+        let modifiers = ModifierState {
+            left_ctrl: true,
+            ..ModifierState::default()
+        };
+
+        let error = run_uinput_synthetic_operation(
+            &mut runtime,
+            OperationId(237),
+            synthetic_operation_control(Some(&control)),
+            modifiers,
+            true,
+            Some(&control),
+            |_operation| {
+                assert_eq!(
+                    control.request_soft_cancel(),
+                    WriterSoftCancelRequest::Requested
+                );
+                control.ensure_active()
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SwitcherError::VirtualKeyboardWriterTransactionCancelled { request_id: 237 }
+        ));
+        assert!(runtime
+            .forward_physical(PhysicalSequence(1), Key::KEY_LEFTCTRL, 0,)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -8545,7 +9364,7 @@ mod tests {
         let caller_handle = handle.clone();
         let (caller_done_tx, caller_done_rx) = mpsc::channel();
         let caller = thread::spawn(move || {
-            let result = caller_handle.forward_deferred_event(Key::KEY_1, 1);
+            let result = caller_handle.forward_deferred_event(PhysicalSequence(41), Key::KEY_1, 1);
             caller_done_tx
                 .send(())
                 .expect("caller completion should be observable");
@@ -8558,9 +9377,15 @@ mod tests {
         let (control, reply) = match command {
             WriterCommand::Transaction(WriterTransaction::Execute {
                 control,
-                kind: WriterTransactionKind::ForwardDeferredEvent { key, value },
+                kind:
+                    WriterTransactionKind::ForwardDeferredEvent {
+                        sequence,
+                        key,
+                        value,
+                    },
                 reply,
             }) => {
+                assert_eq!(sequence, PhysicalSequence(41));
                 assert_eq!(key, Key::KEY_1);
                 assert_eq!(value, 1);
                 (control, reply)
@@ -8596,6 +9421,7 @@ mod tests {
         let caller_handle = handle.clone();
         let caller = thread::spawn(move || {
             caller_handle.forward_deferred_event_with_timeout(
+                PhysicalSequence(42),
                 Key::KEY_1,
                 1,
                 Duration::from_millis(25),
@@ -8608,9 +9434,15 @@ mod tests {
         let (request_id, _held_reply) = match command {
             WriterCommand::Transaction(WriterTransaction::Execute {
                 control,
-                kind: WriterTransactionKind::ForwardDeferredEvent { key, value },
+                kind:
+                    WriterTransactionKind::ForwardDeferredEvent {
+                        sequence,
+                        key,
+                        value,
+                    },
                 reply,
             }) => {
+                assert_eq!(sequence, PhysicalSequence(42));
                 assert_eq!(key, Key::KEY_1);
                 assert_eq!(value, 1);
                 (control.request_id(), reply)
@@ -8629,7 +9461,7 @@ mod tests {
         assert_eq!(handle.transaction_failure_request_id(), Some(request_id));
         assert!(!handle.is_alive());
         assert!(matches!(
-            handle.forward_event(Key::KEY_2, 1),
+            handle.forward_event(PhysicalSequence(43), Key::KEY_2, 1),
             Err(SwitcherError::VirtualKeyboardWriterTransactionTimedOut {
                 request_id: blocked
             }) if blocked == request_id
@@ -10624,6 +11456,7 @@ mod tests {
             .unwrap();
         command_tx
             .send(WriterCommand::Fast(WriterFastCommand::ForwardEvent {
+                sequence: PhysicalSequence(44),
                 key: Key::KEY_A,
                 value: 1,
             }))

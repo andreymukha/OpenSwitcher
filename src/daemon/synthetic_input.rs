@@ -2,7 +2,7 @@ use crate::error::SwitcherError;
 use evdev::Key;
 use std::fmt::Debug;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::Instant;
@@ -107,6 +107,10 @@ impl<T> Drop for ReleaseOnlyFallbackDrain<T> {
 }
 
 pub(crate) trait RestoredModifierTarget<T> {
+    fn begin_restore(&mut self, _key: Key) -> Result<(), SwitcherError> {
+        Ok(())
+    }
+
     fn adopt_restored(
         &mut self,
         key: Key,
@@ -265,6 +269,24 @@ impl<T: Clone + Eq> SyntheticKeyLedger<T> {
         Ok(self.debts.remove(index).token)
     }
 
+    fn cancel_unattempted_down(&mut self, press_id: PressId) -> Result<(), SwitcherError> {
+        let index = self
+            .debts
+            .iter()
+            .position(|debt| debt.press_id == press_id)
+            .ok_or(crate::error::InputSafetyError::Invariant {
+                context: "cancelled press id does not belong to ledger",
+            })?;
+        if self.debts[index].state != DownState::AttemptingDown {
+            return Err(crate::error::InputSafetyError::Invariant {
+                context: "only an unattempted down can be cancelled",
+            }
+            .into());
+        }
+        self.debts.remove(index);
+        Ok(())
+    }
+
     pub(crate) fn begin_terminal(&mut self) {
         self.terminal = true;
     }
@@ -294,6 +316,16 @@ impl<T: Clone + Eq> SyntheticKeyLedger<T> {
 pub(crate) struct OperationControl {
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+    additional_cancelled: Vec<Arc<AtomicBool>>,
+    failure_sources: Vec<Arc<AtomicU64>>,
+    restore_down_authorizer:
+        Arc<dyn Fn(RestoreDownMode) -> Result<(), SwitcherError> + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RestoreDownMode {
+    SuccessCleanup,
+    SoftCancelCleanup,
 }
 
 impl OperationControl {
@@ -301,11 +333,41 @@ impl OperationControl {
         Self {
             deadline,
             cancelled,
+            additional_cancelled: Vec::new(),
+            failure_sources: Vec::new(),
+            restore_down_authorizer: Arc::new(|_| Ok(())),
         }
     }
 
+    pub(crate) fn with_cancellation_source(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.additional_cancelled.push(cancelled);
+        self
+    }
+
+    pub(crate) fn with_failure_source(mut self, failure_request_id: Arc<AtomicU64>) -> Self {
+        self.failure_sources.push(failure_request_id);
+        self
+    }
+
+    pub(crate) fn with_restore_down_authorizer(
+        mut self,
+        authorizer: Arc<dyn Fn(RestoreDownMode) -> Result<(), SwitcherError> + Send + Sync>,
+    ) -> Self {
+        self.restore_down_authorizer = authorizer;
+        self
+    }
+
     fn ensure_active(&self, operation_id: OperationId) -> Result<(), SwitcherError> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.load(Ordering::Acquire)
+            || self
+                .additional_cancelled
+                .iter()
+                .any(|cancelled| cancelled.load(Ordering::Acquire))
+            || self
+                .failure_sources
+                .iter()
+                .any(|failure_request_id| failure_request_id.load(Ordering::Acquire) != 0)
+        {
             return Err(crate::error::InputSafetyError::OperationCancelled {
                 operation_id: operation_id.0,
             }
@@ -318,6 +380,34 @@ impl OperationControl {
             .into());
         }
         Ok(())
+    }
+
+    fn ensure_cleanup_active(&self, operation_id: OperationId) -> Result<(), SwitcherError> {
+        if self
+            .additional_cancelled
+            .iter()
+            .any(|cancelled| cancelled.load(Ordering::Acquire))
+            || self
+                .failure_sources
+                .iter()
+                .any(|failure_request_id| failure_request_id.load(Ordering::Acquire) != 0)
+        {
+            return Err(crate::error::InputSafetyError::OperationCancelled {
+                operation_id: operation_id.0,
+            }
+            .into());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(crate::error::InputSafetyError::OperationTimedOut {
+                operation_id: operation_id.0,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn is_personally_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
     }
 }
 
@@ -333,6 +423,20 @@ impl FrozenPhysicalSnapshot {
             modifier_bits,
             caps_lock_active,
         }
+    }
+
+    pub(crate) fn from_pressed_modifiers(
+        keys: impl IntoIterator<Item = Key>,
+        caps_lock_active: bool,
+    ) -> Result<Self, SwitcherError> {
+        let mut modifier_bits = 0;
+        for key in keys {
+            let bit = modifier_bit(key).ok_or(crate::error::InputSafetyError::Invariant {
+                context: "frozen snapshot contains a non-modifier key",
+            })?;
+            modifier_bits |= bit;
+        }
+        Ok(Self::new(modifier_bits, caps_lock_active))
     }
 
     fn holds_modifier(self, key: Key) -> bool {
@@ -391,7 +495,11 @@ impl PhysicalRestorePlan {
     }
 
     fn snapshot(&self) -> Vec<Key> {
-        self.temporarily_released.clone()
+        self.temporarily_released.iter().rev().copied().collect()
+    }
+
+    fn contains(&self, key: Key) -> bool {
+        self.temporarily_released.contains(&key)
     }
 }
 
@@ -514,6 +622,19 @@ impl<T> SessionModifierLedger<T> {
         self.entries.iter().any(|entry| entry.key == key)
     }
 
+    pub(crate) fn authorize_synthetic_down(&self, key: Key) -> Result<(), SwitcherError> {
+        let Some(entry) = self.entries.iter().find(|entry| entry.key == key) else {
+            return Ok(());
+        };
+        match entry.state {
+            SessionModifierState::OwnedDown => {
+                Err(self.protocol_error("synthetic down cannot cross an owned session modifier"))
+            }
+            SessionModifierState::TemporarilyReleased
+            | SessionModifierState::RestoringPossiblyDown => Ok(()),
+        }
+    }
+
     pub(crate) fn state(&self, key: Key) -> Option<SessionModifierState> {
         self.entries
             .iter()
@@ -567,6 +688,13 @@ impl<T: Clone> SessionModifierLedger<T> {
 }
 
 impl<T: Clone> RestoredModifierTarget<T> for SessionModifierLedger<T> {
+    fn begin_restore(&mut self, key: Key) -> Result<(), SwitcherError> {
+        if self.contains(key) {
+            self.mark_restoring(key)?;
+        }
+        Ok(())
+    }
+
     fn adopt_restored(
         &mut self,
         key: Key,
@@ -641,6 +769,10 @@ impl<'a, S: SyntheticKeySink> SyntheticOperation<'a, S> {
         self.control.ensure_active(self.id)
     }
 
+    pub(crate) fn has_planned_modifier_restore(&self, key: Key) -> bool {
+        self.restore_plan.contains(key)
+    }
+
     pub(crate) fn release(&mut self, press_id: PressId) -> Result<(), SwitcherError> {
         let token = self.ledger.token(press_id)?;
         let mut control_error = self.control.ensure_active(self.id).err();
@@ -703,7 +835,12 @@ impl<'a, S: SyntheticKeySink> SyntheticOperation<'a, S> {
     where
         R: RestoredModifierTarget<S::Token>,
     {
-        let mut cleanup = self.restore_planned_modifiers(restored);
+        let restore_mode = if requested_outcome == OperationOutcome::SoftCancelled {
+            RestoreDownMode::SoftCancelCleanup
+        } else {
+            RestoreDownMode::SuccessCleanup
+        };
+        let mut cleanup = self.restore_planned_modifiers(restored, restore_mode);
         self.ledger.begin_terminal();
         Self::keep_first_error(&mut cleanup, self.release_all());
         Self::keep_first_error(&mut cleanup, self.drain_release_only_fallback());
@@ -716,7 +853,13 @@ impl<'a, S: SyntheticKeySink> SyntheticOperation<'a, S> {
         self.finalized = true;
         OperationTerminalReport {
             outcome: if clean {
-                requested_outcome
+                if requested_outcome == OperationOutcome::Success
+                    && self.control.is_personally_cancelled()
+                {
+                    OperationOutcome::SoftCancelled
+                } else {
+                    requested_outcome
+                }
             } else {
                 OperationOutcome::HardFailed
             },
@@ -726,33 +869,47 @@ impl<'a, S: SyntheticKeySink> SyntheticOperation<'a, S> {
         }
     }
 
-    fn restore_planned_modifiers<R>(&mut self, restored: &mut R) -> Option<SwitcherError>
+    fn restore_planned_modifiers<R>(
+        &mut self,
+        restored: &mut R,
+        restore_mode: RestoreDownMode,
+    ) -> Option<SwitcherError>
     where
         R: RestoredModifierTarget<S::Token>,
     {
         for key in self.restore_plan.snapshot() {
-            if let Err(error) = self.restore_one_modifier(key, restored) {
+            if let Err(error) = self.restore_one_modifier(key, restored, restore_mode) {
                 return Some(error);
             }
         }
         None
     }
 
-    fn restore_one_modifier<R>(&mut self, key: Key, restored: &mut R) -> Result<(), SwitcherError>
+    fn restore_one_modifier<R>(
+        &mut self,
+        key: Key,
+        restored: &mut R,
+        restore_mode: RestoreDownMode,
+    ) -> Result<(), SwitcherError>
     where
         R: RestoredModifierTarget<S::Token>,
     {
-        self.control.ensure_active(self.id)?;
+        self.control.ensure_cleanup_active(self.id)?;
         let token = self.sink.prepare_down(key)?;
-        self.control.ensure_active(self.id)?;
+        self.control.ensure_cleanup_active(self.id)?;
+        (self.control.restore_down_authorizer)(restore_mode)?;
         let press_id = self.ledger.begin_down(token.clone())?;
+        if let Err(error) = restored.begin_restore(key) {
+            self.ledger.cancel_unattempted_down(press_id)?;
+            return Err(error);
+        }
 
         let down_result = self.sink.attempt_down(&token);
         self.ledger.mark_possibly_down(press_id)?;
         down_result?;
-        self.control.ensure_active(self.id)?;
+        self.control.ensure_cleanup_active(self.id)?;
         self.sink.synchronize()?;
-        self.control.ensure_active(self.id)?;
+        self.control.ensure_cleanup_active(self.id)?;
 
         let token = self.ledger.transfer(press_id)?;
         restored.adopt_restored(
@@ -911,7 +1068,10 @@ mod tests {
     use evdev::Key;
     use std::cell::{Cell, RefCell};
     use std::io;
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU64},
+        Arc,
+    };
     use std::time::{Duration, Instant};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1840,21 +2000,23 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_before_restore_escalates_without_new_down() {
+    fn terminal_cancellation_before_restore_escalates_without_new_down() {
         let mut sink = FakeSink::default();
-        let cancelled = Arc::new(AtomicBool::new(false));
+        let soft_cancelled = Arc::new(AtomicBool::new(false));
+        let terminal_cancelled = Arc::new(AtomicBool::new(false));
         let latch = SyntheticFailureLatch::default();
         let mut operation = SyntheticOperation::new(
             OperationId(57),
             &mut sink,
-            OperationControl::new(Instant::now() + Duration::from_secs(1), cancelled.clone()),
+            OperationControl::new(Instant::now() + Duration::from_secs(1), soft_cancelled)
+                .with_cancellation_source(terminal_cancelled.clone()),
             FrozenPhysicalSnapshot::new(0b0000_0100, false),
             latch.clone(),
         );
         operation
             .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
             .unwrap();
-        cancelled.store(true, Ordering::Release);
+        terminal_cancelled.store(true, Ordering::Release);
         let mut restored = FakeRestoredModifierTarget::default();
 
         let report = operation.finish_soft_cancel(&mut restored);
@@ -2435,5 +2597,199 @@ mod tests {
             ledger.state(Key::KEY_LEFTSHIFT),
             Some(SessionModifierState::RestoringPossiblyDown)
         );
+    }
+
+    #[test]
+    fn additional_cancellation_source_blocks_normal_down() {
+        let mut sink = FakeSink::default();
+        let additional = Arc::new(AtomicBool::new(true));
+        let control = OperationControl::new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_cancellation_source(additional);
+        let latch = SyntheticFailureLatch::default();
+        let mut operation = SyntheticOperation::new(
+            OperationId(62),
+            &mut sink,
+            control,
+            FrozenPhysicalSnapshot::default(),
+            latch,
+        );
+
+        let primary = operation.press(Key::KEY_A).unwrap_err();
+        assert!(matches!(
+            primary,
+            SwitcherError::InputSafety(InputSafetyError::OperationCancelled { operation_id: 62 })
+        ));
+        let _ = operation.finish_hard_failure(primary);
+        assert_eq!(sink.down_count, 0);
+    }
+
+    #[test]
+    fn writer_failure_source_blocks_normal_down() {
+        let mut sink = FakeSink::default();
+        let failure_request_id = Arc::new(AtomicU64::new(91));
+        let control = OperationControl::new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_failure_source(failure_request_id);
+        let latch = SyntheticFailureLatch::default();
+        let mut operation = SyntheticOperation::new(
+            OperationId(65),
+            &mut sink,
+            control,
+            FrozenPhysicalSnapshot::default(),
+            latch,
+        );
+
+        let primary = operation.press(Key::KEY_A).unwrap_err();
+        assert!(matches!(
+            primary,
+            SwitcherError::InputSafety(InputSafetyError::OperationCancelled { operation_id: 65 })
+        ));
+        let _ = operation.finish_hard_failure(primary);
+        assert_eq!(sink.down_count, 0);
+    }
+
+    #[test]
+    fn soft_cancel_cleanup_ignores_only_the_personal_cancel_source() {
+        let mut sink = FakeSink::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control =
+            OperationControl::new(Instant::now() + Duration::from_secs(1), cancelled.clone());
+        let latch = SyntheticFailureLatch::default();
+        let mut operation = SyntheticOperation::new(
+            OperationId(63),
+            &mut sink,
+            control,
+            FrozenPhysicalSnapshot::new(0b0000_0100, false),
+            latch,
+        );
+        operation
+            .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        cancelled.store(true, Ordering::Release);
+        let mut restored = FakeRestoredModifierTarget::default();
+
+        let report = operation.finish_soft_cancel(&mut restored);
+
+        assert_eq!(report.outcome, OperationOutcome::SoftCancelled);
+        assert_eq!(report.proof, TerminalProof::Reconciled);
+        assert_eq!(sink.up_count, 1);
+        assert_eq!(sink.down_count, 1);
+        assert_eq!(restored.adopted.len(), 1);
+    }
+
+    #[test]
+    fn restore_down_requires_a_fresh_backend_authorization() {
+        let mut sink = FakeSink::default();
+        let authorizer_calls = Arc::new(AtomicU64::new(0));
+        let observed_calls = authorizer_calls.clone();
+        let control = OperationControl::new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_restore_down_authorizer(Arc::new(move |mode| {
+            assert_eq!(mode, RestoreDownMode::SuccessCleanup);
+            observed_calls.fetch_add(1, Ordering::SeqCst);
+            Err(SwitcherError::VirtualKeyboardWriterDisconnected)
+        }));
+        let latch = SyntheticFailureLatch::default();
+        let mut operation = SyntheticOperation::new(
+            OperationId(66),
+            &mut sink,
+            control,
+            FrozenPhysicalSnapshot::new(0b0000_0100, false),
+            latch,
+        );
+        operation
+            .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        let mut restored = FakeRestoredModifierTarget::default();
+
+        let report = operation.finish_success(&mut restored);
+
+        assert_eq!(report.outcome, OperationOutcome::HardFailed);
+        assert!(matches!(
+            report.cleanup,
+            Some(SwitcherError::VirtualKeyboardWriterDisconnected)
+        ));
+        assert_eq!(authorizer_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.down_count, 0);
+        assert!(restored.adopted.is_empty());
+    }
+
+    #[test]
+    fn late_soft_cancel_during_success_restore_finishes_as_reconciled_soft_cancel() {
+        let mut sink = FakeSink::default();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel_during_authorization = cancelled.clone();
+        let control = OperationControl::new(Instant::now() + Duration::from_secs(1), cancelled)
+            .with_restore_down_authorizer(Arc::new(move |_mode| {
+                cancel_during_authorization.store(true, Ordering::Release);
+                Ok(())
+            }));
+        let latch = SyntheticFailureLatch::default();
+        let mut operation = SyntheticOperation::new(
+            OperationId(67),
+            &mut sink,
+            control,
+            FrozenPhysicalSnapshot::new(0b0000_0100, false),
+            latch,
+        );
+        operation
+            .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        let mut restored = FakeRestoredModifierTarget::default();
+
+        let report = operation.finish_success(&mut restored);
+
+        assert_eq!(report.outcome, OperationOutcome::SoftCancelled);
+        assert_eq!(report.proof, TerminalProof::Reconciled);
+        assert!(report.cleanup.is_none());
+        assert_eq!(sink.up_count, 1);
+        assert_eq!(sink.down_count, 1);
+        assert_eq!(restored.adopted.len(), 1);
+    }
+
+    #[test]
+    fn frozen_snapshot_is_built_from_exact_pressed_modifier_keys() {
+        let snapshot = FrozenPhysicalSnapshot::from_pressed_modifiers(
+            [Key::KEY_LEFTSHIFT, Key::KEY_RIGHTALT],
+            true,
+        )
+        .unwrap();
+
+        assert!(snapshot.holds_modifier(Key::KEY_LEFTSHIFT));
+        assert!(snapshot.holds_modifier(Key::KEY_RIGHTALT));
+        assert!(!snapshot.holds_modifier(Key::KEY_LEFTCTRL));
+        assert!(snapshot.caps_lock_active());
+        assert!(FrozenPhysicalSnapshot::from_pressed_modifiers([Key::KEY_A], false,).is_err());
+    }
+
+    #[test]
+    fn temporary_release_plan_is_observable_only_after_it_is_recorded() {
+        let mut sink = FakeSink::default();
+        let latch = SyntheticFailureLatch::default();
+        let mut operation = SyntheticOperation::new(
+            OperationId(64),
+            &mut sink,
+            OperationControl::new(
+                Instant::now() + Duration::from_secs(1),
+                Arc::new(AtomicBool::new(false)),
+            ),
+            FrozenPhysicalSnapshot::new(0b0000_0100, false),
+            latch,
+        );
+
+        assert!(!operation.has_planned_modifier_restore(Key::KEY_LEFTSHIFT));
+        operation
+            .temporarily_release_physical_modifier(Key::KEY_LEFTSHIFT)
+            .unwrap();
+        assert!(operation.has_planned_modifier_restore(Key::KEY_LEFTSHIFT));
+
+        let _ = operation.finish_hard_failure(SwitcherError::input_safety("test"));
     }
 }

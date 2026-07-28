@@ -11,6 +11,10 @@ use crate::daemon::uinput_synthetic::{
     UinputSyntheticSink,
 };
 use crate::daemon::x11_wait::{wait_for_x11_or_stop, X11WaitOutcome};
+use crate::daemon::xtest_guardian::service::{X11ServerIdentity, XtestExecutor};
+use crate::daemon::xtest_guardian::x11::{
+    verify_external_x11_connection, EmergencyX11Releaser, GuardianX11Executor,
+};
 use crate::error::{InputSafetyError, SwitcherError};
 use crate::model::{
     DesktopEnvironment, DistroKind, HotkeyTrigger, LayoutSwitchCombo, SessionType, SystemContext,
@@ -57,7 +61,6 @@ const WRITER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_WORKER_STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_SEND_RETRY_WINDOW: Duration = Duration::from_millis(50);
 const WRITER_SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(1);
-const X11_EVDEV_KEYCODE_OFFSET: u16 = 8;
 const CINNAMON_XKB_SWITCH_TIMEOUT: Duration = Duration::from_millis(350);
 const CINNAMON_XKB_SWITCH_POLL_INTERVAL: Duration = Duration::from_millis(5);
 static NEXT_WRITER_TRANSACTION_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -3736,8 +3739,13 @@ enum CinnamonX11XtestRuntime {
 }
 
 struct CinnamonX11XtestReplayer {
+    xkb: CinnamonXkbController,
+    xtest: GuardianX11Executor,
+    _emergency: EmergencyX11Releaser,
+}
+
+struct CinnamonXkbController {
     x11: x11rb::rust_connection::RustConnection,
-    root: u32,
 }
 
 fn validate_cinnamon_plan_keycodes_with(
@@ -3783,26 +3791,17 @@ fn cinnamon_xkb_target_group(num_groups: u8, current_group: u8) -> Result<u8, Sw
     Ok((current_group + 1) % num_groups)
 }
 
-impl CinnamonX11XtestReplayer {
-    fn new() -> Result<Self, SwitcherError> {
-        let (x11, screen_num) = x11rb::connect(None)
+impl CinnamonXkbController {
+    fn connect_and_verify(identity: &X11ServerIdentity) -> Result<Self, SwitcherError> {
+        let (x11, screen_number) = x11rb::connect(None)
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-        use x11rb::connection::Connection as _;
-
+        verify_external_x11_connection(&x11, screen_number, identity)?;
         use x11rb::protocol::xkb::ConnectionExt as _;
         x11.xkb_use_extension(1, 0)
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
             .reply()
             .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-
-        use x11rb::protocol::xtest::ConnectionExt as _;
-        x11.xtest_get_version(2, 2)
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
-            .reply()
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-
-        let root = x11.setup().roots[screen_num].root;
-        Ok(Self { x11, root })
+        Ok(Self { x11 })
     }
 
     fn num_xkb_groups(
@@ -3890,9 +3889,23 @@ impl CinnamonX11XtestReplayer {
 
         Ok(u8::from(state.group))
     }
+}
+
+impl CinnamonX11XtestReplayer {
+    fn new() -> Result<Self, SwitcherError> {
+        let xtest = GuardianX11Executor::connect_and_establish()?;
+        let identity = xtest.server_identity().clone();
+        let xkb = CinnamonXkbController::connect_and_verify(&identity)?;
+        let emergency = EmergencyX11Releaser::connect_and_verify(identity)?;
+        Ok(Self {
+            xkb,
+            xtest,
+            _emergency: emergency,
+        })
+    }
 
     fn validate_plan_keycodes(
-        &self,
+        &mut self,
         plan: &CorrectionPlan,
         control: Option<&WriterTransactionControl>,
     ) -> Result<(), SwitcherError> {
@@ -3902,66 +3915,56 @@ impl CinnamonX11XtestReplayer {
     }
 
     fn validate_keycode(
-        &self,
+        &mut self,
         key: Key,
         control: Option<&WriterTransactionControl>,
     ) -> Result<u8, SwitcherError> {
-        let keycode = evdev_key_to_x11_keycode(key)?;
-        use x11rb::connection::Connection as _;
-        let setup = self.x11.setup();
-        if keycode < setup.min_keycode || keycode > setup.max_keycode {
-            return Err(SwitcherError::Io(io::Error::other(format!(
-                "cinnamon-xkb-xtest-before-mutation: keycode out of X11 range key={key:?} keycode={keycode} min={} max={}",
-                setup.min_keycode, setup.max_keycode
-            ))));
-        }
-
-        use x11rb::protocol::xproto::ConnectionExt as _;
-        let mapping = run_checked_external_call(control, || {
-            self.x11
-                .get_keyboard_mapping(keycode, 1)
-                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
-                .reply()
-                .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))
-        })?;
-        if mapping.keysyms.iter().all(|keysym| *keysym == 0) {
-            return Err(SwitcherError::Io(io::Error::other(format!(
-                "cinnamon-xkb-xtest-before-mutation: keycode has empty mapping key={key:?} keycode={keycode}",
-            ))));
-        }
-
-        Ok(keycode)
+        run_checked_external_call(control, || {
+            self.xtest
+                .prepare_key(key.code())
+                .map(|(keycode, _)| keycode)
+                .map_err(Into::into)
+        })
     }
 
-    fn emit_fake_key(&self, keycode: u8, pressed: bool) -> Result<(), SwitcherError> {
-        use x11rb::connection::Connection as _;
-        use x11rb::protocol::xproto;
-        use x11rb::protocol::xtest::ConnectionExt as _;
-        self.x11
-            .xtest_fake_input(
-                if pressed {
-                    xproto::KEY_PRESS_EVENT
-                } else {
-                    xproto::KEY_RELEASE_EVENT
-                },
-                keycode,
-                x11rb::CURRENT_TIME,
-                self.root,
-                0,
-                0,
-                0,
-            )
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?
-            .check()
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-        self.x11
-            .flush()
-            .map_err(|error| SwitcherError::Io(io::Error::other(error.to_string())))?;
-        Ok(())
+    fn emit_fake_key(&mut self, keycode: u8, pressed: bool) -> Result<(), SwitcherError> {
+        if pressed {
+            self.xtest.key_down(keycode).map_err(Into::into)
+        } else {
+            self.xtest.key_up(keycode).map_err(Into::into)
+        }
+    }
+
+    fn fake_key_attempt(
+        &mut self,
+        key: Key,
+        pressed: bool,
+        control: Option<&WriterTransactionControl>,
+        failure_request_id: Option<&AtomicU64>,
+        stop_requested: Option<&AtomicBool>,
+        terminal_gate: Option<&Mutex<()>>,
+    ) -> XtestKeyDownAttempt {
+        match validate_xtest_key_before_mutation(
+            key,
+            control,
+            failure_request_id,
+            stop_requested,
+            terminal_gate,
+            |key| self.validate_keycode(key, control),
+        ) {
+            Ok(keycode) => XtestKeyDownAttempt {
+                mutation_attempted: true,
+                result: self.emit_fake_key(keycode, pressed),
+            },
+            Err(error) => XtestKeyDownAttempt {
+                mutation_attempted: false,
+                result: Err(error),
+            },
+        }
     }
 
     fn fake_key(
-        &self,
+        &mut self,
         key: Key,
         pressed: bool,
         control: Option<&WriterTransactionControl>,
@@ -3969,34 +3972,32 @@ impl CinnamonX11XtestReplayer {
         stop_requested: Option<&AtomicBool>,
         terminal_gate: Option<&Mutex<()>>,
     ) -> Result<(), SwitcherError> {
-        validate_and_emit_xtest_key_attempt(
+        self.fake_key_attempt(
             key,
+            pressed,
             control,
             failure_request_id,
             stop_requested,
             terminal_gate,
-            |key| self.validate_keycode(key, control),
-            |keycode| self.emit_fake_key(keycode, pressed),
         )
         .result
     }
 
     fn fake_key_down_attempt(
-        &self,
+        &mut self,
         key: Key,
         control: Option<&WriterTransactionControl>,
         failure_request_id: Option<&AtomicU64>,
         stop_requested: Option<&AtomicBool>,
         terminal_gate: Option<&Mutex<()>>,
     ) -> XtestKeyDownAttempt {
-        validate_and_emit_xtest_key_attempt(
+        self.fake_key_attempt(
             key,
+            true,
             control,
             failure_request_id,
             stop_requested,
             terminal_gate,
-            |key| self.validate_keycode(key, control),
-            |keycode| self.emit_fake_key(keycode, true),
         )
     }
 
@@ -4018,6 +4019,39 @@ impl CinnamonX11XtestReplayer {
     }
 }
 
+fn validate_xtest_key_before_mutation(
+    key: Key,
+    control: Option<&WriterTransactionControl>,
+    failure_request_id: Option<&AtomicU64>,
+    stop_requested: Option<&AtomicBool>,
+    terminal_gate: Option<&Mutex<()>>,
+    validate: impl FnOnce(Key) -> Result<u8, SwitcherError>,
+) -> Result<u8, SwitcherError> {
+    ensure_transaction_active(control)?;
+    if let Some(failure_request_id) = failure_request_id {
+        ensure_writer_not_failed(failure_request_id)?;
+    }
+    let keycode = validate(key)?;
+    ensure_transaction_active(control)?;
+    if let Some(failure_request_id) = failure_request_id {
+        ensure_writer_not_failed(failure_request_id)?;
+    }
+    match (control, failure_request_id, stop_requested, terminal_gate) {
+        (Some(control), _, _, _) => control.authorize_mutation_start()?,
+        (None, Some(failure_request_id), Some(stop_requested), Some(terminal_gate)) => {
+            authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)?;
+        }
+        (None, Some(failure_request_id), _, None) => {
+            ensure_writer_not_failed(failure_request_id)?;
+        }
+        (None, None, _, _) => {}
+        (None, Some(_), None, Some(_)) => {
+            return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
+        }
+    }
+    Ok(keycode)
+}
+
 fn validate_and_emit_xtest_key_attempt(
     key: Key,
     control: Option<&WriterTransactionControl>,
@@ -4027,31 +4061,14 @@ fn validate_and_emit_xtest_key_attempt(
     validate: impl FnOnce(Key) -> Result<u8, SwitcherError>,
     emit: impl FnOnce(u8) -> Result<(), SwitcherError>,
 ) -> XtestKeyDownAttempt {
-    let before_mutation = (|| {
-        ensure_transaction_active(control)?;
-        if let Some(failure_request_id) = failure_request_id {
-            ensure_writer_not_failed(failure_request_id)?;
-        }
-        let keycode = validate(key)?;
-        ensure_transaction_active(control)?;
-        if let Some(failure_request_id) = failure_request_id {
-            ensure_writer_not_failed(failure_request_id)?;
-        }
-        match (control, failure_request_id, stop_requested, terminal_gate) {
-            (Some(control), _, _, _) => control.authorize_mutation_start()?,
-            (None, Some(failure_request_id), Some(stop_requested), Some(terminal_gate)) => {
-                authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)?;
-            }
-            (None, Some(failure_request_id), _, None) => {
-                ensure_writer_not_failed(failure_request_id)?;
-            }
-            (None, None, _, _) => {}
-            (None, Some(_), None, Some(_)) => {
-                return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
-            }
-        }
-        Ok(keycode)
-    })();
+    let before_mutation = validate_xtest_key_before_mutation(
+        key,
+        control,
+        failure_request_id,
+        stop_requested,
+        terminal_gate,
+        validate,
+    );
 
     match before_mutation {
         Ok(keycode) => XtestKeyDownAttempt {
@@ -4096,9 +4113,9 @@ impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
         ensure_transaction_active(control)?;
         self.validate_plan_keycodes(plan, control)?;
         ensure_transaction_active(control)?;
-        let target_group = self.target_xkb_group(control)?;
+        let target_group = self.xkb.target_xkb_group(control)?;
         ensure_transaction_active(control)?;
-        self.activate_and_verify_group(target_group, control)
+        self.xkb.activate_and_verify_group(target_group, control)
     }
 
     fn key_down_attempt(
@@ -4112,15 +4129,6 @@ impl CinnamonX11XtestReplay for CinnamonX11XtestReplayer {
     fn key_up(&mut self, key: Key) -> Result<(), SwitcherError> {
         self.fake_key(key, false, None, None, None, None)
     }
-}
-
-fn evdev_key_to_x11_keycode(key: Key) -> Result<u8, SwitcherError> {
-    let raw = key.code() + X11_EVDEV_KEYCODE_OFFSET;
-    u8::try_from(raw).map_err(|_| {
-        SwitcherError::Io(io::Error::other(format!(
-            "cinnamon-xkb-xtest-before-mutation: evdev keycode cannot fit in X11 keycode key={key:?} raw={raw}",
-        )))
-    })
 }
 
 fn select_correction_replay_strategy(

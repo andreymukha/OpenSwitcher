@@ -255,6 +255,60 @@ Mapping cache уменьшает guardian p50 ещё примерно на 14–
 median (`128 ms` против `127 ms`). Улучшение p95 на 1–2 ms и XTEST-участка на
 1 ms находится на уровне межсерийного шума.
 
+### Финальный A/B замер перед интеграцией
+
+После выбора barrier-only выполнен отдельный финальный замер без combined:
+
+```text
+H-06 -> barrier-only -> barrier-only -> H-06 -> H-06 -> barrier-only
+```
+
+Каждая из шести серий содержала 30 коррекций. Итого получено 90 измерений на
+вариант и 180 успешных коррекций.
+
+Полное время F12-коррекции:
+
+| Состояние | n | minimum, ms | median, ms | p95, ms | maximum, ms |
+|---|---:|---:|---:|---:|---:|
+| H-06 | 90 | 119 | 131 | 139 | 147 |
+| barrier-only | 90 | 113 | 126 | 132 | 136 |
+
+Участок от первого Backspace press до последнего replay release:
+
+| Состояние | n | minimum, ms | median, ms | p95, ms | maximum, ms |
+|---|---:|---:|---:|---:|---:|
+| H-06 | 90 | 105 | 114 | 120 | 127 |
+| barrier-only | 90 | 102 | 109 | 115 | 116 |
+
+Относительно exact H-06 финальный barrier-only дал:
+
+- median полного пути `-5 ms`, примерно `-3,8%`;
+- p95 полного пути `-7 ms`, примерно `-5,0%`;
+- maximum полного пути `-11 ms`;
+- median и p95 измеренного XTEST-участка по `-5 ms`.
+
+Медианы полного пути по отдельным сериям:
+
+| Состояние | Серия A | Серия B | Серия C |
+|---|---:|---:|---:|
+| H-06 | 128 | 133,5 | 128 |
+| barrier-only | 126 | 127 | 126 |
+
+Guardian p50 range снизился с `254–269 μs` до `141–167 μs`. Его p95 ranges
+перекрываются (`2488–2727 μs` и `2385–2830 μs`), поэтому отдельное улучшение
+редкого IPC-хвоста не заявляется.
+
+Во всех 180 коррекциях:
+
+- ровно 30 exact trace на серию;
+- число уникальных normalized trace равно одному;
+- completion samples и XTEST span samples полны;
+- failure, timeout, protocol failure и `Unreconciled` не найдены.
+
+Первичная кампания дала выигрыш median `6 ms`, финальная — `5 ms`. Абсолютные
+значения дрейфовали между сериями, но направление и практически значимый
+размер выигрыша barrier-only воспроизвелись.
+
 ## Проверка checked mutation до локального Synchronize
 
 Отдельный VM-only test-binary был собран из точного combined source и вызывал
@@ -482,6 +536,7 @@ Combined commit не требуется откатывать или удалят
 | Ubuntu `barrier-final-20260729/barrier-final-journal.txt` | `08a4901f9a07ac83ed543e242082332f924bdc80e17c4cd92933e7da812586b6` |
 | Ubuntu `h06-barrier-final-wayland-f12.ppm` | `2e81dc2326020a9eb354f52c605cf53167b010e11af6ce0626d44e358d156013` |
 | Ubuntu `h06-barrier-final-after-purge.ppm` | `7bbc3efee17d48653cb6062bf2ebb267019a1f22c8dcd6c82cc62bd86ae3b737` |
+| Mint `final-ab-20260729/campaign-summary.json` | `e8b2748057cadedbf8e52a6a21af621446bf9d1cbf26ba68306752308aea615e` |
 
 ## Состояние после проверки
 

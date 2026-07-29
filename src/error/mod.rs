@@ -151,6 +151,10 @@ pub enum SwitcherError {
     InputSessionInactive,
     #[error("Required logind session monitor stopped")]
     SessionMonitorStopped,
+    #[error("Input device does not belong to the authorized seat")]
+    InputDeviceSeatMismatch,
+    #[error("Input device identity could not be verified")]
+    InputDeviceIdentityUnverified,
     #[error("Keyboard device was not found")]
     KeyboardNotFound,
     #[error("Keyboard device is present but access was denied: {path}")]
@@ -225,6 +229,8 @@ impl SwitcherError {
             | SwitcherError::KeyboardAccessDenied { .. }
             | SwitcherError::UinputAccessDenied { .. }
             | SwitcherError::InputSessionInactive
+            | SwitcherError::InputDeviceSeatMismatch
+            | SwitcherError::InputDeviceIdentityUnverified
             | SwitcherError::InputWorkerDisconnected { .. } => true,
             SwitcherError::Io(error) => {
                 matches!(error.raw_os_error(), Some(19))
@@ -314,6 +320,12 @@ mod tests {
     fn inactive_input_session_is_recoverable_but_monitor_loss_is_fatal() {
         assert!(SwitcherError::InputSessionInactive.is_recoverable_input_error());
         assert!(!SwitcherError::SessionMonitorStopped.is_recoverable_input_error());
+    }
+
+    #[test]
+    fn rejected_device_seat_or_identity_waits_for_a_safe_input_backend() {
+        assert!(SwitcherError::InputDeviceSeatMismatch.is_recoverable_input_error());
+        assert!(SwitcherError::InputDeviceIdentityUnverified.is_recoverable_input_error());
     }
 
     #[test]

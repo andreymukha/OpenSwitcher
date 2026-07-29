@@ -3,6 +3,7 @@ use crate::daemon::keyboard::{
     KeyboardController, SharedModifierState, WriterShutdownOutcome,
 };
 use crate::daemon::selected_text::SelectedTextJobRunner;
+use crate::daemon::session_activity::{monotonic_ms, SessionAccessPublication};
 use crate::error::SwitcherError;
 use std::time::{Duration, Instant};
 
@@ -68,8 +69,16 @@ impl InputBackendHandle for ActiveInputBackend {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeyboardInputBackendOpener;
+#[derive(Clone)]
+pub struct KeyboardInputBackendOpener {
+    session_access: SessionAccessPublication,
+}
+
+impl KeyboardInputBackendOpener {
+    pub(crate) fn new(session_access: SessionAccessPublication) -> Self {
+        Self { session_access }
+    }
+}
 
 #[cfg(test)]
 fn finish_prepared_input_backend<Prepared, Active, Dependent, Error>(
@@ -98,7 +107,8 @@ impl InputBackendOpener for KeyboardInputBackendOpener {
         &self,
         shared_modifiers: SharedModifierState,
     ) -> Result<OpenedInputBackend<Self::Backend>, SwitcherError> {
-        let mut prepared_keyboard = KeyboardController::prepare()?;
+        let lease = self.session_access.backend_lease(monotonic_ms())?;
+        let mut prepared_keyboard = KeyboardController::prepare(lease)?;
         let selected_text_runner = match SelectedTextJobRunner::new(
             prepared_keyboard.selection_transport(shared_modifiers),
         ) {

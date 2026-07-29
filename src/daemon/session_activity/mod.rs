@@ -103,7 +103,7 @@ impl SessionAccessPublication {
     }
 
     #[cfg(test)]
-    fn new_for_test(lease_ttl_ms: u64) -> Self {
+    pub(crate) fn new_for_test(lease_ttl_ms: u64) -> Self {
         Self::with_lease_ttl(lease_ttl_ms)
     }
 

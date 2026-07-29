@@ -36,6 +36,7 @@ thiserror = "1.0"
 dirs = "5.0"
 arboard = "3.4"
 libc = "0.2"
+libudev = "0.2"
 nix = { version = "0.26.4", default-features = false, features = [
     "poll",
     "signal",

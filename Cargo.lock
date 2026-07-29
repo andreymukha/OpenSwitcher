@@ -1572,6 +1572,7 @@ dependencies = [
  "ksni",
  "libadwaita",
  "libc",
+ "libudev",
  "nix 0.26.4",
  "serde",
  "tempfile",

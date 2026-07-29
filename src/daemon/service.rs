@@ -1565,12 +1565,14 @@ impl DaemonService {
         let input_snapshot = runtime.input_snapshot_before_grab();
         let shared_modifiers = SharedModifierState::default();
         let signal_publisher = DbusSignalPublisher::spawn(connection);
+        let input_backend =
+            InputBackendLifecycle::new(KeyboardInputBackendOpener::new(session_access.clone()));
         let mut service = Self {
             runtime,
             session_access,
             input_snapshot,
             signal_publisher,
-            input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),
+            input_backend,
             writer_shutdown_latch: WriterShutdownLatch::default(),
             writer_terminal_report: None,
             keyboard: None,

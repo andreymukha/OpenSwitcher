@@ -1,5 +1,9 @@
 use crate::daemon::debug_log::{format_input, try_debug_line, DebugLogKind};
+use crate::daemon::input_device_identity::{
+    verify_input_device, verify_open_device_identity, VerifiedInputDevice,
+};
 use crate::daemon::runtime::RuntimeConfigSnapshot;
+use crate::daemon::session_activity::{monotonic_ms, SessionLease};
 use crate::daemon::switch_logic::CorrectionPlan;
 use crate::daemon::synthetic_input::{
     FrozenPhysicalSnapshot, InputGeneration, OperationControl, OperationId, OperationOutcome,
@@ -26,7 +30,7 @@ use crate::model::{
     UndoKey,
 };
 use crate::system::SystemContextDetector;
-use evdev::{enumerate, Device, InputEvent, Key, LedType};
+use evdev::{Device, InputEvent, Key, LedType};
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -170,6 +174,7 @@ pub struct KeyboardController {
 
 pub struct PreparedKeyboardController {
     controller: KeyboardController,
+    lease: SessionLease,
 }
 
 // Selection keyboard transport
@@ -1465,26 +1470,44 @@ fn take_pointer_click_flags(physical: &AtomicBool, logical: &AtomicBool) -> bool
 
 fn snapshot_then_acquire_grab<Target, Snapshot, Error>(
     target: &mut Target,
+    precheck: impl FnOnce() -> Result<(), Error>,
     snapshot: impl FnOnce(&mut Target) -> Result<Snapshot, Error>,
     acquire_grab: impl FnOnce(&mut Target) -> Result<(), Error>,
+    postcheck: impl FnOnce() -> Result<(), Error>,
+    release_grab: impl FnOnce(&mut Target) -> Result<(), Error>,
 ) -> Result<Snapshot, Error> {
+    precheck()?;
     let snapshot = snapshot(target)?;
     acquire_grab(target)?;
+    if let Err(postcheck_error) = postcheck() {
+        return match release_grab(target) {
+            Ok(()) => Err(postcheck_error),
+            Err(release_error) => Err(release_error),
+        };
+    }
     Ok(snapshot)
 }
 
 impl KeyboardController {
-    pub fn prepare() -> Result<PreparedKeyboardController, SwitcherError> {
-        let keyboard_path = resolve_keyboard_path()?;
-        let pointer_paths = find_pointer_devices(&keyboard_path);
-        let real_device = GrabbedKeyboardDevice::open(keyboard_path)?;
+    pub(crate) fn prepare(
+        lease: SessionLease,
+    ) -> Result<PreparedKeyboardController, SwitcherError> {
+        lease.ensure_current(monotonic_ms())?;
+        if lease.seat() != "seat0" {
+            return Err(SwitcherError::InputDeviceSeatMismatch);
+        }
+
+        let keyboard_device = resolve_keyboard_device(lease.seat())?;
+        let pointer_devices = find_pointer_devices(&keyboard_device.canonical_path, lease.seat())?;
+        let real_device = GrabbedKeyboardDevice::open(keyboard_device)?;
         println!(
             "[INFO] Клавиатура: {}",
             real_device.name().unwrap_or("Unknown")
         );
         let session_type = detect_current_session_type();
-        let mut virtual_device = VirtualKeyboardWriter::new("Open-Switcher Virtual Device")?;
-        let mut pointer_watcher = match PointerWatcher::spawn(pointer_paths) {
+        let mut virtual_device =
+            VirtualKeyboardWriter::new("Open-Switcher Virtual Device", &lease)?;
+        let mut pointer_watcher = match PointerWatcher::spawn(pointer_devices) {
             Ok(watcher) => watcher,
             Err(error) => {
                 let outcome = virtual_device.stop();
@@ -1525,6 +1548,7 @@ impl KeyboardController {
                 input_target_watcher,
                 virtual_device,
             },
+            lease,
         })
     }
 
@@ -1801,8 +1825,11 @@ impl PreparedKeyboardController {
         }
         let caps_lock_active = match snapshot_then_acquire_grab(
             &mut self.controller.real_device,
+            || self.lease.ensure_current(monotonic_ms()),
             |device| Ok::<_, SwitcherError>(device.caps_lock_active().unwrap_or(false)),
             GrabbedKeyboardDevice::grab,
+            || self.lease.ensure_current(monotonic_ms()),
+            GrabbedKeyboardDevice::release_grab,
         ) {
             Ok(caps_lock_active) => caps_lock_active,
             Err(error) => {
@@ -1848,8 +1875,10 @@ fn release_grab_or_close_device<T, E>(
 }
 
 impl GrabbedKeyboardDevice {
-    fn open(path: PathBuf) -> Result<Self, SwitcherError> {
+    fn open(verified: VerifiedInputDevice) -> Result<Self, SwitcherError> {
+        let path = verified.canonical_path.clone();
         let device = Device::open(&path).map_err(|error| map_keyboard_open_error(&path, error))?;
+        verify_open_device_identity(&device, &verified)?;
         Ok(Self {
             path,
             device: Some(device),
@@ -2013,12 +2042,12 @@ fn poll_pointer_device_until_idle(
 }
 
 impl PointerWatcher {
-    fn spawn(paths: Vec<PathBuf>) -> Result<Self, SwitcherError> {
+    fn spawn(devices: Vec<VerifiedInputDevice>) -> Result<Self, SwitcherError> {
         let click_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
 
-        if paths.is_empty() {
+        if devices.is_empty() {
             log_input_debug("pointer-watcher-start", "devices=0 mode=disabled");
             return Ok(Self {
                 click_flag,
@@ -2029,7 +2058,7 @@ impl PointerWatcher {
             });
         }
 
-        let devices = open_pointer_devices(paths);
+        let devices = open_pointer_devices(devices)?;
         if devices.is_empty() {
             log_input_debug(
                 "pointer-watcher-start",
@@ -2374,8 +2403,8 @@ where
 // Virtual keyboard writer
 
 impl VirtualKeyboardWriter {
-    fn new(name: &str) -> Result<Self, SwitcherError> {
-        let device = create_virtual_keyboard(name)?;
+    fn new(name: &str, lease: &SessionLease) -> Result<Self, SwitcherError> {
+        let device = open_uinput_for_session(lease, || create_virtual_keyboard(name))?;
         let generation = allocate_input_generation()?;
         let (command_tx, command_rx) = mpsc::sync_channel(WRITER_QUEUE_CAPACITY);
         let (completion_tx, completion_rx) = mpsc::channel();
@@ -3375,26 +3404,27 @@ fn configured_keyboard_path() -> Option<PathBuf> {
     Some(PathBuf::from(raw))
 }
 
-fn resolve_keyboard_path() -> Result<PathBuf, SwitcherError> {
+fn resolve_keyboard_device(authorized_seat: &str) -> Result<VerifiedInputDevice, SwitcherError> {
     if let Some(path) = configured_keyboard_path() {
+        let verified = verify_input_device(&path, authorized_seat)?;
         log_input_debug(
             "keyboard-detect",
-            &format!("source=env path={}", path.display()),
+            &format!("source=env path={}", verified.canonical_path.display()),
         );
-        return Ok(path);
+        return Ok(verified);
     }
 
-    if let Some(path) = find_keyboard_via_symlinks()? {
-        return Ok(path);
+    if let Some(device) = find_keyboard_via_symlinks(authorized_seat)? {
+        return Ok(device);
     }
 
-    match find_keyboard() {
-        Some(path) => {
+    match find_keyboard(authorized_seat)? {
+        Some(device) => {
             log_input_debug(
                 "keyboard-detect",
-                &format!("source=enumerate path={}", path.display()),
+                &format!("source=enumerate path={}", device.canonical_path.display()),
             );
-            Ok(path)
+            Ok(device)
         }
         None => {
             log_input_debug("keyboard-detect", "source=enumerate result=not-found");
@@ -3403,7 +3433,9 @@ fn resolve_keyboard_path() -> Result<PathBuf, SwitcherError> {
     }
 }
 
-fn find_keyboard_via_symlinks() -> Result<Option<PathBuf>, SwitcherError> {
+fn find_keyboard_via_symlinks(
+    authorized_seat: &str,
+) -> Result<Option<VerifiedInputDevice>, SwitcherError> {
     let search_roots: Vec<&Path> = KEYBOARD_SYMLINK_DIRS.iter().map(Path::new).collect();
     let candidates = collect_keyboard_symlink_candidates_from_dirs(&search_roots);
     log_input_debug(
@@ -3414,21 +3446,40 @@ fn find_keyboard_via_symlinks() -> Result<Option<PathBuf>, SwitcherError> {
     let mut first_access_denied: Option<(PathBuf, io::Error)> = None;
 
     for path in candidates {
-        match Device::open(&path) {
-            Ok(_) => {
+        let verified = match verify_input_device(&path, authorized_seat) {
+            Ok(verified) => verified,
+            Err(SwitcherError::InputDeviceSeatMismatch)
+            | Err(SwitcherError::InputDeviceIdentityUnverified) => continue,
+            Err(SwitcherError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotConnected
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+
+        match Device::open(&verified.canonical_path) {
+            Ok(device) => {
+                verify_open_device_identity(&device, &verified)?;
                 log_input_debug(
                     "keyboard-detect-symlinks",
-                    &format!("result=selected path={}", path.display()),
+                    &format!("result=selected path={}", verified.canonical_path.display()),
                 );
-                return Ok(Some(path));
+                return Ok(Some(verified));
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
                 log_input_debug(
                     "keyboard-detect-symlinks",
-                    &format!("result=access-denied path={} error={error}", path.display()),
+                    &format!(
+                        "result=access-denied path={} error={error}",
+                        verified.canonical_path.display()
+                    ),
                 );
                 if first_access_denied.is_none() {
-                    first_access_denied = Some((path, error));
+                    first_access_denied = Some((verified.canonical_path, error));
                 }
             }
             Err(error) => {
@@ -3481,13 +3532,16 @@ fn map_keyboard_open_error(path: &Path, error: io::Error) -> SwitcherError {
     }
 }
 
-fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<PointerDeviceState> {
+fn open_pointer_devices(
+    verified_devices: Vec<VerifiedInputDevice>,
+) -> Result<Vec<PointerDeviceState>, SwitcherError> {
     let mut devices = Vec::new();
 
-    for path in paths {
-        let Ok(device) = Device::open(&path) else {
+    for verified in verified_devices {
+        let Ok(device) = Device::open(&verified.canonical_path) else {
             continue;
         };
+        verify_open_device_identity(&device, &verified)?;
         if set_nonblocking(&device).is_ok() {
             devices.push(PointerDeviceState {
                 device,
@@ -3496,7 +3550,21 @@ fn open_pointer_devices(paths: Vec<PathBuf>) -> Vec<PointerDeviceState> {
         }
     }
 
-    devices
+    Ok(devices)
+}
+
+fn open_uinput_for_session<T>(
+    lease: &SessionLease,
+    open: impl FnOnce() -> Result<T, SwitcherError>,
+) -> Result<T, SwitcherError> {
+    lease.ensure_current(monotonic_ms())?;
+    if lease.seat() != "seat0" {
+        return Err(SwitcherError::InputDeviceSeatMismatch);
+    }
+
+    let opened = open()?;
+    lease.ensure_current(monotonic_ms())?;
+    Ok(opened)
 }
 
 fn create_virtual_keyboard(name: &str) -> Result<uinput::Device, SwitcherError> {
@@ -3667,8 +3735,55 @@ pub fn undo_key_to_evdev_key(key: UndoKey) -> Key {
     hotkey_trigger_to_evdev_key(HotkeyTrigger::from(key))
 }
 
-fn find_keyboard() -> Option<PathBuf> {
-    for (path, device) in enumerate() {
+fn input_event_candidates() -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir("/dev/input") else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("event"))
+                .is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        })
+        .collect();
+    paths.sort();
+    paths
+}
+
+fn find_keyboard(authorized_seat: &str) -> Result<Option<VerifiedInputDevice>, SwitcherError> {
+    let mut first_access_denied: Option<(PathBuf, io::Error)> = None;
+
+    for path in input_event_candidates() {
+        let verified = match verify_input_device(&path, authorized_seat) {
+            Ok(verified) => verified,
+            Err(SwitcherError::InputDeviceSeatMismatch)
+            | Err(SwitcherError::InputDeviceIdentityUnverified) => continue,
+            Err(SwitcherError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotConnected
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let device = match Device::open(&verified.canonical_path) {
+            Ok(device) => device,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                if first_access_denied.is_none() {
+                    first_access_denied = Some((verified.canonical_path, error));
+                }
+                continue;
+            }
+            Err(_) => continue,
+        };
+        verify_open_device_identity(&device, &verified)?;
+
         let name = device.name().unwrap_or("");
         if name.contains("Virtual") || name.contains("Button") || name.contains("Camera") {
             continue;
@@ -3679,22 +3794,46 @@ fn find_keyboard() -> Option<PathBuf> {
                 && keys.contains(Key::KEY_SPACE)
                 && keys.contains(Key::KEY_A)
             {
-                return Some(path);
+                return Ok(Some(verified));
             }
         }
     }
 
-    None
+    if let Some((path, error)) = first_access_denied {
+        return Err(map_keyboard_open_error(&path, error));
+    }
+    Ok(None)
 }
 
-fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+fn find_pointer_devices(
+    excluded_keyboard_path: &Path,
+    authorized_seat: &str,
+) -> Result<Vec<VerifiedInputDevice>, SwitcherError> {
+    let mut devices = Vec::new();
 
-    for (path, device) in enumerate() {
-        if &path == excluded_keyboard_path {
+    for path in input_event_candidates() {
+        let verified = match verify_input_device(&path, authorized_seat) {
+            Ok(verified) => verified,
+            Err(SwitcherError::InputDeviceSeatMismatch)
+            | Err(SwitcherError::InputDeviceIdentityUnverified) => continue,
+            Err(SwitcherError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotConnected
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if verified.canonical_path == excluded_keyboard_path {
             continue;
         }
 
+        let Ok(device) = Device::open(&verified.canonical_path) else {
+            continue;
+        };
+        verify_open_device_identity(&device, &verified)?;
         let name = device.name().unwrap_or("");
         if name.contains("Camera") {
             continue;
@@ -3713,11 +3852,11 @@ fn find_pointer_devices(excluded_keyboard_path: &PathBuf) -> Vec<PathBuf> {
             || keys.contains(Key::BTN_TOOL_FINGER)
             || keys.contains(Key::BTN_TOOL_DOUBLETAP)
         {
-            paths.push(path);
+            devices.push(verified);
         }
     }
 
-    paths
+    Ok(devices)
 }
 
 fn is_pointer_click(key: Key) -> bool {
@@ -6189,6 +6328,9 @@ impl SharedModifierState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::session_activity::{
+        AuthorizedSession, SessionAccessPublication, SessionDecision,
+    };
     use crate::model::{default_manual_correction_hotkey, default_selected_text_hotkey};
     use crate::model::{DesktopEnvironment, DistroKind, SystemContext};
     use std::cell::{Cell, RefCell};
@@ -6418,6 +6560,111 @@ mod tests {
     }
 
     #[test]
+    fn activation_rejects_changed_session_before_physical_grab() {
+        let publication = SessionAccessPublication::new_for_test(3_000);
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c2", "seat0")),
+            monotonic_ms(),
+        );
+        let lease = publication.backend_lease(monotonic_ms()).unwrap();
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c8", "seat0")),
+            monotonic_ms(),
+        );
+        let trace = RefCell::new(Vec::new());
+        let mut target = ();
+
+        let result = snapshot_then_acquire_grab(
+            &mut target,
+            || {
+                trace.borrow_mut().push("precheck");
+                lease.ensure_current(monotonic_ms())
+            },
+            |_| Ok::<_, SwitcherError>(false),
+            |_| {
+                trace.borrow_mut().push("grab");
+                Ok::<_, SwitcherError>(())
+            },
+            || {
+                trace.borrow_mut().push("postcheck");
+                lease.ensure_current(monotonic_ms())
+            },
+            |_| {
+                trace.borrow_mut().push("release");
+                Ok::<_, SwitcherError>(())
+            },
+        );
+
+        assert!(matches!(result, Err(SwitcherError::InputSessionInactive)));
+        assert_eq!(*trace.borrow(), vec!["precheck"]);
+    }
+
+    #[test]
+    fn activation_closes_grab_when_generation_changes_after_ioctl() {
+        let publication = SessionAccessPublication::new_for_test(3_000);
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c2", "seat0")),
+            monotonic_ms(),
+        );
+        let lease = publication.backend_lease(monotonic_ms()).unwrap();
+        let trace = RefCell::new(Vec::new());
+        let mut target = ();
+
+        let result = snapshot_then_acquire_grab(
+            &mut target,
+            || {
+                trace.borrow_mut().push("precheck");
+                lease.ensure_current(monotonic_ms())
+            },
+            |_| Ok::<_, SwitcherError>(false),
+            |_| {
+                trace.borrow_mut().push("grab");
+                Ok::<_, SwitcherError>(())
+            },
+            || {
+                trace.borrow_mut().push("postcheck");
+                publication.publish(
+                    SessionDecision::Authorized(AuthorizedSession::new("c8", "seat0")),
+                    monotonic_ms(),
+                );
+                lease.ensure_current(monotonic_ms())
+            },
+            |_| {
+                trace.borrow_mut().push("release");
+                Ok::<_, SwitcherError>(())
+            },
+        );
+
+        assert!(matches!(result, Err(SwitcherError::InputSessionInactive)));
+        assert_eq!(
+            *trace.borrow(),
+            vec!["precheck", "grab", "postcheck", "release"]
+        );
+    }
+
+    #[test]
+    fn non_seat_zero_never_opens_uinput() {
+        let publication = SessionAccessPublication::new_for_test(3_000);
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c8", "seat1")),
+            monotonic_ms(),
+        );
+        let lease = publication.backend_lease(monotonic_ms()).unwrap();
+        let opens = Cell::new(0);
+
+        let result = open_uinput_for_session(&lease, || {
+            opens.set(opens.get() + 1);
+            Ok::<_, SwitcherError>(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputDeviceSeatMismatch)
+        ));
+        assert_eq!(opens.get(), 0);
+    }
+
+    #[test]
     fn runtime_input_watcher_health_names_dead_required_worker() {
         assert!(matches!(
             ensure_input_watchers_ready(false, true),
@@ -6447,6 +6694,7 @@ mod tests {
         };
         let caps_lock_active = snapshot_then_acquire_grab(
             &mut keyboard,
+            || Ok::<_, SwitcherError>(()),
             |keyboard| {
                 keyboard.phases.push("caps-snapshot");
                 Ok::<_, SwitcherError>(keyboard.caps_lock_active)
@@ -6455,6 +6703,8 @@ mod tests {
                 keyboard.phases.push("grab");
                 Ok::<_, SwitcherError>(())
             },
+            || Ok::<_, SwitcherError>(()),
+            |_| Ok::<_, SwitcherError>(()),
         )
         .unwrap();
 
@@ -11562,9 +11812,11 @@ mod tests {
 
     #[test]
     fn pointer_watcher_with_no_readable_devices_is_disabled_without_false_worker_ready() {
-        let watcher = PointerWatcher::spawn(vec![PathBuf::from(
-            "/openswitcher-test/nonexistent-pointer-device",
-        )])
+        let watcher = PointerWatcher::spawn(vec![VerifiedInputDevice {
+            canonical_path: PathBuf::from("/openswitcher-test/nonexistent-pointer-device"),
+            devnum: 0,
+            seat: Arc::from("seat0"),
+        }])
         .unwrap();
 
         assert!(!watcher.required);

@@ -188,6 +188,7 @@ pub struct SelectionKeyboardTransport {
 
 #[derive(Clone)]
 struct VirtualKeyboardHandle {
+    session: SessionLease,
     command_tx: mpsc::SyncSender<WriterCommand>,
     alive: Arc<AtomicBool>,
     stop_requested: Arc<AtomicBool>,
@@ -418,6 +419,7 @@ enum WriterTransaction {
 
 #[derive(Clone)]
 struct WriterTransactionControl {
+    session: SessionLease,
     request_id: u64,
     deadline: Instant,
     state: Arc<AtomicU8>,
@@ -480,6 +482,7 @@ impl WriterTransactionControl {
         terminal_gate: Arc<Mutex<()>>,
     ) -> Self {
         Self::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             request_id,
             timeout,
             failure_request_id,
@@ -489,6 +492,7 @@ impl WriterTransactionControl {
     }
 
     fn new_with_writer_state(
+        session: SessionLease,
         request_id: u64,
         timeout: Duration,
         failure_request_id: Arc<AtomicU64>,
@@ -496,6 +500,7 @@ impl WriterTransactionControl {
         terminal_gate: Arc<Mutex<()>>,
     ) -> Self {
         Self {
+            session,
             request_id,
             deadline: Instant::now()
                 .checked_add(timeout)
@@ -512,6 +517,18 @@ impl WriterTransactionControl {
     #[cfg(test)]
     fn with_timeout_for_test(request_id: u64, timeout: Duration) -> Self {
         Self::new(request_id, timeout, Arc::new(AtomicU64::new(0)))
+    }
+
+    #[cfg(test)]
+    fn with_session_for_test(session: SessionLease) -> Self {
+        Self::new_with_writer_state(
+            session,
+            1,
+            Duration::from_secs(1),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(())),
+        )
     }
 
     fn request_id(&self) -> u64 {
@@ -757,6 +774,7 @@ impl WriterTransactionControl {
     }
 
     fn ensure_active_while_terminal_gate_is_held(&self) -> Result<(), SwitcherError> {
+        self.session.ensure_current(monotonic_ms())?;
         if self.stop_requested.load(Ordering::SeqCst) {
             return Err(SwitcherError::VirtualKeyboardWriterDisconnected);
         }
@@ -783,6 +801,7 @@ impl WriterTransactionControl {
                 request_id: self.request_id(),
             });
         }
+        self.session.ensure_current(monotonic_ms())?;
         Ok(())
     }
 
@@ -1468,6 +1487,10 @@ fn take_pointer_click_flags(physical: &AtomicBool, logical: &AtomicBool) -> bool
     physical || logical
 }
 
+fn session_lease_health_error(lease: &SessionLease) -> Option<SwitcherError> {
+    lease.ensure_current(monotonic_ms()).err()
+}
+
 fn snapshot_then_acquire_grab<Target, Snapshot, Error>(
     target: &mut Target,
     precheck: impl FnOnce() -> Result<(), Error>,
@@ -1773,6 +1796,10 @@ impl KeyboardController {
 
     pub fn writer_health_error(&self) -> Option<SwitcherError> {
         self.virtual_device.health_error()
+    }
+
+    pub(crate) fn input_session_health_error(&self) -> Option<SwitcherError> {
+        session_lease_health_error(&self.virtual_device.handle.session)
     }
 
     pub fn input_worker_health_error(&self) -> Option<SwitcherError> {
@@ -2421,6 +2448,7 @@ impl VirtualKeyboardWriter {
         let worker_transaction_terminal_gate = Arc::clone(&transaction_terminal_gate);
         let worker_guardian_health = Arc::clone(&guardian_health);
         let worker_ready_alive = Arc::clone(&alive);
+        let worker_session = lease.clone();
 
         let join_handle = thread::spawn(move || {
             run_writer_thread_with_terminal_report(device, generation, exit_tx, |device| {
@@ -2429,6 +2457,7 @@ impl VirtualKeyboardWriter {
                     run_virtual_keyboard_writer_loop(
                         device,
                         generation,
+                        worker_session,
                         command_rx,
                         completion_tx,
                         worker_transaction_failure_request_id,
@@ -2479,6 +2508,7 @@ impl VirtualKeyboardWriter {
 
         let mut writer = Self {
             handle: VirtualKeyboardHandle {
+                session: lease.clone(),
                 command_tx,
                 alive,
                 stop_requested,
@@ -2777,6 +2807,7 @@ impl VirtualKeyboardWriter {
         }
         let request_id = take_next_nonzero_request_id(&mut self.next_request_id);
         let control = WriterTransactionControl::new_with_writer_state(
+            self.handle.session.clone(),
             request_id,
             timeout.min(MAX_TRANSACTION_TIMEOUT),
             Arc::clone(&self.handle.transaction_failure_request_id),
@@ -3131,6 +3162,7 @@ impl VirtualKeyboardHandle {
         }
         let request_id = next_writer_transaction_request_id();
         let control = WriterTransactionControl::new_with_writer_state(
+            self.session.clone(),
             request_id,
             timeout,
             Arc::clone(&self.transaction_failure_request_id),
@@ -4542,6 +4574,7 @@ impl CinnamonGuardianReplay {
     fn type_key(
         &mut self,
         key: Key,
+        session: &SessionLease,
         failure_request_id: &Arc<AtomicU64>,
         stop_requested: &Arc<AtomicBool>,
         terminal_gate: &Arc<Mutex<()>>,
@@ -4567,11 +4600,13 @@ impl CinnamonGuardianReplay {
             FrozenPhysicalSnapshot::default(),
             failure_latch,
         );
-        let execution =
-            authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)
-                .and_then(|_| {
-                    replay_synthetic_stroke(&mut operation, key, false, Duration::ZERO, None)
-                });
+        let execution = authorize_writer_mutation_start(
+            session,
+            failure_request_id,
+            stop_requested,
+            terminal_gate,
+        )
+        .and_then(|_| replay_synthetic_stroke(&mut operation, key, false, Duration::ZERO, None));
         finish_guardian_synthetic_operation(
             operation,
             &mut session_modifiers,
@@ -4615,7 +4650,12 @@ fn validate_xtest_key_before_mutation(
     match (control, failure_request_id, stop_requested, terminal_gate) {
         (Some(control), _, _, _) => control.authorize_mutation_start()?,
         (None, Some(failure_request_id), Some(stop_requested), Some(terminal_gate)) => {
-            authorize_writer_mutation_start(failure_request_id, stop_requested, terminal_gate)?;
+            authorize_writer_mutation_start(
+                &SessionLease::always_authorized_for_test(),
+                failure_request_id,
+                stop_requested,
+                terminal_gate,
+            )?;
         }
         (None, Some(failure_request_id), _, None) => {
             ensure_writer_not_failed(failure_request_id)?;
@@ -5827,11 +5867,14 @@ fn ensure_writer_not_failed(failure_request_id: &AtomicU64) -> Result<(), Switch
 }
 
 fn authorize_writer_mutation_start(
+    session: &SessionLease,
     failure_request_id: &AtomicU64,
     stop_requested: &AtomicBool,
     terminal_gate: &Mutex<()>,
 ) -> Result<(), SwitcherError> {
-    ensure_writer_running(failure_request_id, stop_requested, terminal_gate)
+    session.ensure_current(monotonic_ms())?;
+    ensure_writer_running(failure_request_id, stop_requested, terminal_gate)?;
+    session.ensure_current(monotonic_ms())
 }
 
 fn ensure_writer_running(
@@ -6036,6 +6079,7 @@ fn forward_physical_event_with_commit<R: UinputRawSink>(
 fn run_virtual_keyboard_writer_loop(
     device: uinput::Device,
     generation: crate::daemon::synthetic_input::InputGeneration,
+    session: SessionLease,
     command_rx: mpsc::Receiver<WriterCommand>,
     completion_tx: mpsc::Sender<ManualCurrentWordCompletion>,
     failure_request_id: Arc<AtomicU64>,
@@ -6075,6 +6119,7 @@ fn run_virtual_keyboard_writer_loop(
                         value,
                     } => {
                         authorize_writer_mutation_start(
+                            &session,
                             &failure_request_id,
                             &stop_requested,
                             &terminal_gate,
@@ -6098,6 +6143,7 @@ fn run_virtual_keyboard_writer_loop(
                             CinnamonX11XtestRuntime::Available(replay) => {
                                 let result = replay.type_key(
                                     key,
+                                    &session,
                                     &failure_request_id,
                                     &stop_requested,
                                     &terminal_gate,
@@ -6126,6 +6172,7 @@ fn run_virtual_keyboard_writer_loop(
                         };
                         finish_fast_separator_replay(xtest_attempt, || {
                             authorize_writer_mutation_start(
+                                &session,
                                 &failure_request_id,
                                 &stop_requested,
                                 &terminal_gate,
@@ -6329,7 +6376,7 @@ impl SharedModifierState {
 mod tests {
     use super::*;
     use crate::daemon::session_activity::{
-        AuthorizedSession, SessionAccessPublication, SessionDecision,
+        AuthorizedSession, SessionAccessPublication, SessionDecision, SessionUnavailableReason,
     };
     use crate::model::{default_manual_correction_hotkey, default_selected_text_hotkey};
     use crate::model::{DesktopEnvironment, DistroKind, SystemContext};
@@ -6365,6 +6412,16 @@ mod tests {
         }
     }
 
+    fn authorized_session_lease() -> (SessionAccessPublication, SessionLease) {
+        let publication = SessionAccessPublication::new_for_test(3_000);
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c2", "seat0")),
+            monotonic_ms(),
+        );
+        let lease = publication.backend_lease(monotonic_ms()).unwrap();
+        (publication, lease)
+    }
+
     fn test_writer_handle(
         capacity: usize,
         alive: bool,
@@ -6372,6 +6429,7 @@ mod tests {
         let (command_tx, command_rx) = mpsc::sync_channel(capacity);
         (
             VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(alive)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -6557,6 +6615,69 @@ mod tests {
             })
         ));
         assert!(ensure_input_dependencies_ready(true, true, true).is_ok());
+    }
+
+    #[test]
+    fn session_change_denies_next_normal_mutation() {
+        let (publication, lease) = authorized_session_lease();
+        let control = WriterTransactionControl::with_session_for_test(lease);
+        publication.publish(
+            SessionDecision::Unauthorized(SessionUnavailableReason::NoCandidate),
+            monotonic_ms(),
+        );
+
+        assert!(matches!(
+            control.authorize_mutation_start(),
+            Err(SwitcherError::InputSessionInactive)
+        ));
+    }
+
+    #[test]
+    fn session_change_still_allows_cleanup_release() {
+        let (publication, lease) = authorized_session_lease();
+        let control = WriterTransactionControl::with_session_for_test(lease);
+        control.authorize_mutation_start().unwrap();
+        publication.publish(
+            SessionDecision::Unauthorized(SessionUnavailableReason::NoCandidate),
+            monotonic_ms(),
+        );
+
+        assert!(control.authorize_cleanup_mutation_start().is_ok());
+    }
+
+    #[test]
+    fn session_change_remains_visible_to_backend_after_fast_reauthorization() {
+        let (publication, lease) = authorized_session_lease();
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c8", "seat0")),
+            monotonic_ms(),
+        );
+
+        assert!(publication.health_error(monotonic_ms()).is_none());
+        assert!(matches!(
+            session_lease_health_error(&lease),
+            Some(SwitcherError::InputSessionInactive)
+        ));
+    }
+
+    #[test]
+    fn fast_physical_forward_is_denied_after_epoch_change() {
+        let (publication, lease) = authorized_session_lease();
+        let failure = AtomicU64::new(0);
+        let stop_requested = AtomicBool::new(false);
+        let terminal_gate = Mutex::new(());
+        let backend_calls = Cell::new(0);
+        publication.publish(
+            SessionDecision::Unauthorized(SessionUnavailableReason::NoCandidate),
+            monotonic_ms(),
+        );
+
+        let result =
+            authorize_writer_mutation_start(&lease, &failure, &stop_requested, &terminal_gate)
+                .map(|()| backend_calls.set(backend_calls.get() + 1));
+
+        assert!(matches!(result, Err(SwitcherError::InputSessionInactive)));
+        assert_eq!(backend_calls.get(), 0);
     }
 
     #[test]
@@ -9317,6 +9438,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: alive.clone(),
                 stop_requested: Arc::clone(&stop_requested),
@@ -9368,6 +9490,7 @@ mod tests {
         let terminal_gate = Arc::new(Mutex::new(()));
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::clone(&alive),
                 stop_requested: Arc::clone(&stop_requested),
@@ -9385,6 +9508,7 @@ mod tests {
             pending_manual_current_word: None,
         };
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             109,
             Duration::from_secs(1),
             Arc::clone(&failure),
@@ -9392,7 +9516,13 @@ mod tests {
             Arc::clone(&terminal_gate),
         );
         control.authorize_mutation_start().unwrap();
-        authorize_writer_mutation_start(&failure, &stop_requested, &terminal_gate).unwrap();
+        authorize_writer_mutation_start(
+            &SessionLease::always_authorized_for_test(),
+            &failure,
+            &stop_requested,
+            &terminal_gate,
+        )
+        .unwrap();
 
         writer.request_stop();
 
@@ -9403,7 +9533,12 @@ mod tests {
             Err(SwitcherError::VirtualKeyboardWriterDisconnected)
         ));
         assert!(matches!(
-            authorize_writer_mutation_start(&failure, &stop_requested, &terminal_gate),
+            authorize_writer_mutation_start(
+                &SessionLease::always_authorized_for_test(),
+                &failure,
+                &stop_requested,
+                &terminal_gate,
+            ),
             Err(SwitcherError::VirtualKeyboardWriterDisconnected)
         ));
     }
@@ -9419,11 +9554,16 @@ mod tests {
         }
         let backend_calls = Cell::new(0);
 
-        let result = authorize_writer_mutation_start(&failure, &stop_requested, &terminal_gate)
-            .and_then(|_| {
-                backend_calls.set(backend_calls.get() + 1);
-                Ok(())
-            });
+        let result = authorize_writer_mutation_start(
+            &SessionLease::always_authorized_for_test(),
+            &failure,
+            &stop_requested,
+            &terminal_gate,
+        )
+        .and_then(|_| {
+            backend_calls.set(backend_calls.get() + 1);
+            Ok(())
+        });
 
         assert!(matches!(
             result,
@@ -9444,6 +9584,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: alive.clone(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -9494,6 +9635,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: alive.clone(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -9539,6 +9681,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: alive.clone(),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -9593,10 +9736,12 @@ mod tests {
         let worker_stop_requested = Arc::clone(&stop_requested);
         let worker_failure = Arc::clone(&failure);
         let worker_terminal_gate = Arc::clone(&terminal_gate);
+        let worker_session = SessionLease::always_authorized_for_test();
         let join_handle = thread::spawn(move || {
             let _keep_receiver_alive = command_rx;
             run_writer_thread_with_exit_notification((), exit_tx, |_| {
                 authorize_writer_mutation_start(
+                    &worker_session,
                     &worker_failure,
                     &worker_stop_requested,
                     &worker_terminal_gate,
@@ -9608,6 +9753,7 @@ mod tests {
         });
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive,
                 stop_requested,
@@ -9681,6 +9827,7 @@ mod tests {
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -9725,6 +9872,7 @@ mod tests {
         let worker_stop_requested = Arc::clone(&stop_requested);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested,
@@ -9827,6 +9975,7 @@ mod tests {
         let worker_stop_requested = Arc::clone(&stop_requested);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested,
@@ -9868,6 +10017,7 @@ mod tests {
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -9912,6 +10062,7 @@ mod tests {
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -9965,6 +10116,7 @@ mod tests {
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -10185,6 +10337,7 @@ mod tests {
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(false)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -10232,6 +10385,7 @@ mod tests {
         let (exit_tx, exit_rx) = mpsc::sync_channel(1);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(false)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -10284,6 +10438,7 @@ mod tests {
         let worker_stop_requested = Arc::clone(&stop_requested);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(false)),
                 stop_requested,
@@ -10958,6 +11113,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let terminal_gate = Arc::new(Mutex::new(()));
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             204,
             Duration::from_secs(1),
             Arc::new(AtomicU64::new(0)),
@@ -11015,6 +11171,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let terminal_gate = Arc::new(Mutex::new(()));
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             107,
             Duration::from_millis(200),
             failure,
@@ -11177,6 +11334,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let terminal_gate = Arc::new(Mutex::new(()));
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             108,
             Duration::from_secs(1),
             failure,
@@ -11198,6 +11356,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let terminal_gate = Arc::new(Mutex::new(()));
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             110,
             Duration::from_secs(1),
             Arc::clone(&failure),
@@ -11228,6 +11387,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let terminal_gate = Arc::new(Mutex::new(()));
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             111,
             Duration::from_secs(1),
             Arc::clone(&failure),
@@ -12067,6 +12227,7 @@ mod tests {
         let (_completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12138,6 +12299,7 @@ mod tests {
         let (_completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12186,6 +12348,7 @@ mod tests {
         let (completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12248,6 +12411,7 @@ mod tests {
         let (completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12319,6 +12483,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::clone(&alive),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12392,6 +12557,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(true));
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::clone(&alive),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12679,6 +12845,7 @@ mod tests {
         let (_completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12723,6 +12890,7 @@ mod tests {
         let worker_alive = Arc::clone(&keep_receiver_alive);
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12773,6 +12941,7 @@ mod tests {
         let (_completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx: _command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),
@@ -12805,6 +12974,7 @@ mod tests {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let terminal_gate = Arc::new(Mutex::new(()));
         let control = WriterTransactionControl::new_with_writer_state(
+            SessionLease::always_authorized_for_test(),
             221,
             Duration::from_secs(1),
             Arc::clone(&failure_request_id),
@@ -12813,6 +12983,7 @@ mod tests {
         );
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested,
@@ -12858,6 +13029,7 @@ mod tests {
         let (completion_tx, completion_rx) = mpsc::channel();
         let mut writer = VirtualKeyboardWriter {
             handle: VirtualKeyboardHandle {
+                session: SessionLease::always_authorized_for_test(),
                 command_tx,
                 alive: Arc::new(AtomicBool::new(true)),
                 stop_requested: Arc::new(AtomicBool::new(false)),

@@ -25,7 +25,10 @@ fn runtime_failure_recovery_state(error: &SwitcherError) -> Option<InputBackendS
     match error {
         SwitcherError::KeyboardNotFound
         | SwitcherError::KeyboardAccessDenied { .. }
-        | SwitcherError::UinputAccessDenied { .. } => {
+        | SwitcherError::UinputAccessDenied { .. }
+        | SwitcherError::InputSessionInactive
+        | SwitcherError::InputDeviceSeatMismatch
+        | SwitcherError::InputDeviceIdentityUnverified => {
             Some(InputBackendState::WaitingForInputAccess)
         }
         SwitcherError::InputWorkerDisconnected { .. } => Some(InputBackendState::Recovering),
@@ -673,6 +676,35 @@ mod tests {
 
         assert_eq!(lifecycle.state(), InputBackendState::Recovering);
         assert!(lifecycle.retry_deadline().is_some());
+    }
+
+    #[test]
+    fn session_deactivation_enters_waiting_for_input_access() {
+        assert_eq!(
+            runtime_failure_recovery_state(&SwitcherError::InputSessionInactive),
+            Some(InputBackendState::WaitingForInputAccess)
+        );
+    }
+
+    #[test]
+    fn reactivation_returns_lifecycle_to_ready_after_session_wait() {
+        let opener = FakeOpener {
+            outcome: FakeOutcome::Ok {
+                shutdowns: Rc::new(RefCell::new(0)),
+                readiness: ready_readiness(),
+                shutdown_outcome: WriterShutdownOutcome::Stopped,
+            },
+        };
+        let mut lifecycle = InputBackendLifecycle::new(opener);
+        lifecycle.mark_backend_ready(ready_readiness());
+        assert!(
+            lifecycle.record_runtime_failure(&SwitcherError::InputSessionInactive, Instant::now())
+        );
+        assert_eq!(lifecycle.state(), InputBackendState::WaitingForInputAccess);
+
+        lifecycle.mark_backend_ready(ready_readiness());
+
+        assert_eq!(lifecycle.state(), InputBackendState::Ready);
     }
 
     #[test]

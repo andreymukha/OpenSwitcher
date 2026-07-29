@@ -16,7 +16,7 @@ use crate::daemon::keyboard::{
 };
 use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
-use crate::daemon::session_activity::SessionAccessPublication;
+use crate::daemon::session_activity::{monotonic_ms, SessionAccessPublication};
 use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
     should_switch, CorrectionPlan, Keystroke,
@@ -461,6 +461,18 @@ fn route_runtime_health_failure<E>(
         Ok(true) => Ok(()),
         Ok(false) => Err(error),
         Err(recovery_error) => Err(recovery_error),
+    }
+}
+
+fn active_backend_session_health_error(
+    session_access: &SessionAccessPublication,
+    backend_active: bool,
+    now_ms: u64,
+) -> Option<SwitcherError> {
+    match session_access.health_error(now_ms) {
+        Some(error @ SwitcherError::SessionMonitorStopped) => Some(error),
+        Some(error) if backend_active => Some(error),
+        _ => None,
     }
 }
 
@@ -1837,6 +1849,23 @@ impl DaemonService {
     }
 
     fn ensure_input_backend_healthy(&mut self) -> Result<(), SwitcherError> {
+        let backend_active = self.keyboard.is_some() || self.selected_text_runner.is_some();
+        if let Some(error) = active_backend_session_health_error(
+            &self.session_access,
+            backend_active,
+            monotonic_ms(),
+        ) {
+            log_input_debug("input-session-health-error", &format!("error={error}"));
+            return Err(error);
+        }
+        if let Some(error) = self
+            .keyboard
+            .as_ref()
+            .and_then(KeyboardController::input_session_health_error)
+        {
+            log_input_debug("input-session-lease-error", &format!("error={error}"));
+            return Err(error);
+        }
         self.ensure_writer_healthy()?;
         if let Some(error) = self
             .keyboard
@@ -3505,7 +3534,12 @@ impl DaemonService {
                 succeeded
             },
             |service| {
-                service.reset_transient_input_state("input-backend-unavailable");
+                let reset_reason = if matches!(error, SwitcherError::InputSessionInactive) {
+                    "input-session-changed"
+                } else {
+                    "input-backend-unavailable"
+                };
+                service.reset_transient_input_state(reset_reason);
                 let transitioned = service.input_backend.record_runtime_failure(error, now);
                 debug_assert!(transitioned);
             },
@@ -3655,7 +3689,10 @@ impl DaemonService {
 }
 
 fn writer_terminal_report_requires_fail_stop(report: &WriterTerminalReport) -> bool {
-    report.primary.is_some()
+    report
+        .primary
+        .as_ref()
+        .is_some_and(|error| !matches!(error, SwitcherError::InputSessionInactive))
         || report.cleanup.is_some()
         || matches!(
             report.proof,
@@ -3730,6 +3767,9 @@ pub(crate) fn should_invalidate_for_wayland_focus_switch_shortcut(
 mod tests {
     use super::*;
     use crate::daemon::runtime::ConfigService;
+    use crate::daemon::session_activity::{
+        monotonic_ms, AuthorizedSession, SessionDecision, SessionUnavailableReason,
+    };
     use crate::model::{SelectedTextHotkey, SessionType, UndoKey};
     use evdev::Key;
     use std::cell::Cell;
@@ -4096,6 +4136,96 @@ mod tests {
         assert!(recovered);
         assert!(state.recovering);
         assert_eq!(state.trace, vec!["shutdown", "recovering"]);
+    }
+
+    #[test]
+    fn session_deactivation_releases_backend_before_resetting_recovery_state() {
+        #[derive(Default)]
+        struct State {
+            trace: Vec<&'static str>,
+        }
+
+        let mut state = State {
+            trace: vec!["admission-closed"],
+        };
+        let recovered = recover_runtime_failure_after_backend_shutdown(
+            &mut state,
+            &SwitcherError::InputSessionInactive,
+            true,
+            |state| {
+                state.trace.extend(["shutdown", "ungrab"]);
+                WriterShutdownOutcome::Stopped
+            },
+            |_| true,
+            |state| state.trace.extend(["context-reset", "waiting"]),
+        )
+        .unwrap();
+
+        assert!(recovered);
+        assert_eq!(
+            state.trace,
+            vec![
+                "admission-closed",
+                "shutdown",
+                "ungrab",
+                "context-reset",
+                "waiting"
+            ]
+        );
+    }
+
+    #[test]
+    fn inactive_session_health_is_routed_only_while_backend_is_active() {
+        let publication = SessionAccessPublication::new_for_test(3_000);
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new("c2", "seat0")),
+            monotonic_ms(),
+        );
+        publication.publish(
+            SessionDecision::Unauthorized(SessionUnavailableReason::NoCandidate),
+            monotonic_ms(),
+        );
+
+        assert!(matches!(
+            active_backend_session_health_error(&publication, true, monotonic_ms()),
+            Some(SwitcherError::InputSessionInactive)
+        ));
+        assert!(active_backend_session_health_error(&publication, false, monotonic_ms()).is_none());
+    }
+
+    #[test]
+    fn stopped_session_monitor_is_fatal_even_without_an_active_backend() {
+        let publication = SessionAccessPublication::new_for_test(3_000);
+        publication.mark_worker_stopped();
+
+        assert!(matches!(
+            active_backend_session_health_error(&publication, false, monotonic_ms()),
+            Some(SwitcherError::SessionMonitorStopped)
+        ));
+    }
+
+    #[test]
+    fn old_epoch_fetched_tail_is_accounted_but_never_replayed() {
+        let mut old_epoch = VecDeque::from([sequenced_deferred_event(41, Key::KEY_A, 1)]);
+
+        let report = reconcile_fetched_tail(&mut old_epoch, "input-session-changed");
+
+        assert!(old_epoch.is_empty());
+        assert_eq!(report.reconciled, 1);
+        assert_eq!(report.sequence_ids, vec![41]);
+    }
+
+    #[test]
+    fn session_invalidation_writer_exit_is_recoverable_with_clean_terminal_proof() {
+        let report = WriterTerminalReport {
+            primary: Some(SwitcherError::InputSessionInactive),
+            cleanup: None,
+            proof: crate::daemon::synthetic_input::TerminalProof::OwnerGenerationDestroyed {
+                generation: 17,
+            },
+        };
+
+        assert!(!writer_terminal_report_requires_fail_stop(&report));
     }
 
     #[test]

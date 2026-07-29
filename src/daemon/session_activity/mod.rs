@@ -225,6 +225,21 @@ pub(crate) struct SessionLease {
 }
 
 impl SessionLease {
+    #[cfg(test)]
+    pub(crate) fn always_authorized_for_test() -> Self {
+        let publication = SessionAccessPublication::new_for_test(u64::MAX);
+        publication.publish(
+            SessionDecision::Authorized(AuthorizedSession::new(
+                "openswitcher-test-session",
+                "seat0",
+            )),
+            monotonic_ms(),
+        );
+        publication
+            .backend_lease(monotonic_ms())
+            .expect("test session lease must be authorized")
+    }
+
     pub(crate) fn ensure_current(&self, now_ms: u64) -> Result<(), SwitcherError> {
         self.publication.ensure_available(now_ms)?;
         if self.publication.inner.generation.load(Ordering::Acquire) != self.generation {

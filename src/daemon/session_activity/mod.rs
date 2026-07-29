@@ -1,9 +1,19 @@
+mod logind;
+
 use crate::error::SwitcherError;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::RwLock;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 const SESSION_LEASE_TTL_MS: u64 = 3_000;
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const SESSION_WAIT_SLICE: Duration = Duration::from_millis(50);
+const SESSION_RECONNECT_INITIAL: Duration = Duration::from_millis(100);
+const SESSION_RECONNECT_MAX: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SessionRecord {
@@ -236,6 +246,292 @@ impl SessionLease {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionSourceEvent {
+    Changed,
+    Timeout,
+}
+
+trait SessionSource: Send {
+    fn subscribe(&mut self) -> Result<(), SwitcherError>;
+    fn snapshot(&mut self, uid: u32) -> Result<Vec<SessionRecord>, SwitcherError>;
+    fn wait_for_change(&mut self, timeout: Duration) -> Result<SessionSourceEvent, SwitcherError>;
+}
+
+#[derive(Clone, Copy)]
+struct MonitorTiming {
+    refresh_interval: Duration,
+    wait_slice: Duration,
+    reconnect_initial: Duration,
+    reconnect_max: Duration,
+}
+
+impl Default for MonitorTiming {
+    fn default() -> Self {
+        Self {
+            refresh_interval: SESSION_REFRESH_INTERVAL,
+            wait_slice: SESSION_WAIT_SLICE,
+            reconnect_initial: SESSION_RECONNECT_INITIAL,
+            reconnect_max: SESSION_RECONNECT_MAX,
+        }
+    }
+}
+
+pub(crate) struct SessionActivityMonitor {
+    publication: SessionAccessPublication,
+    stop_tx: async_channel::Sender<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl SessionActivityMonitor {
+    pub(crate) fn start() -> Result<Self, SwitcherError> {
+        let source = Box::new(logind::LogindSessionSource::new());
+        let uid = nix::unistd::Uid::effective().as_raw();
+        Self::spawn(source, uid, MonitorTiming::default())
+    }
+
+    #[cfg(test)]
+    fn start_with_source_for_test(
+        source: Box<dyn SessionSource>,
+        uid: u32,
+        timing: MonitorTiming,
+    ) -> Result<Self, SwitcherError> {
+        Self::spawn(source, uid, timing)
+    }
+
+    fn spawn(
+        source: Box<dyn SessionSource>,
+        uid: u32,
+        timing: MonitorTiming,
+    ) -> Result<Self, SwitcherError> {
+        let publication = SessionAccessPublication::new();
+        let worker_publication = publication.clone();
+        let (stop_tx, stop_rx) = async_channel::bounded(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let join = thread::Builder::new()
+            .name("openswitcher-session-activity".to_owned())
+            .spawn(move || {
+                run_session_monitor(source, uid, timing, worker_publication, stop_rx, ready_tx)
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                publication,
+                stop_tx,
+                join: Some(join),
+            }),
+            Ok(Err(error)) => {
+                let _ = join.join();
+                Err(error)
+            }
+            Err(error) => {
+                let _ = join.join();
+                Err(std::io::Error::other(format!(
+                    "session activity monitor stopped before startup completed: {error}"
+                ))
+                .into())
+            }
+        }
+    }
+
+    pub(crate) fn publication(&self) -> SessionAccessPublication {
+        self.publication.clone()
+    }
+
+    pub(crate) fn stop(&mut self) -> thread::Result<()> {
+        let _ = self.stop_tx.try_send(());
+        match self.join.take() {
+            Some(join) => join.join(),
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn detach(&mut self) {
+        let _ = self.stop_tx.try_send(());
+        drop(self.join.take());
+    }
+}
+
+impl Drop for SessionActivityMonitor {
+    fn drop(&mut self) {
+        if self.stop().is_err() {
+            eprintln!("[input] Session activity monitor worker panicked");
+        }
+    }
+}
+
+struct WorkerDeathGuard {
+    publication: SessionAccessPublication,
+}
+
+impl WorkerDeathGuard {
+    fn new(publication: SessionAccessPublication) -> Self {
+        Self { publication }
+    }
+}
+
+impl Drop for WorkerDeathGuard {
+    fn drop(&mut self) {
+        self.publication.mark_worker_stopped();
+    }
+}
+
+fn run_session_monitor(
+    mut source: Box<dyn SessionSource>,
+    uid: u32,
+    timing: MonitorTiming,
+    publication: SessionAccessPublication,
+    stop_rx: async_channel::Receiver<()>,
+    ready_tx: mpsc::SyncSender<Result<(), SwitcherError>>,
+) {
+    let _death_guard = WorkerDeathGuard::new(publication.clone());
+
+    if let Err(error) = subscribe_and_refresh(source.as_mut(), uid, &publication) {
+        publication.publish(
+            SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
+            monotonic_ms(),
+        );
+        let _ = ready_tx.send(Err(error));
+        return;
+    }
+    if ready_tx.send(Ok(())).is_err() {
+        return;
+    }
+
+    let mut last_refresh = Instant::now();
+    loop {
+        if stop_requested(&stop_rx) {
+            return;
+        }
+
+        let elapsed = last_refresh.elapsed();
+        if elapsed >= timing.refresh_interval {
+            match refresh_decision(source.as_mut(), uid, &publication) {
+                Ok(()) => {
+                    last_refresh = Instant::now();
+                    continue;
+                }
+                Err(_) => {
+                    publication.publish(
+                        SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
+                        monotonic_ms(),
+                    );
+                    if !reconnect_source(source.as_mut(), uid, &publication, &stop_rx, timing) {
+                        return;
+                    }
+                    last_refresh = Instant::now();
+                    continue;
+                }
+            }
+        }
+
+        let until_refresh = timing.refresh_interval.saturating_sub(elapsed);
+        let wait = timing.wait_slice.min(until_refresh);
+        match source.wait_for_change(wait) {
+            Ok(SessionSourceEvent::Changed) => {
+                if refresh_decision(source.as_mut(), uid, &publication).is_err() {
+                    publication.publish(
+                        SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
+                        monotonic_ms(),
+                    );
+                    if !reconnect_source(source.as_mut(), uid, &publication, &stop_rx, timing) {
+                        return;
+                    }
+                }
+                last_refresh = Instant::now();
+            }
+            Ok(SessionSourceEvent::Timeout) => {}
+            Err(_) => {
+                publication.publish(
+                    SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
+                    monotonic_ms(),
+                );
+                if !reconnect_source(source.as_mut(), uid, &publication, &stop_rx, timing) {
+                    return;
+                }
+                last_refresh = Instant::now();
+            }
+        }
+    }
+}
+
+fn subscribe_and_refresh(
+    source: &mut dyn SessionSource,
+    uid: u32,
+    publication: &SessionAccessPublication,
+) -> Result<(), SwitcherError> {
+    source.subscribe()?;
+    refresh_decision(source, uid, publication)
+}
+
+fn refresh_decision(
+    source: &mut dyn SessionSource,
+    uid: u32,
+    publication: &SessionAccessPublication,
+) -> Result<(), SwitcherError> {
+    let records = source.snapshot(uid)?;
+    publication.publish(decide_session(uid, &records), monotonic_ms());
+    Ok(())
+}
+
+fn reconnect_source(
+    source: &mut dyn SessionSource,
+    uid: u32,
+    publication: &SessionAccessPublication,
+    stop_rx: &async_channel::Receiver<()>,
+    timing: MonitorTiming,
+) -> bool {
+    let mut backoff = timing.reconnect_initial;
+    loop {
+        if wait_for_stop(stop_rx, backoff, timing.wait_slice) {
+            return false;
+        }
+
+        match subscribe_and_refresh(source, uid, publication) {
+            Ok(()) => return true,
+            Err(_) => publication.publish(
+                SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
+                monotonic_ms(),
+            ),
+        }
+        backoff = backoff.saturating_mul(2).min(timing.reconnect_max);
+    }
+}
+
+fn wait_for_stop(
+    stop_rx: &async_channel::Receiver<()>,
+    duration: Duration,
+    wait_slice: Duration,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        if stop_requested(stop_rx) {
+            return true;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(wait_slice.min(remaining));
+    }
+}
+
+fn stop_requested(stop_rx: &async_channel::Receiver<()>) -> bool {
+    match stop_rx.try_recv() {
+        Ok(()) | Err(async_channel::TryRecvError::Closed) => true,
+        Err(async_channel::TryRecvError::Empty) => false,
+    }
+}
+
+pub(crate) fn monotonic_ms() -> u64 {
+    static MONOTONIC_EPOCH: OnceLock<Instant> = OnceLock::new();
+    let elapsed = MONOTONIC_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis();
+    elapsed.min(u64::MAX as u128) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +640,270 @@ mod tests {
             publication.health_error(3_011),
             Some(SwitcherError::SessionMonitorStopped)
         ));
+    }
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Clone, Copy)]
+    enum FakeEvent {
+        Changed,
+        Disconnect,
+        Panic,
+    }
+
+    struct FakeSessionSource {
+        trace: Arc<Mutex<Vec<&'static str>>>,
+        snapshots: VecDeque<Vec<SessionRecord>>,
+        current_snapshot: Vec<SessionRecord>,
+        events: mpsc::Receiver<FakeEvent>,
+        subscribe_calls: Arc<AtomicUsize>,
+        reconnect_gate: Option<mpsc::Receiver<()>>,
+    }
+
+    impl SessionSource for FakeSessionSource {
+        fn subscribe(&mut self) -> Result<(), SwitcherError> {
+            self.trace.lock().unwrap().push("subscribe");
+            let call = self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
+            if call > 0 {
+                if let Some(gate) = self.reconnect_gate.take() {
+                    gate.recv().expect("test must release reconnect");
+                }
+            }
+            Ok(())
+        }
+
+        fn snapshot(&mut self, _uid: u32) -> Result<Vec<SessionRecord>, SwitcherError> {
+            self.trace.lock().unwrap().push("snapshot");
+            if let Some(snapshot) = self.snapshots.pop_front() {
+                self.current_snapshot = snapshot;
+            }
+            Ok(self.current_snapshot.clone())
+        }
+
+        fn wait_for_change(
+            &mut self,
+            timeout: Duration,
+        ) -> Result<SessionSourceEvent, SwitcherError> {
+            self.trace.lock().unwrap().push("wait");
+            match self.events.recv_timeout(timeout) {
+                Ok(FakeEvent::Changed) => Ok(SessionSourceEvent::Changed),
+                Ok(FakeEvent::Disconnect) => {
+                    Err(std::io::Error::other("injected session source disconnect").into())
+                }
+                Ok(FakeEvent::Panic) => panic!("injected session source panic"),
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(SessionSourceEvent::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(std::io::Error::other("fake event sender disconnected").into())
+                }
+            }
+        }
+    }
+
+    struct FakeControl {
+        trace: Arc<Mutex<Vec<&'static str>>>,
+        events: mpsc::Sender<FakeEvent>,
+        subscribe_calls: Arc<AtomicUsize>,
+        reconnect_gate: Option<mpsc::Sender<()>>,
+    }
+
+    fn fake_source(
+        snapshots: Vec<Vec<SessionRecord>>,
+        gate_reconnect: bool,
+    ) -> (Box<dyn SessionSource>, FakeControl) {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let subscribe_calls = Arc::new(AtomicUsize::new(0));
+        let (events_tx, events_rx) = mpsc::channel();
+        let (reconnect_gate, reconnect_gate_rx) = if gate_reconnect {
+            let (tx, rx) = mpsc::channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+        let source = FakeSessionSource {
+            trace: Arc::clone(&trace),
+            snapshots: snapshots.into(),
+            current_snapshot: Vec::new(),
+            events: events_rx,
+            subscribe_calls: Arc::clone(&subscribe_calls),
+            reconnect_gate: reconnect_gate_rx,
+        };
+        let control = FakeControl {
+            trace,
+            events: events_tx,
+            subscribe_calls,
+            reconnect_gate,
+        };
+        (Box::new(source), control)
+    }
+
+    fn graphical_session(id: &str) -> Vec<SessionRecord> {
+        vec![SessionRecord {
+            id: id.to_owned(),
+            uid: 1000,
+            seat: "seat0".to_owned(),
+            session_type: "x11".to_owned(),
+            class: "user".to_owned(),
+            active: true,
+            remote: false,
+        }]
+    }
+
+    fn test_timing(refresh: Duration) -> MonitorTiming {
+        MonitorTiming {
+            refresh_interval: refresh,
+            wait_slice: Duration::from_millis(2),
+            reconnect_initial: Duration::from_millis(2),
+            reconnect_max: Duration::from_millis(8),
+        }
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !predicate() {
+            assert!(
+                Instant::now() < deadline,
+                "condition was not reached before test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn published_session(publication: &SessionAccessPublication) -> Option<String> {
+        publication
+            .backend_lease(monotonic_ms())
+            .ok()
+            .map(|lease| lease.session_id().to_owned())
+    }
+
+    #[test]
+    fn subscribe_precedes_first_snapshot() {
+        let (source, control) = fake_source(vec![graphical_session("c2")], false);
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_secs(5)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            &control.trace.lock().unwrap()[..2],
+            &["subscribe", "snapshot"]
+        );
+        assert!(monitor.stop().is_ok());
+    }
+
+    #[test]
+    fn source_signal_triggers_immediate_authoritative_snapshot() {
+        let (source, control) = fake_source(
+            vec![graphical_session("c2"), graphical_session("c8")],
+            false,
+        );
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let publication = monitor.publication();
+        assert_eq!(published_session(&publication).as_deref(), Some("c2"));
+
+        control.events.send(FakeEvent::Changed).unwrap();
+        wait_until(|| published_session(&publication).as_deref() == Some("c8"));
+
+        assert!(monitor.stop().is_ok());
+    }
+
+    #[test]
+    fn timeout_triggers_periodic_authoritative_snapshot() {
+        let (source, _control) = fake_source(
+            vec![graphical_session("c2"), graphical_session("c8")],
+            false,
+        );
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_millis(20)),
+        )
+        .unwrap();
+        let publication = monitor.publication();
+
+        wait_until(|| published_session(&publication).as_deref() == Some("c8"));
+
+        assert!(monitor.stop().is_ok());
+    }
+
+    #[test]
+    fn disconnect_invalidates_then_reconnects_and_refreshes() {
+        let (source, mut control) =
+            fake_source(vec![graphical_session("c2"), graphical_session("c8")], true);
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let publication = monitor.publication();
+
+        control.events.send(FakeEvent::Disconnect).unwrap();
+        wait_until(|| {
+            matches!(
+                publication.health_error(monotonic_ms()),
+                Some(SwitcherError::InputSessionInactive)
+            )
+        });
+        wait_until(|| control.subscribe_calls.load(Ordering::SeqCst) >= 2);
+
+        control.reconnect_gate.take().unwrap().send(()).unwrap();
+        wait_until(|| published_session(&publication).as_deref() == Some("c8"));
+
+        assert!(monitor.stop().is_ok());
+    }
+
+    #[test]
+    fn stop_and_join_is_idempotent_and_marks_worker_dead() {
+        let (source, _control) = fake_source(vec![graphical_session("c2")], false);
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let publication = monitor.publication();
+
+        assert!(monitor.stop().is_ok());
+        assert!(monitor.stop().is_ok());
+        assert!(matches!(
+            publication.health_error(monotonic_ms()),
+            Some(SwitcherError::SessionMonitorStopped)
+        ));
+    }
+
+    #[test]
+    fn worker_panic_marks_publication_dead() {
+        let (source, control) = fake_source(vec![graphical_session("c2")], false);
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_secs(5)),
+        )
+        .unwrap();
+        let publication = monitor.publication();
+
+        control.events.send(FakeEvent::Panic).unwrap();
+        wait_until(|| {
+            matches!(
+                publication.health_error(monotonic_ms()),
+                Some(SwitcherError::SessionMonitorStopped)
+            )
+        });
+
+        assert!(monitor.stop().is_err());
     }
 }

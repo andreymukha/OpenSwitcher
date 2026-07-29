@@ -22,6 +22,7 @@ use crate::system::is_dev_runtime_mode;
 use keyboard::{log_input_debug, WriterShutdownOutcome, WriterTerminalReport};
 use runtime::{log_layout_debug, BackendSyncResult, ConfigService, RuntimeState};
 use service::DaemonService;
+use session_activity::SessionActivityMonitor;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use zbus::blocking::fdo::DBusProxy;
@@ -87,14 +88,20 @@ pub fn run() -> Result<(), SwitcherError> {
             "enabled=false reason=dev-runtime-mode",
         );
     }
+    let mut session_monitor = SessionActivityMonitor::start()?;
+    let session_access = session_monitor.publication();
     let (connection, mut capture_owner_monitor) =
         start_dbus_endpoint(runtime.clone(), SERVICE_NAME)?;
 
-    let mut service = match DaemonService::new(runtime, connection) {
+    let mut service = match DaemonService::new(runtime, connection, session_access) {
         Ok(service) => service,
         Err(error) => {
             return finalize_service_initialization_error(error, |mode| {
-                shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode)
+                shutdown_daemon_monitors(
+                    mode,
+                    |mode| shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode),
+                    |mode| shutdown_session_activity_monitor(&mut session_monitor, mode),
+                )
             });
         }
     };
@@ -116,7 +123,13 @@ pub fn run() -> Result<(), SwitcherError> {
     let result = finalize_daemon_run_with_postmortem(
         result,
         || service.shutdown(),
-        |mode| shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode),
+        |mode| {
+            shutdown_daemon_monitors(
+                mode,
+                |mode| shutdown_capture_owner_monitor(&mut capture_owner_monitor, mode),
+                |mode| shutdown_session_activity_monitor(&mut session_monitor, mode),
+            )
+        },
         move || {
             if let Some(reason) = input_loop_postmortem {
                 eprintln!("[input] Демон аварийно завершился в input loop: {reason}");
@@ -142,6 +155,37 @@ fn shutdown_capture_owner_monitor(
             monitor.detach_for_process_fail_stop();
             Ok(())
         }
+    }
+}
+
+fn shutdown_session_activity_monitor(
+    monitor: &mut SessionActivityMonitor,
+    mode: SecondaryShutdownMode,
+) -> std::thread::Result<()> {
+    match mode {
+        SecondaryShutdownMode::Join => monitor.stop(),
+        SecondaryShutdownMode::DetachForProcessFailStop => {
+            monitor.detach();
+            Ok(())
+        }
+    }
+}
+
+fn shutdown_daemon_monitors<StopCapture, StopSession>(
+    mode: SecondaryShutdownMode,
+    stop_capture: StopCapture,
+    stop_session: StopSession,
+) -> std::thread::Result<()>
+where
+    StopCapture: FnOnce(SecondaryShutdownMode) -> std::thread::Result<()>,
+    StopSession: FnOnce(SecondaryShutdownMode) -> std::thread::Result<()>,
+{
+    let capture_result = stop_capture(mode);
+    let session_result = stop_session(mode);
+
+    match (capture_result, session_result) {
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
     }
 }
 
@@ -195,11 +239,8 @@ where
     let result = resolve_daemon_result_after_shutdown(result, shutdown_outcome);
 
     if stop_monitor(monitor_mode).is_err() {
-        log_layout_debug(
-            "dbus-capture-owner-monitor-stop-error",
-            "worker_panicked=true",
-        );
-        eprintln!("[dbus] Capture owner monitor worker panicked during shutdown");
+        log_layout_debug("daemon-monitor-stop-error", "worker_panicked=true");
+        eprintln!("[daemon] A monitor worker panicked during shutdown");
     }
     result
 }
@@ -404,6 +445,28 @@ mod tests {
 
         assert!(matches!(result, Err(SwitcherError::KeyboardNotFound)));
         assert_eq!(*phases.borrow(), vec!["release-input", "join-monitor"]);
+    }
+
+    #[test]
+    fn secondary_monitors_stop_capture_before_session_and_both_are_attempted() {
+        let phases = RefCell::new(Vec::new());
+
+        let result = shutdown_daemon_monitors(
+            SecondaryShutdownMode::Join,
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::Join);
+                phases.borrow_mut().push("capture");
+                Err(Box::new("injected capture monitor panic"))
+            },
+            |mode| {
+                assert_eq!(mode, SecondaryShutdownMode::Join);
+                phases.borrow_mut().push("session");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*phases.borrow(), vec!["capture", "session"]);
     }
 
     #[test]

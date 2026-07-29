@@ -16,6 +16,7 @@ use crate::daemon::keyboard::{
 };
 use crate::daemon::runtime::{log_layout_debug, RuntimeState};
 use crate::daemon::selected_text::{log_selected_text_debug, SelectedTextJobRunner};
+use crate::daemon::session_activity::SessionAccessPublication;
 use crate::daemon::switch_logic::{
     apply_case_fixes_to_strokes, manual_correction_plan, same_layout_case_correction_plan,
     should_switch, CorrectionPlan, Keystroke,
@@ -1527,6 +1528,7 @@ fn apply_corrected_word_commit_state(
 
 pub struct DaemonService {
     runtime: Arc<RuntimeState>,
+    session_access: SessionAccessPublication,
     input_snapshot: InputRuntimeSnapshot,
     signal_publisher: DbusSignalPublisher,
     input_backend: InputBackendLifecycle<KeyboardInputBackendOpener>,
@@ -1555,12 +1557,17 @@ pub struct DaemonService {
 }
 
 impl DaemonService {
-    pub fn new(runtime: Arc<RuntimeState>, connection: Connection) -> Result<Self, SwitcherError> {
+    pub(crate) fn new(
+        runtime: Arc<RuntimeState>,
+        connection: Connection,
+        session_access: SessionAccessPublication,
+    ) -> Result<Self, SwitcherError> {
         let input_snapshot = runtime.input_snapshot_before_grab();
         let shared_modifiers = SharedModifierState::default();
         let signal_publisher = DbusSignalPublisher::spawn(connection);
         let mut service = Self {
             runtime,
+            session_access,
             input_snapshot,
             signal_publisher,
             input_backend: InputBackendLifecycle::new(KeyboardInputBackendOpener),

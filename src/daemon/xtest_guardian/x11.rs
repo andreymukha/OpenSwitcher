@@ -27,13 +27,20 @@ pub(crate) struct X11SetupIdentity {
     pub(crate) fingerprint: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CheckedX11Mutation(());
+
 pub(crate) trait X11ConnectionBoundary {
     fn setup_identity(&self) -> &X11SetupIdentity;
     fn create_epoch_marker(&mut self, nonce: [u8; EPOCH_NONCE_BYTES])
         -> Result<u32, SwitcherError>;
     fn read_epoch_marker(&mut self, window: u32) -> Result<[u8; EPOCH_NONCE_BYTES], SwitcherError>;
     fn keyboard_mapping(&mut self, keycode: u8) -> Result<Vec<u32>, SwitcherError>;
-    fn fake_key(&mut self, keycode: u8, pressed: bool) -> Result<(), SwitcherError>;
+    fn checked_fake_key(
+        &mut self,
+        keycode: u8,
+        pressed: bool,
+    ) -> Result<CheckedX11Mutation, SwitcherError>;
     fn round_trip(&mut self) -> Result<(), SwitcherError>;
 }
 
@@ -215,7 +222,11 @@ impl X11ConnectionBoundary for RustX11Connection {
             .keysyms)
     }
 
-    fn fake_key(&mut self, keycode: u8, pressed: bool) -> Result<(), SwitcherError> {
+    fn checked_fake_key(
+        &mut self,
+        keycode: u8,
+        pressed: bool,
+    ) -> Result<CheckedX11Mutation, SwitcherError> {
         self.connection
             .xtest_fake_input(
                 if pressed {
@@ -235,7 +246,8 @@ impl X11ConnectionBoundary for RustX11Connection {
             .map_err(|error| x11_error("confirm XTEST key mutation", error))?;
         self.connection
             .flush()
-            .map_err(|error| x11_error("flush XTEST key mutation", error))
+            .map_err(|error| x11_error("flush XTEST key mutation", error))?;
+        Ok(CheckedX11Mutation(()))
     }
 
     fn round_trip(&mut self) -> Result<(), SwitcherError> {
@@ -344,6 +356,7 @@ fn read_epoch_random() -> Result<[u8; EPOCH_RANDOM_BYTES], SwitcherError> {
 pub(crate) struct GuardianX11Executor<C: X11ConnectionBoundary = RustX11Connection> {
     connection: C,
     identity: X11ServerIdentity,
+    pending_confirmation: Option<CheckedX11Mutation>,
 }
 
 impl GuardianX11Executor<RustX11Connection> {
@@ -363,7 +376,23 @@ impl<C: X11ConnectionBoundary> GuardianX11Executor<C> {
         Ok(Self {
             connection,
             identity,
+            pending_confirmation: None,
         })
+    }
+
+    fn checked_mutation(
+        &mut self,
+        keycode: u8,
+        pressed: bool,
+        failure: &'static str,
+    ) -> Result<(), InputSafetyError> {
+        self.pending_confirmation = None;
+        let confirmation = self
+            .connection
+            .checked_fake_key(keycode, pressed)
+            .map_err(|_| executor_error(failure))?;
+        self.pending_confirmation = Some(confirmation);
+        Ok(())
     }
 
     pub(crate) fn connection_ref(&self) -> &C {
@@ -406,21 +435,18 @@ impl<C: X11ConnectionBoundary> XtestExecutor for GuardianX11Executor<C> {
     }
 
     fn key_down(&mut self, keycode: u8) -> Result<(), InputSafetyError> {
-        self.connection
-            .fake_key(keycode, true)
-            .map_err(|_| executor_error("XTEST guardian key-down failed"))
+        self.checked_mutation(keycode, true, "XTEST guardian key-down failed")
     }
 
     fn key_up(&mut self, keycode: u8) -> Result<(), InputSafetyError> {
-        self.connection
-            .fake_key(keycode, false)
-            .map_err(|_| executor_error("XTEST guardian key-up failed"))
+        self.checked_mutation(keycode, false, "XTEST guardian key-up failed")
     }
 
     fn synchronize(&mut self) -> Result<(), InputSafetyError> {
-        self.connection
-            .round_trip()
-            .map_err(|_| executor_error("XTEST guardian synchronization failed"))
+        self.pending_confirmation
+            .take()
+            .map(|_| ())
+            .ok_or_else(|| executor_error("XTEST guardian synchronization has no checked mutation"))
     }
 }
 
@@ -469,7 +495,9 @@ impl<C: X11ConnectionBoundary> EmergencyX11Releaser<C> {
                 "emergency XTEST token key code does not match its evdev code",
             ));
         }
-        self.connection.fake_key(token.x11_keycode, false)
+        self.connection
+            .checked_fake_key(token.x11_keycode, false)
+            .map(|_| ())
     }
 
     pub(crate) fn synchronize(&mut self) -> Result<(), SwitcherError> {
@@ -495,6 +523,7 @@ mod tests {
         marker: Option<(u32, [u8; EPOCH_NONCE_BYTES])>,
         next_window: u32,
         fake_events: Vec<(u8, bool)>,
+        fail_fake_event_number: Option<usize>,
         fail_round_trip: bool,
         round_trips: usize,
     }
@@ -512,6 +541,7 @@ mod tests {
                 marker: None,
                 next_window: 2,
                 fake_events: Vec::new(),
+                fail_fake_event_number: None,
                 fail_round_trip: false,
                 round_trips: 0,
             }
@@ -564,9 +594,18 @@ mod tests {
             Ok(self.mappings.get(&keycode).cloned().unwrap_or_default())
         }
 
-        fn fake_key(&mut self, keycode: u8, pressed: bool) -> Result<(), SwitcherError> {
+        fn checked_fake_key(
+            &mut self,
+            keycode: u8,
+            pressed: bool,
+        ) -> Result<CheckedX11Mutation, SwitcherError> {
             self.fake_events.push((keycode, pressed));
-            Ok(())
+            if self.fail_fake_event_number == Some(self.fake_events.len()) {
+                return Err(SwitcherError::input_safety(
+                    "fake X11 checked-mutation failure",
+                ));
+            }
+            Ok(CheckedX11Mutation(()))
         }
 
         fn round_trip(&mut self) -> Result<(), SwitcherError> {
@@ -620,16 +659,48 @@ mod tests {
     }
 
     #[test]
-    fn release_is_not_acknowledged_until_real_round_trip() {
+    fn checked_mutation_satisfies_sync_without_second_round_trip() {
         let identity = test_server_identity();
-        let mut connection = FakeX11Connection::default().with_identity(&identity);
-        connection.fail_round_trip = true;
+        let connection = FakeX11Connection::default().with_identity(&identity);
         let mut executor = GuardianX11Executor::from_connection(connection, identity).unwrap();
 
         executor.key_up(38).unwrap();
-        assert!(executor.synchronize().is_err());
+        executor.synchronize().unwrap();
+
         assert_eq!(executor.connection_ref().fake_events, [(38, false)]);
-        assert_eq!(executor.connection_ref().round_trips, 1);
+        assert_eq!(executor.connection_ref().round_trips, 0);
+    }
+
+    #[test]
+    fn checked_mutation_confirmation_is_consumed_once() {
+        let identity = test_server_identity();
+        let connection = FakeX11Connection::default().with_identity(&identity);
+        let mut executor = GuardianX11Executor::from_connection(connection, identity).unwrap();
+
+        executor.key_up(38).unwrap();
+        executor.synchronize().unwrap();
+
+        assert!(executor.synchronize().is_err());
+        assert_eq!(executor.connection_ref().round_trips, 0);
+    }
+
+    #[test]
+    fn failed_new_mutation_cannot_reuse_stale_confirmation() {
+        let identity = test_server_identity();
+        let connection = FakeX11Connection {
+            fail_fake_event_number: Some(2),
+            ..FakeX11Connection::default().with_identity(&identity)
+        };
+        let mut executor = GuardianX11Executor::from_connection(connection, identity).unwrap();
+
+        executor.key_up(38).unwrap();
+        assert!(executor.key_up(39).is_err());
+
+        assert!(executor.synchronize().is_err());
+        assert_eq!(
+            executor.connection_ref().fake_events,
+            [(38, false), (39, false)]
+        );
     }
 
     #[test]

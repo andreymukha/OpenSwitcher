@@ -4198,9 +4198,10 @@ fn guardian_correction_plan_steps(
 fn guardian_operation_context(
     control: Option<&WriterTransactionControl>,
 ) -> (OperationId, Instant, OperationControl) {
+    let operation_id = OperationId(next_writer_transaction_request_id());
     match control {
         Some(control) => (
-            OperationId(control.request_id()),
+            operation_id,
             control.deadline,
             synthetic_operation_control(Some(control)),
         ),
@@ -4209,7 +4210,7 @@ fn guardian_operation_context(
                 .checked_add(SHORTCUT_TRANSACTION_TIMEOUT)
                 .unwrap_or_else(Instant::now);
             (
-                OperationId(next_writer_transaction_request_id()),
+                operation_id,
                 deadline,
                 OperationControl::new(deadline, Arc::new(AtomicBool::new(false))),
             )
@@ -6503,6 +6504,28 @@ mod tests {
         assert_eq!(take_next_nonzero_request_id(&mut next), u64::MAX);
         assert_eq!(take_next_nonzero_request_id(&mut next), 1);
         assert_eq!(next, 2);
+    }
+
+    #[test]
+    fn guardian_operation_ids_stay_monotonic_across_manual_and_regular_writer_paths() {
+        let first_manual =
+            WriterTransactionControl::with_timeout_for_test(1, Duration::from_secs(1));
+        let second_manual =
+            WriterTransactionControl::with_timeout_for_test(2, Duration::from_secs(1));
+
+        let first = guardian_operation_context(Some(&first_manual)).0;
+        let regular_request_id = next_writer_transaction_request_id();
+        let regular_control = WriterTransactionControl::with_timeout_for_test(
+            regular_request_id,
+            Duration::from_secs(1),
+        );
+        let regular = guardian_operation_context(Some(&regular_control)).0;
+        let second = guardian_operation_context(Some(&second_manual)).0;
+
+        assert!(
+            first.0 < regular.0 && regular.0 < second.0,
+            "guardian operation ids must follow execution order: first={first:?}, regular={regular:?}, second={second:?}"
+        );
     }
 
     // Modifier state / layout shortcuts

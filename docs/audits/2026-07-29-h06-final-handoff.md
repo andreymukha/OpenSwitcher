@@ -3,7 +3,7 @@
 **Дата:** 2026-07-29
 
 **Статус:** реализация, package-first runtime-проверка и выбранная оптимизация
-завершены; ветка готова к локальному fast-forward в `master`.
+завершены; H-06 интегрирована в `master` и отправлена в `origin`.
 
 ## Итоговое решение
 
@@ -150,12 +150,39 @@ permissions и не является незавершённой частью H-0
 ретроспективное переключение чекбоксов не выполняется, чтобы не создавать
 шумный документационный diff.
 
-## Следующий шаг
+## Результат интеграции
 
-1. Закоммитить этот handoff.
-2. Fast-forward влить `fix/h06-synthetic-input-ledger` в `master`.
-3. Повторить safe gates на слитом `master`.
-4. Сохранить точный DEB в основном worktree и отправить согласованный
-   `master` в `origin`.
-5. Установку пакета на host выполнять отдельной точной `sudo apt install`
-   командой; VM-лабораторию не удалять.
+`fix/h06-synthetic-input-ledger` влита в `master` обычным fast-forward без
+конфликтов. Интеграционная точка:
+
+```text
+48fc75ee4ca36d08dd98e5b148e4c64bd4c36c37
+```
+
+После слияния на `master` повторены:
+
+- полный Rust-набор:
+  `920` library passed, `1` ignored, `4` daemon, `11` D-Bus и `5` VM probe;
+- `cargo check --locked --all-targets --features settings-ui`;
+- `cargo fmt --all -- --check`;
+- `git diff --check`;
+- четыре shell/package suite.
+
+Wayland diagnostics и mock package test внутри restricted syscall/filesystem
+sandbox получили ожидаемые ограничения `EPERM`. Те же неизменённые команды
+вне sandbox завершились `ok`.
+
+Финальный пакет сохранён в основном worktree:
+
+```text
+/home/andrey/Projects/OpenSwitcher/dist/packages/
+open-switcher_0.1.0-3_amd64.deb
+```
+
+Незакоммиченные документы от 2026-07-15 и изменение `.gitignore`, находившиеся
+в основном worktree до fast-forward, не входят в H-06. Их содержимое сверено
+по SHA-256 до и после слияния и осталось неизменным.
+
+Установку пакета на host следует выполнять отдельной точной
+`sudo apt install` командой. VM-лаборатория, overlay и evidence сохранены и
+могут быть удалены только по прямой просьбе пользователя.

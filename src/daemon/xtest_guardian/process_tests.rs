@@ -24,6 +24,7 @@ const FD_ENV: &str = "OPEN_SWITCHER_H06_TEST_FD";
 const TRACE_ENV: &str = "OPEN_SWITCHER_H06_TEST_TRACE";
 const SCENARIO_ENV: &str = "OPEN_SWITCHER_H06_TEST_SCENARIO";
 const FIXTURE_TEST_NAME: &str = "daemon::xtest_guardian::process_tests::fixture_process_entry";
+const CHILD_CONNECTION_FD: i32 = 3;
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn test_identity() -> X11ServerIdentity {
@@ -321,13 +322,10 @@ fn fixture_process_entry() {
     }
 }
 
-fn clear_close_on_exec(fd: i32) {
+fn close_on_exec_is_set(fd: i32) -> bool {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     assert!(flags >= 0);
-    assert_eq!(
-        unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
-        0
-    );
+    flags & libc::FD_CLOEXEC != 0
 }
 
 fn spawn_role(
@@ -344,7 +342,7 @@ fn spawn_role(
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(ROLE_ENV, role)
-        .env(FD_ENV, inherited_fd.to_string())
+        .env(FD_ENV, CHILD_CONNECTION_FD.to_string())
         .env(TRACE_ENV, trace)
         .env(SCENARIO_ENV, scenario)
         .stdin(Stdio::null())
@@ -352,7 +350,28 @@ fn spawn_role(
         .stderr(Stdio::null());
     unsafe {
         command.pre_exec(move || {
-            if libc::close(closed_fd) != 0 {
+            if inherited_fd != CHILD_CONNECTION_FD
+                && libc::dup2(inherited_fd, CHILD_CONNECTION_FD) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let flags = libc::fcntl(CHILD_CONNECTION_FD, libc::F_GETFD);
+            if flags < 0
+                || libc::fcntl(
+                    CHILD_CONNECTION_FD,
+                    libc::F_SETFD,
+                    flags & !libc::FD_CLOEXEC,
+                ) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            if inherited_fd != CHILD_CONNECTION_FD && libc::close(inherited_fd) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if closed_fd != CHILD_CONNECTION_FD
+                && closed_fd != inherited_fd
+                && libc::close(closed_fd) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -376,8 +395,10 @@ impl ProcessFixture {
         let (guardian_socket, daemon_socket) = Seqpacket::pair().unwrap();
         let guardian_fd = guardian_socket.as_raw_fd();
         let daemon_fd = daemon_socket.as_raw_fd();
-        clear_close_on_exec(guardian_fd);
-        clear_close_on_exec(daemon_fd);
+        assert!(
+            close_on_exec_is_set(guardian_fd) && close_on_exec_is_set(daemon_fd),
+            "process fixture sockets must remain close-on-exec in the parallel test parent"
+        );
 
         let mut guardian =
             spawn_role("guardian", scenario, &trace, guardian_fd, daemon_fd).unwrap();

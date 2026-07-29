@@ -1,6 +1,233 @@
 #!/bin/sh
-set -e
+set -eu
+
+warn() {
+    echo "open-switcher: warning: $*" >&2
+}
+
+udev_tags() {
+    properties="$1"
+    current_tags="$(
+        printf '%s\n' "$properties" \
+            | sed -n 's/^CURRENT_TAGS=//p' \
+            | head -n 1
+    )"
+    legacy_tags="$(
+        printf '%s\n' "$properties" \
+            | sed -n 's/^TAGS=//p' \
+            | head -n 1
+    )"
+
+    if [ -n "$current_tags" ]; then
+        printf '%s\n' "$current_tags"
+    else
+        printf '%s\n' "$legacy_tags"
+    fi
+}
+
+has_uaccess_tag() {
+    properties="$1"
+    tags="$(udev_tags "$properties")"
+
+    case "$tags" in
+        *:uaccess:*) return 0 ;;
+    esac
+
+    return 1
+}
+
+is_allowed_device_path() {
+    device_path="$1"
+
+    case "$device_path" in
+        /dev/uinput|/dev/input/uinput)
+            return 0
+            ;;
+        /dev/input/event*)
+            event_number="${device_path#/dev/input/event}"
+            case "$event_number" in
+                ""|*[!0-9]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+    esac
+
+    return 1
+}
+
+validate_manifest_storage() {
+    runtime_dir="/run/open-switcher"
+    manifest="$runtime_dir/input-access-acl.tsv"
+
+    [ -e "$manifest" ] || return 1
+
+    if [ -L "$runtime_dir" ] || [ ! -d "$runtime_dir" ]; then
+        echo "open-switcher: unsafe ACL manifest directory" >&2
+        return 2
+    fi
+    runtime_owner="$(stat -Lc %u -- "$runtime_dir")"
+    runtime_mode="$(stat -Lc %a -- "$runtime_dir")"
+    if [ "$runtime_owner" != "0" ] || [ "$runtime_mode" != "700" ]; then
+        echo "open-switcher: unsafe ACL manifest directory ownership or mode" >&2
+        return 2
+    fi
+
+    if [ -L "$manifest" ] || [ ! -f "$manifest" ]; then
+        echo "open-switcher: unsafe ACL manifest type" >&2
+        return 2
+    fi
+    manifest_owner="$(stat -Lc %u -- "$manifest")"
+    manifest_mode="$(stat -Lc %a -- "$manifest")"
+    if [ "$manifest_owner" != "0" ] || [ "$manifest_mode" != "600" ]; then
+        echo "open-switcher: unsafe ACL manifest ownership or mode" >&2
+        return 2
+    fi
+}
+
+current_uaccess_state() {
+    device_path="$1"
+
+    if ! properties="$(udevadm info --query=property --name="$device_path")"; then
+        return 2
+    fi
+
+    has_uaccess_tag "$properties"
+}
+
+has_named_user_acl() {
+    acl="$1"
+    uid="$2"
+
+    printf '%s\n' "$acl" | grep -Eq "^user:${uid}:"
+}
+
+has_named_user_rw_acl() {
+    acl="$1"
+    uid="$2"
+
+    printf '%s\n' "$acl" | grep -Eq "^user:${uid}:rw-$"
+}
+
+device_identity_matches() {
+    device_path="$1"
+    recorded_number="$2"
+
+    canonical_path="$(readlink -f -- "$device_path" 2>/dev/null || true)"
+    [ "$canonical_path" = "$device_path" ] || return 1
+    [ -c "$device_path" ] || return 1
+
+    current_number="$(stat -Lc '%t:%T' -- "$device_path" 2>/dev/null || true)"
+    [ -n "$current_number" ] && [ "$current_number" = "$recorded_number" ]
+}
+
+cleanup_recorded_acl() {
+    device_path="$1"
+    recorded_number="$2"
+    recorded_uid="$3"
+
+    case "$recorded_uid" in
+        ""|*[!0-9]*)
+            warn "ignored malformed ACL manifest uid"
+            return 0
+            ;;
+    esac
+    if ! is_allowed_device_path "$device_path"; then
+        warn "ignored non-allowlisted ACL manifest path"
+        return 0
+    fi
+
+    if ! device_identity_matches "$device_path" "$recorded_number"; then
+        warn "ignored input device with changed identity"
+        return 0
+    fi
+
+    if current_uaccess_state "$device_path"; then
+        return 0
+    else
+        tag_status="$?"
+        if [ "$tag_status" -ne 1 ]; then
+            warn "unable to verify current input udev tags"
+            return 0
+        fi
+    fi
+
+    if ! acl="$(getfacl -cpn -- "$device_path" 2>/dev/null)"; then
+        warn "unable to inspect current input ACL"
+        return 0
+    fi
+    if ! has_named_user_rw_acl "$acl" "$recorded_uid"; then
+        warn "ignored changed input ACL entry"
+        return 0
+    fi
+
+    if ! device_identity_matches "$device_path" "$recorded_number"; then
+        warn "ignored input device changed before ACL cleanup"
+        return 0
+    fi
+
+    if ! setfacl -n -x "u:$recorded_uid" -- "$device_path"; then
+        echo "open-switcher: unable to remove recorded input ACL" >&2
+        return 1
+    fi
+
+    if ! acl="$(getfacl -cpn -- "$device_path" 2>/dev/null)"; then
+        echo "open-switcher: unable to verify input ACL cleanup" >&2
+        return 1
+    fi
+    if has_named_user_acl "$acl" "$recorded_uid"; then
+        echo "open-switcher: recorded input ACL remains after cleanup" >&2
+        return 1
+    fi
+}
+
+cleanup_input_access() {
+    if [ ! -e /run/udev/control ]; then
+        echo "open-switcher: input ACL cleanup deferred because udev is offline"
+        return 0
+    fi
+
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=input --action=change
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change
+    udevadm settle --timeout=10
+
+    if validate_manifest_storage; then
+        :
+    else
+        manifest_status="$?"
+        [ "$manifest_status" -eq 1 ] && return 0
+        return "$manifest_status"
+    fi
+
+    manifest="/run/open-switcher/input-access-acl.tsv"
+    tab="$(printf '\t')"
+    cleanup_failed=0
+    while IFS="$tab" read -r device_path device_number recorded_uid extra; do
+        if [ -z "$device_path" ] \
+            || [ -z "$device_number" ] \
+            || [ -z "$recorded_uid" ] \
+            || [ -n "$extra" ]; then
+            warn "ignored malformed ACL manifest row"
+            continue
+        fi
+
+        if ! cleanup_recorded_acl \
+            "$device_path" "$device_number" "$recorded_uid"; then
+            cleanup_failed=1
+        fi
+    done <"$manifest"
+
+    [ "$cleanup_failed" -eq 0 ] || return 1
+    rm -f -- "$manifest"
+    rmdir /run/open-switcher 2>/dev/null || true
+}
 
 #DEBHELPER#
+
+case "${1:-}" in
+remove|purge)
+    cleanup_input_access
+    ;;
+esac
 
 exit 0

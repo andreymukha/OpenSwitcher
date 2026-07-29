@@ -3,9 +3,13 @@ set -e
 
 case "${1:-}" in
 upgrade|remove|deconfigure|failed-upgrade)
-    if [ -x /usr/lib/open-switcher/open-switcher-user-session-stop ]; then
-        /usr/lib/open-switcher/open-switcher-user-session-stop || true
-    fi
+    /usr/lib/open-switcher/open-switcher-user-session-stop
+    ;;
+esac
+
+case "${1:-}" in
+remove|deconfigure)
+    /usr/lib/open-switcher/open-switcher-input-access-maintenance capture
     ;;
 esac
 

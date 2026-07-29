@@ -2,10 +2,10 @@
 set -eu
 
 usage() {
-    echo "usage: open-switcher-input-access-maintenance apply" >&2
+    echo "usage: open-switcher-input-access-maintenance apply|capture" >&2
 }
 
-has_required_tags() {
+udev_tags() {
     properties="$1"
     current_tags="$(
         printf '%s\n' "$properties" \
@@ -19,19 +19,29 @@ has_required_tags() {
     )"
 
     if [ -n "$current_tags" ]; then
-        tags="$current_tags"
+        printf '%s\n' "$current_tags"
     else
-        tags="$legacy_tags"
+        printf '%s\n' "$legacy_tags"
     fi
+}
+
+has_udev_tag() {
+    properties="$1"
+    required_tag="$2"
+    tags="$(udev_tags "$properties")"
 
     case "$tags" in
-        *:uaccess:*) ;;
-        *) return 1 ;;
+        *:"$required_tag":*) return 0 ;;
     esac
-    case "$tags" in
-        *:openswitcher-input:*) ;;
-        *) return 1 ;;
-    esac
+
+    return 1
+}
+
+has_required_tags() {
+    properties="$1"
+
+    has_udev_tag "$properties" uaccess \
+        && has_udev_tag "$properties" openswitcher-input
 }
 
 is_supported_input() {
@@ -84,6 +94,165 @@ apply_rules() {
     verify_existing_nodes
 }
 
+warn() {
+    echo "open-switcher: warning: $*" >&2
+}
+
+is_allowed_device_path() {
+    device_path="$1"
+
+    case "$device_path" in
+        /dev/uinput|/dev/input/uinput)
+            return 0
+            ;;
+        /dev/input/event*)
+            event_number="${device_path#/dev/input/event}"
+            case "$event_number" in
+                ""|*[!0-9]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+    esac
+
+    return 1
+}
+
+ensure_runtime_directory() {
+    runtime_dir="/run/open-switcher"
+
+    if [ -L "$runtime_dir" ]; then
+        echo "open-switcher: unsafe runtime directory symlink" >&2
+        return 1
+    fi
+
+    if [ ! -e "$runtime_dir" ]; then
+        umask 077
+        mkdir -m 0700 -- "$runtime_dir"
+    fi
+
+    if [ ! -d "$runtime_dir" ]; then
+        echo "open-switcher: unsafe runtime directory type" >&2
+        return 1
+    fi
+
+    runtime_owner="$(stat -Lc %u -- "$runtime_dir")"
+    runtime_mode="$(stat -Lc %a -- "$runtime_dir")"
+    if [ "$runtime_owner" != "0" ] || [ "$runtime_mode" != "700" ]; then
+        echo "open-switcher: unsafe runtime directory ownership or mode" >&2
+        return 1
+    fi
+}
+
+capture_tagged_node() {
+    sys_path="$1"
+    output_manifest="$2"
+
+    if ! properties="$(udevadm info --query=property --path="$sys_path")"; then
+        [ ! -e "$sys_path" ] && return 0
+        echo "open-switcher: unable to inspect tagged input device" >&2
+        return 1
+    fi
+
+    has_udev_tag "$properties" openswitcher-input || return 0
+    case "$sys_path" in
+        /sys/class/input/event*)
+            is_supported_input "$properties" || return 0
+            ;;
+    esac
+
+    device_path="$(
+        printf '%s\n' "$properties" \
+            | sed -n 's/^DEVNAME=//p' \
+            | head -n 1
+    )"
+    if [ -z "$device_path" ]; then
+        warn "tagged input device has no devnode"
+        return 0
+    fi
+
+    canonical_path="$(readlink -f -- "$device_path" 2>/dev/null || true)"
+    if [ -z "$canonical_path" ] || ! is_allowed_device_path "$canonical_path"; then
+        warn "tagged input device has an unexpected devnode"
+        return 0
+    fi
+    if [ ! -c "$canonical_path" ]; then
+        warn "tagged input devnode is not a character device"
+        return 0
+    fi
+
+    device_number="$(stat -Lc '%t:%T' -- "$canonical_path" 2>/dev/null || true)"
+    if [ -z "$device_number" ]; then
+        warn "unable to record input device identity"
+        return 0
+    fi
+
+    seat="$(
+        printf '%s\n' "$properties" \
+            | sed -n 's/^ID_SEAT=//p' \
+            | head -n 1
+    )"
+    [ -n "$seat" ] || seat="seat0"
+    case "$seat" in
+        [-]*|*[!A-Za-z0-9_.-]*)
+            warn "tagged input device has an invalid seat"
+            return 0
+            ;;
+    esac
+
+    active_session="$(
+        loginctl show-seat "$seat" -p ActiveSession --value 2>/dev/null || true
+    )"
+    case "$active_session" in
+        ""|[-]*|*[!A-Za-z0-9_.-]*) return 0 ;;
+    esac
+
+    active_uid="$(
+        loginctl show-session "$active_session" -p User --value 2>/dev/null || true
+    )"
+    case "$active_uid" in
+        ""|*[!0-9]*) return 0 ;;
+    esac
+
+    if ! acl="$(getfacl -cpn -- "$canonical_path" 2>/dev/null)"; then
+        warn "unable to inspect input ACL"
+        return 0
+    fi
+    if ! printf '%s\n' "$acl" | grep -Eq "^user:${active_uid}:rw-$"; then
+        return 0
+    fi
+
+    printf '%s\t%s\t%s\n' \
+        "$canonical_path" "$device_number" "$active_uid" >>"$output_manifest"
+}
+
+capture_acl_manifest() {
+    if [ ! -e /run/udev/control ]; then
+        echo "open-switcher: ACL capture deferred because udev is offline"
+        return 0
+    fi
+
+    ensure_runtime_directory
+    umask 077
+    runtime_dir="/run/open-switcher"
+    manifest="$runtime_dir/input-access-acl.tsv"
+    capture_manifest_new="$runtime_dir/.input-access-acl.tsv.new.$$"
+    trap 'rm -f -- "$capture_manifest_new"' 0 1 2 15
+    : >"$capture_manifest_new"
+
+    for sys_path in /sys/class/input/event*; do
+        [ -e "$sys_path" ] || continue
+        capture_tagged_node "$sys_path" "$capture_manifest_new"
+    done
+
+    if [ -e /sys/class/misc/uinput ]; then
+        capture_tagged_node /sys/class/misc/uinput "$capture_manifest_new"
+    fi
+
+    chmod 0600 -- "$capture_manifest_new"
+    mv -f -- "$capture_manifest_new" "$manifest"
+    trap - 0 1 2 15
+}
+
 if [ "$#" -ne 1 ]; then
     usage
     exit 2
@@ -92,6 +261,9 @@ fi
 case "$1" in
     apply)
         apply_rules
+        ;;
+    capture)
+        capture_acl_manifest
         ;;
     *)
         usage

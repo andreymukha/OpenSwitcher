@@ -24,90 +24,157 @@ run_user_systemctl() {
     user="$2"
     shift 2
 
-    runuser -u "$user" -- env \
-        "XDG_RUNTIME_DIR=/run/user/$uid" \
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-        systemctl --user "$@"
+    timeout --signal=TERM --kill-after=2s 10s \
+        runuser -u "$user" -- env \
+            "XDG_RUNTIME_DIR=/run/user/$uid" \
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+            systemctl --user "$@"
 }
 
 wait_for_guardian_inactive() {
     uid="$1"
     user="$2"
 
-    command -v timeout >/dev/null 2>&1 || return 0
     # Переменные внутри строки раскрывает дочерний shell пользователя.
     # shellcheck disable=SC2016
-    runuser -u "$user" -- env \
-        "XDG_RUNTIME_DIR=/run/user/$uid" \
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
-        timeout --signal=KILL 7s sh -c '
-            while :; do
-                state="$(
-                    systemctl --user show \
-                        --property=ActiveState \
-                        --value \
-                        open-switcher-xtest-guardian.service \
-                        2>/dev/null
-                )" || exit 0
-                case "$state" in
-                    active|activating|deactivating|reloading)
-                        sleep 0.1
-                        ;;
-                    *)
-                        exit 0
-                        ;;
-                esac
-            done
-        ' || true
+    timeout --signal=TERM --kill-after=2s 10s \
+        runuser -u "$user" -- env \
+            "XDG_RUNTIME_DIR=/run/user/$uid" \
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" \
+            sh -c '
+                while :; do
+                    state="$(
+                        systemctl --user show \
+                            --property=ActiveState \
+                            --value \
+                            open-switcher-xtest-guardian.service \
+                            2>/dev/null
+                    )" || exit 0
+                    case "$state" in
+                        active|activating|deactivating|reloading)
+                            sleep 0.1
+                            ;;
+                        *)
+                            exit 0
+                            ;;
+                    esac
+                done
+            '
+}
+
+warn() {
+    echo "open-switcher: warning: $*" >&2
+}
+
+exact_daemon_is_running() {
+    uid="$1"
+    daemon_path="/usr/bin/open-switcher-daemon"
+
+    for proc_dir in /proc/[0-9]*; do
+        [ -d "$proc_dir" ] || continue
+
+        proc_uid="$(stat -c %u "$proc_dir" 2>/dev/null || true)"
+        [ "$proc_uid" = "$uid" ] || continue
+
+        proc_exe="$(readlink -f "$proc_dir/exe" 2>/dev/null || true)"
+        case "$proc_exe" in
+            "$daemon_path"|"$daemon_path (deleted)") return 0 ;;
+        esac
+    done
+
+    return 1
 }
 
 stop_for_user() {
     uid="$1"
     user="$2"
 
-    run_user_systemctl "$uid" "$user" \
-        stop open-switcher-tray.service || true
-    run_user_systemctl "$uid" "$user" \
-        stop open-switcher-daemon.service || true
-    wait_for_guardian_inactive "$uid" "$user"
-    run_user_systemctl "$uid" "$user" \
-        stop open-switcher-xtest-guardian.socket || true
-    run_user_systemctl "$uid" "$user" \
-        stop open-switcher-xtest-guardian.service || true
-    run_user_systemctl "$uid" "$user" daemon-reload || true
+    if ! run_user_systemctl "$uid" "$user" \
+        stop open-switcher-tray.service; then
+        warn "unable to stop tray for uid $uid"
+    fi
+    if ! run_user_systemctl "$uid" "$user" \
+        stop open-switcher-daemon.service; then
+        warn "unable to stop daemon unit for uid $uid"
+    fi
+    if ! wait_for_guardian_inactive "$uid" "$user"; then
+        warn "guardian drain timed out for uid $uid"
+    fi
+    if ! run_user_systemctl "$uid" "$user" \
+        stop open-switcher-xtest-guardian.socket; then
+        warn "unable to stop guardian socket for uid $uid"
+    fi
+    if ! run_user_systemctl "$uid" "$user" \
+        stop open-switcher-xtest-guardian.service; then
+        warn "unable to stop guardian service for uid $uid"
+    fi
+    if ! run_user_systemctl "$uid" "$user" daemon-reload; then
+        warn "unable to reload user manager for uid $uid"
+    fi
+
+    if unit_state="$(
+        run_user_systemctl "$uid" "$user" \
+            show --property=ActiveState --value open-switcher-daemon.service \
+            2>/dev/null
+    )"; then
+        case "$unit_state" in
+            active|activating|deactivating|reloading)
+                warn "daemon unit still reports $unit_state for uid $uid"
+                ;;
+        esac
+    fi
+
+    if exact_daemon_is_running "$uid"; then
+        echo "open-switcher: running daemon remains for uid $uid" >&2
+        return 1
+    fi
 }
 
 stop_all_local_user_managers() {
     command -v loginctl >/dev/null 2>&1 || return 0
     command -v runuser >/dev/null 2>&1 || return 0
     command -v systemctl >/dev/null 2>&1 || return 0
+    if ! command -v timeout >/dev/null 2>&1; then
+        echo "open-switcher: timeout is required for bounded shutdown" >&2
+        return 1
+    fi
 
-    seen_uids=" "
-    loginctl list-sessions --no-legend 2>/dev/null | while read -r session _rest; do
-        [ -n "$session" ] || continue
-        is_local_graphical_session "$session" || continue
+    loginctl list-sessions --no-legend 2>/dev/null | (
+        seen_uids=" "
+        stop_failed=0
 
-        uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
-        user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
-        case "$uid" in
-            ""|*[!0-9]*) continue ;;
-        esac
-        [ -n "$user" ] || continue
-        [ -d "/run/user/$uid" ] || continue
-        [ -S "/run/user/$uid/bus" ] || continue
+        while read -r session _rest; do
+            [ -n "$session" ] || continue
+            is_local_graphical_session "$session" || continue
 
-        case "$seen_uids" in
-            *" $uid "*) continue ;;
-        esac
-        seen_uids="${seen_uids}${uid} "
+            uid="$(loginctl show-session "$session" -p User --value 2>/dev/null || true)"
+            user="$(loginctl show-session "$session" -p Name --value 2>/dev/null || true)"
+            case "$uid" in
+                ""|*[!0-9]*) continue ;;
+            esac
+            [ -n "$user" ] || continue
+            [ -d "/run/user/$uid" ] || continue
+            [ -S "/run/user/$uid/bus" ] || continue
 
-        stop_for_user "$uid" "$user"
-    done
+            case "$seen_uids" in
+                *" $uid "*) continue ;;
+            esac
+            seen_uids="${seen_uids}${uid} "
+
+            if ! stop_for_user "$uid" "$user"; then
+                stop_failed=1
+            fi
+        done
+
+        exit "$stop_failed"
+    )
 }
 
 if [ "${1:-}" = "upgrade" ]; then
     if [ -x /usr/lib/open-switcher/open-switcher-user-session-stop ]; then
-        /usr/lib/open-switcher/open-switcher-user-session-stop || true
+        timeout --signal=TERM --kill-after=2s 10s \
+            /usr/lib/open-switcher/open-switcher-user-session-stop || \
+            warn "legacy session-stop helper did not complete cleanly"
     fi
     stop_all_local_user_managers
 fi

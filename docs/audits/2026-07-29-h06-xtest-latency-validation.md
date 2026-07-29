@@ -2,7 +2,8 @@
 
 **Дата:** 2026-07-29
 
-**Статус:** реализация и Mint/Cinnamon/X11-проверка завершены
+**Статус:** выбранный barrier-only вариант и предынтеграционные проверки
+завершены
 
 **Техническое решение:** рекомендовать только `barrier-only`, коммит
 `9276bc05814b48113dc2285bae6199e454f0e501`. Operation-scoped mapping cache из
@@ -10,7 +11,9 @@
 эксперимент, но не включать в интеграцию: дополнительный пользовательский
 выигрыш не отделяется от шума.
 
-Автоматическое слияние не выполнялось.
+Для интеграции создана отдельная ветка `perf/h06-xtest-barrier`: в её
+production-код входит `9276bc0`, но отсутствует `7b1475c`. Автоматическое
+слияние не выполнялось.
 
 ## Что проверялось
 
@@ -68,6 +71,25 @@ layout backend и общая логика коррекции в production-ко�
 Barrier-only DEB собран с package test phase. Combined DEB собран с
 `DEB_BUILD_OPTIONS=nocheck` только после уже пройденных полных gates, чтобы не
 дублировать тот же тестовый прогон; эта опция не меняет release binary.
+
+После выбора варианта на точной ветке `perf/h06-xtest-barrier` выполнена
+свежая предынтеграционная перепроверка:
+
+| Проверка | Результат |
+|---|---|
+| полная Rust-регрессия без `DISPLAY`/`WAYLAND_DISPLAY` | 920 library + 4 daemon + 11 D-Bus + 5 probe passed; 1 ignored |
+| `cargo check --locked --all-targets --features settings-ui` | exit 0 |
+| `cargo fmt --all -- --check` | exit 0 |
+| `git diff --check` | exit 0 |
+| Wayland diagnostics | `ok` вне syscall-песочницы |
+| Linux input setup tests | `ok` |
+| Debian package scripts | `ok` |
+| DEB management tests | `ok` |
+
+Первый Wayland diagnostics run внутри restricted syscall sandbox получил
+`EPERM` на создании временного Unix socket. Тот же неизменённый тест вне этой
+песочницы завершился `ok`; это ограничение среды запуска, а не отказ
+OpenSwitcher.
 
 ## Идентичность пакетов
 
@@ -312,6 +334,58 @@ stage=guardian-emergency-terminal proof=Reconciled
 запущены daemon PID `34961` и guardian PID `35013`; key state был up, marker
 `456` ввёлся.
 
+## Exact barrier-only Mint crash smoke
+
+После выбора варианта короткая safety-матрица повторена на exact barrier-only
+DEB с SHA-256
+`3ac9360dbe79b15565958968a1cbef5bc5984ac915c4948b7aa0063ca2d15157`.
+SHA daemon внутри пакета и установленного `/usr/bin/open-switcher-daemon`
+совпал:
+
+```text
+9193f22eff01c8ae190b5a7da21ffcf75a0e010404972195763e0828cb02699e
+```
+
+| Gate | Наблюдаемый результат | Статус |
+|---|---|---|
+| обычный F12 | `ыгвщ` → `sudo` | PASS |
+| accidental Caps Lock | `пРИВЕТ` + Space → `Привет` + Space | PASS |
+| две заглавные | `ПРивет` + Space → `Привет` + Space | PASS |
+| Shift и punctuation | `руддщ!` + F12 → `hello!` | PASS |
+| штатный stop/start | markers `789` и `456` | PASS |
+| daemon `SIGKILL` после real XTEST down | matching key-up, marker `123`, новый daemon | PASS |
+| guardian `SIGKILL` после real XTEST down | emergency `Reconciled`, marker `456`, новый daemon | PASS |
+| порядок аварийного пути | `grab-released` до `guardian-emergency-terminal` | PASS |
+| keymap после аварий | QEMU, XTEST и OpenSwitcher devices: все key up | PASS |
+| опасные строки | timeout/protocol failure/`Unreconciled` не найдены | PASS |
+
+Следовательно, предположение о совпадении критического terminal-release пути
+combined и barrier-only подтверждено отдельным runtime-прогоном.
+
+## Exact barrier-only Ubuntu/GNOME/Wayland package smoke
+
+Тот же DEB установлен в Ubuntu 24.04.4/GNOME/Wayland. После установки:
+
+- пакет и установленный daemon совпали с указанными выше SHA;
+- daemon вышел в input-ready и захватил QEMU USB keyboard;
+- guardian service/process остался inactive, guardian socket был active;
+  это ожидаемый Wayland-путь без XTEST;
+- при устойчивой начальной RU-раскладке F12 дал `sudo`, completion занял
+  `102 ms`;
+- опасных строк в input-debug не найдено.
+
+Active same-version reinstall заменил и процесс, и inode бинарника:
+
+```text
+daemon PID: 8735 -> 15684
+daemon inode: 3196 -> 3214
+```
+
+После reinstall физический marker `321` ввёлся. После `remove` marker `654`
+ввёлся, процесс и units отсутствовали. После `purge` marker `987` ввёлся,
+пакет, binary, systemd units, udev rule и guardian socket отсутствовали;
+пользовательские config и opt-in autostart сохранились.
+
 ## Почему выбран barrier-only
 
 Первый commit выполняет исходную цель:
@@ -351,6 +425,17 @@ Combined commit не требуется откатывать или удалят
 Эти прогоны не использованы как product results и сохранены с префиксом
 `preflight-`. Финальная матрица после исправления harness прошла целиком.
 
+При предынтеграционной перепроверке отдельно учтены ещё два свойства среды:
+
+1. после холодного запуска Mint тестовое окно Xed не восстановилось
+   автоматически; harness остановился до ввода, после явного открытия того же
+   документа exact barrier-only smoke прошёл;
+2. прямой `gsettings set ... current` в GNOME не является надёжным аналогом
+   пользовательского переключения: daemon сообщил успешную F12-транзакцию,
+   но GNOME не сменил фактическую раскладку при synthetic Super+Space, поэтому
+   слово визуально осталось тем же. Этот прогон исключён; функциональный
+   результат получен после запуска с устойчивой начальной RU-раскладкой.
+
 ## Ограничения
 
 1. Timing и crash gates выполнены в QEMU Mint/Cinnamon/X11, а не на реальной
@@ -358,17 +443,10 @@ Combined commit не требуется откатывать или удалят
 2. X server timestamps имеют миллисекундное разрешение. Разница combined и
    barrier-only в 1–2 ms поэтому не считается доказанным пользовательским
    выигрышем.
-3. Crash-матрица выполнена на combined DEB. Критический checked-mutation код и
-   terminal release в barrier-only те же; mapping cache затрагивает только
-   preflight mapping. Тем не менее перед окончательным merge полезен один
-   короткий exact barrier-only crash smoke.
-4. Ubuntu/GNOME/Wayland не использует изменённый XTEST hot path. Его
-   performance-кампания не нужна, но перед merge exact barrier-only DEB ещё
-   должен пройти install/upgrade/purge и функциональный package smoke.
-5. Не повторялись неизменившиеся предельные сценарии H-06: одновременная
+3. Не повторялись неизменившиеся предельные сценарии H-06: одновременная
    гибель daemon и guardian, зависание X server, power loss и отказ emergency
    X11 connection.
-6. Mapping mutation непосредственно во время одной операции не
+4. Mapping mutation непосредственно во время одной операции не
    воспроизводилась. Это не влияет на выбранный barrier-only результат,
    поскольку mapping cache не рекомендуется к интеграции.
 
@@ -394,20 +472,30 @@ Combined commit не требуется откатывать или удалят
 девять per-series summary, screenshots, SIGKILL JSONL и все preflight
 артефакты.
 
+Предынтеграционные exact barrier-only evidence:
+
+| Evidence | SHA-256 |
+|---|---|
+| Mint `barrier-final-20260729/safety-combined-summary.json` | `eb871168cc31ac3b99c3a5fb89695074be71ed4cf1389d5b7559bb035cc06593` |
+| Mint `barrier-final-20260729/safety-combined-journal.txt` | `f2b82ddffe61c69c1dc35b6cfcd9c1c24d91029ebbf4769b4521d794db239105` |
+| Ubuntu `barrier-final-20260729/wayland-input-debug.log` | `053576e469bc7b2233a0c72645fa6a11803d85080d220f294f7cf2c9240666b2` |
+| Ubuntu `barrier-final-20260729/barrier-final-journal.txt` | `08a4901f9a07ac83ed543e242082332f924bdc80e17c4cd92933e7da812586b6` |
+| Ubuntu `h06-barrier-final-wayland-f12.ppm` | `2e81dc2326020a9eb354f52c605cf53167b010e11af6ce0626d44e358d156013` |
+| Ubuntu `h06-barrier-final-after-purge.ppm` | `7bbc3efee17d48653cb6062bf2ebb267019a1f22c8dcd6c82cc62bd86ae3b737` |
+
 ## Состояние после проверки
 
-- Mint guest штатно выключен;
-- QEMU process, SSH forward `127.0.0.1:22223` и QMP socket отсутствуют;
+- Mint и Ubuntu guests штатно выключены;
+- QEMU processes, SSH forwards `127.0.0.1:22222`/`22223` и оба QMP socket
+  отсутствуют;
 - VM, overlay, ключи, пакеты и evidence сохранены;
 - лаборатория не удалялась;
 - merge и push не выполнялись.
 
 ## Следующий интеграционный шаг
 
-После отдельного согласия пользователя:
-
-1. сформировать integration branch только до
-   `9276bc05814b48113dc2285bae6199e454f0e501`, без mapping-cache commit;
-2. выполнить короткий exact barrier-only Mint crash smoke;
-3. выполнить Ubuntu/GNOME/Wayland package install/upgrade/purge smoke;
-4. только после зелёных результатов решать вопрос о merge и финальном DEB.
+Integration branch, exact barrier-only Mint crash smoke и
+Ubuntu/GNOME/Wayland package lifecycle smoke завершены. Следующий шаг — после
+отдельного решения пользователя слить `perf/h06-xtest-barrier` в основную
+линию H-06, затем выполнить проверку уже объединённого результата и собрать
+финальный DEB.

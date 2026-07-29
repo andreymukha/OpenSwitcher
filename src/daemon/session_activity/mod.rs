@@ -386,15 +386,22 @@ fn run_session_monitor(
 ) {
     let _death_guard = WorkerDeathGuard::new(publication.clone());
 
-    if let Err(error) = subscribe_and_refresh(source.as_mut(), uid, &publication) {
-        publication.publish(
-            SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
-            monotonic_ms(),
-        );
-        let _ = ready_tx.send(Err(error));
+    let initially_connected = match subscribe_and_refresh(source.as_mut(), uid, &publication) {
+        Ok(()) => true,
+        Err(_) => {
+            publication.publish(
+                SessionDecision::Unauthorized(SessionUnavailableReason::SourceUnavailable),
+                monotonic_ms(),
+            );
+            false
+        }
+    };
+    if ready_tx.send(Ok(())).is_err() {
         return;
     }
-    if ready_tx.send(Ok(())).is_err() {
+    if !initially_connected
+        && !reconnect_source(source.as_mut(), uid, &publication, &stop_rx, timing)
+    {
         return;
     }
 
@@ -664,6 +671,7 @@ mod monitor_tests {
         current_snapshot: Vec<SessionRecord>,
         events: mpsc::Receiver<FakeEvent>,
         subscribe_calls: Arc<AtomicUsize>,
+        subscribe_failures_remaining: usize,
         reconnect_gate: Option<mpsc::Receiver<()>>,
     }
 
@@ -671,6 +679,10 @@ mod monitor_tests {
         fn subscribe(&mut self) -> Result<(), SwitcherError> {
             self.trace.lock().unwrap().push("subscribe");
             let call = self.subscribe_calls.fetch_add(1, Ordering::SeqCst);
+            if self.subscribe_failures_remaining > 0 {
+                self.subscribe_failures_remaining -= 1;
+                return Err(std::io::Error::other("injected initial subscribe failure").into());
+            }
             if call > 0 {
                 if let Some(gate) = self.reconnect_gate.take() {
                     gate.recv().expect("test must release reconnect");
@@ -717,6 +729,14 @@ mod monitor_tests {
         snapshots: Vec<Vec<SessionRecord>>,
         gate_reconnect: bool,
     ) -> (Box<dyn SessionSource>, FakeControl) {
+        fake_source_with_subscribe_failures(snapshots, gate_reconnect, 0)
+    }
+
+    fn fake_source_with_subscribe_failures(
+        snapshots: Vec<Vec<SessionRecord>>,
+        gate_reconnect: bool,
+        subscribe_failures_remaining: usize,
+    ) -> (Box<dyn SessionSource>, FakeControl) {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let subscribe_calls = Arc::new(AtomicUsize::new(0));
         let (events_tx, events_rx) = mpsc::channel();
@@ -732,6 +752,7 @@ mod monitor_tests {
             current_snapshot: Vec::new(),
             events: events_rx,
             subscribe_calls: Arc::clone(&subscribe_calls),
+            subscribe_failures_remaining,
             reconnect_gate: reconnect_gate_rx,
         };
         let control = FakeControl {
@@ -862,6 +883,30 @@ mod monitor_tests {
 
         control.reconnect_gate.take().unwrap().send(()).unwrap();
         wait_until(|| published_session(&publication).as_deref() == Some("c8"));
+
+        assert!(monitor.stop().is_ok());
+    }
+
+    #[test]
+    fn initial_source_failure_starts_fail_closed_then_reconnects() {
+        let (source, mut control) =
+            fake_source_with_subscribe_failures(vec![graphical_session("c2")], true, 1);
+        let mut monitor = SessionActivityMonitor::start_with_source_for_test(
+            source,
+            1000,
+            test_timing(Duration::from_secs(5)),
+        )
+        .expect("source outage must not hide the diagnostic daemon endpoint");
+        let publication = monitor.publication();
+
+        assert!(matches!(
+            publication.health_error(monotonic_ms()),
+            Some(SwitcherError::InputSessionInactive)
+        ));
+        wait_until(|| control.subscribe_calls.load(Ordering::SeqCst) >= 2);
+
+        control.reconnect_gate.take().unwrap().send(()).unwrap();
+        wait_until(|| published_session(&publication).as_deref() == Some("c2"));
 
         assert!(monitor.stop().is_ok());
     }

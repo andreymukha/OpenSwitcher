@@ -27,6 +27,7 @@ override_dh_auto_test: check-rust-toolchain
 	$(CARGO) test --locked
 	$(CARGO) test --locked --features settings-ui --lib
 	bash tests/wayland_diagnostics_test.sh
+	bash tests/input_access_package_test.sh
 	bash tests/debian_package_scripts_test.sh
 
 override_dh_auto_install:
@@ -35,10 +36,10 @@ override_dh_auto_install:
 	install -D -m 0755 target/release/open-switcher-settings debian/open-switcher/usr/bin/open-switcher-settings
 
 override_dh_installudev:
-	dh_installudev --name=openswitcher-input --priority=80
+	dh_installudev --name=openswitcher-input --priority=70
 
 execute_after_dh_install:
-	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-acl-bridge
+	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-access-maintenance
 	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-launch
 	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-user-session-start
 	chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-user-session-stop

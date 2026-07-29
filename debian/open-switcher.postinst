@@ -22,17 +22,11 @@ case "${1:-}" in
 configure|abort-upgrade|abort-remove|abort-deconfigure)
     remove_legacy_global_user_enablement
 
-    if [ "${1:-}" = "configure" ]; then
-        if command -v udevadm >/dev/null 2>&1; then
-            udevadm control --reload-rules || true
-            udevadm trigger --subsystem-match=input --action=change || true
-            udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change || true
-        fi
-
-        if [ -x /usr/lib/open-switcher/open-switcher-input-acl-bridge ]; then
-            /usr/lib/open-switcher/open-switcher-input-acl-bridge || true
-        fi
-    fi
+    case "${1:-}" in
+    configure|abort-remove|abort-deconfigure)
+        /usr/lib/open-switcher/open-switcher-input-access-maintenance apply
+        ;;
+    esac
 
     if [ -x /usr/lib/open-switcher/open-switcher-user-session-start ]; then
         /usr/lib/open-switcher/open-switcher-user-session-start || true

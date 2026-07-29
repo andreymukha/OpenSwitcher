@@ -28,6 +28,15 @@ assert_file_exists() {
     fi
 }
 
+assert_file_not_exists() {
+    local file="$1"
+
+    if [[ -e "$file" ]]; then
+        echo "expected file not to exist: $file" >&2
+        exit 1
+    fi
+}
+
 assert_not_contains() {
     local file="$1"
     local unexpected="$2"
@@ -314,14 +323,27 @@ test_privileged_input_setup_uses_package_owned_trust_anchors() {
     local postinst="$REPO_ROOT/debian/open-switcher.postinst"
     local prerm="$REPO_ROOT/debian/open-switcher.prerm"
     local postrm="$REPO_ROOT/debian/open-switcher.postrm"
+    local maintenance="$REPO_ROOT/debian/scripts/open-switcher-input-access-maintenance"
     local acl_bridge="$REPO_ROOT/debian/scripts/open-switcher-input-acl-bridge"
     local udev_rule="$REPO_ROOT/debian/open-switcher.openswitcher-input.udev"
+    local dist_udev_rule="$REPO_ROOT/dist/udev/80-openswitcher-input.rules"
     local file=""
 
-    assert_contains "$install_file" "debian/scripts/open-switcher-input-acl-bridge usr/lib/open-switcher/"
-    assert_contains "$rules" "dh_installudev --name=openswitcher-input --priority=80"
-    assert_contains "$rules" "chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-acl-bridge"
-    assert_contains "$postinst" "/usr/lib/open-switcher/open-switcher-input-acl-bridge"
+    assert_file_exists "$maintenance"
+    assert_file_not_exists "$acl_bridge"
+    assert_file_not_exists "$dist_udev_rule"
+    assert_contains "$install_file" \
+        "debian/scripts/open-switcher-input-access-maintenance usr/lib/open-switcher/"
+    assert_contains "$rules" "dh_installudev --name=openswitcher-input --priority=70"
+    assert_contains "$rules" \
+        "chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-access-maintenance"
+    assert_contains "$postinst" \
+        "/usr/lib/open-switcher/open-switcher-input-access-maintenance apply"
+    assert_not_contains "$postinst" "open-switcher-input-acl-bridge"
+    assert_not_contains "$postinst" \
+        "open-switcher-input-access-maintenance apply || true"
+    assert_not_contains "$postinst" "udevadm control --reload-rules || true"
+    assert_contains "$udev_rule" 'TAG+="uaccess", TAG+="openswitcher-input"'
 
     for file in \
         "$install_file" \
@@ -329,11 +351,15 @@ test_privileged_input_setup_uses_package_owned_trust_anchors() {
         "$postinst" \
         "$prerm" \
         "$postrm" \
-        "$acl_bridge" \
+        "$maintenance" \
         "$udev_rule"; do
         assert_not_contains "$file" "scripts/linux_input_setup.sh"
         assert_not_contains "$file" "dist/udev"
         assert_not_contains "$file" "OPEN_SWITCHER_LINUX_INPUT_"
+    done
+
+    for unsafe_token in "eval" "source" "sudo" "/tmp"; do
+        assert_not_contains "$maintenance" "$unsafe_token"
     done
 }
 

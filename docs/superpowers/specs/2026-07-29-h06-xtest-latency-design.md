@@ -240,6 +240,17 @@ OperationId -> [(evdev_code, x11_keycode, server_epoch)]
 Кэш не должен попадать в общий `SyntheticOperation`: это X11-специфичная
 оптимизация, не являющаяся обязанностью будущих KDE/Wayland/uinput backend.
 
+### Порядок внедрения
+
+Две оптимизации реализуются независимыми коммитами:
+
+1. сначала типизированное подтверждение и удаление второго round-trip;
+2. затем operation-scoped mapping cache.
+
+Для обеих точек собираются отдельные артефакты. Это позволяет измерить вклад
+каждой оптимизации и полностью отбросить mapping cache, если первый этап уже
+даёт достаточный выигрыш или второй не оправдывает дополнительное состояние.
+
 ## Ошибочные и прерванные пути
 
 ### Ошибка mapping
@@ -289,7 +300,8 @@ Emergency connection использует заранее проверенные 
 2. `GuardianX11Executor::synchronize` потребляет proof без вызова
    `round_trip`.
 3. `synchronize` без proof возвращает invariant error.
-4. Ошибка checked mutation не оставляет ложного proof.
+4. Перед каждой новой mutation старый proof извлекается из pending state;
+   ошибка новой mutation не может оставить доступным proof предыдущей.
 5. Повторный cleanup key-up заменяет старый proof и успешно подтверждается.
 6. Четыре одинаковых `PrepareKey` одной операции выполняют один mapping query,
    но возвращают четыре уникальных token.
@@ -328,7 +340,8 @@ performance DEB в одной и той же сохранённой ВМ, с о�
 
 Собираются:
 
-- не менее 30 успешных F12-коррекций на серию;
+- не менее трёх чередующихся серий по 30 успешных F12-коррекций для каждого
+  сравниваемого состояния;
 - full completion `elapsed_ms`;
 - высокоточный интервал от первого Backspace press до последнего replay
   release;
@@ -353,6 +366,8 @@ Mint повторяются:
 - daemon `SIGKILL` с восстановлением клавиатуры и чистым keymap;
 - guardian `SIGKILL` с emergency release и чистым keymap;
 - штатный stop/restart;
+- отдельный probe, который видит применённую XTEST mutation после
+  `checked_fake_key`, но до локального протокольного `Synchronize`;
 - проверка логов на timeout, protocol failure и `Unreconciled`.
 
 Ubuntu/GNOME/Wayland не использует изменённый горячий путь. Для него полный

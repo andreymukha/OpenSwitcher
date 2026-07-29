@@ -230,9 +230,7 @@ mod tests {
         let background_pixels = icon
             .data
             .chunks_exact(4)
-            .filter(|pixel| {
-                pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 80 && pixel[3] == 220
-            })
+            .filter(|pixel| pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 80 && pixel[3] == 220)
             .count();
 
         assert!(white_pixels > 0);

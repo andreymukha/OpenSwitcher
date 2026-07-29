@@ -251,7 +251,7 @@ mod tests {
     use super::*;
     use crate::error::ValidationError;
     use crate::model::{
-        DetectionConfidence, DetectionStrategy, DesktopEnvironment, DistroKind, HotkeyModifiers,
+        DesktopEnvironment, DetectionConfidence, DetectionStrategy, DistroKind, HotkeyModifiers,
         HotkeySpec, HotkeyTrigger, SelectedTextHotkey, SessionType, SystemContext, UndoKey,
         INPUT_KEY_DELAY_MAX_MS, MAX_CORRECTION_SCHEDULE_MS,
     };
@@ -679,8 +679,14 @@ selected_text_switch_hotkey = "ShiftPause"
             config.features.selected_text_switch_hotkey,
             HotkeySpec::from(SelectedTextHotkey::AltScrollLock)
         );
-        assert_eq!(config.layout.switch_combo, LayoutSwitchCombo::left_alt_left_shift());
-        assert_eq!(config.layout.switch_source, LayoutSwitchSource::AutoFallback);
+        assert_eq!(
+            config.layout.switch_combo,
+            LayoutSwitchCombo::left_alt_left_shift()
+        );
+        assert_eq!(
+            config.layout.switch_source,
+            LayoutSwitchSource::AutoFallback
+        );
         assert_eq!(config.layout.auto_detected, xfce_x11_detection());
         assert_eq!(config.settings(), updated);
     }
@@ -702,8 +708,14 @@ selected_text_switch_hotkey = "ShiftPause"
             loaded.features.selected_text_switch_hotkey,
             HotkeySpec::from(SelectedTextHotkey::CtrlF12)
         );
-        assert_eq!(loaded.layout.switch_combo, LayoutSwitchCombo::right_ctrl_right_shift());
-        assert_eq!(loaded.layout.switch_source, LayoutSwitchSource::AutoDetected);
+        assert_eq!(
+            loaded.layout.switch_combo,
+            LayoutSwitchCombo::right_ctrl_right_shift()
+        );
+        assert_eq!(
+            loaded.layout.switch_source,
+            LayoutSwitchSource::AutoDetected
+        );
         assert_eq!(loaded.layout.auto_detected, cinnamon_x11_detection());
         assert_eq!(loaded.layout.delay_ms, 123);
         assert_eq!(loaded.delays.backspace_ms, 4);
@@ -718,7 +730,10 @@ selected_text_switch_hotkey = "ShiftPause"
         let parsed_manual: AppConfigFile = toml::from_str(&manual_toml).unwrap();
         assert!(parsed_manual.layout.auto_detected.is_none());
         assert_eq!(
-            AppConfig::try_from(parsed_manual).unwrap().layout.auto_detected,
+            AppConfig::try_from(parsed_manual)
+                .unwrap()
+                .layout
+                .auto_detected,
             AutoDetectedLayoutSwitch::default()
         );
 

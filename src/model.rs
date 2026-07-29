@@ -252,13 +252,15 @@ impl HotkeySpec {
     }
 
     pub fn matches(self, trigger: HotkeyTrigger, modifiers: HotkeyModifiers) -> bool {
-        self.trigger == trigger && self.modifiers.shift == modifiers.shift
+        self.trigger == trigger
+            && self.modifiers.shift == modifiers.shift
             && self.modifiers.ctrl == modifiers.ctrl
             && self.modifiers.alt == modifiers.alt
     }
 
     pub fn conflicts_exact(self, other: Self) -> bool {
-        self.trigger == other.trigger && self.modifiers.shift == other.modifiers.shift
+        self.trigger == other.trigger
+            && self.modifiers.shift == other.modifiers.shift
             && self.modifiers.ctrl == other.modifiers.ctrl
             && self.modifiers.alt == other.modifiers.alt
     }
@@ -1145,7 +1147,10 @@ mod tests {
         assert!(!settings.auto_switch_enabled);
         assert!(settings.fix_two_capitals);
         assert!(settings.fix_accidental_caps_lock);
-        assert_eq!(settings.manual_correction_hotkey, HotkeySpec::from(UndoKey::F12));
+        assert_eq!(
+            settings.manual_correction_hotkey,
+            HotkeySpec::from(UndoKey::F12)
+        );
         assert_eq!(
             settings.selected_text_hotkey,
             HotkeySpec::from(SelectedTextHotkey::AltPause)
@@ -1238,10 +1243,7 @@ mod tests {
             (HotkeyModifiers::shift_ctrl(), "shift+ctrl+f12"),
             (HotkeyModifiers::shift_alt(), "shift+alt+f12"),
             (HotkeyModifiers::ctrl_alt(), "ctrl+alt+f12"),
-            (
-                HotkeyModifiers::shift_ctrl_alt(),
-                "shift+ctrl+alt+f12",
-            ),
+            (HotkeyModifiers::shift_ctrl_alt(), "shift+ctrl+alt+f12"),
         ];
 
         for (modifiers, expected) in modifier_masks {
@@ -1301,10 +1303,22 @@ mod tests {
     #[test]
     fn hotkey_spec_parses_legacy_undo_key_values() {
         let values = [
-            ("Pause", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause)),
-            ("pause", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause)),
-            ("F12", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12)),
-            ("f12", HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12)),
+            (
+                "Pause",
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause),
+            ),
+            (
+                "pause",
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::Pause),
+            ),
+            (
+                "F12",
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12),
+            ),
+            (
+                "f12",
+                HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::F12),
+            ),
             (
                 "ScrollLock",
                 HotkeySpec::new(HotkeyModifiers::none(), HotkeyTrigger::ScrollLock),
@@ -1419,10 +1433,7 @@ mod tests {
             HotkeySpec::new(HotkeyModifiers::shift_ctrl_alt(), HotkeyTrigger::Insert);
 
         assert_eq!(ctrl_alt_f12.config_value(), "ctrl+alt+f12");
-        assert_eq!(
-            HotkeySpec::from_str("ctrl+alt+f12").unwrap(),
-            ctrl_alt_f12
-        );
+        assert_eq!(HotkeySpec::from_str("ctrl+alt+f12").unwrap(), ctrl_alt_f12);
         assert_eq!(shift_ctrl_alt_f12.config_value(), "shift+ctrl+alt+f12");
         assert_eq!(
             HotkeySpec::from_str("shift+ctrl+alt+f12").unwrap(),
@@ -1499,8 +1510,7 @@ mod tests {
     #[test]
     fn hotkey_spec_detects_layout_prefix_conflict_as_warning_helper() {
         let ctrl_shift_f12 = HotkeySpec::new(HotkeyModifiers::shift_ctrl(), HotkeyTrigger::F12);
-        let alt_shift_insert =
-            HotkeySpec::new(HotkeyModifiers::shift_alt(), HotkeyTrigger::Insert);
+        let alt_shift_insert = HotkeySpec::new(HotkeyModifiers::shift_alt(), HotkeyTrigger::Insert);
         let ctrl_alt_f12 = HotkeySpec::new(HotkeyModifiers::ctrl_alt(), HotkeyTrigger::F12);
 
         assert!(ctrl_shift_f12.has_layout_switch_prefix_conflict(LayoutSwitchCombo::ctrl_shift()));

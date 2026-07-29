@@ -147,6 +147,10 @@ pub enum SwitcherError {
     InputSafety(#[from] InputSafetyError),
     #[error(transparent)]
     Ui(#[from] UiError),
+    #[error("Input session is not currently authorized")]
+    InputSessionInactive,
+    #[error("Required logind session monitor stopped")]
+    SessionMonitorStopped,
     #[error("Keyboard device was not found")]
     KeyboardNotFound,
     #[error("Keyboard device is present but access was denied: {path}")]
@@ -220,6 +224,7 @@ impl SwitcherError {
             SwitcherError::KeyboardNotFound
             | SwitcherError::KeyboardAccessDenied { .. }
             | SwitcherError::UinputAccessDenied { .. }
+            | SwitcherError::InputSessionInactive
             | SwitcherError::InputWorkerDisconnected { .. } => true,
             SwitcherError::Io(error) => {
                 matches!(error.raw_os_error(), Some(19))
@@ -303,6 +308,12 @@ mod tests {
 
         assert!(disconnected.is_recoverable_input_error());
         assert!(!timed_out.is_recoverable_input_error());
+    }
+
+    #[test]
+    fn inactive_input_session_is_recoverable_but_monitor_loss_is_fatal() {
+        assert!(SwitcherError::InputSessionInactive.is_recoverable_input_error());
+        assert!(!SwitcherError::SessionMonitorStopped.is_recoverable_input_error());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod layout_switcher;
 pub mod runtime;
 pub mod selected_text;
 pub mod service;
+pub(crate) mod session_activity;
 pub mod switch_logic;
 pub(crate) mod synthetic_input;
 pub(crate) mod uinput_synthetic;

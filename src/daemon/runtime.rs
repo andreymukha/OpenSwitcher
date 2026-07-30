@@ -2041,6 +2041,45 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn x11_layout_property_change_forces_same_count_setup_redetection() {
+        let now = Instant::now();
+        let runtime = test_runtime_with_backend_and_context(
+            known_layout_state(english_layout()),
+            Box::new(SetupOutcomeBackend {
+                outcomes: Mutex::new(
+                    [LayoutSetupDetection::Unsupported {
+                        reason: "english-russian-pair-missing".to_string(),
+                    }]
+                    .into_iter()
+                    .collect(),
+                ),
+            }),
+            cinnamon_x11_context(),
+        );
+        runtime.apply_layout_setup_detection(
+            LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup()),
+            now,
+        );
+        runtime.publish_confirmed_layout(now, runtime.input_layout_epoch());
+        let epoch_before = runtime.input_layout_epoch();
+
+        runtime.invalidate_layout_setup_and_request_refresh_at(now, "x11-rules-property");
+
+        assert_eq!(runtime.input_layout_epoch(), epoch_before + 1);
+        assert_eq!(runtime.layout_setup_retry_due(), Some(now));
+        assert!(runtime.maybe_redetect_layout_setup_at(now));
+        assert_eq!(
+            runtime.layout_compatibility(),
+            LayoutCompatibility::Unsupported
+        );
+        assert!(!runtime.feature_availability().manual_word_fix);
+        assert!(matches!(
+            runtime.input_snapshot_before_grab().layout_state,
+            CurrentLayoutState::Unknown { .. }
+        ));
+    }
+
+    #[test]
     fn generic_x11_rejects_untrusted_legacy_led_state() {
         let raw = CurrentLayoutState::Known {
             layout: english_layout(),
@@ -3732,6 +3771,15 @@ impl RuntimeState {
             "input-layout-invalidated",
             &format!("reason={reason} epoch={epoch} request={outcome:?}"),
         );
+    }
+
+    pub(crate) fn invalidate_layout_setup_and_request_refresh(&self, reason: &str) {
+        self.invalidate_layout_setup_and_request_refresh_at(Instant::now(), reason);
+    }
+
+    fn invalidate_layout_setup_and_request_refresh_at(&self, now: Instant, reason: &str) {
+        self.force_layout_setup_redetection_at(now);
+        self.invalidate_layout_and_request_refresh(reason);
     }
 
     #[cfg(test)]

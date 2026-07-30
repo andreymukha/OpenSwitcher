@@ -1691,6 +1691,19 @@ impl DaemonService {
             if self
                 .keyboard
                 .as_ref()
+                .is_some_and(KeyboardController::take_layout_setup_invalidation)
+            {
+                self.runtime
+                    .invalidate_layout_setup_and_request_refresh("x11-layout-configuration-change");
+                self.handle_non_key_invalidation(
+                    "layout-setup-invalidation",
+                    "word context invalidated by X11 keyboard layout configuration change",
+                );
+            }
+
+            if self
+                .keyboard
+                .as_ref()
                 .is_some_and(KeyboardController::take_input_target_invalidation)
             {
                 self.handle_non_key_invalidation(

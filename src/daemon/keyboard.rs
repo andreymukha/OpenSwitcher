@@ -1086,6 +1086,7 @@ struct InputTargetWatcher {
     changed_flag: Arc<AtomicBool>,
     target_generation: Arc<AtomicU64>,
     pointer_click_flag: Arc<AtomicBool>,
+    layout_setup_changed_flag: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     required: bool,
@@ -1109,12 +1110,14 @@ enum X11ContextEvent {
     PointerClick {
         detail: u32,
     },
+    KeyboardLayoutChanged,
 }
 
 struct ActiveWindowMonitor {
     conn: x11rb::rust_connection::RustConnection,
     root: u32,
     active_window_atom: u32,
+    keyboard_layout_atom: u32,
     current_window: Option<u32>,
 }
 
@@ -1144,6 +1147,7 @@ fn publish_x11_context_event(
     event: X11ContextEvent,
     changed_flag: &AtomicBool,
     pointer_click_flag: &AtomicBool,
+    layout_setup_changed_flag: &AtomicBool,
     target_generation: &AtomicU64,
 ) {
     match event {
@@ -1162,6 +1166,13 @@ fn publish_x11_context_event(
         X11ContextEvent::PointerClick { detail } => {
             pointer_click_flag.store(true, Ordering::SeqCst);
             log_input_debug("pointer-click", &format!("source=xinput2 detail={detail}"));
+        }
+        X11ContextEvent::KeyboardLayoutChanged => {
+            layout_setup_changed_flag.store(true, Ordering::SeqCst);
+            log_input_debug(
+                "layout-setup-change",
+                "source=x11-root-property atom=_XKB_RULES_NAMES",
+            );
         }
     }
 }
@@ -1595,6 +1606,10 @@ impl KeyboardController {
 
     pub fn take_input_target_invalidation(&self) -> bool {
         self.input_target_watcher.take_change_invalidation()
+    }
+
+    pub fn take_layout_setup_invalidation(&self) -> bool {
+        self.input_target_watcher.take_layout_setup_invalidation()
     }
 
     pub(crate) fn input_target_generation(&self) -> u64 {
@@ -2203,6 +2218,7 @@ impl InputTargetWatcher {
         let changed_flag = Arc::new(AtomicBool::new(false));
         let target_generation = Arc::new(AtomicU64::new(0));
         let pointer_click_flag = Arc::new(AtomicBool::new(false));
+        let layout_setup_changed_flag = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
 
@@ -2220,6 +2236,7 @@ impl InputTargetWatcher {
                 changed_flag,
                 target_generation,
                 pointer_click_flag,
+                layout_setup_changed_flag,
                 stop_flag,
                 alive,
             ));
@@ -2231,6 +2248,7 @@ impl InputTargetWatcher {
         let worker_changed_flag = Arc::clone(&changed_flag);
         let worker_target_generation = Arc::clone(&target_generation);
         let worker_pointer_click_flag = Arc::clone(&pointer_click_flag);
+        let worker_layout_setup_changed_flag = Arc::clone(&layout_setup_changed_flag);
         let worker_stop_flag = Arc::clone(&stop_flag);
         let worker_alive = Arc::clone(&alive);
         let handle = thread::spawn(move || {
@@ -2256,6 +2274,7 @@ impl InputTargetWatcher {
                             event,
                             &worker_changed_flag,
                             &worker_pointer_click_flag,
+                            &worker_layout_setup_changed_flag,
                             &worker_target_generation,
                         );
                     },
@@ -2296,6 +2315,7 @@ impl InputTargetWatcher {
             changed_flag,
             target_generation,
             pointer_click_flag,
+            layout_setup_changed_flag,
             stop_flag,
             alive,
             required: true,
@@ -2308,6 +2328,7 @@ impl InputTargetWatcher {
         changed_flag: Arc<AtomicBool>,
         target_generation: Arc<AtomicU64>,
         pointer_click_flag: Arc<AtomicBool>,
+        layout_setup_changed_flag: Arc<AtomicBool>,
         stop_flag: Arc<AtomicBool>,
         alive: Arc<AtomicBool>,
     ) -> Self {
@@ -2315,6 +2336,7 @@ impl InputTargetWatcher {
             changed_flag,
             target_generation,
             pointer_click_flag,
+            layout_setup_changed_flag,
             stop_flag,
             alive,
             required: false,
@@ -2325,6 +2347,10 @@ impl InputTargetWatcher {
 
     fn take_change_invalidation(&self) -> bool {
         self.changed_flag.swap(false, Ordering::SeqCst)
+    }
+
+    fn take_layout_setup_invalidation(&self) -> bool {
+        self.layout_setup_changed_flag.swap(false, Ordering::SeqCst)
     }
 
     fn target_generation(&self) -> u64 {
@@ -3321,6 +3347,12 @@ impl ActiveWindowMonitor {
             .reply()
             .map_err(|error| io::Error::other(error.to_string()))?
             .atom;
+        let keyboard_layout_atom = conn
+            .intern_atom(false, b"_XKB_RULES_NAMES")
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .reply()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .atom;
 
         conn.change_window_attributes(
             root,
@@ -3348,6 +3380,7 @@ impl ActiveWindowMonitor {
             conn,
             root,
             active_window_atom,
+            keyboard_layout_atom,
             current_window,
         })
     }
@@ -3389,6 +3422,12 @@ impl ActiveWindowMonitor {
             }
 
             match event {
+                Event::PropertyNotify(property)
+                    if property.window == self.root
+                        && property.atom == self.keyboard_layout_atom =>
+                {
+                    return Ok(Some(X11ContextEvent::KeyboardLayoutChanged));
+                }
                 Event::PropertyNotify(property)
                     if property.window == self.root && property.atom == self.active_window_atom =>
                 {
@@ -11871,6 +11910,7 @@ mod tests {
     fn x11_context_events_set_only_the_matching_invalidation_flag() {
         let changed = AtomicBool::new(false);
         let pointer_click = AtomicBool::new(false);
+        let layout_setup_changed = AtomicBool::new(false);
         let generation = AtomicU64::new(0);
 
         publish_x11_context_event(
@@ -11880,25 +11920,42 @@ mod tests {
             },
             &changed,
             &pointer_click,
+            &layout_setup_changed,
             &generation,
         );
         assert!(changed.swap(false, Ordering::SeqCst));
         assert!(!pointer_click.load(Ordering::SeqCst));
+        assert!(!layout_setup_changed.load(Ordering::SeqCst));
 
         publish_x11_context_event(
             X11ContextEvent::PointerClick { detail: 1 },
             &changed,
             &pointer_click,
+            &layout_setup_changed,
             &generation,
         );
         assert!(!changed.load(Ordering::SeqCst));
         assert!(pointer_click.swap(false, Ordering::SeqCst));
+        assert!(!layout_setup_changed.load(Ordering::SeqCst));
+
+        publish_x11_context_event(
+            X11ContextEvent::KeyboardLayoutChanged,
+            &changed,
+            &pointer_click,
+            &layout_setup_changed,
+            &generation,
+        );
+        assert!(!changed.load(Ordering::SeqCst));
+        assert!(!pointer_click.load(Ordering::SeqCst));
+        assert!(layout_setup_changed.swap(false, Ordering::SeqCst));
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
     }
 
     #[test]
     fn x11_active_window_change_advances_generation_independently_of_flag_drain() {
         let changed = AtomicBool::new(false);
         let pointer_click = AtomicBool::new(false);
+        let layout_setup_changed = AtomicBool::new(false);
         let generation = AtomicU64::new(0);
 
         publish_x11_context_event(
@@ -11908,6 +11965,7 @@ mod tests {
             },
             &changed,
             &pointer_click,
+            &layout_setup_changed,
             &generation,
         );
         assert_eq!(generation.load(Ordering::SeqCst), 1);
@@ -11921,6 +11979,7 @@ mod tests {
             },
             &changed,
             &pointer_click,
+            &layout_setup_changed,
             &generation,
         );
         assert_eq!(generation.load(Ordering::SeqCst), 2);
@@ -11929,6 +11988,7 @@ mod tests {
             X11ContextEvent::PointerClick { detail: 1 },
             &changed,
             &pointer_click,
+            &layout_setup_changed,
             &generation,
         );
         assert_eq!(generation.load(Ordering::SeqCst), 2);
@@ -11948,6 +12008,7 @@ mod tests {
             changed_flag: Arc::new(AtomicBool::new(false)),
             target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::clone(&logical_click),
+            layout_setup_changed_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             required: false,
@@ -12132,6 +12193,7 @@ mod tests {
             changed_flag: Arc::new(AtomicBool::new(false)),
             target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::new(AtomicBool::new(false)),
+            layout_setup_changed_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             required: false,
@@ -12181,6 +12243,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
         );
 
         assert!(watcher.is_ready());
@@ -12192,6 +12255,7 @@ mod tests {
             changed_flag: Arc::new(AtomicBool::new(false)),
             target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::new(AtomicBool::new(false)),
+            layout_setup_changed_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(false)),
             required: true,
@@ -12208,6 +12272,7 @@ mod tests {
             changed_flag: Arc::new(AtomicBool::new(false)),
             target_generation: Arc::new(AtomicU64::new(0)),
             pointer_click_flag: Arc::new(AtomicBool::new(false)),
+            layout_setup_changed_flag: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
             alive: Arc::new(AtomicBool::new(true)),
             required: true,

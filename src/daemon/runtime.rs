@@ -231,6 +231,13 @@ impl ConfigService {
             .map(|config| should_redetect_layout_switch_after_context_upgrade(&config))
             .map_err(|_| SettingsError::LockPoisoned)
     }
+
+    fn should_redetect_layout_switch_after_setup_recovery(&self) -> Result<bool, SettingsError> {
+        self.inner
+            .read()
+            .map(|config| should_redetect_layout_switch_after_setup_recovery(&config))
+            .map_err(|_| SettingsError::LockPoisoned)
+    }
 }
 
 fn should_detect_layout_switch(config: &AppConfig) -> bool {
@@ -245,6 +252,13 @@ fn should_redetect_layout_switch_after_context_upgrade(config: &AppConfig) -> bo
         config.layout.switch_source,
         crate::model::LayoutSwitchSource::AutoDetected
             | crate::model::LayoutSwitchSource::AutoFallback
+    )
+}
+
+fn should_redetect_layout_switch_after_setup_recovery(config: &AppConfig) -> bool {
+    matches!(
+        config.layout.switch_source,
+        crate::model::LayoutSwitchSource::AutoFallback
     )
 }
 
@@ -785,6 +799,14 @@ mod tests {
         outcomes: impl IntoIterator<Item = LayoutSetupDetection>,
         now: Instant,
     ) -> RuntimeState {
+        runtime_with_pending_setup_outcomes_in_context(outcomes, now, cinnamon_x11_context())
+    }
+
+    fn runtime_with_pending_setup_outcomes_in_context(
+        outcomes: impl IntoIterator<Item = LayoutSetupDetection>,
+        now: Instant,
+        system_context: SystemContext,
+    ) -> RuntimeState {
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Unknown {
                 reason: "setup-pending".to_string(),
@@ -792,7 +814,7 @@ mod tests {
             Box::new(SetupOutcomeBackend {
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
             }),
-            cinnamon_x11_context(),
+            system_context,
         );
         *runtime
             .layout_setup_retry
@@ -1754,6 +1776,121 @@ undo_key = "Pause"
                 .manual_word_fix
         );
         assert_eq!(runtime.layout_setup_retry_due(), None);
+    }
+
+    #[test]
+    fn setup_recovery_redetects_auto_fallback_layout_switch_once() {
+        let now = Instant::now() - Duration::from_secs(2);
+        let runtime = runtime_with_pending_setup_outcomes_in_context(
+            [LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup())],
+            now,
+            gnome_wayland_context(),
+        );
+        {
+            let mut config = runtime
+                .config_service
+                .inner
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            config.layout.switch_combo = LayoutSwitchCombo::ctrl_shift();
+            config.layout.switch_source = LayoutSwitchSource::AutoFallback;
+            config.layout.auto_detected = AutoDetectedLayoutSwitch {
+                strategy: DetectionStrategy::NoSupportedStrategy,
+                confidence: DetectionConfidence::Unsupported,
+                context: gnome_wayland_context(),
+            };
+        }
+        runtime.publish_committed_config(runtime.config_service.snapshot().unwrap());
+        let published_before = runtime.input_snapshot_before_grab();
+
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            calls: Arc::clone(&reader_calls),
+            combo: LayoutSwitchCombo::super_space(),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                    confidence: DetectionConfidence::High,
+                    context: gnome_wayland_context(),
+                },
+            }
+        );
+        let published_after = runtime.input_snapshot_before_grab();
+        assert_eq!(
+            published_after.config.layout_switch_combo,
+            LayoutSwitchCombo::super_space()
+        );
+        assert_eq!(
+            published_after.config_generation,
+            published_before.config_generation + 1
+        );
+
+        let calls_after_recovery = reader_calls.load(Ordering::SeqCst);
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst) - calls_after_recovery,
+            2,
+            "steady state may read current GNOME sources, but must not redetect the switch combo",
+        );
+    }
+
+    #[test]
+    fn setup_recovery_preserves_manual_layout_switch() {
+        let now = Instant::now() - Duration::from_secs(2);
+        let runtime = runtime_with_pending_setup_outcomes_in_context(
+            [LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup())],
+            now,
+            gnome_wayland_context(),
+        );
+        {
+            let mut config = runtime
+                .config_service
+                .inner
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            config.layout.switch_combo = LayoutSwitchCombo::caps_lock();
+            config.layout.switch_source = LayoutSwitchSource::Manual;
+            config.layout.auto_detected = AutoDetectedLayoutSwitch::default();
+        }
+        runtime.publish_committed_config(runtime.config_service.snapshot().unwrap());
+
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            calls: Arc::clone(&reader_calls),
+            combo: LayoutSwitchCombo::super_space(),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::caps_lock(),
+                source: LayoutSwitchSource::Manual,
+                auto_detected: AutoDetectedLayoutSwitch::default(),
+            }
+        );
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst),
+            2,
+            "manual settings must avoid switch-combo detection",
+        );
     }
 
     #[test]
@@ -4034,7 +4171,9 @@ impl RuntimeState {
             self.redetect_layout_switch_after_context_upgrade(reader);
             self.force_layout_setup_redetection_at(now);
         }
-        let _ = self.maybe_redetect_layout_setup_at(now);
+        if self.maybe_redetect_layout_setup_at(now) {
+            self.redetect_layout_switch_after_setup_recovery(reader);
+        }
         let observation_confirmed =
             self.refresh_current_layout_observation_with_readers(reader, cinnamon_reader);
         let backend_result = self.sync_with_backend();
@@ -4548,6 +4687,41 @@ impl RuntimeState {
             }
         }
 
+        self.redetect_layout_switch_with_reader(reader, context, "layout-switch-redetect");
+    }
+
+    fn redetect_layout_switch_after_setup_recovery<R: DesktopSettingsReader>(&self, reader: &R) {
+        let context = self.system_context();
+        match self
+            .config_service
+            .should_redetect_layout_switch_after_setup_recovery()
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                log_layout_debug(
+                    "layout-switch-setup-recovery",
+                    &format!("context={context:?} result=skipped reason=not-auto-fallback"),
+                );
+                return;
+            }
+            Err(error) => {
+                log_layout_debug(
+                    "layout-switch-setup-recovery",
+                    &format!("context={context:?} result=skipped error={error}"),
+                );
+                return;
+            }
+        }
+
+        self.redetect_layout_switch_with_reader(reader, context, "layout-switch-setup-recovery");
+    }
+
+    fn redetect_layout_switch_with_reader<R: DesktopSettingsReader>(
+        &self,
+        reader: &R,
+        context: SystemContext,
+        debug_stage: &'static str,
+    ) {
         let detector = LayoutSwitchAutoDetector::with_reader(reader);
         let detected = detect_layout_switch_setting(context, &detector);
 
@@ -4562,16 +4736,16 @@ impl RuntimeState {
             Ok(Some(snapshot)) => {
                 self.publish_committed_config(snapshot);
                 log_layout_debug(
-                    "layout-switch-redetect",
+                    debug_stage,
                     &format!("context={context:?} result=applied setting={detected:?}"),
                 );
             }
             Ok(None) => log_layout_debug(
-                "layout-switch-redetect",
+                debug_stage,
                 &format!("context={context:?} result=unchanged-or-manual"),
             ),
             Err(error) => log_layout_debug(
-                "layout-switch-redetect",
+                debug_stage,
                 &format!("context={context:?} result=skipped error={error}"),
             ),
         }

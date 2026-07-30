@@ -1376,6 +1376,12 @@ sleep 4
 После confirmed setup журнал не должен показывать новые setup transition,
 хотя существующее чтение current GNOME source продолжает работать.
 
+VM-проверка должна также подтвердить, что ранний отказ `gsettings` не оставил
+рабочую коррекцию со стартовым `AutoFallback`: после marker ожидается
+однократный `layout-switch-setup-recovery` с `SuperSpace`, новый config
+generation и успешный F12 без restart daemon. Ручную комбинацию этот путь не
+меняет и в steady state повторно не опрашивает.
+
 Для extra-layout:
 
 ```bash

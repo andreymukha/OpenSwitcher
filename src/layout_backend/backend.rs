@@ -1,6 +1,7 @@
 use super::{
-    BackendCapabilities, CurrentLayoutState, LayoutBackendError, LayoutSetup, SystemLayout,
+    BackendCapabilities, CurrentLayoutState, LayoutBackendError, LayoutSetupDetection, SystemLayout,
 };
+use crate::model::SystemContext;
 use std::sync::mpsc;
 
 pub type LayoutStateSink = mpsc::Sender<CurrentLayoutState>;
@@ -9,7 +10,7 @@ pub trait LayoutBackend: Send {
     fn id(&self) -> &'static str;
     fn capabilities(&self) -> BackendCapabilities;
 
-    fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError>;
+    fn detect_setup(&self, context: SystemContext) -> LayoutSetupDetection;
     fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError>;
 
     fn switch_to(&mut self, target: &SystemLayout) -> Result<(), LayoutBackendError>;

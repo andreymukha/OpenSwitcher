@@ -1,137 +1,214 @@
 use crate::daemon::keyboard::is_russian_layout;
 use crate::daemon::layout_switcher::{LayoutSwitcher, X11LayoutSwitcher};
 use crate::layout_backend::{
-    AppLayoutKind, BackendCapabilities, CurrentLayoutState, LayoutBackend, LayoutBackendError,
-    LayoutBackendOperation, LayoutCode, LayoutSetup, LayoutStateSink, SystemLayout,
+    detect_layout_setup, BackendCapabilities, CurrentLayoutState, LayoutBackend,
+    LayoutBackendError, LayoutBackendOperation, LayoutSetup, LayoutSetupDetection, LayoutStateSink,
+    SystemLayout,
 };
-use crate::model::LayoutSwitchCombo;
-use std::process::Command;
+use crate::layout_switch::{CommandDesktopSettingsReader, DesktopSettingsReader};
+use crate::model::{LayoutSwitchCombo, SystemContext};
+use std::sync::RwLock;
 
 pub fn legacy_backend_factory() -> Result<Box<dyn LayoutBackend>, LayoutBackendError> {
     Ok(Box::new(LegacyLayoutBackend::new()))
 }
 
 struct LegacyLayoutBackend {
-    en: SystemLayout,
-    ru: SystemLayout,
+    setup: RwLock<LayoutSetup>,
 }
 
 impl LegacyLayoutBackend {
     fn new() -> Self {
-        let (en, ru) = detect_legacy_layout_pair();
-        Self { en, ru }
-    }
-
-    fn english_layout(code: LayoutCode, index: Option<u32>) -> SystemLayout {
-        let (backend_key, display_name) = match code {
-            LayoutCode::Gb => ("legacy:gb", "English (UK)"),
-            _ => ("legacy:english", "English"),
-        };
-
-        SystemLayout {
-            backend_key: backend_key.to_string(),
-            normalized_code: code,
-            display_name: display_name.to_string(),
-            kind: AppLayoutKind::English,
-            index,
+        Self {
+            setup: RwLock::new(LayoutSetup::Unsupported {
+                reason: "layout-setup-not-detected".to_string(),
+            }),
         }
     }
 
-    fn russian_layout(index: Option<u32>) -> SystemLayout {
-        SystemLayout {
-            backend_key: "legacy:russian".to_string(),
-            normalized_code: LayoutCode::Ru,
-            display_name: "Russian".to_string(),
-            kind: AppLayoutKind::Russian,
-            index,
+    fn detect_setup_with_reader<R: DesktopSettingsReader + ?Sized>(
+        &self,
+        context: SystemContext,
+        reader: &R,
+    ) -> LayoutSetupDetection {
+        let detection = detect_layout_setup(context, reader);
+        *self
+            .setup
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = detection.effective_setup();
+        detection
+    }
+
+    fn cached_setup(&self) -> LayoutSetup {
+        self.setup
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn cached_pair(&self) -> Option<(SystemLayout, SystemLayout)> {
+        match self.cached_setup() {
+            LayoutSetup::StrictPair { en, ru } | LayoutSetup::PairPlusOther { en, ru, .. } => {
+                Some((en, ru))
+            }
+            LayoutSetup::Unsupported { .. } => None,
         }
     }
-}
-
-fn detect_legacy_layout_pair() -> (SystemLayout, SystemLayout) {
-    Command::new("setxkbmap")
-        .arg("-query")
-        .output()
-        .ok()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .map(|query| legacy_layout_pair_from_setxkbmap_query(&query))
-        .unwrap_or_else(default_legacy_layout_pair)
-}
-
-fn default_legacy_layout_pair() -> (SystemLayout, SystemLayout) {
-    (
-        LegacyLayoutBackend::english_layout(LayoutCode::Us, None),
-        LegacyLayoutBackend::russian_layout(None),
-    )
-}
-
-fn legacy_layout_pair_from_setxkbmap_query(query: &str) -> (SystemLayout, SystemLayout) {
-    let Some(layouts) = query.lines().find_map(parse_setxkbmap_layouts_line) else {
-        return default_legacy_layout_pair();
-    };
-
-    let mut english = None;
-    let mut russian = None;
-    for (index, layout) in layouts.split(',').map(str::trim).enumerate() {
-        match layout {
-            "us" if english.is_none() => {
-                english = Some(LegacyLayoutBackend::english_layout(
-                    LayoutCode::Us,
-                    Some(index as u32),
-                ));
-            }
-            "gb" if english.is_none() => {
-                english = Some(LegacyLayoutBackend::english_layout(
-                    LayoutCode::Gb,
-                    Some(index as u32),
-                ));
-            }
-            "ru" if russian.is_none() => {
-                russian = Some(LegacyLayoutBackend::russian_layout(Some(index as u32)));
-            }
-            _ => {}
-        }
-    }
-
-    match (english, russian) {
-        (Some(en), Some(ru)) => (en, ru),
-        _ => default_legacy_layout_pair(),
-    }
-}
-
-fn parse_setxkbmap_layouts_line(line: &str) -> Option<&str> {
-    line.trim_start()
-        .strip_prefix("layout:")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::LayoutAutoDetectError;
+    use crate::layout_backend::LayoutSetupDetection;
+    use crate::layout_switch::DesktopSettingsReader;
+    use crate::model::{DesktopEnvironment, SessionType, SystemContext};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn detects_us_ru_legacy_pair_from_setxkbmap_query() {
-        let (en, ru) = legacy_layout_pair_from_setxkbmap_query(
-            "rules: evdev\nlayout: us,ru\noptions: grp:alt_shift_toggle\n",
-        );
+    fn legacy_backend_never_installs_default_pair_after_detection_failure() {
+        let backend = LegacyLayoutBackend::new();
+        let detection =
+            backend.detect_setup_with_reader(x11_context(), &SetupReaderStub::failing());
 
-        assert_eq!(en.normalized_code, LayoutCode::Us);
-        assert_eq!(en.kind, AppLayoutKind::English);
-        assert_eq!(ru.normalized_code, LayoutCode::Ru);
-        assert_eq!(ru.kind, AppLayoutKind::Russian);
+        assert!(matches!(
+            detection,
+            LayoutSetupDetection::TemporarilyUnavailable { .. }
+        ));
+        assert!(matches!(
+            backend.cached_setup(),
+            LayoutSetup::Unsupported { .. }
+        ));
     }
 
     #[test]
-    fn detects_gb_ru_legacy_pair_from_setxkbmap_query() {
-        let (en, ru) = legacy_layout_pair_from_setxkbmap_query(
-            "rules: evdev\nlayout: gb,ru\noptions: grp:alt_shift_toggle\n",
-        );
+    fn x11_backend_uses_setxkbmap_and_caches_the_confirmed_pair() {
+        let reader = SetupReaderStub::x11_us_ru();
+        let backend = LegacyLayoutBackend::new();
 
-        assert_eq!(en.normalized_code, LayoutCode::Gb);
-        assert_eq!(en.kind, AppLayoutKind::English);
-        assert_eq!(ru.normalized_code, LayoutCode::Ru);
-        assert_eq!(ru.kind, AppLayoutKind::Russian);
+        assert!(matches!(
+            backend.detect_setup_with_reader(x11_context(), &reader),
+            LayoutSetupDetection::Confirmed(LayoutSetup::StrictPair { .. })
+        ));
+        assert!(matches!(
+            backend.cached_setup(),
+            LayoutSetup::StrictPair { .. }
+        ));
+        assert_eq!(reader.gsettings_calls(), 0);
+        assert_eq!(reader.setxkbmap_calls(), 1);
+    }
+
+    #[test]
+    fn gnome_wayland_backend_uses_gsettings_not_setxkbmap() {
+        let reader = SetupReaderStub::gnome_us_ru();
+        let backend = LegacyLayoutBackend::new();
+
+        assert!(matches!(
+            backend.detect_setup_with_reader(gnome_wayland_context(), &reader),
+            LayoutSetupDetection::Confirmed(LayoutSetup::StrictPair { .. })
+        ));
+        assert_eq!(reader.gsettings_calls(), 1);
+        assert_eq!(reader.setxkbmap_calls(), 0);
+    }
+
+    fn x11_context() -> SystemContext {
+        SystemContext {
+            session_type: SessionType::X11,
+            desktop_environment: DesktopEnvironment::Cinnamon,
+            ..SystemContext::default()
+        }
+    }
+
+    fn gnome_wayland_context() -> SystemContext {
+        SystemContext {
+            session_type: SessionType::Wayland,
+            desktop_environment: DesktopEnvironment::Gnome,
+            ..SystemContext::default()
+        }
+    }
+
+    struct SetupReaderStub {
+        gnome_sources: Option<Vec<String>>,
+        x11_query: Option<String>,
+        gsettings_calls: AtomicUsize,
+        setxkbmap_calls: AtomicUsize,
+    }
+
+    impl SetupReaderStub {
+        fn failing() -> Self {
+            Self {
+                gnome_sources: None,
+                x11_query: None,
+                gsettings_calls: AtomicUsize::new(0),
+                setxkbmap_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn x11_us_ru() -> Self {
+            Self {
+                x11_query: Some("layout: us,ru\nvariant: ,\n".to_string()),
+                ..Self::failing()
+            }
+        }
+
+        fn gnome_us_ru() -> Self {
+            Self {
+                gnome_sources: Some(vec!["xkb".into(), "us".into(), "xkb".into(), "ru".into()]),
+                ..Self::failing()
+            }
+        }
+
+        fn gsettings_calls(&self) -> usize {
+            self.gsettings_calls.load(Ordering::SeqCst)
+        }
+
+        fn setxkbmap_calls(&self) -> usize {
+            self.setxkbmap_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DesktopSettingsReader for SetupReaderStub {
+        fn gsettings_string_list(
+            &self,
+            _schema: &str,
+            _key: &str,
+        ) -> Result<Vec<String>, LayoutAutoDetectError> {
+            self.gsettings_calls.fetch_add(1, Ordering::SeqCst);
+            self.gnome_sources
+                .clone()
+                .ok_or_else(|| LayoutAutoDetectError::GSettingsFailed {
+                    stderr: "injected unavailable".to_string(),
+                })
+        }
+
+        fn xfconf_string(
+            &self,
+            _channel: &str,
+            _property: &str,
+        ) -> Result<String, LayoutAutoDetectError> {
+            Err(LayoutAutoDetectError::XfconfFailed {
+                stderr: "unused".to_string(),
+            })
+        }
+
+        fn xfconf_bool(
+            &self,
+            _channel: &str,
+            _property: &str,
+        ) -> Result<bool, LayoutAutoDetectError> {
+            Err(LayoutAutoDetectError::XfconfFailed {
+                stderr: "unused".to_string(),
+            })
+        }
+
+        fn setxkbmap_query(&self) -> Result<String, LayoutAutoDetectError> {
+            self.setxkbmap_calls.fetch_add(1, Ordering::SeqCst);
+            self.x11_query
+                .clone()
+                .ok_or_else(|| LayoutAutoDetectError::SetXkbMapFailed {
+                    stderr: "injected unavailable".to_string(),
+                })
+        }
     }
 }
 
@@ -151,21 +228,23 @@ impl LayoutBackend for LegacyLayoutBackend {
         }
     }
 
-    fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
-        Ok(LayoutSetup::StrictPair {
-            en: self.en.clone(),
-            ru: self.ru.clone(),
-        })
+    fn detect_setup(&self, context: SystemContext) -> LayoutSetupDetection {
+        self.detect_setup_with_reader(context, &CommandDesktopSettingsReader)
     }
 
     fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
+        let Some((en, ru)) = self.cached_pair() else {
+            return Ok(CurrentLayoutState::Unknown {
+                reason: "legacy-layout-setup-unconfirmed".to_string(),
+            });
+        };
         match is_russian_layout() {
             Ok(true) => Ok(CurrentLayoutState::Known {
-                layout: self.ru.clone(),
+                layout: ru,
                 trustworthy: false,
             }),
             Ok(false) => Ok(CurrentLayoutState::Known {
-                layout: self.en.clone(),
+                layout: en,
                 trustworthy: false,
             }),
             Err(error) => Err(LayoutBackendError::runtime(

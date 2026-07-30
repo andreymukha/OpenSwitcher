@@ -7456,6 +7456,9 @@ fn fresh_service_snapshot(
 #[cfg(test)]
 mod service_snapshot_fresh_tests {
     use super::*;
+    use crate::layout_backend::{
+        feature_availability_for, BackendCapabilities, LayoutCompatibility,
+    };
 
     #[test]
     fn fresh_snapshot_keeps_layout_auto_correction_enabled() {
@@ -7479,6 +7482,30 @@ mod service_snapshot_fresh_tests {
             &snapshot,
             now,
             snapshot.confirmed_layout_epoch
+        ));
+    }
+
+    #[test]
+    fn pair_plus_other_disables_layout_switch_but_keeps_confirmed_case_fix() {
+        let now = Instant::now();
+        let mut snapshot = fresh_service_snapshot(AppLayoutKind::English, now);
+        snapshot.features = feature_availability_for(
+            LayoutCompatibility::PairPlusOther,
+            BackendCapabilities {
+                can_read_current_layout: true,
+                can_switch_next: true,
+                can_map_layouts_to_app_kinds: true,
+                ..Default::default()
+            },
+        );
+        snapshot.config.fix_two_capitals = true;
+
+        assert!(!snapshot.features.auto_switch);
+        assert!(!snapshot.features.manual_word_fix);
+        assert!(same_layout_fixes_allowed(
+            &snapshot,
+            now,
+            snapshot.confirmed_layout_epoch,
         ));
     }
 

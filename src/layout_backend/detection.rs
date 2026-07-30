@@ -228,14 +228,26 @@ fn system_layout(
     index: u32,
 ) -> SystemLayout {
     let (display_name, kind) = match normalized_code {
-        LayoutCode::Us => ("English (US)".to_string(), AppLayoutKind::English),
+        LayoutCode::Us => (
+            if source == "gnome" {
+                "English"
+            } else {
+                "English (US)"
+            }
+            .to_string(),
+            AppLayoutKind::English,
+        ),
         LayoutCode::Gb => ("English (UK)".to_string(), AppLayoutKind::English),
         LayoutCode::Ru => ("Russian".to_string(), AppLayoutKind::Russian),
         LayoutCode::Other(_) => (layout_id.to_string(), AppLayoutKind::Other),
         LayoutCode::Unknown => ("Unknown".to_string(), AppLayoutKind::Unknown),
     };
     SystemLayout {
-        backend_key: format!("{source}:{layout_id}:{index}"),
+        backend_key: if source == "gnome" {
+            layout_id.to_string()
+        } else {
+            format!("{source}:{layout_id}:{index}")
+        },
         normalized_code,
         display_name,
         kind,

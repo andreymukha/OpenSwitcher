@@ -10,10 +10,11 @@ use crate::error::{
     ValidationError,
 };
 use crate::layout_backend::{
-    compatibility_from_setup, feature_availability_for, legacy_backend_factory,
-    legacy_current_layout_bool, legacy_layout_state_from_bool, AppLayoutKind, BackendCapabilities,
-    CurrentLayoutState, FeatureAvailability, LayoutBackend, LayoutBackendRegistry,
-    LayoutBackendRegistryResult, LayoutCode, LayoutCompatibility, LayoutSetup, SystemLayout,
+    compatibility_from_setup, current_layout_from_gnome_sources, current_layout_from_group,
+    feature_availability_for, legacy_backend_factory, legacy_current_layout_bool,
+    legacy_layout_state_from_bool, AppLayoutKind, BackendCapabilities, CurrentLayoutState,
+    FeatureAvailability, LayoutBackend, LayoutBackendRegistry, LayoutBackendRegistryResult,
+    LayoutCode, LayoutCompatibility, LayoutSetup, LayoutSetupDetection, SystemLayout,
 };
 use crate::layout_switch::{
     failed_detection_fallback, CommandDesktopSettingsReader, DesktopSettingsReader,
@@ -477,11 +478,10 @@ mod tests {
             BackendCapabilities::default()
         }
 
-        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
-            Err(LayoutBackendError::unsupported(
-                self.id(),
-                LayoutBackendOperation::DetectSetup,
-            ))
+        fn detect_setup(&self, _context: SystemContext) -> LayoutSetupDetection {
+            LayoutSetupDetection::Unsupported {
+                reason: "test-backend-does-not-detect-setup".to_string(),
+            }
         }
 
         fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
@@ -540,11 +540,10 @@ mod tests {
             BackendCapabilities::default()
         }
 
-        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
-            Err(LayoutBackendError::unsupported(
-                self.id(),
-                LayoutBackendOperation::DetectSetup,
-            ))
+        fn detect_setup(&self, _context: SystemContext) -> LayoutSetupDetection {
+            LayoutSetupDetection::Unsupported {
+                reason: "test-backend-does-not-detect-setup".to_string(),
+            }
         }
 
         fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
@@ -586,11 +585,10 @@ mod tests {
             BackendCapabilities::default()
         }
 
-        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
-            Err(LayoutBackendError::unsupported(
-                self.id(),
-                LayoutBackendOperation::DetectSetup,
-            ))
+        fn detect_setup(&self, _context: SystemContext) -> LayoutSetupDetection {
+            LayoutSetupDetection::Unsupported {
+                reason: "test-backend-does-not-detect-setup".to_string(),
+            }
         }
 
         fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
@@ -1433,15 +1431,15 @@ undo_key = "Pause"
     }
 
     #[derive(Clone)]
-    struct CinnamonCurrentGroupReaderStub {
+    struct X11GroupStateReaderStub {
         calls: Arc<AtomicUsize>,
-        current_group: Result<u8, String>,
+        group_state: Result<X11GroupState, String>,
     }
 
-    impl CinnamonCurrentGroupReader for CinnamonCurrentGroupReaderStub {
-        fn cinnamon_current_group(&self) -> Result<u8, String> {
+    impl X11GroupStateReader for X11GroupStateReaderStub {
+        fn x11_group_state(&self) -> Result<X11GroupState, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.current_group.clone()
+            self.group_state.clone()
         }
     }
 
@@ -1565,6 +1563,49 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn x11_group_state_confirms_us_and_ru_for_exact_pair() {
+        let setup = cinnamon_strict_pair_setup();
+
+        assert_eq!(
+            x11_current_layout_state_from_group(X11GroupState::new(0, 2), &setup),
+            known_layout_state(english_layout())
+        );
+        assert_eq!(
+            x11_current_layout_state_from_group(X11GroupState::new(1, 2), &setup),
+            known_layout_state(russian_layout())
+        );
+    }
+
+    #[test]
+    fn x11_group_state_rejects_a_different_group_count() {
+        assert!(matches!(
+            x11_current_layout_state_from_group(
+                X11GroupState::new(0, 3),
+                &cinnamon_strict_pair_setup(),
+            ),
+            CurrentLayoutState::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn generic_x11_rejects_untrusted_legacy_led_state() {
+        let raw = CurrentLayoutState::Known {
+            layout: english_layout(),
+            trustworthy: false,
+        };
+        let generic_x11 = SystemContext {
+            session_type: SessionType::X11,
+            desktop_environment: DesktopEnvironment::Xfce,
+            distro: DistroKind::LinuxMint,
+        };
+
+        assert!(matches!(
+            effective_current_layout_state(&raw, None, generic_x11),
+            CurrentLayoutState::Unknown { .. }
+        ));
+    }
+
+    #[test]
     fn cinnamon_x11_current_layout_observation_rejects_unmapped_xkb_group() {
         assert_untrusted_observation(Some(cinnamon_x11_current_layout_state_from_group(
             2,
@@ -1604,9 +1645,9 @@ undo_key = "Pause"
             sources: Some(trusted_gnome_sources()),
             mru_sources: Some(gnome_sources(&[("xkb", "ru"), ("xkb", "us")])),
         };
-        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
+        let cinnamon_reader = X11GroupStateReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            current_group: Ok(0),
+            group_state: Ok(X11GroupState::new(0, 2)),
         };
         *runtime
             .layout_setup
@@ -1711,7 +1752,7 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn non_cinnamon_x11_keeps_untrusted_legacy_state_behavior_unchanged() {
+    fn non_cinnamon_x11_without_observation_rejects_untrusted_legacy_state() {
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
                 layout: english_layout(),
@@ -1730,16 +1771,13 @@ undo_key = "Pause"
             },
         );
 
-        assert_eq!(
+        assert!(matches!(
             runtime.current_layout_state(),
-            CurrentLayoutState::Known {
-                layout: english_layout(),
-                trustworthy: false,
-            }
-        );
+            CurrentLayoutState::Unknown { .. }
+        ));
         assert_eq!(
             runtime.auto_correction_layout_kind(),
-            AppLayoutKind::English
+            AppLayoutKind::Unknown
         );
     }
 
@@ -1795,13 +1833,10 @@ undo_key = "Pause"
         runtime.refresh_current_layout_observation_with_reader(&reader);
 
         assert_eq!(calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
+        assert!(matches!(
             runtime.current_layout_state(),
-            CurrentLayoutState::Known {
-                layout: russian_layout(),
-                trustworthy: false,
-            }
-        );
+            CurrentLayoutState::Unknown { .. }
+        ));
     }
 
     #[test]
@@ -1843,9 +1878,9 @@ undo_key = "Pause"
             sources: Some(trusted_gnome_sources()),
             mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
-        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
+        let cinnamon_reader = X11GroupStateReaderStub {
             calls: Arc::clone(&cinnamon_calls),
-            current_group: Ok(1),
+            group_state: Ok(X11GroupState::new(1, 2)),
         };
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -1971,7 +2006,7 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn gnome_wayland_observation_rejects_more_than_two_configured_xkb_sources() {
+    fn gnome_wayland_observation_maps_current_group_with_extra_xkb_source() {
         let reader = LayoutObservationReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
             sources: Some(gnome_sources(&[
@@ -1982,7 +2017,10 @@ undo_key = "Pause"
             mru_sources: Some(gnome_sources(&[("xkb", "us"), ("xkb", "ru")])),
         };
 
-        assert_untrusted_observation(gnome_wayland_current_layout_state(&reader));
+        assert_trusted_observed_kind(
+            gnome_wayland_current_layout_state(&reader),
+            AppLayoutKind::English,
+        );
     }
 
     #[test]
@@ -2096,9 +2134,9 @@ undo_key = "Pause"
             calls: Arc::new(AtomicUsize::new(0)),
             context: cinnamon_x11_context(),
         };
-        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
+        let cinnamon_reader = X11GroupStateReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            current_group: Ok(1),
+            group_state: Ok(X11GroupState::new(1, 2)),
         };
         let runtime = test_runtime_with_backend_and_context(
             CurrentLayoutState::Known {
@@ -2157,7 +2195,7 @@ undo_key = "Pause"
             runtime.periodic_sync_tick_with_readers(
                 &reader,
                 &detector,
-                &PreserveCinnamonCurrentGroupReader,
+                &PreserveX11GroupStateReader,
             ),
             BackendSyncResult::Skipped
         );
@@ -2174,9 +2212,9 @@ undo_key = "Pause"
             calls: Arc::new(AtomicUsize::new(0)),
             context: cinnamon_x11_context(),
         };
-        let cinnamon_reader = CinnamonCurrentGroupReaderStub {
+        let cinnamon_reader = X11GroupStateReaderStub {
             calls: Arc::new(AtomicUsize::new(0)),
-            current_group: Err("XKB unavailable".to_string()),
+            group_state: Err("XKB unavailable".to_string()),
         };
         let initial = CurrentLayoutState::Known {
             layout: english_layout(),
@@ -2959,14 +2997,29 @@ impl SystemContextSource for SystemContextDetector {
     }
 }
 
-trait CinnamonCurrentGroupReader {
-    fn cinnamon_current_group(&self) -> Result<u8, String>;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct X11GroupState {
+    current_group: u8,
+    num_groups: u8,
 }
 
-struct X11CinnamonCurrentGroupReader;
+impl X11GroupState {
+    fn new(current_group: u8, num_groups: u8) -> Self {
+        Self {
+            current_group,
+            num_groups,
+        }
+    }
+}
 
-impl CinnamonCurrentGroupReader for X11CinnamonCurrentGroupReader {
-    fn cinnamon_current_group(&self) -> Result<u8, String> {
+trait X11GroupStateReader {
+    fn x11_group_state(&self) -> Result<X11GroupState, String>;
+}
+
+struct X11XkbGroupStateReader;
+
+impl X11GroupStateReader for X11XkbGroupStateReader {
+    fn x11_group_state(&self) -> Result<X11GroupState, String> {
         use x11rb::protocol::xkb::{self, ConnectionExt as _};
 
         let (connection, _) = x11rb::connect(None).map_err(|error| error.to_string())?;
@@ -2975,23 +3028,30 @@ impl CinnamonCurrentGroupReader for X11CinnamonCurrentGroupReader {
             .map_err(|error| error.to_string())?
             .reply()
             .map_err(|error| error.to_string())?;
-        let current_group = connection
+        let controls = connection
+            .xkb_get_controls(xkb::ID::USE_CORE_KBD.into())
+            .map_err(|error| error.to_string())?
+            .reply()
+            .map_err(|error| error.to_string())?;
+        let state = connection
             .xkb_get_state(xkb::ID::USE_CORE_KBD.into())
             .map_err(|error| error.to_string())?
             .reply()
-            .map(|state| u8::from(state.group))
             .map_err(|error| error.to_string())?;
-        Ok(current_group)
+        Ok(X11GroupState::new(
+            u8::from(state.group),
+            controls.num_groups,
+        ))
     }
 }
 
 #[cfg(test)]
-struct PreserveCinnamonCurrentGroupReader;
+struct PreserveX11GroupStateReader;
 
 #[cfg(test)]
-impl CinnamonCurrentGroupReader for PreserveCinnamonCurrentGroupReader {
-    fn cinnamon_current_group(&self) -> Result<u8, String> {
-        Err("cinnamon XKB group reader unavailable in this path".to_string())
+impl X11GroupStateReader for PreserveX11GroupStateReader {
+    fn x11_group_state(&self) -> Result<X11GroupState, String> {
+        Err("X11 XKB group reader unavailable in this path".to_string())
     }
 }
 
@@ -3106,10 +3166,16 @@ impl RuntimeState {
     // Runtime state initialization and flags
 
     pub fn new(config_service: ConfigService) -> Self {
-        let (backend, layout_state, layout_setup, layout_compatibility, feature_availability) =
-            Self::initialize_layout_backend();
-        let enabled = config_service.auto_switch_enabled().unwrap_or(true);
         let system_context = SystemContextDetector::detect_current().unwrap_or_default();
+        let (
+            backend,
+            layout_state,
+            layout_setup,
+            layout_compatibility,
+            feature_availability,
+            _setup_detection,
+        ) = Self::initialize_layout_backend(system_context);
+        let enabled = config_service.auto_switch_enabled().unwrap_or(true);
         let initial_input_snapshot = initial_input_snapshot(
             &config_service,
             enabled,
@@ -3494,7 +3560,7 @@ impl RuntimeState {
         self.periodic_sync_tick_with_readers(
             &CommandDesktopSettingsReader,
             &SystemContextDetector,
-            &X11CinnamonCurrentGroupReader,
+            &X11XkbGroupStateReader,
         )
     }
 
@@ -3504,13 +3570,13 @@ impl RuntimeState {
         reader: &R,
         detector: &D,
     ) -> BackendSyncResult {
-        self.periodic_sync_tick_with_readers(reader, detector, &PreserveCinnamonCurrentGroupReader)
+        self.periodic_sync_tick_with_readers(reader, detector, &PreserveX11GroupStateReader)
     }
 
     fn periodic_sync_tick_with_readers<
         R: DesktopSettingsReader,
         D: SystemContextSource,
-        C: CinnamonCurrentGroupReader,
+        C: X11GroupStateReader,
     >(
         &self,
         reader: &R,
@@ -3811,12 +3877,15 @@ impl RuntimeState {
 
     // Layout backend initialization
 
-    fn initialize_layout_backend() -> (
+    fn initialize_layout_backend(
+        context: SystemContext,
+    ) -> (
         Option<Box<dyn LayoutBackend>>,
         CurrentLayoutState,
         LayoutSetup,
         LayoutCompatibility,
         FeatureAvailability,
+        LayoutSetupDetection,
     ) {
         let mut registry = LayoutBackendRegistry::new();
         registry.register_factory(legacy_backend_factory);
@@ -3824,12 +3893,8 @@ impl RuntimeState {
         match registry.pick_backend() {
             LayoutBackendRegistryResult::Backend(backend) => {
                 let capabilities = backend.capabilities();
-                let layout_setup = match backend.detect_setup() {
-                    Ok(setup) => setup,
-                    Err(error) => LayoutSetup::Unsupported {
-                        reason: error.to_string(),
-                    },
-                };
+                let setup_detection = backend.detect_setup(context);
+                let layout_setup = setup_detection.effective_setup();
                 let layout_compatibility = compatibility_from_setup(&layout_setup);
                 let feature_availability =
                     feature_availability_for(layout_compatibility, capabilities);
@@ -3846,6 +3911,7 @@ impl RuntimeState {
                     layout_setup,
                     layout_compatibility,
                     feature_availability,
+                    setup_detection,
                 )
             }
             LayoutBackendRegistryResult::Unsupported { reason } => {
@@ -3858,6 +3924,9 @@ impl RuntimeState {
                 let layout_compatibility = compatibility_from_setup(&layout_setup);
                 let feature_availability =
                     feature_availability_for(layout_compatibility, Default::default());
+                let setup_detection = LayoutSetupDetection::Unsupported {
+                    reason: reason.clone(),
+                };
 
                 (
                     None,
@@ -3865,6 +3934,7 @@ impl RuntimeState {
                     layout_setup,
                     layout_compatibility,
                     feature_availability,
+                    setup_detection,
                 )
             }
         }
@@ -3875,7 +3945,7 @@ impl RuntimeState {
     fn refresh_current_layout_observation(&self) -> bool {
         self.refresh_current_layout_observation_with_readers(
             &CommandDesktopSettingsReader,
-            &X11CinnamonCurrentGroupReader,
+            &X11XkbGroupStateReader,
         )
     }
 
@@ -3884,32 +3954,29 @@ impl RuntimeState {
         &self,
         reader: &R,
     ) -> bool {
-        self.refresh_current_layout_observation_with_readers(
-            reader,
-            &PreserveCinnamonCurrentGroupReader,
-        )
+        self.refresh_current_layout_observation_with_readers(reader, &PreserveX11GroupStateReader)
     }
 
     fn refresh_current_layout_observation_with_readers<
         R: DesktopSettingsReader,
-        C: CinnamonCurrentGroupReader,
+        C: X11GroupStateReader,
     >(
         &self,
         reader: &R,
         cinnamon_reader: &C,
     ) -> bool {
+        if self.system_context().session_type == SessionType::X11 {
+            let layout_setup = self.layout_setup();
+            let Some(next_observation) = x11_current_layout_state(cinnamon_reader, &layout_setup)
+            else {
+                return false;
+            };
+            self.update_current_layout_observation(Some(next_observation), "runtime-sync");
+            return true;
+        }
+
         if !is_gnome_wayland_context(self.system_context()) {
-            if is_cinnamon_x11_context(self.system_context()) {
-                let layout_setup = self.layout_setup();
-                let Some(next_observation) =
-                    cinnamon_x11_current_layout_state(cinnamon_reader, &layout_setup)
-                else {
-                    return false;
-                };
-                self.update_current_layout_observation(Some(next_observation), "runtime-sync");
-            } else {
-                self.clear_current_layout_observation();
-            }
+            self.clear_current_layout_observation();
             return true;
         }
 
@@ -4032,11 +4099,6 @@ fn is_gnome_wayland_context(context: SystemContext) -> bool {
         && context.desktop_environment == DesktopEnvironment::Gnome
 }
 
-fn is_cinnamon_x11_context(context: SystemContext) -> bool {
-    context.session_type == SessionType::X11
-        && context.desktop_environment == DesktopEnvironment::Cinnamon
-}
-
 fn is_late_system_context_upgrade(current: SystemContext, candidate: SystemContext) -> bool {
     if candidate == current {
         return false;
@@ -4089,7 +4151,7 @@ fn effective_current_layout_state(
     observed_state: Option<&CurrentLayoutState>,
     context: SystemContext,
 ) -> CurrentLayoutState {
-    if is_gnome_wayland_context(context) || is_cinnamon_x11_context(context) {
+    if is_gnome_wayland_context(context) || context.session_type == SessionType::X11 {
         if let Some(observed_state) = observed_state {
             return observed_state.clone();
         }
@@ -4101,10 +4163,10 @@ fn effective_current_layout_state(
             }
         ) {
             return CurrentLayoutState::Unknown {
-                reason: if is_gnome_wayland_context(context) {
-                    "gnome-wayland-observation:missing-untrusted-legacy-fallback".to_string()
+                reason: if context.session_type == SessionType::X11 {
+                    "x11-observation:missing-untrusted-legacy-fallback".to_string()
                 } else {
-                    "cinnamon-x11-observation:missing-untrusted-legacy-fallback".to_string()
+                    "gnome-wayland-observation:missing-untrusted-legacy-fallback".to_string()
                 },
             };
         }
@@ -4113,71 +4175,39 @@ fn effective_current_layout_state(
     raw_state.clone()
 }
 
-// Cinnamon X11 observation
+// X11 observation
 
-fn cinnamon_x11_current_layout_state<R: CinnamonCurrentGroupReader>(
+fn x11_current_layout_state<R: X11GroupStateReader>(
     reader: &R,
     setup: &LayoutSetup,
 ) -> Option<CurrentLayoutState> {
-    let current_group = match reader.cinnamon_current_group() {
-        Ok(current_group) => current_group,
+    let group_state = match reader.x11_group_state() {
+        Ok(group_state) => group_state,
         Err(error) => {
             log_layout_debug(
-                "cinnamon-x11-observation",
+                "x11-observation",
                 &format!("result=preserve reason=xkb-group-read-error error={error}"),
             );
             return None;
         }
     };
 
-    Some(cinnamon_x11_current_layout_state_from_group(
-        current_group,
-        setup,
-    ))
+    Some(x11_current_layout_state_from_group(group_state, setup))
 }
 
+fn x11_current_layout_state_from_group(
+    group_state: X11GroupState,
+    setup: &LayoutSetup,
+) -> CurrentLayoutState {
+    current_layout_from_group(setup, group_state.current_group, group_state.num_groups)
+}
+
+#[cfg(test)]
 fn cinnamon_x11_current_layout_state_from_group(
     current_group: u8,
     setup: &LayoutSetup,
 ) -> CurrentLayoutState {
-    match trusted_cinnamon_layout_for_group(current_group, setup) {
-        Ok(layout) => known_layout_state_from_layout(layout),
-        Err(reason) => cinnamon_x11_unknown_layout_state(reason),
-    }
-}
-
-fn trusted_cinnamon_layout_for_group(
-    current_group: u8,
-    setup: &LayoutSetup,
-) -> Result<SystemLayout, &'static str> {
-    let LayoutSetup::StrictPair { en, ru } = setup else {
-        return Err("unsupported-layout-setup");
-    };
-    let Some(english_group) = en.index else {
-        return Err("missing-layout-index");
-    };
-    let Some(russian_group) = ru.index else {
-        return Err("missing-layout-index");
-    };
-    if english_group == russian_group {
-        return Err("duplicate-layout-index");
-    }
-
-    match u32::from(current_group) {
-        group if group == english_group => Ok(en.clone()),
-        group if group == russian_group => Ok(ru.clone()),
-        _ => Err("unsupported-current-group"),
-    }
-}
-
-fn cinnamon_x11_unknown_layout_state(reason: &'static str) -> CurrentLayoutState {
-    log_layout_debug(
-        "cinnamon-x11-observation",
-        &format!("result=unknown reason={reason}"),
-    );
-    CurrentLayoutState::Unknown {
-        reason: format!("cinnamon-x11-observation:{reason}"),
-    }
+    x11_current_layout_state_from_group(X11GroupState::new(current_group, 2), setup)
 }
 
 // GNOME Wayland observation
@@ -4318,10 +4348,7 @@ fn gnome_wayland_current_layout_state_from_sources(
     configured_sources: &[String],
     mru_sources: &[String],
 ) -> CurrentLayoutState {
-    match trusted_gnome_layout_pair_from_sources(configured_sources, mru_sources) {
-        Ok(pair) => known_layout_state_from_layout(pair.current_layout),
-        Err(reason) => gnome_wayland_unknown_layout_state(reason),
-    }
+    current_layout_from_gnome_sources(configured_sources, mru_sources)
 }
 
 pub(crate) fn trusted_gnome_layout_pair_from_sources(
@@ -4431,16 +4458,6 @@ fn gnome_input_source_matches_layout(source: &GnomeInputSource, layout: &SystemL
             .normalized_code
             .normalized_str()
             .is_some_and(|code| source.source_id == code)
-}
-
-fn gnome_wayland_unknown_layout_state(reason: &'static str) -> CurrentLayoutState {
-    log_layout_debug(
-        "gnome-wayland-observation",
-        &format!("result=unknown reason={reason}"),
-    );
-    CurrentLayoutState::Unknown {
-        reason: format!("gnome-wayland-observation:{reason}"),
-    }
 }
 
 // Logging helpers

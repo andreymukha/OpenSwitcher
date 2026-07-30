@@ -44,8 +44,9 @@ impl LayoutBackendRegistry {
 mod tests {
     use super::*;
     use crate::layout_backend::{
-        BackendCapabilities, CurrentLayoutState, LayoutBackendOperation, LayoutSetup,
+        BackendCapabilities, CurrentLayoutState, LayoutBackendOperation, LayoutSetupDetection,
     };
+    use crate::model::SystemContext;
     use std::io;
 
     struct TestBackend;
@@ -59,8 +60,10 @@ mod tests {
             BackendCapabilities::default()
         }
 
-        fn detect_setup(&self) -> Result<LayoutSetup, LayoutBackendError> {
-            unreachable!()
+        fn detect_setup(&self, _context: SystemContext) -> LayoutSetupDetection {
+            LayoutSetupDetection::Unsupported {
+                reason: "test-backend-does-not-detect-setup".to_string(),
+            }
         }
 
         fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {

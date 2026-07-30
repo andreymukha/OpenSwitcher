@@ -14,6 +14,7 @@ pub use capabilities::BackendCapabilities;
 pub use compat::{
     legacy_current_layout_bool, legacy_layout_state_from_bool, LEGACY_LAYOUT_FALLBACK_IS_ENGLISH,
 };
+pub(crate) use detection::detect_gnome_setup_from_sources;
 pub use detection::{
     current_layout_from_gnome_sources, current_layout_from_group, detect_layout_setup,
     LayoutSetupDetection,

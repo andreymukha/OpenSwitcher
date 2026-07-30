@@ -5,16 +5,18 @@ use crate::daemon::input_snapshot::{
     InputRuntimeSnapshot, InputSnapshotPublication, LayoutRefreshRequests, RefreshRequestOutcome,
     SnapshotTryLoad, INPUT_LAYOUT_POLL_INTERVAL,
 };
+use crate::daemon::layout_setup_retry::LayoutSetupRetry;
 use crate::error::{
     CaptureError, ConfigError, ServiceManagerError, SettingsError, SystemContextError,
     ValidationError,
 };
 use crate::layout_backend::{
     compatibility_from_setup, current_layout_from_gnome_sources, current_layout_from_group,
-    feature_availability_for, legacy_backend_factory, legacy_current_layout_bool,
-    legacy_layout_state_from_bool, AppLayoutKind, BackendCapabilities, CurrentLayoutState,
-    FeatureAvailability, LayoutBackend, LayoutBackendRegistry, LayoutBackendRegistryResult,
-    LayoutCode, LayoutCompatibility, LayoutSetup, LayoutSetupDetection, SystemLayout,
+    detect_gnome_setup_from_sources, feature_availability_for, legacy_backend_factory,
+    legacy_current_layout_bool, legacy_layout_state_from_bool, AppLayoutKind, BackendCapabilities,
+    CurrentLayoutState, FeatureAvailability, LayoutBackend, LayoutBackendRegistry,
+    LayoutBackendRegistryResult, LayoutCode, LayoutCompatibility, LayoutSetup,
+    LayoutSetupDetection, SystemLayout,
 };
 use crate::layout_switch::{
     failed_detection_fallback, CommandDesktopSettingsReader, DesktopSettingsReader,
@@ -300,6 +302,7 @@ mod tests {
         DesktopEnvironment, DetectionConfidence, DetectionStrategy, DistroKind,
         LayoutSwitchSetting, LayoutSwitchSource, SessionType,
     };
+    use std::collections::VecDeque;
     use std::io;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -617,6 +620,61 @@ mod tests {
         }
     }
 
+    struct SetupOutcomeBackend {
+        outcomes: Mutex<VecDeque<LayoutSetupDetection>>,
+    }
+
+    impl LayoutBackend for SetupOutcomeBackend {
+        fn id(&self) -> &'static str {
+            "setup-outcome-test"
+        }
+
+        fn capabilities(&self) -> BackendCapabilities {
+            BackendCapabilities {
+                can_list_layouts: true,
+                can_read_current_layout: true,
+                can_switch_next: true,
+                can_map_layouts_to_app_kinds: true,
+                ..Default::default()
+            }
+        }
+
+        fn detect_setup(&self, _context: SystemContext) -> LayoutSetupDetection {
+            self.outcomes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .expect("injected setup outcome")
+        }
+
+        fn current_layout_snapshot(&self) -> Result<CurrentLayoutState, LayoutBackendError> {
+            Ok(CurrentLayoutState::Unknown {
+                reason: "awaiting injected observation".to_string(),
+            })
+        }
+
+        fn switch_to(&mut self, _target: &SystemLayout) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchTo,
+            ))
+        }
+
+        fn switch_next(&mut self) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::SwitchNext,
+            ))
+        }
+
+        fn start_monitoring(&mut self, _sink: LayoutStateSink) -> Result<(), LayoutBackendError> {
+            Err(LayoutBackendError::unsupported(
+                self.id(),
+                LayoutBackendOperation::StartMonitoring,
+            ))
+        }
+    }
+
     fn english_layout() -> SystemLayout {
         SystemLayout {
             backend_key: "us".to_string(),
@@ -701,11 +759,14 @@ mod tests {
             settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
             layout_state: RwLock::new(initial_layout_state),
             backend: Mutex::new(Some(backend)),
-            layout_setup: RwLock::new(LayoutSetup::Unsupported {
-                reason: "test".to_string(),
-            }),
-            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(feature_availability),
+            layout_setup_state: RwLock::new(LayoutSetupRuntimeState::new(
+                LayoutSetup::Unsupported {
+                    reason: "test".to_string(),
+                },
+                LayoutCompatibility::Unsupported,
+                feature_availability,
+            )),
+            layout_setup_retry: Mutex::new(LayoutSetupRetry::confirmed()),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
@@ -718,6 +779,43 @@ mod tests {
             background_sync_started: AtomicBool::new(false),
             pending_status_change: AtomicBool::new(false),
         }
+    }
+
+    fn runtime_with_pending_setup_outcomes(
+        outcomes: impl IntoIterator<Item = LayoutSetupDetection>,
+        now: Instant,
+    ) -> RuntimeState {
+        let runtime = test_runtime_with_backend_and_context(
+            CurrentLayoutState::Unknown {
+                reason: "setup-pending".to_string(),
+            },
+            Box::new(SetupOutcomeBackend {
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+            }),
+            cinnamon_x11_context(),
+        );
+        *runtime
+            .layout_setup_retry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = LayoutSetupRetry::pending_at(now);
+        runtime
+    }
+
+    fn runtime_with_confirmed_setup(
+        context: SystemContext,
+        setup: LayoutSetup,
+        now: Instant,
+    ) -> RuntimeState {
+        let runtime = test_runtime_with_backend_and_context(
+            known_layout_state(english_layout()),
+            Box::new(SnapshotBackend {
+                snapshot: SnapshotOutcome::State(known_layout_state(english_layout())),
+            }),
+            context,
+        );
+        runtime.apply_layout_setup_detection(LayoutSetupDetection::Confirmed(setup), now);
+        runtime.publish_confirmed_layout(now, runtime.input_layout_epoch());
+        runtime
     }
 
     // Config auto-detection
@@ -1065,14 +1163,29 @@ undo_key = "Pause"
     fn periodic_sync_tick_delegates_to_backend_sync() {
         let initial = known_layout_state(english_layout());
         let expected = known_layout_state(russian_layout());
-        let runtime = test_runtime_with_backend(
+        let context = SystemContext {
+            session_type: SessionType::Wayland,
+            desktop_environment: DesktopEnvironment::Xfce,
+            distro: DistroKind::LinuxMint,
+        };
+        let runtime = test_runtime_with_backend_and_context(
             initial.clone(),
             Box::new(SnapshotBackend {
                 snapshot: SnapshotOutcome::State(expected.clone()),
             }),
+            context,
         );
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: None,
+            mru_sources: None,
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context,
+        };
 
-        let outcome = runtime.periodic_sync_tick();
+        let outcome = runtime.periodic_sync_tick_with(&reader, &detector);
 
         assert_eq!(
             outcome,
@@ -1499,11 +1612,14 @@ undo_key = "Pause"
                     reason: "test".to_string(),
                 }),
             }))),
-            layout_setup: RwLock::new(LayoutSetup::Unsupported {
-                reason: "test".to_string(),
-            }),
-            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(feature_availability),
+            layout_setup_state: RwLock::new(LayoutSetupRuntimeState::new(
+                LayoutSetup::Unsupported {
+                    reason: "test".to_string(),
+                },
+                LayoutCompatibility::Unsupported,
+                feature_availability,
+            )),
+            layout_setup_retry: Mutex::new(LayoutSetupRetry::confirmed()),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
@@ -1588,6 +1704,114 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn unavailable_startup_recovers_features_without_daemon_restart() {
+        let now = Instant::now();
+        let runtime = runtime_with_pending_setup_outcomes(
+            [LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup())],
+            now,
+        );
+
+        assert!(!runtime.feature_availability().manual_word_fix);
+        assert!(!runtime.maybe_redetect_layout_setup_at(now + Duration::from_millis(999)));
+        assert!(runtime.maybe_redetect_layout_setup_at(now + Duration::from_secs(1)));
+        assert!(runtime.feature_availability().manual_word_fix);
+        assert!(
+            runtime
+                .input_snapshot_before_grab()
+                .features
+                .manual_word_fix
+        );
+        assert_eq!(runtime.layout_setup_retry_due(), None);
+    }
+
+    #[test]
+    fn setup_change_invalidates_pending_snapshot_authorization() {
+        let now = Instant::now();
+        let runtime =
+            runtime_with_confirmed_setup(cinnamon_x11_context(), cinnamon_strict_pair_setup(), now);
+        let before = runtime.input_snapshot_before_grab();
+        let authorization = before
+            .authorization_at(now, runtime.input_layout_epoch())
+            .unwrap();
+
+        runtime.apply_layout_setup_detection(
+            LayoutSetupDetection::Unsupported {
+                reason: "extra-layout".to_string(),
+            },
+            now,
+        );
+
+        let after = runtime.input_snapshot_before_grab();
+        assert!(!after.authorizes_at(authorization, now, runtime.input_layout_epoch(),));
+        assert!(!after.features.manual_word_fix);
+        assert!(matches!(
+            after.layout_state,
+            CurrentLayoutState::Unknown { .. }
+        ));
+        assert_eq!(after.confirmed_at, None);
+    }
+
+    #[test]
+    fn gnome_source_reclassification_reuses_the_observation_read() {
+        let now = Instant::now();
+        let runtime = runtime_with_confirmed_setup(
+            gnome_wayland_context(),
+            cinnamon_strict_pair_setup(),
+            now,
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::clone(&calls),
+            sources: Some(gnome_sources(&[
+                ("xkb", "us"),
+                ("xkb", "de"),
+                ("xkb", "ru"),
+            ])),
+            mru_sources: Some(gnome_sources(&[
+                ("xkb", "us"),
+                ("xkb", "de"),
+                ("xkb", "ru"),
+            ])),
+        };
+
+        assert!(runtime.refresh_current_layout_observation_with_reader(&reader));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            runtime.layout_compatibility(),
+            LayoutCompatibility::PairPlusOther
+        );
+        assert!(!runtime.feature_availability().manual_word_fix);
+        assert_eq!(
+            current_layout_kind_from_state(&runtime.current_layout_state()),
+            AppLayoutKind::English
+        );
+    }
+
+    #[test]
+    fn x11_group_count_mismatch_schedules_setup_redetection() {
+        let now = Instant::now();
+        let runtime =
+            runtime_with_confirmed_setup(cinnamon_x11_context(), cinnamon_strict_pair_setup(), now);
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: None,
+            mru_sources: None,
+        };
+        let x11_reader = X11GroupStateReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            group_state: Ok(X11GroupState::new(0, 3)),
+        };
+
+        assert!(runtime.refresh_current_layout_observation_with_readers(&reader, &x11_reader,));
+        assert!(matches!(
+            runtime.current_layout_state(),
+            CurrentLayoutState::Unknown { .. }
+        ));
+        assert!(runtime.layout_setup_retry_due().is_some());
+    }
+
+    #[test]
     fn generic_x11_rejects_untrusted_legacy_led_state() {
         let raw = CurrentLayoutState::Known {
             layout: english_layout(),
@@ -1649,10 +1873,10 @@ undo_key = "Pause"
             calls: Arc::new(AtomicUsize::new(0)),
             group_state: Ok(X11GroupState::new(0, 2)),
         };
-        *runtime
-            .layout_setup
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
+        runtime.apply_layout_setup_detection(
+            LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup()),
+            Instant::now(),
+        );
 
         runtime.refresh_current_layout_observation_with_readers(&reader, &cinnamon_reader);
 
@@ -1840,7 +2064,7 @@ undo_key = "Pause"
     }
 
     #[test]
-    fn refresh_current_layout_observation_updates_only_the_runtime_cache() {
+    fn refresh_current_layout_observation_updates_runtime_cache_and_confirmed_setup() {
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = LayoutObservationReaderStub {
             calls: Arc::clone(&calls),
@@ -1866,7 +2090,7 @@ undo_key = "Pause"
             known_layout_state(english_layout())
         );
         assert!(!runtime.take_pending_status_change());
-        assert_eq!(runtime.last_confirmed_status(), (true, false));
+        assert_eq!(runtime.last_confirmed_status(), (true, true));
     }
 
     #[test]
@@ -1892,10 +2116,10 @@ undo_key = "Pause"
             }),
             cinnamon_x11_context(),
         );
-        *runtime
-            .layout_setup
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
+        runtime.apply_layout_setup_detection(
+            LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup()),
+            Instant::now(),
+        );
 
         runtime.refresh_current_layout_observation_with_readers(&reader, &cinnamon_reader);
 
@@ -2151,10 +2375,10 @@ undo_key = "Pause"
             }),
             cinnamon_x11_context(),
         );
-        *runtime
-            .layout_setup
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
+        runtime.apply_layout_setup_detection(
+            LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup()),
+            Instant::now(),
+        );
 
         assert_eq!(
             runtime.periodic_sync_tick_with_readers(&reader, &detector, &cinnamon_reader),
@@ -2227,10 +2451,10 @@ undo_key = "Pause"
             }),
             cinnamon_x11_context(),
         );
-        *runtime
-            .layout_setup
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = cinnamon_strict_pair_setup();
+        runtime.apply_layout_setup_detection(
+            LayoutSetupDetection::Confirmed(cinnamon_strict_pair_setup()),
+            Instant::now(),
+        );
 
         assert_eq!(
             runtime.periodic_sync_tick_with_readers(&reader, &detector, &cinnamon_reader),
@@ -2926,6 +3150,34 @@ undo_key = "Pause"
 
 // Runtime state
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayoutSetupRuntimeState {
+    setup: LayoutSetup,
+    compatibility: LayoutCompatibility,
+    features: FeatureAvailability,
+}
+
+impl LayoutSetupRuntimeState {
+    fn new(
+        setup: LayoutSetup,
+        compatibility: LayoutCompatibility,
+        features: FeatureAvailability,
+    ) -> Self {
+        Self {
+            setup,
+            compatibility,
+            features,
+        }
+    }
+
+    fn from_detection(detection: &LayoutSetupDetection, capabilities: BackendCapabilities) -> Self {
+        let setup = detection.effective_setup();
+        let compatibility = compatibility_from_setup(&setup);
+        let features = feature_availability_for(compatibility, capabilities);
+        Self::new(setup, compatibility, features)
+    }
+}
+
 pub struct RuntimeState {
     enabled: AtomicBool,
     should_exit: AtomicBool,
@@ -2933,9 +3185,8 @@ pub struct RuntimeState {
     settings_hotkey_capture_inhibited_until_ms: AtomicU64,
     layout_state: RwLock<CurrentLayoutState>,
     backend: Mutex<Option<Box<dyn LayoutBackend>>>,
-    layout_setup: RwLock<LayoutSetup>,
-    layout_compatibility: RwLock<LayoutCompatibility>,
-    feature_availability: RwLock<FeatureAvailability>,
+    layout_setup_state: RwLock<LayoutSetupRuntimeState>,
+    layout_setup_retry: Mutex<LayoutSetupRetry>,
     system_context: RwLock<SystemContext>,
     current_layout_observation: RwLock<Option<CurrentLayoutState>>,
     config_service: ConfigService,
@@ -3173,7 +3424,7 @@ impl RuntimeState {
             layout_setup,
             layout_compatibility,
             feature_availability,
-            _setup_detection,
+            setup_detection,
         ) = Self::initialize_layout_backend(system_context);
         let enabled = config_service.auto_switch_enabled().unwrap_or(true);
         let initial_input_snapshot = initial_input_snapshot(
@@ -3184,6 +3435,8 @@ impl RuntimeState {
             layout_state.clone(),
         );
         let (layout_refresh_requests, layout_refresh_receiver) = LayoutRefreshRequests::new();
+        let layout_setup_state =
+            LayoutSetupRuntimeState::new(layout_setup, layout_compatibility, feature_availability);
         let runtime = Self {
             enabled: AtomicBool::new(enabled),
             should_exit: AtomicBool::new(false),
@@ -3191,9 +3444,11 @@ impl RuntimeState {
             settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
             layout_state: RwLock::new(layout_state),
             backend: Mutex::new(backend),
-            layout_setup: RwLock::new(layout_setup),
-            layout_compatibility: RwLock::new(layout_compatibility),
-            feature_availability: RwLock::new(feature_availability),
+            layout_setup_state: RwLock::new(layout_setup_state),
+            layout_setup_retry: Mutex::new(LayoutSetupRetry::from_detection(
+                &setup_detection,
+                Instant::now(),
+            )),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,
@@ -3512,24 +3767,183 @@ impl RuntimeState {
     }
 
     pub fn layout_setup(&self) -> LayoutSetup {
-        self.layout_setup
+        self.layout_setup_state
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .setup
             .clone()
     }
 
     pub fn layout_compatibility(&self) -> LayoutCompatibility {
-        *self
-            .layout_compatibility
+        self.layout_setup_state
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .compatibility
     }
 
     pub fn feature_availability(&self) -> FeatureAvailability {
-        self.feature_availability
+        self.layout_setup_state
             .read()
             .unwrap_or_else(|error| error.into_inner())
+            .features
             .clone()
+    }
+
+    fn backend_capabilities(&self) -> BackendCapabilities {
+        self.backend
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|backend| backend.capabilities())
+            .unwrap_or_default()
+    }
+
+    fn apply_layout_setup_detection(&self, detection: LayoutSetupDetection, now: Instant) -> bool {
+        let capabilities = self.backend_capabilities();
+        self.apply_layout_setup_detection_with_capabilities(detection, capabilities, now)
+    }
+
+    fn apply_layout_setup_detection_with_capabilities(
+        &self,
+        detection: LayoutSetupDetection,
+        capabilities: BackendCapabilities,
+        now: Instant,
+    ) -> bool {
+        let next = LayoutSetupRuntimeState::from_detection(&detection, capabilities);
+        let mut state = self
+            .layout_setup_state
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let changed = *state != next;
+
+        if changed {
+            self.layout_invalidation_epoch
+                .fetch_add(1, Ordering::AcqRel);
+            *state = next.clone();
+        }
+        drop(state);
+
+        {
+            let mut retry = self
+                .layout_setup_retry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if detection.is_confirmed() {
+                retry.record_confirmed();
+            } else if retry.next_due().is_none() {
+                *retry = LayoutSetupRetry::pending_at(now);
+            }
+        }
+
+        if !changed {
+            return false;
+        }
+
+        self.clear_current_layout_observation();
+        let mut generation = 0;
+        self.input_snapshot.update(|published| {
+            published.features = next.features.clone();
+            published.layout_state = CurrentLayoutState::Unknown {
+                reason: "layout-setup-changed-awaiting-confirmation".to_string(),
+            };
+            published.layout_generation = published.layout_generation.saturating_add(1);
+            generation = published.layout_generation;
+            published.confirmed_at = None;
+        });
+
+        let (result, reason) = match &detection {
+            LayoutSetupDetection::Confirmed(_) => ("confirmed", "none"),
+            LayoutSetupDetection::TemporarilyUnavailable { reason } => {
+                ("temporary", reason.as_str())
+            }
+            LayoutSetupDetection::Unsupported { reason } => ("unsupported", reason.as_str()),
+        };
+        log_layout_debug(
+            "layout-setup-detection",
+            &format!(
+                "strategy={} result={result} compatibility={:?} generation={generation} reason={reason}",
+                layout_setup_detection_strategy(self.system_context()),
+                next.compatibility,
+            ),
+        );
+        true
+    }
+
+    fn maybe_redetect_layout_setup_at(&self, now: Instant) -> bool {
+        let due = self
+            .layout_setup_retry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_due(now);
+        if !due {
+            return false;
+        }
+
+        let context = self.system_context();
+        let detected = {
+            let backend = self
+                .backend
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            backend
+                .as_ref()
+                .map(|backend| (backend.detect_setup(context), backend.capabilities()))
+        };
+        let Some((detection, capabilities)) = detected else {
+            self.layout_setup_retry
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .record_failure(now);
+            return false;
+        };
+
+        match detection {
+            LayoutSetupDetection::Confirmed(_) => {
+                self.apply_layout_setup_detection_with_capabilities(detection, capabilities, now);
+                true
+            }
+            LayoutSetupDetection::Unsupported { .. } => {
+                let changed = self.apply_layout_setup_detection_with_capabilities(
+                    detection,
+                    capabilities,
+                    now,
+                );
+                self.layout_setup_retry
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .record_failure(now);
+                changed
+            }
+            LayoutSetupDetection::TemporarilyUnavailable { reason } => {
+                self.layout_setup_retry
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .record_failure(now);
+                log_layout_debug(
+                    "layout-setup-detection",
+                    &format!(
+                        "strategy={} result=temporary reason={reason}",
+                        layout_setup_detection_strategy(context),
+                    ),
+                );
+                false
+            }
+        }
+    }
+
+    fn force_layout_setup_redetection_at(&self, now: Instant) {
+        self.layout_setup_retry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .force_due(now);
+    }
+
+    #[cfg(test)]
+    fn layout_setup_retry_due(&self) -> Option<Instant> {
+        self.layout_setup_retry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .next_due()
     }
 
     // Layout backend sync
@@ -3583,9 +3997,12 @@ impl RuntimeState {
         detector: &D,
         cinnamon_reader: &C,
     ) -> BackendSyncResult {
+        let now = Instant::now();
         if self.refresh_system_context_with_detector(detector) {
             self.redetect_layout_switch_after_context_upgrade(reader);
+            self.force_layout_setup_redetection_at(now);
         }
+        let _ = self.maybe_redetect_layout_setup_at(now);
         let observation_confirmed =
             self.refresh_current_layout_observation_with_readers(reader, cinnamon_reader);
         let backend_result = self.sync_with_backend();
@@ -3971,6 +4388,13 @@ impl RuntimeState {
             else {
                 return false;
             };
+            if matches!(
+                &next_observation,
+                CurrentLayoutState::Unknown { reason }
+                    if reason == "layout-group-count-mismatch"
+            ) {
+                self.force_layout_setup_redetection_at(Instant::now());
+            }
             self.update_current_layout_observation(Some(next_observation), "runtime-sync");
             return true;
         }
@@ -3980,9 +4404,34 @@ impl RuntimeState {
             return true;
         }
 
-        let Some(next_observation) = gnome_wayland_current_layout_state(reader) else {
-            return false;
-        };
+        let configured_sources =
+            match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_SOURCES_KEY) {
+                Ok(values) => values,
+                Err(error) => {
+                    log_layout_debug(
+                        "gnome-wayland-observation",
+                        &format!("result=preserve reason=sources-read-error error={error}"),
+                    );
+                    return false;
+                }
+            };
+        self.apply_layout_setup_detection(
+            detect_gnome_setup_from_sources(&configured_sources),
+            Instant::now(),
+        );
+
+        let mru_sources =
+            match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_MRU_SOURCES_KEY) {
+                Ok(values) => values,
+                Err(error) => {
+                    log_layout_debug(
+                        "gnome-wayland-observation",
+                        &format!("result=preserve reason=mru-read-error error={error}"),
+                    );
+                    return false;
+                }
+            };
+        let next_observation = current_layout_from_gnome_sources(&configured_sources, &mru_sources);
         self.update_current_layout_observation(Some(next_observation), "runtime-sync");
         true
     }
@@ -4097,6 +4546,14 @@ fn current_layout_kind_from_state(state: &CurrentLayoutState) -> AppLayoutKind {
 fn is_gnome_wayland_context(context: SystemContext) -> bool {
     context.session_type == SessionType::Wayland
         && context.desktop_environment == DesktopEnvironment::Gnome
+}
+
+fn layout_setup_detection_strategy(context: SystemContext) -> &'static str {
+    match (context.session_type, context.desktop_environment) {
+        (SessionType::X11, _) => "x11-setxkbmap",
+        (SessionType::Wayland, DesktopEnvironment::Gnome) => "gnome-gsettings",
+        _ => "unsupported-context",
+    }
 }
 
 fn is_late_system_context_upgrade(current: SystemContext, candidate: SystemContext) -> bool {
@@ -4512,11 +4969,14 @@ mod input_snapshot_config_tests {
             settings_hotkey_capture_inhibited_until_ms: AtomicU64::new(0),
             layout_state: RwLock::new(layout_state),
             backend: Mutex::new(None),
-            layout_setup: RwLock::new(LayoutSetup::Unsupported {
-                reason: "test".to_string(),
-            }),
-            layout_compatibility: RwLock::new(LayoutCompatibility::Unsupported),
-            feature_availability: RwLock::new(feature_availability),
+            layout_setup_state: RwLock::new(LayoutSetupRuntimeState::new(
+                LayoutSetup::Unsupported {
+                    reason: "test".to_string(),
+                },
+                LayoutCompatibility::Unsupported,
+                feature_availability,
+            )),
+            layout_setup_retry: Mutex::new(LayoutSetupRetry::confirmed()),
             system_context: RwLock::new(system_context),
             current_layout_observation: RwLock::new(None),
             config_service,

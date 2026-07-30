@@ -5,6 +5,7 @@ pub mod input_backend;
 pub(crate) mod input_device_identity;
 pub(crate) mod input_snapshot;
 pub mod keyboard;
+mod layout_setup_retry;
 pub mod layout_switcher;
 pub mod runtime;
 pub mod selected_text;

@@ -2,6 +2,7 @@ mod backend;
 mod backends;
 mod capabilities;
 mod compat;
+mod detection;
 mod error;
 mod model;
 mod policy;
@@ -12,6 +13,10 @@ pub use backends::legacy_backend_factory;
 pub use capabilities::BackendCapabilities;
 pub use compat::{
     legacy_current_layout_bool, legacy_layout_state_from_bool, LEGACY_LAYOUT_FALLBACK_IS_ENGLISH,
+};
+pub use detection::{
+    current_layout_from_gnome_sources, current_layout_from_group, detect_layout_setup,
+    LayoutSetupDetection,
 };
 pub use error::{LayoutBackendError, LayoutBackendOperation, LayoutCodeNormalizationError};
 pub use model::{

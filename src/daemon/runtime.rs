@@ -1063,12 +1063,27 @@ undo_key = "Pause"
     fn status_snapshot_pending_is_owned_by_published_refresh() {
         let initial = known_layout_state(english_layout());
         let expected = known_layout_state(russian_layout());
-        let runtime = test_runtime_with_backend(
+        let context = SystemContext {
+            session_type: SessionType::Wayland,
+            desktop_environment: DesktopEnvironment::Xfce,
+            distro: DistroKind::LinuxMint,
+        };
+        let runtime = test_runtime_with_backend_and_context(
             initial.clone(),
             Box::new(SnapshotBackend {
                 snapshot: SnapshotOutcome::State(expected.clone()),
             }),
+            context,
         );
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: None,
+            mru_sources: None,
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context,
+        };
 
         assert!(matches!(
             runtime.sync_with_backend(),
@@ -1080,7 +1095,7 @@ undo_key = "Pause"
         );
 
         assert_eq!(
-            runtime.refresh_and_publish_layout(),
+            runtime.refresh_and_publish_layout_with(&reader, &detector),
             BackendSyncResult::Unchanged
         );
         assert_eq!(runtime.input_snapshot_before_grab().layout_state, expected);
@@ -1306,15 +1321,32 @@ undo_key = "Pause"
     fn layout_refresh_blocked_backend_does_not_block_snapshot_reads() {
         let entered = Arc::new(Barrier::new(2));
         let release = Arc::new(Barrier::new(2));
-        let runtime = Arc::new(test_runtime_with_backend(
+        let context = SystemContext {
+            session_type: SessionType::Wayland,
+            desktop_environment: DesktopEnvironment::Xfce,
+            distro: DistroKind::LinuxMint,
+        };
+        let runtime = Arc::new(test_runtime_with_backend_and_context(
             known_layout_state(english_layout()),
             Box::new(BlockingSnapshotBackend::new(
                 Arc::clone(&entered),
                 Arc::clone(&release),
             )),
+            context,
         ));
+        let reader = LayoutObservationReaderStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            sources: None,
+            mru_sources: None,
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context,
+        };
         let worker_runtime = Arc::clone(&runtime);
-        let worker = thread::spawn(move || worker_runtime.refresh_and_publish_layout());
+        let worker = thread::spawn(move || {
+            worker_runtime.refresh_and_publish_layout_with(&reader, &detector)
+        });
         entered.wait();
 
         assert!(matches!(
@@ -4018,8 +4050,24 @@ impl RuntimeState {
     }
 
     fn refresh_and_publish_layout(&self) -> BackendSyncResult {
+        self.refresh_and_publish_layout_from(|| self.periodic_sync_tick())
+    }
+
+    #[cfg(test)]
+    fn refresh_and_publish_layout_with<R: DesktopSettingsReader, D: SystemContextSource>(
+        &self,
+        reader: &R,
+        detector: &D,
+    ) -> BackendSyncResult {
+        self.refresh_and_publish_layout_from(|| self.periodic_sync_tick_with(reader, detector))
+    }
+
+    fn refresh_and_publish_layout_from(
+        &self,
+        refresh: impl FnOnce() -> BackendSyncResult,
+    ) -> BackendSyncResult {
         let epoch_before = self.input_layout_epoch();
-        let result = self.periodic_sync_tick();
+        let result = refresh();
         let epoch_after = self.input_layout_epoch();
 
         if !matches!(result, BackendSyncResult::Skipped) && epoch_before == epoch_after {

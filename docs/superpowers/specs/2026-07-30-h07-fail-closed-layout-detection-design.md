@@ -126,6 +126,16 @@ Setup читается через `setxkbmap -query` вне input path:
 доказательством текущей раскладки. Несовпадение числа групп или неизвестный
 индекс дают `CurrentLayoutState::Unknown`.
 
+Одного сравнения числа групп недостаточно: `us,ru` может быть заменена на
+`us,de` без изменения `num_groups`. Поэтому уже существующий X11 watcher
+root-window property events также отслеживает `_XKB_RULES_NAMES`.
+`PropertyNotify` только атомарно инвалидирует layout epoch и ставит запрос
+существующему background coordinator. Фактический `setxkbmap -query`,
+классификация и публикация выполняются вне watcher и grabbed input path.
+Таким образом одинаковое число групп не сохраняет доверие к старой паре, но
+постоянный setup polling, новый поток и внешняя команда на каждое нажатие не
+добавляются.
+
 При `PairPlusOther` legacy-механизм умеет только `switch_next`, но не
 `switch_to(target)`, поэтому существующая policy отключает automatic/manual
 word correction. Это намеренное безопасное поведение.
@@ -223,6 +233,9 @@ generation. Повторяющиеся одинаковые ошибки rate-li
   IBus, variant, malformed flat values и ошибка GSettings;
 - XKB current group: обе группы строгой пары, индекс вне пары и несовпадение
   фактического числа групп;
+- X11 `_XKB_RULES_NAMES` change: отдельный atomic signal, немедленная
+  инвалидация старого layout epoch и one-shot setup redetection даже при том
+  же числе групп;
 - ни один ошибочный случай не создаёт default US/RU;
 - `PairPlusOther` не разрешает `switch_next`-коррекцию;
 - transient retry соблюдает интервалы, прекращается после успеха и не вызывает

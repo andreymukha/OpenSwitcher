@@ -1224,6 +1224,108 @@ Critical/High review findings исправить до VM узким TDD-cycle.
 
 ---
 
+### Task 5a: Review remediation для X11 same-count layout change
+
+**Files:**
+
+- Modify: `src/daemon/keyboard.rs`
+- Modify: `src/daemon/runtime.rs`
+- Modify: `src/daemon/service.rs`
+- Modify:
+  `docs/superpowers/specs/2026-07-30-h07-fail-closed-layout-detection-design.md`
+
+- [ ] **Step 1: зафиксировать RED для отдельного X11 layout signal**
+
+В tests `src/daemon/keyboard.rs` расширить матрицу
+`x11_context_events_set_only_the_matching_invalidation_flag`: событие
+`KeyboardLayoutChanged` должно устанавливать только новый
+`layout_setup_changed_flag`, не менять active-window generation и не
+считаться pointer click.
+
+Run:
+
+```bash
+cargo test --locked --lib \
+  daemon::keyboard::tests::x11_context_events_set_only_the_matching_invalidation_flag \
+  -- --nocapture
+```
+
+Expected: compile failure, пока variant и flag не существуют.
+
+- [ ] **Step 2: зафиксировать RED для runtime fail-closed transition**
+
+Добавить runtime test, который начинает с подтверждённой `us,ru`, подаёт
+`LayoutSetupDetection::Unsupported` из injected backend, вызывает новый
+`invalidate_layout_setup_and_request_refresh_at(now, reason)` и подтверждает:
+
+```rust
+assert!(runtime.maybe_redetect_layout_setup_at(now));
+assert_eq!(
+    runtime.layout_compatibility(),
+    LayoutCompatibility::Unsupported
+);
+assert!(!runtime.feature_availability().manual_word_fix);
+```
+
+Run:
+
+```bash
+cargo test --locked --lib \
+  daemon::runtime::tests::x11_layout_property_change_forces_same_count_setup_redetection \
+  -- --nocapture
+```
+
+Expected: compile failure, пока invalidation API не существует.
+
+- [ ] **Step 3: реализовать только event-driven wiring**
+
+В `ActiveWindowMonitor` один раз intern `_XKB_RULES_NAMES`; существующая
+подписка `EventMask::PROPERTY_CHANGE` уже охватывает этот atom.
+Соответствующий `PropertyNotify` публикует
+`X11ContextEvent::KeyboardLayoutChanged`. `InputTargetWatcher` хранит
+отдельный capacity-one atomic flag и предоставляет
+`take_layout_setup_invalidation()`.
+
+В `RuntimeState` новый метод сначала делает setup retry due, затем использует
+существующий `invalidate_layout_and_request_refresh`. В `DaemonService`
+сигнал потребляется до обработки fetched keyboard batch, инвалидирует word
+context и ставит one-shot refresh. Не запускать `setxkbmap` в watcher или
+input handler.
+
+- [ ] **Step 4: выполнить GREEN и затронутую регрессию**
+
+```bash
+cargo test --locked --lib \
+  daemon::keyboard::tests::x11_context_events_set_only_the_matching_invalidation_flag \
+  -- --nocapture
+cargo test --locked --lib \
+  daemon::runtime::tests::x11_layout_property_change_forces_same_count_setup_redetection \
+  -- --nocapture
+cargo test --locked --lib daemon::runtime::tests:: -- --test-threads=1
+cargo test --locked --lib daemon::keyboard::tests::input_target_ \
+  -- --test-threads=1
+cargo fmt --all -- --check
+git diff --check
+```
+
+Expected: PASS без нового thread/polling.
+
+- [ ] **Step 5: подтвердить исходный сценарий в Mint**
+
+На новом exact DEB:
+
+1. запустить с `us,ru`;
+2. без restart выполнить `setxkbmap -layout us,de`;
+3. дождаться `PropertyNotify`;
+4. подтвердить `compatibility=Unsupported`, тот же PID и `NRestarts=0`;
+5. физический F12 не должен изменить контрольный текст;
+6. вернуть `us,ru` и подтвердить автоматическое восстановление.
+
+После review remediation пересобрать exact DEB, обновить SHA в обеих VM и в
+отчёте. Старый SHA больше не считается финальным.
+
+---
+
 ### Task 6: Целевая package-first проверка в двух VM
 
 **Files:**

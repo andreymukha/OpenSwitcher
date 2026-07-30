@@ -1847,6 +1847,66 @@ undo_key = "Pause"
     }
 
     #[test]
+    fn gnome_observation_recovery_redetects_auto_fallback_layout_switch_once() {
+        let mut config = AppConfig::default();
+        config.layout.switch_combo = LayoutSwitchCombo::ctrl_shift();
+        config.layout.switch_source = LayoutSwitchSource::AutoFallback;
+        config.layout.auto_detected = AutoDetectedLayoutSwitch {
+            strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+            confidence: DetectionConfidence::Low,
+            context: gnome_wayland_context(),
+        };
+        let runtime = runtime_with_config_and_context(config, gnome_wayland_context());
+        let published_before = runtime.input_snapshot_before_grab();
+
+        let reader_calls = Arc::new(AtomicUsize::new(0));
+        let reader = CountingReader {
+            calls: Arc::clone(&reader_calls),
+            combo: LayoutSwitchCombo::super_space(),
+        };
+        let detector = SystemContextDetectorStub {
+            calls: Arc::new(AtomicUsize::new(0)),
+            context: gnome_wayland_context(),
+        };
+
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+
+        assert_eq!(
+            runtime.get_settings().unwrap().layout_switch,
+            LayoutSwitchSetting {
+                combo: LayoutSwitchCombo::super_space(),
+                source: LayoutSwitchSource::AutoDetected,
+                auto_detected: AutoDetectedLayoutSwitch {
+                    strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                    confidence: DetectionConfidence::High,
+                    context: gnome_wayland_context(),
+                },
+            }
+        );
+        assert_eq!(
+            runtime.layout_compatibility(),
+            LayoutCompatibility::FullStrictPair
+        );
+        let published_after = runtime.input_snapshot_before_grab();
+        assert_eq!(
+            published_after.config.layout_switch_combo,
+            LayoutSwitchCombo::super_space()
+        );
+        assert_eq!(
+            published_after.config_generation,
+            published_before.config_generation + 1
+        );
+
+        let calls_after_recovery = reader_calls.load(Ordering::SeqCst);
+        let _ = runtime.periodic_sync_tick_with(&reader, &detector);
+        assert_eq!(
+            reader_calls.load(Ordering::SeqCst) - calls_after_recovery,
+            2,
+            "steady-state observation must not redetect the switch combo",
+        );
+    }
+
+    #[test]
     fn setup_recovery_preserves_manual_layout_switch() {
         let now = Instant::now() - Duration::from_secs(2);
         let runtime = runtime_with_pending_setup_outcomes_in_context(
@@ -4602,10 +4662,12 @@ impl RuntimeState {
                     return false;
                 }
             };
-        self.apply_layout_setup_detection(
-            detect_gnome_setup_from_sources(&configured_sources),
-            Instant::now(),
-        );
+        let setup_detection = detect_gnome_setup_from_sources(&configured_sources);
+        let setup_confirmed = setup_detection.is_confirmed();
+        let setup_changed = self.apply_layout_setup_detection(setup_detection, Instant::now());
+        if setup_confirmed && setup_changed {
+            self.redetect_layout_switch_after_setup_recovery(reader);
+        }
 
         let mru_sources =
             match reader.gsettings_string_list(GNOME_INPUT_SOURCES_SCHEMA, GNOME_MRU_SOURCES_KEY) {

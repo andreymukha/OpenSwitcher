@@ -9560,9 +9560,8 @@ mod tests {
             &stop_requested,
             &terminal_gate,
         )
-        .and_then(|_| {
+        .map(|_| {
             backend_calls.set(backend_calls.get() + 1);
-            Ok(())
         });
 
         assert!(matches!(

@@ -24,6 +24,7 @@ struct ObservedDeviceIdentity {
 }
 
 impl ObservedDeviceIdentity {
+    #[cfg(test)]
     fn character(devnum: u64) -> Self {
         Self {
             character: true,
@@ -80,7 +81,7 @@ pub(crate) fn verify_input_device(
     enumerator.match_subsystem("input").map_err(udev_error)?;
     let mut devices = enumerator.scan_devices().map_err(udev_error)?;
     let device = devices
-        .find(|device| device.devnum().map(|value| value as u64) == Some(devnum))
+        .find(|device| device.devnum() == Some(devnum))
         .ok_or(SwitcherError::InputDeviceIdentityUnverified)?;
 
     if !device.is_initialized() {
@@ -122,7 +123,7 @@ pub(crate) fn verify_open_device_identity(
     let stat = unsafe { stat.assume_init() };
     let observed = ObservedDeviceIdentity {
         character: (stat.st_mode & libc::S_IFMT) == libc::S_IFCHR,
-        devnum: stat.st_rdev as u64,
+        devnum: stat.st_rdev,
     };
 
     if identity_matches(ExpectedDeviceIdentity::character(expected.devnum), observed) {

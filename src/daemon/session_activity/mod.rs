@@ -40,6 +40,7 @@ impl AuthorizedSession {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -248,10 +249,12 @@ impl SessionLease {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
 
+    #[cfg(test)]
     pub(crate) fn session_id(&self) -> &str {
         self.session.session_id()
     }

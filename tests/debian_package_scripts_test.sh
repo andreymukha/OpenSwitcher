@@ -584,6 +584,14 @@ MOCK
     assert_not_contains "$call_log" "maintenance capture"
 }
 
+test_package_declares_layout_detection_runtime_dependencies() {
+    local control="$REPO_ROOT/debian/control"
+
+    assert_contains "$control" "x11-xkb-utils,"
+    assert_contains "$control" "libglib2.0-bin,"
+    assert_contains "$control" "gsettings-desktop-schemas,"
+}
+
 test_privileged_input_setup_uses_package_owned_trust_anchors() {
     local control="$REPO_ROOT/debian/control"
     local install_file="$REPO_ROOT/debian/open-switcher.install"
@@ -656,6 +664,7 @@ test_session_stop_enforces_bounded_exact_executable_postcondition
 test_preinst_upgrade_stops_inactive_old_daemon_after_legacy_helper
 test_preinst_legacy_fallback_rejects_a_remaining_exact_daemon
 test_prerm_does_not_capture_after_unverified_stop
+test_package_declares_layout_detection_runtime_dependencies
 test_privileged_input_setup_uses_package_owned_trust_anchors
 
 echo "debian_package_scripts_test.sh: ok"

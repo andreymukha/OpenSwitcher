@@ -24,6 +24,9 @@ Depends:
  udev (>= 247),
  acl,
  dbus-user-session,
+ x11-xkb-utils,
+ libglib2.0-bin,
+ gsettings-desktop-schemas,
 Description: EN/RU keyboard layout correction utility for Linux desktops
  OpenSwitcher is a Linux desktop utility for EN/RU typing workflows.
  It provides automatic correction of words typed in the wrong keyboard layout,

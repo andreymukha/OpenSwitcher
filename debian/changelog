@@ -1,3 +1,14 @@
+open-switcher (0.1.0-5) unstable; urgency=high
+
+  * Close H-07 by requiring a confirmed EN/RU layout setup before any
+    layout-dependent text mutation.
+  * Detect Cinnamon/X11 through setxkbmap plus XKB group state and
+    GNOME/Wayland through configured GSettings input sources.
+  * Recover layout features after an early unavailable desktop session without
+    adding setup commands to the grabbed input path.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Thu, 30 Jul 2026 20:57:39 +0300
+
 open-switcher (0.1.0-4) unstable; urgency=high
 
   * Close H-08 by delegating input ACLs to seat-aware logind uaccess and

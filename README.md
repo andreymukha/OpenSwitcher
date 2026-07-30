@@ -172,6 +172,11 @@ a warning but allows saving.
 - session D-Bus
 - `systemd --user` for the official autostart/runtime model
 - a desktop environment with a compatible StatusNotifier/AppIndicator tray host
+- layout detection tools: `setxkbmap` from `x11-xkb-utils`, `gsettings` from
+  `libglib2.0-bin`, and the schemas from `gsettings-desktop-schemas`
+
+APT installs these runtime dependencies automatically when OpenSwitcher is
+installed from its supported `.deb` package.
 
 ## Linux Input Setup
 
@@ -250,8 +255,7 @@ sudo apt-get install -y \
   desktop-file-utils
 ```
 
-Optional helper packages on Debian/Ubuntu-like systems:
-- `libglib2.0-bin` for `gdbus` in the D-Bus examples below
+Optional helper package on Debian/Ubuntu-like systems:
 - `lintian` for optional local Debian package checks
 
 ## Building

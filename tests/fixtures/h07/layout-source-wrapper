@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+if [ ! -e /tmp/h07-layout-source-ready ]; then
+    exit 42
+fi
+
+tool="$(basename -- "$0")"
+case "$tool" in
+    gsettings|setxkbmap)
+        exec "/usr/bin/$tool" "$@"
+        ;;
+    *)
+        exit 64
+        ;;
+esac

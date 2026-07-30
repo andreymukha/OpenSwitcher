@@ -91,7 +91,7 @@ prepare_session_fixture() {
     local mock_bin="$fixture_root/bin"
     local runtime_root="$fixture_root/run/user"
 
-    mkdir -p "$mock_bin" "$runtime_root/1000"
+    mkdir -p "$mock_bin" "$runtime_root/1000" "$fixture_root/proc"
     : >"$runtime_root/1000/bus"
 
     cat >"$mock_bin/loginctl" <<'MOCK'
@@ -143,9 +143,13 @@ render_session_script_fixture() {
     local source="$1"
     local destination="$2"
     local runtime_root="$3"
+    local fixture_root
+
+    fixture_root="$(dirname "$destination")"
 
     sed \
         -e "s|/run/user|$runtime_root|g" \
+        -e "s|/proc|$fixture_root/proc|g" \
         -e 's/\[ -S /[ -e /g' \
         "$source" >"$destination"
     chmod +x "$destination"
@@ -487,6 +491,7 @@ MOCK
     sed \
         -e "s|/usr/lib/open-switcher/open-switcher-user-session-stop|$old_helper|g" \
         -e "s|/run/user|$fixture_root/run/user|g" \
+        -e "s|/proc|$fixture_root/proc|g" \
         -e 's/\[ -S /[ -e /g' \
         "$REPO_ROOT/debian/open-switcher.preinst" >"$fixture_script"
     chmod +x "$fixture_script"
@@ -580,6 +585,7 @@ MOCK
 }
 
 test_privileged_input_setup_uses_package_owned_trust_anchors() {
+    local control="$REPO_ROOT/debian/control"
     local install_file="$REPO_ROOT/debian/open-switcher.install"
     local rules="$REPO_ROOT/debian/rules"
     local postinst="$REPO_ROOT/debian/open-switcher.postinst"
@@ -597,6 +603,7 @@ test_privileged_input_setup_uses_package_owned_trust_anchors() {
     assert_contains "$install_file" \
         "debian/scripts/open-switcher-input-access-maintenance usr/lib/open-switcher/"
     assert_contains "$rules" "dh_installudev --name=openswitcher-input --priority=70"
+    assert_contains "$control" "udev (>= 247),"
     assert_contains "$rules" \
         "chmod 0755 debian/open-switcher/usr/lib/open-switcher/open-switcher-input-access-maintenance"
     assert_contains "$postinst" \

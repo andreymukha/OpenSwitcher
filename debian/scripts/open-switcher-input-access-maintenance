@@ -5,30 +5,21 @@ usage() {
     echo "usage: open-switcher-input-access-maintenance apply|capture" >&2
 }
 
-udev_tags() {
+current_udev_tags() {
     properties="$1"
-    current_tags="$(
-        printf '%s\n' "$properties" \
-            | sed -n 's/^CURRENT_TAGS=//p' \
-            | head -n 1
-    )"
-    legacy_tags="$(
-        printf '%s\n' "$properties" \
-            | sed -n 's/^TAGS=//p' \
-            | head -n 1
-    )"
 
-    if [ -n "$current_tags" ]; then
-        printf '%s\n' "$current_tags"
-    else
-        printf '%s\n' "$legacy_tags"
-    fi
+    # Since udev 247, TAGS is intentionally sticky across events while
+    # CURRENT_TAGS describes only the latest rules pass. Falling back to
+    # TAGS would let a stale package tag satisfy a live access check.
+    printf '%s\n' "$properties" \
+        | sed -n 's/^CURRENT_TAGS=//p' \
+        | head -n 1
 }
 
 has_udev_tag() {
     properties="$1"
     required_tag="$2"
-    tags="$(udev_tags "$properties")"
+    tags="$(current_udev_tags "$properties")"
 
     case "$tags" in
         *:"$required_tag":*) return 0 ;;

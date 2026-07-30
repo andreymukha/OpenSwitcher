@@ -47,7 +47,7 @@ desktop-specific layout detection/observation support.
 For normal use, download the Debian package from the GitHub Release and install it locally:
 
 ```bash
-sudo apt install ./open-switcher_0.1.0-1_amd64.deb
+sudo apt install ./open-switcher_0.1.0-4_amd64.deb
 ```
 
 Add `--reinstall` only when reinstalling the same package version that is already installed.
@@ -57,9 +57,13 @@ OpenSwitcher starts automatically after login/reboot; launching it manually from
 menu always starts it even when autostart is disabled.
 
 The package installs the required application files, user systemd units, desktop launchers, icon,
-and package-owned Linux input setup. Installing or reinstalling the `.deb` is the only supported
-privileged setup path; source-tree scripts never install udev rules or change device ACLs. Never
-run `./manage.sh` with `sudo`.
+and package-owned Linux input setup. Its rule uses standard `uaccess`: systemd-logind grants access
+only to the current active local session for the device seat, rather than to every active user.
+The daemon also validates the session and seat before grabbing a device and releases an already
+open backend when the authorized session changes.
+
+Installing or reinstalling the `.deb` is the only supported privileged setup path; source-tree
+scripts never install udev rules or change device ACLs. Never run `./manage.sh` with `sudo`.
 
 ## Development Quick Start
 
@@ -70,7 +74,6 @@ local binaries:
 ./manage.sh package deb
 # Run the exact `sudo apt install <artifact>` command printed by the build.
 # Add `--reinstall` only if that same package version is already installed.
-# Sign out and sign in once after installing the package.
 ./manage.sh dev build
 ./manage.sh doctor
 # Stop the packaged instance first if it is running:
@@ -175,8 +178,12 @@ a warning but allows saving.
 OpenSwitcher reads real input devices from `/dev/input/event*` and writes virtual key events through `/dev/uinput`.
 
 The OpenSwitcher `.deb` is the only supported channel for privileged Linux input setup. Its
-package-owned maintainer scripts install the udev rule and apply the runtime access setup; no code
-from the working tree is run as root.
+package-owned maintainer scripts install the canonical udev rule with `TAG+="uaccess"` before
+systemd's `73-seat-late.rules`. The current logind owner of each seat receives access; the previous
+blanket ACL bridge is no longer installed or run. Because `/dev/uinput` is global, the current
+release intentionally permits only `seat0` and fails closed on other seats.
+
+Source-tree code is not a production setup path and is not run as root.
 
 Build and install (or reinstall) the package before running from the source tree:
 
@@ -186,7 +193,9 @@ Build and install (or reinstall) the package before running from the source tree
 # Add `--reinstall` only if that same package version is already installed.
 ```
 
-Sign out and sign in again, then check the current session:
+On a live udev system the package applies and verifies the rule before starting OpenSwitcher, so a
+new login is normally unnecessary. Installation into an offline image/chroot defers activation
+until boot. Check the current session:
 
 ```bash
 ./manage.sh doctor

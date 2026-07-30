@@ -97,7 +97,10 @@ case "${1:-}" in
                 ;;
         esac
 
-        if [[ "${FAIL_PHASE:-}" == "verify" ]]; then
+        if [[ "${STICKY_ONLY_TAGS:-}" == "1" ]]; then
+            printf '%s\n' \
+                'TAGS=:seat:uaccess:openswitcher-input:'
+        elif [[ "${FAIL_PHASE:-}" == "verify" ]]; then
             printf '%s\n' \
                 'TAGS=:seat:uaccess:' \
                 'CURRENT_TAGS=:seat:uaccess:'
@@ -209,6 +212,9 @@ case "${1:-}" in
             printf '%s\n' \
                 'TAGS=:seat:uaccess:' \
                 'CURRENT_TAGS=:seat:uaccess:'
+        elif ((is_cleanup)) && [[ "${STICKY_ONLY_TAGS:-}" == "1" ]]; then
+            printf '%s\n' \
+                'TAGS=:seat:uaccess:openswitcher-input:'
         elif ((is_cleanup)); then
             printf '%s\n' \
                 'TAGS=:seat:' \
@@ -325,12 +331,25 @@ printf 'setfacl %s\n' "$*" >>"$CALL_LOG"
 touch "$ACL_STATE_DIR/$(basename "$path")-${BASH_REMATCH[1]}-removed"
 MOCK
 
+    cat >"$fake_bin/sleep" <<'MOCK'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'sleep %s\n' "$*" >>"$CALL_LOG"
+
+if [[ "${LATE_ACL_READD:-}" == "1" \
+    && ! -e "$ACL_STATE_DIR/late-uinput-readd-fired" ]]; then
+    rm -f "$ACL_STATE_DIR/uinput-1000-removed"
+    touch "$ACL_STATE_DIR/late-uinput-readd-fired"
+fi
+MOCK
+
     chmod +x \
         "$fake_bin/udevadm" \
         "$fake_bin/loginctl" \
         "$fake_bin/stat" \
         "$fake_bin/getfacl" \
-        "$fake_bin/setfacl"
+        "$fake_bin/setfacl" \
+        "$fake_bin/sleep"
 }
 
 render_postrm() {
@@ -437,6 +456,27 @@ test_live_failures_are_not_suppressed() {
 
         [[ "$status" != 0 ]] || fail "$phase failure was suppressed"
     done
+}
+
+test_sticky_historical_tags_do_not_satisfy_live_verification() {
+    local fixture_root="$TMP_DIR/sticky-live-tags"
+    local call_log="$fixture_root/calls.log"
+    local helper=""
+    local status=""
+
+    prepare_live_fixture "$fixture_root"
+    helper="$(render_helper "$fixture_root")"
+
+    set +e
+    PATH="$fixture_root/bin:$PATH" \
+        CALL_LOG="$call_log" \
+        STICKY_ONLY_TAGS=1 \
+        "$helper" apply >/dev/null 2>&1
+    status="$?"
+    set -e
+
+    [[ "$status" != 0 ]] \
+        || fail "sticky historical tags passed live udev verification"
 }
 
 test_postinst_applies_before_start_on_required_paths() {
@@ -591,8 +631,37 @@ test_remove_cleanup_is_narrow_and_idempotent() {
     assert_not_contains "$call_log" "g:3001"
     [[ ! -e "$manifest" ]] || fail "successful cleanup retained its manifest"
 
-    run_acl_command "$fixture_root" "$postrm" remove
     assert_count "$call_log" "setfacl " 2
+
+    : >"$call_log"
+    run_acl_command "$fixture_root" "$postrm" purge
+    [[ ! -s "$call_log" ]] \
+        || fail "manifest-free purge retriggered udev or ACL cleanup"
+}
+
+test_cleanup_ignores_sticky_historical_uaccess_tags() {
+    local fixture_root="$TMP_DIR/cleanup-sticky-tags"
+    local helper=""
+    local postrm=""
+    local call_log="$fixture_root/calls.log"
+
+    prepare_acl_fixture "$fixture_root"
+    helper="$(render_helper "$fixture_root")"
+    postrm="$(render_postrm "$fixture_root")"
+    run_acl_command "$fixture_root" "$helper" capture
+    : >"$call_log"
+
+    PATH="$fixture_root/bin:$PATH" \
+        CALL_LOG="$call_log" \
+        FIXTURE_ROOT="$fixture_root" \
+        ACL_STATE_DIR="$fixture_root/acl-state" \
+        STICKY_ONLY_TAGS=1 \
+        "$postrm" remove
+
+    assert_contains "$call_log" \
+        "setfacl -n -x u:1000 -- $fixture_root/dev/input/event4"
+    assert_contains "$call_log" \
+        "setfacl -n -x u:1000 -- $fixture_root/dev/uinput"
 }
 
 test_changed_device_identity_is_never_mutated() {
@@ -670,6 +739,35 @@ test_failed_acl_mutation_retains_manifest_for_retry() {
     [[ ! -e "$manifest" ]] || fail "successful cleanup retry retained its manifest"
 }
 
+test_late_uaccess_acl_readd_is_reconciled_before_manifest_removal() {
+    local fixture_root="$TMP_DIR/cleanup-late-readd"
+    local helper=""
+    local postrm=""
+    local manifest="$fixture_root/run/open-switcher/input-access-acl.tsv"
+    local call_log="$fixture_root/calls.log"
+
+    prepare_acl_fixture "$fixture_root"
+    helper="$(render_helper "$fixture_root")"
+    postrm="$(render_postrm "$fixture_root")"
+    run_acl_command "$fixture_root" "$helper" capture
+    : >"$call_log"
+
+    PATH="$fixture_root/bin:$PATH" \
+        CALL_LOG="$call_log" \
+        FIXTURE_ROOT="$fixture_root" \
+        ACL_STATE_DIR="$fixture_root/acl-state" \
+        LATE_ACL_READD=1 \
+        "$postrm" remove
+
+    assert_contains "$call_log" "sleep 1"
+    assert_count "$call_log" \
+        "setfacl -n -x u:1000 -- $fixture_root/dev/uinput" 2
+    [[ -e "$fixture_root/acl-state/uinput-1000-removed" ]] \
+        || fail "late logind ACL re-add was not removed"
+    [[ ! -e "$manifest" ]] \
+        || fail "successful late ACL reconciliation retained its manifest"
+}
+
 test_postrm_udev_failures_abort_before_acl_mutation() {
     local phase=""
     local status=""
@@ -726,14 +824,17 @@ test_helper_rejects_unknown_invocations
 test_offline_udev_is_explicit_success_without_commands
 test_live_apply_orders_and_verifies_both_device_classes
 test_live_failures_are_not_suppressed
+test_sticky_historical_tags_do_not_satisfy_live_verification
 test_postinst_applies_before_start_on_required_paths
 test_postinst_does_not_start_sessions_after_apply_failure
 test_repeated_apply_has_the_same_postcondition
 test_capture_records_only_verified_active_seat_owners
 test_remove_cleanup_is_narrow_and_idempotent
+test_cleanup_ignores_sticky_historical_uaccess_tags
 test_changed_device_identity_is_never_mutated
 test_capture_rejects_unsafe_runtime_directory
 test_failed_acl_mutation_retains_manifest_for_retry
+test_late_uaccess_acl_readd_is_reconciled_before_manifest_removal
 test_postrm_udev_failures_abort_before_acl_mutation
 test_upgrade_never_runs_remove_cleanup
 

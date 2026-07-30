@@ -5,29 +5,20 @@ warn() {
     echo "open-switcher: warning: $*" >&2
 }
 
-udev_tags() {
+current_udev_tags() {
     properties="$1"
-    current_tags="$(
-        printf '%s\n' "$properties" \
-            | sed -n 's/^CURRENT_TAGS=//p' \
-            | head -n 1
-    )"
-    legacy_tags="$(
-        printf '%s\n' "$properties" \
-            | sed -n 's/^TAGS=//p' \
-            | head -n 1
-    )"
 
-    if [ -n "$current_tags" ]; then
-        printf '%s\n' "$current_tags"
-    else
-        printf '%s\n' "$legacy_tags"
-    fi
+    # TAGS is sticky history in udev 247+, while CURRENT_TAGS is the result of
+    # the latest rules pass. Cleanup must never treat a removed package
+    # tag as a current grant.
+    printf '%s\n' "$properties" \
+        | sed -n 's/^CURRENT_TAGS=//p' \
+        | head -n 1
 }
 
 has_uaccess_tag() {
     properties="$1"
-    tags="$(udev_tags "$properties")"
+    tags="$(current_udev_tags "$properties")"
 
     case "$tags" in
         *:uaccess:*) return 0 ;;
@@ -155,6 +146,9 @@ cleanup_recorded_acl() {
         warn "unable to inspect current input ACL"
         return 0
     fi
+    if ! has_named_user_acl "$acl" "$recorded_uid"; then
+        return 0
+    fi
     if ! has_named_user_rw_acl "$acl" "$recorded_uid"; then
         warn "ignored changed input ACL entry"
         return 0
@@ -180,29 +174,12 @@ cleanup_recorded_acl() {
     fi
 }
 
-cleanup_input_access() {
-    if [ ! -e /run/udev/control ]; then
-        echo "open-switcher: input ACL cleanup deferred because udev is offline"
-        return 0
-    fi
+cleanup_manifest_once() {
+    manifest_path="$1"
+    manifest_tab="$(printf '\t')"
+    manifest_cleanup_failed=0
 
-    udevadm control --reload-rules
-    udevadm trigger --subsystem-match=input --action=change
-    udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change
-    udevadm settle --timeout=10
-
-    if validate_manifest_storage; then
-        :
-    else
-        manifest_status="$?"
-        [ "$manifest_status" -eq 1 ] && return 0
-        return "$manifest_status"
-    fi
-
-    manifest="/run/open-switcher/input-access-acl.tsv"
-    tab="$(printf '\t')"
-    cleanup_failed=0
-    while IFS="$tab" read -r device_path device_number recorded_uid extra; do
+    while IFS="$manifest_tab" read -r device_path device_number recorded_uid extra; do
         if [ -z "$device_path" ] \
             || [ -z "$device_number" ] \
             || [ -z "$recorded_uid" ] \
@@ -213,11 +190,45 @@ cleanup_input_access() {
 
         if ! cleanup_recorded_acl \
             "$device_path" "$device_number" "$recorded_uid"; then
-            cleanup_failed=1
+            manifest_cleanup_failed=1
         fi
-    done <"$manifest"
+    done <"$manifest_path"
 
-    [ "$cleanup_failed" -eq 0 ] || return 1
+    [ "$manifest_cleanup_failed" -eq 0 ]
+}
+
+cleanup_input_access() {
+    if validate_manifest_storage; then
+        :
+    else
+        manifest_status="$?"
+        [ "$manifest_status" -eq 1 ] && return 0
+        return "$manifest_status"
+    fi
+
+    manifest="/run/open-switcher/input-access-acl.tsv"
+
+    if [ ! -e /run/udev/control ]; then
+        echo "open-switcher: input ACL cleanup deferred because udev is offline"
+        return 0
+    fi
+
+    udevadm control --reload-rules
+    udevadm trigger --subsystem-match=input --action=change
+    udevadm trigger --subsystem-match=misc --sysname-match=uinput --action=change
+    udevadm settle --timeout=10
+
+    if cleanup_manifest_once "$manifest"; then
+        :
+    else
+        warn "initial input ACL cleanup will be retried after a bounded quiet interval"
+    fi
+
+    # Keep one bounded second pass because an ACL update responding to the
+    # trigger can race the first inspection even after udevadm settle.
+    sleep 1
+    cleanup_manifest_once "$manifest" || return 1
+
     rm -f -- "$manifest"
     rmdir /run/open-switcher 2>/dev/null || true
 }

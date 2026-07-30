@@ -12,6 +12,9 @@ CARGO := $(if $(RUSTUP),$(RUSTUP) run $(RUST_TOOLCHAIN) cargo,cargo)
 %:
 	dh $@
 
+override_dh_clean:
+	dh_clean -Xvendor/uinput-0.1.3/Cargo.toml.orig
+
 check-rust-toolchain:
 	@version="$$( $(CARGO) --version | sed -n 's/^cargo \([0-9][^ ]*\).*/\1/p' )"; \
 	if [ "$$version" != "$(RUST_TOOLCHAIN)" ]; then \

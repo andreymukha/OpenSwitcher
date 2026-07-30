@@ -21,7 +21,7 @@ Depends:
  ${shlibs:Depends},
  ${misc:Depends},
  systemd,
- udev,
+ udev (>= 247),
  acl,
  dbus-user-session,
 Description: EN/RU keyboard layout correction utility for Linux desktops

@@ -54,6 +54,8 @@ const KEYBOARD_SYMLINK_DIRS: [&str; 2] = ["/dev/input/by-path", "/dev/input/by-i
 const UINPUT_PATHS: [&str; 2] = ["/dev/uinput", "/dev/input/uinput"];
 pub const INPUT_EVENT_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 const POINTER_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const INPUT_HANDOFF_QUIET_WINDOW: Duration = Duration::from_millis(20);
+const INPUT_HANDOFF_MAX_WAIT: Duration = Duration::from_millis(100);
 // Fast-path writer queue is bounded to avoid unbounded memory growth under load.
 // Transactional commands use the same total-order queue, but are represented as
 // single indivisible commands and get a larger bounded enqueue window because
@@ -1065,6 +1067,7 @@ enum CorrectionReplayStrategy {
 // Real keyboard device
 
 struct GrabbedKeyboardDevice {
+    verified: VerifiedInputDevice,
     path: PathBuf,
     device: Option<Device>,
     grabbed: bool,
@@ -1502,24 +1505,84 @@ fn session_lease_health_error(lease: &SessionLease) -> Option<SwitcherError> {
     lease.ensure_current(monotonic_ms()).err()
 }
 
-fn snapshot_then_acquire_grab<Target, Snapshot, Error>(
+fn acquire_grab_then_snapshot<Target, Snapshot, Error>(
     target: &mut Target,
     precheck: impl FnOnce() -> Result<(), Error>,
-    snapshot: impl FnOnce(&mut Target) -> Result<Snapshot, Error>,
     acquire_grab: impl FnOnce(&mut Target) -> Result<(), Error>,
     postcheck: impl FnOnce() -> Result<(), Error>,
+    validate_grab: impl FnOnce(&mut Target) -> Result<(), Error>,
+    snapshot: impl FnOnce(&mut Target) -> Result<Snapshot, Error>,
     release_grab: impl FnOnce(&mut Target) -> Result<(), Error>,
 ) -> Result<Snapshot, Error> {
     precheck()?;
-    let snapshot = snapshot(target)?;
     acquire_grab(target)?;
-    if let Err(postcheck_error) = postcheck() {
-        return match release_grab(target) {
-            Ok(()) => Err(postcheck_error),
+
+    let result = postcheck()
+        .and_then(|()| validate_grab(target))
+        .and_then(|()| snapshot(target));
+    match result {
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => match release_grab(target) {
+            Ok(()) => Err(error),
             Err(release_error) => Err(release_error),
-        };
+        },
     }
-    Ok(snapshot)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuiescentHandoffOutcome {
+    Ready { discarded_events: usize },
+    Busy { discarded_events: usize },
+}
+
+fn wait_for_quiescent_input<T, E>(
+    target: &mut T,
+    quiet_window: Duration,
+    deadline: Instant,
+    mut now: impl FnMut() -> Instant,
+    mut discard_ready: impl FnMut(&mut T) -> Result<usize, E>,
+    mut any_key_pressed: impl FnMut(&mut T) -> Result<bool, E>,
+    mut wait_once: impl FnMut(&mut T, Duration) -> Result<InputWaitOutcome, E>,
+) -> Result<QuiescentHandoffOutcome, E> {
+    let mut discarded_events = 0usize;
+
+    loop {
+        discarded_events = discarded_events.saturating_add(discard_ready(target)?);
+        let observed_now = now();
+        if observed_now >= deadline {
+            return Ok(QuiescentHandoffOutcome::Busy { discarded_events });
+        }
+
+        if any_key_pressed(target)? {
+            let wait = deadline
+                .saturating_duration_since(observed_now)
+                .min(quiet_window);
+            let _ = wait_once(target, wait)?;
+            continue;
+        }
+
+        let remaining = deadline.saturating_duration_since(observed_now);
+        if remaining < quiet_window {
+            return Ok(QuiescentHandoffOutcome::Busy { discarded_events });
+        }
+
+        match wait_once(target, quiet_window)? {
+            InputWaitOutcome::Readable => continue,
+            InputWaitOutcome::TimedOut => {
+                let post_window_discarded = discard_ready(target)?;
+                discarded_events = discarded_events.saturating_add(post_window_discarded);
+                if post_window_discarded > 0 || any_key_pressed(target)? {
+                    continue;
+                }
+                if matches!(
+                    wait_once(target, Duration::ZERO)?,
+                    InputWaitOutcome::TimedOut
+                ) {
+                    return Ok(QuiescentHandoffOutcome::Ready { discarded_events });
+                }
+            }
+        }
+    }
 }
 
 impl KeyboardController {
@@ -1533,11 +1596,7 @@ impl KeyboardController {
 
         let keyboard_device = resolve_keyboard_device(lease.seat())?;
         let pointer_devices = find_pointer_devices(&keyboard_device.canonical_path, lease.seat())?;
-        let real_device = GrabbedKeyboardDevice::open(keyboard_device)?;
-        println!(
-            "[INFO] Клавиатура: {}",
-            real_device.name().unwrap_or("Unknown")
-        );
+        let real_device = GrabbedKeyboardDevice::pending(keyboard_device);
         let session_type = detect_current_session_type();
         let mut virtual_device =
             VirtualKeyboardWriter::new("Open-Switcher Virtual Device", &lease)?;
@@ -1853,36 +1912,89 @@ impl PreparedKeyboardController {
     }
 
     pub fn activate(mut self) -> Result<(KeyboardController, bool), SwitcherError> {
-        if let Err(error) = ensure_input_dependencies_ready(
-            self.controller.virtual_device.handle().is_alive(),
-            self.controller.pointer_watcher.is_ready(),
-            self.controller.input_target_watcher.is_ready(),
-        ) {
-            let outcome = self.controller.shutdown();
-            return Err(resolve_error_after_writer_shutdown(
-                error,
-                "keyboard-activate-readiness",
-                outcome,
-            ));
-        }
-        let caps_lock_active = match snapshot_then_acquire_grab(
-            &mut self.controller.real_device,
-            || self.lease.ensure_current(monotonic_ms()),
-            |device| Ok::<_, SwitcherError>(device.caps_lock_active().unwrap_or(false)),
-            GrabbedKeyboardDevice::grab,
-            || self.lease.ensure_current(monotonic_ms()),
-            GrabbedKeyboardDevice::release_grab,
-        ) {
-            Ok(caps_lock_active) => caps_lock_active,
+        let activation_result = (|| -> Result<(bool, usize), SwitcherError> {
+            self.lease.ensure_current(monotonic_ms())?;
+            ensure_input_dependencies_ready(
+                self.controller.virtual_device.handle().is_alive(),
+                self.controller.pointer_watcher.is_ready(),
+                self.controller.input_target_watcher.is_ready(),
+            )?;
+            self.controller.real_device.open_for_handoff()?;
+            println!(
+                "[INFO] Клавиатура: {}",
+                self.controller.real_device.name().unwrap_or("Unknown")
+            );
+
+            let deadline = Instant::now() + INPUT_HANDOFF_MAX_WAIT;
+            let handoff = wait_for_quiescent_input(
+                &mut self.controller.real_device,
+                INPUT_HANDOFF_QUIET_WINDOW,
+                deadline,
+                Instant::now,
+                GrabbedKeyboardDevice::discard_ready_events,
+                |device| device.any_key_pressed(),
+                |device, timeout| device.wait_for_input(timeout),
+            )?;
+
+            let discarded_events = match handoff {
+                QuiescentHandoffOutcome::Ready { discarded_events } => discarded_events,
+                QuiescentHandoffOutcome::Busy { discarded_events } => {
+                    let path = self.controller.real_device.path.clone();
+                    log_input_debug(
+                        "input-handoff-busy",
+                        &format!(
+                            "path={} discarded_events={discarded_events}",
+                            path.display()
+                        ),
+                    );
+                    self.controller.real_device.close_ungrabbed();
+                    return Err(SwitcherError::PhysicalKeyboardHandoffBusy { path });
+                }
+            };
+
+            ensure_input_dependencies_ready(
+                self.controller.virtual_device.handle().is_alive(),
+                self.controller.pointer_watcher.is_ready(),
+                self.controller.input_target_watcher.is_ready(),
+            )?;
+            let path = self.controller.real_device.path.clone();
+            let lease = &self.lease;
+            let caps_lock_active = acquire_grab_then_snapshot(
+                &mut self.controller.real_device,
+                || lease.ensure_current(monotonic_ms()),
+                GrabbedKeyboardDevice::grab,
+                || lease.ensure_current(monotonic_ms()),
+                |device| {
+                    if device.any_key_pressed()? {
+                        Err(SwitcherError::PhysicalKeyboardHandoffBusy { path: path.clone() })
+                    } else {
+                        Ok(())
+                    }
+                },
+                |device| Ok::<_, SwitcherError>(device.caps_lock_active().unwrap_or(false)),
+                GrabbedKeyboardDevice::release_grab,
+            )?;
+            Ok((caps_lock_active, discarded_events))
+        })();
+
+        let (caps_lock_active, discarded_events) = match activation_result {
+            Ok(active) => active,
             Err(error) => {
                 let outcome = self.controller.shutdown();
                 return Err(resolve_error_after_writer_shutdown(
                     error,
-                    "keyboard-activate-grab",
+                    "keyboard-activate-handoff",
                     outcome,
                 ));
             }
         };
+        log_input_debug(
+            "input-handoff-complete",
+            &format!(
+                "path={} discarded_events={discarded_events}",
+                self.controller.real_device.path.display()
+            ),
+        );
         Ok((self.controller, caps_lock_active))
     }
 }
@@ -1923,15 +2035,32 @@ enum InputWaitOutcome {
 }
 
 impl GrabbedKeyboardDevice {
-    fn open(verified: VerifiedInputDevice) -> Result<Self, SwitcherError> {
-        let path = verified.canonical_path.clone();
-        let device = Device::open(&path).map_err(|error| map_keyboard_open_error(&path, error))?;
-        verify_open_device_identity(&device, &verified)?;
-        Ok(Self {
-            path,
-            device: Some(device),
+    fn pending(verified: VerifiedInputDevice) -> Self {
+        Self {
+            path: verified.canonical_path.clone(),
+            verified,
+            device: None,
             grabbed: false,
-        })
+        }
+    }
+
+    fn open_for_handoff(&mut self) -> Result<(), SwitcherError> {
+        if self.device.is_some() || self.grabbed {
+            return Err(SwitcherError::input_safety(
+                "physical keyboard opened twice during handoff",
+            ));
+        }
+
+        let device =
+            Device::open(&self.path).map_err(|error| map_keyboard_open_error(&self.path, error))?;
+        verify_open_device_identity(&device, &self.verified)?;
+        self.device = Some(device);
+        Ok(())
+    }
+
+    fn close_ungrabbed(&mut self) {
+        debug_assert!(!self.grabbed);
+        drop(self.device.take());
     }
 
     fn name(&self) -> Option<&str> {
@@ -2004,6 +2133,29 @@ impl GrabbedKeyboardDevice {
                     path: self.path.clone(),
                     poll_events: revents,
                 })
+            }
+        }
+    }
+
+    fn any_key_pressed(&self) -> Result<bool, SwitcherError> {
+        self.device
+            .as_ref()
+            .ok_or(SwitcherError::InputWorkerDisconnected {
+                worker: "keyboard-device",
+            })?
+            .get_key_state()
+            .map(|keys| keys.iter().next().is_some())
+            .map_err(|error| map_keyboard_open_error(&self.path, error))
+    }
+
+    fn discard_ready_events(&mut self) -> Result<usize, SwitcherError> {
+        let mut discarded = 0usize;
+        loop {
+            match self.wait_for_input(Duration::ZERO)? {
+                InputWaitOutcome::TimedOut => return Ok(discarded),
+                InputWaitOutcome::Readable => {
+                    discarded = discarded.saturating_add(self.fetch_events()?.len());
+                }
             }
         }
     }
@@ -6537,6 +6689,167 @@ mod tests {
         );
     }
 
+    #[test]
+    fn quiet_handoff_accepts_an_idle_device_after_one_window() {
+        let start = Instant::now();
+        let mut target = ();
+        let outcome = wait_for_quiescent_input(
+            &mut target,
+            Duration::from_millis(20),
+            start + Duration::from_millis(100),
+            || start,
+            |_| Ok::<_, SwitcherError>(0),
+            |_| Ok::<_, SwitcherError>(false),
+            |_, _| Ok::<_, SwitcherError>(InputWaitOutcome::TimedOut),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            QuiescentHandoffOutcome::Ready {
+                discarded_events: 0
+            }
+        );
+    }
+
+    #[test]
+    fn quiet_handoff_held_key_reaches_deadline_without_grab_permission() {
+        let start = Instant::now();
+        let mut times = vec![start, start + Duration::from_millis(100)].into_iter();
+        let mut target = ();
+        let outcome = wait_for_quiescent_input(
+            &mut target,
+            Duration::from_millis(20),
+            start + Duration::from_millis(100),
+            || times.next().unwrap_or(start + Duration::from_millis(100)),
+            |_| Ok::<_, SwitcherError>(0),
+            |_| Ok::<_, SwitcherError>(true),
+            |_, _| Ok::<_, SwitcherError>(InputWaitOutcome::TimedOut),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, QuiescentHandoffOutcome::Busy { .. }));
+    }
+
+    #[test]
+    fn quiet_handoff_discards_pre_grab_activity_and_restarts_window() {
+        let start = Instant::now();
+        let mut waits = vec![
+            InputWaitOutcome::Readable,
+            InputWaitOutcome::TimedOut,
+            InputWaitOutcome::TimedOut,
+        ]
+        .into_iter();
+        let mut discards = vec![2usize, 3, 0].into_iter();
+        let mut target = ();
+
+        let outcome = wait_for_quiescent_input(
+            &mut target,
+            Duration::from_millis(20),
+            start + Duration::from_millis(100),
+            || start,
+            |_| Ok::<_, SwitcherError>(discards.next().unwrap_or(0)),
+            |_| Ok::<_, SwitcherError>(false),
+            |_, _| Ok::<_, SwitcherError>(waits.next().unwrap_or(InputWaitOutcome::TimedOut)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            QuiescentHandoffOutcome::Ready {
+                discarded_events: 5
+            }
+        );
+    }
+
+    #[test]
+    fn quiet_handoff_final_readable_poll_requires_another_discard_cycle() {
+        let start = Instant::now();
+        let mut waits = vec![
+            InputWaitOutcome::TimedOut,
+            InputWaitOutcome::Readable,
+            InputWaitOutcome::TimedOut,
+            InputWaitOutcome::TimedOut,
+        ]
+        .into_iter();
+        let mut discards = vec![0usize, 0, 1, 0].into_iter();
+        let mut target = ();
+
+        let outcome = wait_for_quiescent_input(
+            &mut target,
+            Duration::from_millis(20),
+            start + Duration::from_millis(100),
+            || start,
+            |_| Ok::<_, SwitcherError>(discards.next().unwrap_or(0)),
+            |_| Ok::<_, SwitcherError>(false),
+            |_, _| Ok::<_, SwitcherError>(waits.next().unwrap_or(InputWaitOutcome::TimedOut)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            QuiescentHandoffOutcome::Ready {
+                discarded_events: 1
+            }
+        );
+    }
+
+    #[test]
+    fn quiet_handoff_post_window_discard_restarts_the_full_window() {
+        let start = Instant::now();
+        let mut waits = vec![
+            InputWaitOutcome::TimedOut,
+            InputWaitOutcome::TimedOut,
+            InputWaitOutcome::TimedOut,
+        ]
+        .into_iter();
+        let mut discards = vec![0usize, 1, 0, 0].into_iter();
+        let observed_waits = RefCell::new(Vec::new());
+        let mut target = ();
+
+        let outcome = wait_for_quiescent_input(
+            &mut target,
+            Duration::from_millis(20),
+            start + Duration::from_millis(100),
+            || start,
+            |_| Ok::<_, SwitcherError>(discards.next().unwrap_or(0)),
+            |_| Ok::<_, SwitcherError>(false),
+            |_, timeout| {
+                observed_waits.borrow_mut().push(timeout);
+                Ok::<_, SwitcherError>(waits.next().unwrap_or(InputWaitOutcome::TimedOut))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            QuiescentHandoffOutcome::Ready {
+                discarded_events: 1
+            }
+        );
+        assert_eq!(
+            *observed_waits.borrow(),
+            vec![
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+                Duration::ZERO
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_physical_keyboard_keeps_identity_without_live_fd() {
+        let device = GrabbedKeyboardDevice::pending(VerifiedInputDevice {
+            canonical_path: PathBuf::from("/dev/input/event5"),
+            devnum: 0x0d05,
+            seat: Arc::from("seat0"),
+        });
+
+        assert_eq!(device.path, PathBuf::from("/dev/input/event5"));
+        assert!(device.device.is_none());
+        assert!(!device.grabbed);
+    }
+
     fn test_writer_handle(
         capacity: usize,
         alive: bool,
@@ -6810,13 +7123,12 @@ mod tests {
         let trace = RefCell::new(Vec::new());
         let mut target = ();
 
-        let result = snapshot_then_acquire_grab(
+        let result = acquire_grab_then_snapshot(
             &mut target,
             || {
                 trace.borrow_mut().push("precheck");
                 lease.ensure_current(monotonic_ms())
             },
-            |_| Ok::<_, SwitcherError>(false),
             |_| {
                 trace.borrow_mut().push("grab");
                 Ok::<_, SwitcherError>(())
@@ -6825,6 +7137,8 @@ mod tests {
                 trace.borrow_mut().push("postcheck");
                 lease.ensure_current(monotonic_ms())
             },
+            |_| Ok::<_, SwitcherError>(()),
+            |_| Ok::<_, SwitcherError>(false),
             |_| {
                 trace.borrow_mut().push("release");
                 Ok::<_, SwitcherError>(())
@@ -6846,13 +7160,12 @@ mod tests {
         let trace = RefCell::new(Vec::new());
         let mut target = ();
 
-        let result = snapshot_then_acquire_grab(
+        let result = acquire_grab_then_snapshot(
             &mut target,
             || {
                 trace.borrow_mut().push("precheck");
                 lease.ensure_current(monotonic_ms())
             },
-            |_| Ok::<_, SwitcherError>(false),
             |_| {
                 trace.borrow_mut().push("grab");
                 Ok::<_, SwitcherError>(())
@@ -6865,6 +7178,8 @@ mod tests {
                 );
                 lease.ensure_current(monotonic_ms())
             },
+            |_| Ok::<_, SwitcherError>(()),
+            |_| Ok::<_, SwitcherError>(false),
             |_| {
                 trace.borrow_mut().push("release");
                 Ok::<_, SwitcherError>(())
@@ -6918,7 +7233,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_lock_snapshot_is_taken_immediately_before_physical_grab() {
+    fn grab_is_validated_before_caps_lock_snapshot_and_publish() {
         struct FakeKeyboard {
             caps_lock_active: bool,
             phases: Vec<&'static str>,
@@ -6928,24 +7243,69 @@ mod tests {
             caps_lock_active: true,
             phases: Vec::new(),
         };
-        let caps_lock_active = snapshot_then_acquire_grab(
+        let caps_lock_active = acquire_grab_then_snapshot(
             &mut keyboard,
             || Ok::<_, SwitcherError>(()),
-            |keyboard| {
-                keyboard.phases.push("caps-snapshot");
-                Ok::<_, SwitcherError>(keyboard.caps_lock_active)
-            },
             |keyboard| {
                 keyboard.phases.push("grab");
                 Ok::<_, SwitcherError>(())
             },
             || Ok::<_, SwitcherError>(()),
+            |keyboard| {
+                keyboard.phases.push("post-grab-key-check");
+                Ok::<_, SwitcherError>(())
+            },
+            |keyboard| {
+                keyboard.phases.push("caps-snapshot");
+                Ok::<_, SwitcherError>(keyboard.caps_lock_active)
+            },
             |_| Ok::<_, SwitcherError>(()),
         )
         .unwrap();
 
         assert!(caps_lock_active);
-        assert_eq!(keyboard.phases, vec!["caps-snapshot", "grab"]);
+        assert_eq!(
+            keyboard.phases,
+            vec!["grab", "post-grab-key-check", "caps-snapshot"]
+        );
+    }
+
+    #[test]
+    fn post_grab_pressed_key_releases_without_caps_snapshot() {
+        let trace = RefCell::new(Vec::new());
+        let mut target = ();
+        let result = acquire_grab_then_snapshot(
+            &mut target,
+            || Ok::<_, SwitcherError>(()),
+            |_| {
+                trace.borrow_mut().push("grab");
+                Ok::<_, SwitcherError>(())
+            },
+            || Ok::<_, SwitcherError>(()),
+            |_| {
+                trace.borrow_mut().push("post-grab-key-check");
+                Err(SwitcherError::PhysicalKeyboardHandoffBusy {
+                    path: PathBuf::from("/dev/input/event5"),
+                })
+            },
+            |_| {
+                trace.borrow_mut().push("caps-snapshot");
+                Ok::<_, SwitcherError>(false)
+            },
+            |_| {
+                trace.borrow_mut().push("release");
+                Ok::<_, SwitcherError>(())
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::PhysicalKeyboardHandoffBusy { .. })
+        ));
+        assert_eq!(
+            *trace.borrow(),
+            vec!["grab", "post-grab-key-check", "release"]
+        );
     }
 
     #[test]

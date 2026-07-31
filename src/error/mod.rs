@@ -162,6 +162,8 @@ pub enum SwitcherError {
         path: PathBuf,
         poll_events: libc::c_short,
     },
+    #[error("Physical keyboard is active during safe input handoff: {path}")]
+    PhysicalKeyboardHandoffBusy { path: PathBuf },
     #[error("Keyboard device is present but access was denied: {path}")]
     KeyboardAccessDenied {
         path: PathBuf,
@@ -237,6 +239,7 @@ impl SwitcherError {
             | SwitcherError::InputDeviceSeatMismatch
             | SwitcherError::InputDeviceIdentityUnverified
             | SwitcherError::PhysicalKeyboardDeviceLost { .. }
+            | SwitcherError::PhysicalKeyboardHandoffBusy { .. }
             | SwitcherError::InputWorkerDisconnected { .. } => true,
             SwitcherError::Io(error) => {
                 matches!(error.raw_os_error(), Some(19))
@@ -309,6 +312,16 @@ mod tests {
         };
 
         assert!(error.is_recoverable_input_error());
+    }
+
+    #[test]
+    fn busy_physical_keyboard_handoff_is_recoverable_without_setup_hint() {
+        let error = SwitcherError::PhysicalKeyboardHandoffBusy {
+            path: PathBuf::from("/dev/input/event5"),
+        };
+
+        assert!(error.is_recoverable_input_error());
+        assert!(error.linux_input_setup_hint().is_none());
     }
 
     #[test]

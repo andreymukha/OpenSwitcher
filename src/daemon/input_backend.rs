@@ -448,6 +448,7 @@ mod tests {
             phase: &'static str,
             trigger: &'static str,
         },
+        HandoffBusy,
         KeyboardAccessDenied,
     }
 
@@ -522,6 +523,9 @@ mod tests {
                         trigger: (*trigger).to_string(),
                     })
                 }
+                FakeOutcome::HandoffBusy => Err(SwitcherError::PhysicalKeyboardHandoffBusy {
+                    path: PathBuf::from("/dev/input/event5"),
+                }),
                 FakeOutcome::KeyboardAccessDenied => Err(SwitcherError::KeyboardAccessDenied {
                     path: PathBuf::from("/dev/input/event3"),
                     source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
@@ -658,6 +662,27 @@ mod tests {
 
         assert_eq!(lifecycle.state(), InputBackendState::WaitingForInputAccess);
         assert!(lifecycle.retry_deadline().is_some());
+    }
+
+    #[test]
+    fn busy_physical_handoff_schedules_retry_without_active_backend() {
+        let now = Instant::now();
+        let mut lifecycle = InputBackendLifecycle::new(FakeOpener {
+            outcome: FakeOutcome::HandoffBusy,
+        });
+
+        let opened = lifecycle
+            .initialize(SharedModifierState::default(), now)
+            .unwrap();
+
+        assert!(opened.is_none());
+        assert_eq!(lifecycle.state(), InputBackendState::WaitingForInputAccess);
+        assert!(lifecycle
+            .retry_deadline()
+            .is_some_and(|deadline| deadline > now));
+        assert!(lifecycle
+            .last_error()
+            .is_some_and(|error| error.contains("safe input handoff")));
     }
 
     #[test]

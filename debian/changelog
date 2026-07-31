@@ -1,3 +1,13 @@
+open-switcher (0.1.0-6) unstable; urgency=high
+
+  * Close the remaining H-02 startup handoff gap by opening and grabbing the
+    physical keyboard only after the input pipeline is ready and input is
+    briefly quiescent.
+  * Recover immediately when evdev poll reports HUP, ERR, or an invalid file
+    descriptor.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Fri, 31 Jul 2026 12:32:45 +0300
+
 open-switcher (0.1.0-5) unstable; urgency=high
 
   * Close H-07 by requiring a confirmed EN/RU layout setup before any

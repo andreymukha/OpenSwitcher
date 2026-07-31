@@ -7309,6 +7309,27 @@ mod tests {
     }
 
     #[test]
+    fn failed_release_overrides_post_grab_validation_error() {
+        let mut target = ();
+        let result = acquire_grab_then_snapshot(
+            &mut target,
+            || Ok::<_, SwitcherError>(()),
+            |_| Ok::<_, SwitcherError>(()),
+            || Ok::<_, SwitcherError>(()),
+            |_| Err(SwitcherError::InputSessionInactive),
+            |_| Ok::<_, SwitcherError>(false),
+            |_| Err::<(), _>(SwitcherError::input_safety("post-grab release failed")),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SwitcherError::InputSafety(InputSafetyError::Invariant {
+                context: "post-grab release failed"
+            }))
+        ));
+    }
+
+    #[test]
     fn correction_transaction_timeout_is_estimated_work_plus_bounded_backend_grace() {
         let mut config = test_runtime_config_snapshot();
         config.layout_delay_ms = 500;
@@ -9785,6 +9806,19 @@ mod tests {
         assert!(!grabbed);
         assert!(device.is_none());
         assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn unplug_release_error_closes_the_physical_fd_state() {
+        let mut device = Some(());
+        let mut grabbed = true;
+        let result = release_grab_or_close_device(&mut device, &mut grabbed, |_| {
+            Err::<(), _>(io::Error::from_raw_os_error(libc::ENODEV))
+        });
+
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENODEV));
+        assert!(device.is_none());
+        assert!(!grabbed);
     }
 
     #[test]

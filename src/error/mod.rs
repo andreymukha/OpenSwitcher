@@ -157,6 +157,11 @@ pub enum SwitcherError {
     InputDeviceIdentityUnverified,
     #[error("Keyboard device was not found")]
     KeyboardNotFound,
+    #[error("Physical keyboard device became unavailable: {path} (poll events=0x{poll_events:x})")]
+    PhysicalKeyboardDeviceLost {
+        path: PathBuf,
+        poll_events: libc::c_short,
+    },
     #[error("Keyboard device is present but access was denied: {path}")]
     KeyboardAccessDenied {
         path: PathBuf,
@@ -231,6 +236,7 @@ impl SwitcherError {
             | SwitcherError::InputSessionInactive
             | SwitcherError::InputDeviceSeatMismatch
             | SwitcherError::InputDeviceIdentityUnverified
+            | SwitcherError::PhysicalKeyboardDeviceLost { .. }
             | SwitcherError::InputWorkerDisconnected { .. } => true,
             SwitcherError::Io(error) => {
                 matches!(error.raw_os_error(), Some(19))
@@ -290,6 +296,16 @@ mod tests {
         let error = SwitcherError::KeyboardAccessDenied {
             path: PathBuf::from("/dev/input/event3"),
             source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+
+        assert!(error.is_recoverable_input_error());
+    }
+
+    #[test]
+    fn physical_keyboard_device_loss_is_recoverable() {
+        let error = SwitcherError::PhysicalKeyboardDeviceLost {
+            path: PathBuf::from("/dev/input/event5"),
+            poll_events: libc::POLLHUP,
         };
 
         assert!(error.is_recoverable_input_error());

@@ -1916,6 +1916,12 @@ fn release_grab_or_close_device<T, E>(
     result
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputWaitOutcome {
+    TimedOut,
+    Readable,
+}
+
 impl GrabbedKeyboardDevice {
     fn open(verified: VerifiedInputDevice) -> Result<Self, SwitcherError> {
         let path = verified.canonical_path.clone();
@@ -1976,17 +1982,30 @@ impl GrabbedKeyboardDevice {
         &mut self,
         timeout: Duration,
     ) -> Result<Vec<InputEvent>, SwitcherError> {
+        match self.wait_for_input(timeout)? {
+            InputWaitOutcome::TimedOut => Ok(Vec::new()),
+            InputWaitOutcome::Readable => self.fetch_events(),
+        }
+    }
+
+    fn wait_for_input(&self, timeout: Duration) -> Result<InputWaitOutcome, SwitcherError> {
         let device = self
             .device
             .as_ref()
             .ok_or(SwitcherError::InputWorkerDisconnected {
                 worker: "keyboard-device",
             })?;
-        if !wait_for_device_input(device, timeout)? {
-            return Ok(Vec::new());
-        }
 
-        self.fetch_events()
+        match wait_for_device_input(device, timeout)? {
+            DevicePollOutcome::TimedOut => Ok(InputWaitOutcome::TimedOut),
+            DevicePollOutcome::Readable => Ok(InputWaitOutcome::Readable),
+            DevicePollOutcome::DeviceLost { revents } => {
+                Err(SwitcherError::PhysicalKeyboardDeviceLost {
+                    path: self.path.clone(),
+                    poll_events: revents,
+                })
+            }
+        }
     }
 
     fn caps_lock_active(&self) -> Result<bool, SwitcherError> {
@@ -3711,7 +3730,28 @@ fn set_nonblocking(device: &Device) -> io::Result<()> {
     Ok(())
 }
 
-fn wait_for_device_input(device: &Device, timeout: Duration) -> io::Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DevicePollOutcome {
+    TimedOut,
+    Readable,
+    DeviceLost { revents: libc::c_short },
+}
+
+fn classify_device_poll_result(result: libc::c_int, revents: libc::c_short) -> DevicePollOutcome {
+    debug_assert!(result >= 0);
+    if result == 0 {
+        return DevicePollOutcome::TimedOut;
+    }
+
+    let terminal = libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
+    if revents & terminal != 0 || revents & libc::POLLIN == 0 {
+        return DevicePollOutcome::DeviceLost { revents };
+    }
+
+    DevicePollOutcome::Readable
+}
+
+fn wait_for_device_input(device: &Device, timeout: Duration) -> io::Result<DevicePollOutcome> {
     let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
     let mut poll_fd = libc::pollfd {
         fd: device.as_raw_fd(),
@@ -3721,11 +3761,8 @@ fn wait_for_device_input(device: &Device, timeout: Duration) -> io::Result<bool>
 
     loop {
         let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-        if result > 0 {
-            return Ok((poll_fd.revents & libc::POLLIN) != 0);
-        }
-        if result == 0 {
-            return Ok(false);
+        if result >= 0 {
+            return Ok(classify_device_poll_result(result, poll_fd.revents));
         }
 
         let error = io::Error::last_os_error();
@@ -6459,6 +6496,45 @@ mod tests {
         );
         let lease = publication.backend_lease(monotonic_ms()).unwrap();
         (publication, lease)
+    }
+
+    #[test]
+    fn physical_input_poll_timeout_and_readable_are_distinct() {
+        assert_eq!(
+            classify_device_poll_result(0, 0),
+            DevicePollOutcome::TimedOut
+        );
+        assert_eq!(
+            classify_device_poll_result(1, libc::POLLIN),
+            DevicePollOutcome::Readable
+        );
+    }
+
+    #[test]
+    fn physical_input_poll_terminal_flags_are_device_loss() {
+        for revents in [libc::POLLHUP, libc::POLLERR, libc::POLLNVAL] {
+            assert_eq!(
+                classify_device_poll_result(1, revents),
+                DevicePollOutcome::DeviceLost { revents }
+            );
+        }
+    }
+
+    #[test]
+    fn physical_input_poll_terminal_flag_wins_over_readable() {
+        let revents = libc::POLLIN | libc::POLLHUP;
+        assert_eq!(
+            classify_device_poll_result(1, revents),
+            DevicePollOutcome::DeviceLost { revents }
+        );
+    }
+
+    #[test]
+    fn physical_input_poll_unexpected_positive_is_not_a_timeout() {
+        assert_eq!(
+            classify_device_poll_result(1, 0),
+            DevicePollOutcome::DeviceLost { revents: 0 }
+        );
     }
 
     fn test_writer_handle(

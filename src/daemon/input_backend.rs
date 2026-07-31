@@ -31,7 +31,8 @@ fn runtime_failure_recovery_state(error: &SwitcherError) -> Option<InputBackendS
         | SwitcherError::InputDeviceIdentityUnverified => {
             Some(InputBackendState::WaitingForInputAccess)
         }
-        SwitcherError::InputWorkerDisconnected { .. } => Some(InputBackendState::Recovering),
+        SwitcherError::PhysicalKeyboardDeviceLost { .. }
+        | SwitcherError::InputWorkerDisconnected { .. } => Some(InputBackendState::Recovering),
         SwitcherError::Io(io_error)
             if matches!(io_error.raw_os_error(), Some(19))
                 || io_error.to_string().contains("No such device") =>
@@ -676,6 +677,17 @@ mod tests {
 
         assert_eq!(lifecycle.state(), InputBackendState::Recovering);
         assert!(lifecycle.retry_deadline().is_some());
+    }
+
+    #[test]
+    fn typed_runtime_device_loss_enters_recovering() {
+        assert_eq!(
+            runtime_failure_recovery_state(&SwitcherError::PhysicalKeyboardDeviceLost {
+                path: PathBuf::from("/dev/input/event5"),
+                poll_events: libc::POLLHUP,
+            }),
+            Some(InputBackendState::Recovering)
+        );
     }
 
     #[test]

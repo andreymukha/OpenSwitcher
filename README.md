@@ -67,20 +67,23 @@ scripts never install udev rules or change device ACLs. Never run `./manage.sh` 
 
 ## Development Quick Start
 
-For the first development setup on a machine, build and install the `.deb` once before starting
-local binaries:
+For local compilation without starting processes:
+
+```bash
+./manage.sh build
+```
+
+Use the canonical package for real installation and runtime checks:
 
 ```bash
 ./manage.sh package deb
 # Run the exact `sudo apt install <artifact>` command printed by the build.
 # Add `--reinstall` only if that same package version is already installed.
-./manage.sh dev build
 ./manage.sh doctor
-# Stop the packaged instance first if it is running:
-systemctl --user stop open-switcher-tray.service open-switcher-daemon.service
-./manage.sh dev start
-./manage.sh dev settings
 ```
+
+Direct `target/` binary launches through `manage.sh` are no longer supported.
+User runtime checks use the installed package and `systemd --user`.
 
 ## Components
 
@@ -190,7 +193,7 @@ release intentionally permits only `seat0` and fails closed on other seats.
 
 Source-tree code is not a production setup path and is not run as root.
 
-Build and install (or reinstall) the package before running from the source tree:
+Build and install (or reinstall) the package before runtime testing:
 
 ```bash
 ./manage.sh package deb
@@ -206,9 +209,8 @@ until boot. Check the current session:
 ./manage.sh doctor
 ```
 
-If the packaged daemon is already running while developing, stop it before starting the local dev
-daemon. Do not run `manage.sh` through `sudo`. Runtime layout auto-detect may use desktop-specific
-tools such as `gsettings`, `xfconf-query`, or `setxkbmap` depending on the current environment.
+Do not run `manage.sh` through `sudo`. Runtime layout auto-detect may use desktop-specific tools
+such as `gsettings`, `xfconf-query`, or `setxkbmap` depending on the current environment.
 
 ## Layout Switch Detection
 
@@ -319,44 +321,34 @@ but is not needed for normal installation.
 
 ## Development Workflow
 
-The repository ships with `manage.sh`, which supports two explicit modes:
+The repository ships with `manage.sh` for safe development operations:
 
-- `dev`
-  Direct local binaries from `target/`
-- `systemd`
-  Real user-service runtime through `systemctl --user`
+- `build` compiles local binaries without starting them;
+- `package deb` builds the canonical package;
+- `doctor` runs diagnostics;
+- `systemd` explicitly controls user services.
 
-Old top-level commands are kept as aliases for `dev`, but the preferred form is the explicit namespace.
+The direct PID-file runtime from `target/` has been retired. The old `dev`,
+`start`, `stop`, `restart`, `status`, `logs`, and `settings` commands fail closed
+and are never redirected to systemd.
 
-### `dev` mode
+### Local build
 
-Build:
-
-```bash
-./manage.sh dev build
-```
-
-Start the local `daemon + tray` pair from the build tree:
+Build daemon, tray, and settings without starting them:
 
 ```bash
-./manage.sh dev start
-```
-
-Useful helpers:
-
-```bash
-./manage.sh dev status
-./manage.sh dev logs
-./manage.sh dev settings
-./manage.sh dev stop
+./manage.sh build
 ```
 
 Use a release profile if needed:
 
 ```bash
-OPEN_SWITCHER_PROFILE=release ./manage.sh dev build
-OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
+OPEN_SWITCHER_PROFILE=release ./manage.sh build
 ```
+
+Detailed input/layout/capture logs are no longer enabled automatically. The
+corresponding `OPEN_SWITCHER_*_DEBUG` variables remain opt-in for controlled
+diagnostics, such as a temporary systemd override or the VM lab.
 
 ## `systemd --user` Runtime
 
@@ -503,14 +495,13 @@ gdbus monitor \
 
 Recommended source-tree sanity-check order:
 
-1. `./manage.sh dev build`
-2. `./manage.sh dev start`
-3. `./manage.sh dev settings`
-4. `./manage.sh dev stop`
-5. `./manage.sh systemd install`
-6. `./manage.sh systemd start`
-7. `./manage.sh systemd status`
-8. `./manage.sh systemd logs`
+1. `./manage.sh build`
+2. `./manage.sh package deb`
+3. Install the exact `.deb` printed by the build.
+4. Run `./manage.sh doctor`.
+5. Start OpenSwitcher from the desktop application menu.
+6. For diagnostics, use `./manage.sh systemd status` and
+   `./manage.sh systemd logs`.
 
 Supported-environment smoke checklist:
 
@@ -547,7 +538,6 @@ That usually means the daemon is not running or exited during startup.
 Check:
 
 ```bash
-./manage.sh dev status
 ./manage.sh systemd status
 ./manage.sh systemd logs
 ```
@@ -566,7 +556,6 @@ Likely causes:
 Check:
 
 ```bash
-./manage.sh dev status
 ./manage.sh systemd status
 ./manage.sh systemd logs tray
 gdbus call \
@@ -575,7 +564,6 @@ gdbus call \
   --object-path /org/freedesktop/DBus \
   --method org.freedesktop.DBus.NameHasOwner \
   org.oswitch.core
-./manage.sh dev settings
 ```
 
 ## License

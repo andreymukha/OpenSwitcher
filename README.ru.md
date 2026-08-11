@@ -69,20 +69,23 @@ package-owned настройку Linux input. Правило пакета исп
 
 ## Быстрый старт для разработки
 
-При первой настройке разработки на машине один раз собери и установи `.deb` перед запуском
-локальных бинарников:
+Для локальной компиляции без запуска процессов:
+
+```bash
+./manage.sh build
+```
+
+Для реальной установки и runtime-проверки используй канонический пакет:
 
 ```bash
 ./manage.sh package deb
 # Выполни точную команду `sudo apt install <artifact>`, которую напечатает сборка.
 # Добавляй `--reinstall`, только если эта же версия пакета уже установлена.
-./manage.sh dev build
 ./manage.sh doctor
-# Если пакетный экземпляр запущен, сначала останови его:
-systemctl --user stop open-switcher-tray.service open-switcher-daemon.service
-./manage.sh dev start
-./manage.sh dev settings
 ```
+
+Прямой запуск бинарников из `target/` через `manage.sh` больше не поддерживается.
+Пользовательский runtime проверяется через установленный пакет и `systemd --user`.
 
 ## Состав проекта
 
@@ -187,7 +190,7 @@ systemd `73-seat-late.rules`. Доступ к подходящим устрой�
 
 Код из working tree не является production-путём настройки и не запускается с правами root.
 
-Перед запуском из исходников собери и установи (или переустанови) пакет:
+Перед runtime-проверкой собери и установи (или переустанови) пакет:
 
 ```bash
 ./manage.sh package deb
@@ -203,8 +206,7 @@ systemd `73-seat-late.rules`. Доступ к подходящим устрой�
 ./manage.sh doctor
 ```
 
-Если пакетный daemon уже запущен во время разработки, останови его перед запуском локального dev
-daemon. Не запускай `manage.sh` через `sudo`. Runtime auto-detect раскладки может использовать
+Не запускай `manage.sh` через `sudo`. Runtime auto-detect раскладки может использовать
 environment-specific инструменты, например `gsettings`, `xfconf-query` или `setxkbmap`, в
 зависимости от текущего окружения.
 
@@ -318,44 +320,34 @@ dist/packages/
 
 ## Процесс разработки
 
-В репозитории есть `manage.sh`, который поддерживает два явных режима:
+В репозитории есть `manage.sh` для безопасных операций разработки:
 
-- `dev`
-  Прямой запуск локальных бинарников из `target/`
-- `systemd`
-  Реальный пользовательский режим работы через `systemctl --user`
+- `build` собирает локальные бинарники, не запуская их;
+- `package deb` собирает канонический пакет;
+- `doctor` выполняет диагностику;
+- `systemd` предоставляет явное управление пользовательскими службами.
 
-Старые верхнеуровневые команды сохранены как алиасы для `dev`, но предпочтительная форма — явное пространство имён.
+Прямой dev-runtime с PID-файлами и запуском из `target/` удалён. Старые команды
+`dev`, `start`, `stop`, `restart`, `status`, `logs` и `settings` завершаются
+безопасным отказом и не перенаправляются на systemd.
 
-### Режим `dev`
+### Локальная сборка
 
-Сборка:
-
-```bash
-./manage.sh dev build
-```
-
-Запуск локальной пары `daemon + tray` из каталога сборки:
+Собрать daemon, tray и settings без запуска:
 
 ```bash
-./manage.sh dev start
-```
-
-Полезные команды:
-
-```bash
-./manage.sh dev status
-./manage.sh dev logs
-./manage.sh dev settings
-./manage.sh dev stop
+./manage.sh build
 ```
 
 При необходимости можно использовать профиль `release`:
 
 ```bash
-OPEN_SWITCHER_PROFILE=release ./manage.sh dev build
-OPEN_SWITCHER_PROFILE=release ./manage.sh dev start
+OPEN_SWITCHER_PROFILE=release ./manage.sh build
 ```
+
+Подробные input/layout/capture логи больше не включаются автоматически.
+Соответствующие `OPEN_SWITCHER_*_DEBUG` переменные остаются opt-in для
+контролируемой диагностики, например во временном systemd override или ВМ.
 
 ## Работа через `systemd --user`
 
@@ -502,14 +494,13 @@ gdbus monitor \
 
 Рекомендуемый порядок базовой проверки из исходников:
 
-1. `./manage.sh dev build`
-2. `./manage.sh dev start`
-3. `./manage.sh dev settings`
-4. `./manage.sh dev stop`
-5. `./manage.sh systemd install`
-6. `./manage.sh systemd start`
-7. `./manage.sh systemd status`
-8. `./manage.sh systemd logs`
+1. `./manage.sh build`
+2. `./manage.sh package deb`
+3. установить точный напечатанный `.deb`;
+4. выполнить `./manage.sh doctor`;
+5. запустить OpenSwitcher из меню приложений;
+6. при диагностике использовать `./manage.sh systemd status` и
+   `./manage.sh systemd logs`.
 
 Smoke checklist для поддерживаемого окружения:
 
@@ -546,7 +537,6 @@ gdbus call \
 Проверь:
 
 ```bash
-./manage.sh dev status
 ./manage.sh systemd status
 ./manage.sh systemd logs
 ```
@@ -565,7 +555,6 @@ gdbus call \
 Проверь:
 
 ```bash
-./manage.sh dev status
 ./manage.sh systemd status
 ./manage.sh systemd logs tray
 gdbus call \
@@ -574,7 +563,6 @@ gdbus call \
   --object-path /org/freedesktop/DBus \
   --method org.freedesktop.DBus.NameHasOwner \
   org.oswitch.core
-./manage.sh dev settings
 ```
 
 ## Лицензия

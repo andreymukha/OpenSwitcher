@@ -1,6 +1,8 @@
 use crate::dbus::OpenSwitcherProxyBlocking;
 use crate::error::SettingsClientError;
-use crate::model::{LayoutSwitchCaptureState, Settings, SettingsDto, UpdateSettingsResult};
+use crate::model::{
+    LayoutSwitchCaptureState, Settings, SettingsPatch, SettingsPatchDto, UpdateSettingsResult,
+};
 use async_channel::Sender;
 use std::thread;
 use std::time::Duration;
@@ -33,10 +35,10 @@ impl SettingsDbusClient {
 
     pub fn save_settings(
         &self,
-        settings: Settings,
+        patch: SettingsPatch,
     ) -> Result<UpdateSettingsResult, SettingsClientError> {
         self.proxy()?
-            .update_settings(SettingsDto::from(settings))
+            .update_settings(SettingsPatchDto::from(patch))
             .map_err(SettingsClientError::Daemon)
     }
 

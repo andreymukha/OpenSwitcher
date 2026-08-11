@@ -1,6 +1,6 @@
 use crate::model::{
     hotkeys_conflict_exact, AutoDetectedLayoutSwitch, HotkeySpec, LayoutSwitchCombo,
-    LayoutSwitchSource, Settings, SystemContext,
+    LayoutSwitchSource, Settings, SettingsPatch, SystemContext,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +24,7 @@ pub struct DomainState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PendingSave {
     pub settings: Settings,
+    pub patch: SettingsPatch,
     pub autostart_change: Option<bool>,
 }
 
@@ -115,9 +116,12 @@ impl DomainState {
             return None;
         }
 
+        let loaded = self.loaded.expect("loaded state was checked above");
+        let settings = self.settings_for_save();
         self.request_state = RequestState::Saving;
         Some(PendingSave {
-            settings: self.settings_for_save(),
+            settings,
+            patch: SettingsPatch::between(loaded, settings),
             autostart_change: self
                 .loaded_autostart_enabled
                 .filter(|loaded| *loaded != self.autostart_enabled)
@@ -125,8 +129,8 @@ impl DomainState {
         })
     }
 
-    pub fn save_succeeded(&mut self, snapshot: PendingSave) {
-        self.save_persisted_settings_succeeded(snapshot.settings);
+    pub fn save_succeeded(&mut self, snapshot: PendingSave, committed: Settings) {
+        self.save_persisted_settings_succeeded(committed);
         if let Some(enabled) = snapshot.autostart_change {
             self.loaded_autostart_enabled = Some(enabled);
             self.autostart_enabled = enabled;
@@ -437,7 +441,7 @@ mod tests {
     use super::*;
     use crate::model::{
         DesktopEnvironment, DetectionConfidence, DetectionStrategy, DistroKind, SessionType,
-        SystemContext,
+        SettingsFieldMask, SystemContext,
     };
 
     // Dirty/save state
@@ -488,6 +492,59 @@ mod tests {
         assert!(snapshot.settings.fix_two_capitals);
         assert!(snapshot.settings.fix_accidental_caps_lock);
         assert!(state.view_state().saving);
+    }
+
+    #[test]
+    fn begin_save_builds_patch_only_for_changed_fields() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+        state.update_fix_two_capitals(true);
+
+        let pending = state.begin_save().unwrap();
+
+        assert!(pending
+            .patch
+            .changed()
+            .contains(SettingsFieldMask::FIX_TWO_CAPITALS));
+        assert!(!pending
+            .patch
+            .changed()
+            .contains(SettingsFieldMask::AUTO_SWITCH_ENABLED));
+    }
+
+    #[test]
+    fn autostart_only_save_builds_empty_settings_patch() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+        state.set_autostart_enabled(true);
+
+        let pending = state.begin_save().unwrap();
+
+        assert!(pending.patch.changed().is_empty());
+        assert_eq!(pending.autostart_change, Some(true));
+    }
+
+    #[test]
+    fn save_success_uses_committed_settings_returned_by_daemon() {
+        let mut state = DomainState::new();
+        state.apply_loaded(Settings::default());
+        state.apply_loaded_autostart(false);
+        state.update_fix_two_capitals(true);
+        let pending = state.begin_save().unwrap();
+        let committed = Settings {
+            auto_switch_enabled: false,
+            fix_two_capitals: true,
+            ..Settings::default()
+        };
+
+        state.save_succeeded(pending, committed);
+
+        let view = state.view_state();
+        assert!(!view.auto_switch_enabled);
+        assert!(view.fix_two_capitals);
+        assert!(!view.dirty);
     }
 
     #[test]

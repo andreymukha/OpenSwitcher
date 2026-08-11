@@ -1,7 +1,10 @@
 use super::dbus_client::SettingsDbusClient;
 use super::state::{DomainState, ViewState};
 use crate::error::{SettingsClientError, UiError};
-use crate::model::{HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, UpdateSettingsResult};
+use crate::model::{
+    HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, Settings, SettingsPatch,
+    UpdateSettingsResult,
+};
 use crate::system::user_services::{CommandRunner, ProcessCommandRunner};
 use crate::system::UserServiceController;
 use async_channel::Sender;
@@ -38,7 +41,7 @@ pub trait SettingsClientBackend: Clone + Send + Sync + 'static {
     fn load_settings(&self) -> Result<crate::model::Settings, SettingsClientError>;
     fn save_settings(
         &self,
-        settings: crate::model::Settings,
+        patch: SettingsPatch,
     ) -> Result<UpdateSettingsResult, SettingsClientError>;
     fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
     fn renew_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError>;
@@ -60,9 +63,9 @@ impl SettingsClientBackend for SettingsDbusClient {
 
     fn save_settings(
         &self,
-        settings: crate::model::Settings,
+        patch: SettingsPatch,
     ) -> Result<UpdateSettingsResult, SettingsClientError> {
-        SettingsDbusClient::save_settings(self, settings)
+        SettingsDbusClient::save_settings(self, patch)
     }
 
     fn start_layout_switch_capture(&self) -> Result<LayoutSwitchCaptureState, SettingsClientError> {
@@ -411,8 +414,20 @@ where
 
         let presenter = self.clone();
         thread::spawn(
-            move || match presenter.inner.client.save_settings(snapshot.settings) {
+            move || match presenter.inner.client.save_settings(snapshot.patch) {
                 Ok(result) => {
+                    let committed = match Settings::try_from(result.settings.clone()) {
+                        Ok(settings) => settings,
+                        Err(error) => {
+                            presenter.with_state(DomainState::save_failed);
+                            let _ = presenter.emit_view_state();
+                            let _ = presenter.send_event(PresenterEvent::SaveFailed(
+                                SettingsClientError::from(error),
+                            ));
+                            return;
+                        }
+                    };
+
                     if let Some(enabled) = snapshot.autostart_change {
                         let service_result = if enabled {
                             presenter.inner.services.enable_autostart()
@@ -424,7 +439,7 @@ where
                             let actual_autostart =
                                 presenter.inner.services.is_autostart_enabled().ok();
                             presenter.with_state(|state| {
-                                state.save_persisted_settings_succeeded(snapshot.settings);
+                                state.save_persisted_settings_succeeded(committed);
                                 if let Some(actual_autostart) = actual_autostart {
                                     state.apply_loaded_autostart(actual_autostart);
                                 }
@@ -438,7 +453,7 @@ where
                         }
                     }
 
-                    presenter.with_state(|state| state.save_succeeded(snapshot));
+                    presenter.with_state(|state| state.save_succeeded(snapshot, committed));
                     let _ = presenter.emit_view_state();
                     let _ = presenter.send_event(PresenterEvent::SaveSucceeded(result));
                 }
@@ -606,7 +621,9 @@ mod tests {
     use crate::error::ServiceManagerError;
     use crate::error::ValidationError;
     use crate::model::LayoutSwitchCapturePhase;
-    use crate::model::{LayoutSwitchSetting, LayoutSwitchSource, Settings, SettingsDto};
+    use crate::model::{
+        LayoutSwitchSetting, LayoutSwitchSource, Settings, SettingsDto, SettingsFieldMask,
+    };
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -620,7 +637,7 @@ mod tests {
     #[derive(Default)]
     struct FakeSettingsClientState {
         save_results: VecDeque<Result<UpdateSettingsResult, SettingsClientError>>,
-        saved_settings: Vec<Settings>,
+        saved_patches: Vec<SettingsPatch>,
         hotkey_capture_inhibitions: Vec<bool>,
         renew_results: VecDeque<FakeRenewResult>,
         renew_delay: Duration,
@@ -646,8 +663,8 @@ mod tests {
             self.state.lock().unwrap().save_results.push_back(result);
         }
 
-        fn saved_settings(&self) -> Vec<Settings> {
-            self.state.lock().unwrap().saved_settings.clone()
+        fn saved_patches(&self) -> Vec<SettingsPatch> {
+            self.state.lock().unwrap().saved_patches.clone()
         }
 
         fn hotkey_capture_inhibitions(&self) -> Vec<bool> {
@@ -690,10 +707,10 @@ mod tests {
 
         fn save_settings(
             &self,
-            settings: Settings,
+            patch: SettingsPatch,
         ) -> Result<UpdateSettingsResult, SettingsClientError> {
             let mut state = self.state.lock().unwrap();
-            state.saved_settings.push(settings);
+            state.saved_patches.push(patch);
             state
                 .save_results
                 .pop_front()
@@ -798,9 +815,9 @@ mod tests {
 
         fn save_settings(
             &self,
-            settings: Settings,
+            patch: SettingsPatch,
         ) -> Result<UpdateSettingsResult, SettingsClientError> {
-            self.base.save_settings(settings)
+            self.base.save_settings(patch)
         }
 
         fn start_layout_switch_capture(
@@ -1268,6 +1285,88 @@ mod tests {
 
     // Save flow
     #[test]
+    fn save_sends_only_changed_fields_and_uses_daemon_committed_settings() {
+        let client = FakeSettingsClient::default();
+        let committed = Settings {
+            auto_switch_enabled: false,
+            fix_two_capitals: true,
+            ..Settings::default()
+        };
+        client.push_save_result(Ok(UpdateSettingsResult {
+            message: "saved".to_string(),
+            restart_required: false,
+            settings: SettingsDto::from(committed),
+        }));
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let presenter = SettingsPresenter::with_services(
+            client.clone(),
+            UserServiceController::new(FakeCommandRunner::default()),
+            event_tx,
+        );
+        presenter.with_state(|state| {
+            state.apply_loaded(Settings::default());
+            state.apply_loaded_autostart(false);
+        });
+        presenter.update_fix_two_capitals(true);
+
+        assert!(matches!(presenter.save(), SaveRequest::Accepted(_)));
+        loop {
+            match event_rx.recv_blocking().unwrap() {
+                PresenterEvent::SaveSucceeded(_) => break,
+                PresenterEvent::ViewStateChanged(_) => {}
+                other => panic!("unexpected presenter event: {other:?}"),
+            }
+        }
+
+        let patches = client.saved_patches();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].changed(), SettingsFieldMask::FIX_TWO_CAPITALS);
+        let view = presenter.with_state(|state| state.view_state());
+        assert!(!view.auto_switch_enabled);
+        assert!(view.fix_two_capitals);
+        assert!(!view.dirty);
+    }
+
+    #[test]
+    fn invalid_committed_settings_from_daemon_fail_closed_in_presenter() {
+        let client = FakeSettingsClient::default();
+        let invalid = SettingsDto {
+            layout_delay_ms: 999,
+            ..SettingsDto::from(Settings::default())
+        };
+        client.push_save_result(Ok(UpdateSettingsResult {
+            message: "saved".to_string(),
+            restart_required: false,
+            settings: invalid,
+        }));
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let presenter = SettingsPresenter::with_services(
+            client,
+            UserServiceController::new(FakeCommandRunner::default()),
+            event_tx,
+        );
+        presenter.with_state(|state| {
+            state.apply_loaded(Settings::default());
+            state.apply_loaded_autostart(false);
+        });
+        presenter.update_fix_two_capitals(true);
+
+        assert!(matches!(presenter.save(), SaveRequest::Accepted(_)));
+        loop {
+            match event_rx.recv_blocking().unwrap() {
+                PresenterEvent::SaveFailed(SettingsClientError::Validation(_)) => break,
+                PresenterEvent::ViewStateChanged(_) => {}
+                other => panic!("unexpected presenter event: {other:?}"),
+            }
+        }
+
+        let view = presenter.with_state(|state| state.view_state());
+        assert!(view.fix_two_capitals);
+        assert!(view.dirty);
+        assert!(!view.saving);
+    }
+
+    #[test]
     fn save_keeps_persisted_changes_when_autostart_apply_fails_and_reloads_real_state() {
         let client = FakeSettingsClient::default();
         let committed = Settings {
@@ -1316,11 +1415,12 @@ mod tests {
         assert!(!final_view.dirty);
         assert!(!final_view.save_enabled);
 
-        let saved_settings = client.saved_settings();
-        assert_eq!(saved_settings.len(), 1);
-        assert!(!saved_settings[0].auto_switch_enabled);
+        let saved_patches = client.saved_patches();
+        assert_eq!(saved_patches.len(), 1);
+        let saved_settings = saved_patches[0].apply_to(Settings::default()).unwrap();
+        assert!(!saved_settings.auto_switch_enabled);
         assert_eq!(
-            saved_settings[0].layout_switch,
+            saved_settings.layout_switch,
             LayoutSwitchSetting {
                 combo: LayoutSwitchCombo::default(),
                 source: LayoutSwitchSource::Unknown,

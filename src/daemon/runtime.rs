@@ -4487,13 +4487,6 @@ impl RuntimeState {
         self.config_service.get_settings()
     }
 
-    pub fn update_settings(
-        &self,
-        settings: Settings,
-    ) -> Result<UpdateSettingsResult, SettingsError> {
-        self.update_settings_patch(SettingsPatch::all(settings))
-    }
-
     pub fn update_settings_patch(
         &self,
         patch: SettingsPatch,
@@ -5394,7 +5387,9 @@ mod input_snapshot_config_tests {
         let mut settings = runtime.get_settings().unwrap();
         settings.fix_two_capitals = !settings.fix_two_capitals;
 
-        assert!(runtime.update_settings(settings).is_err());
+        assert!(runtime
+            .update_settings_patch(SettingsPatch::all(settings))
+            .is_err());
         let after = runtime.input_snapshot_before_grab();
         assert_eq!(after.config_generation, before.config_generation);
         assert_eq!(
@@ -5411,7 +5406,9 @@ mod input_snapshot_config_tests {
         let mut settings = runtime.get_settings().unwrap();
         settings.fix_two_capitals = true;
 
-        runtime.update_settings(settings).unwrap();
+        runtime
+            .update_settings_patch(SettingsPatch::all(settings))
+            .unwrap();
         let after = runtime.input_snapshot_before_grab();
         assert_eq!(after.config_generation, before.config_generation + 1);
         assert!(after.config.fix_two_capitals);

@@ -6,7 +6,8 @@ use open_switcher::dbus::{
 use open_switcher::model::{
     AutoDetectedLayoutSwitch, HotkeyModifiers, HotkeySpec, HotkeyTrigger, LayoutSwitchCapturePhase,
     LayoutSwitchCaptureState, LayoutSwitchCombo, LayoutSwitchSetting, LayoutSwitchSource,
-    SelectedTextHotkey, SettingsDto, UndoKey, UpdateSettingsResult,
+    SelectedTextHotkey, SettingsDto, SettingsFieldMask, SettingsPatchDto, UndoKey,
+    UpdateSettingsResult,
 };
 use std::error::Error;
 use std::path::Path;
@@ -25,6 +26,163 @@ fn dbus_public_constants_match_contract() {
 }
 
 // Settings roundtrip
+
+fn settings_patch(changed: SettingsFieldMask, values: SettingsDto) -> SettingsPatchDto {
+    SettingsPatchDto { changed, values }
+}
+
+#[test]
+fn stale_clients_merge_different_settings_fields() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("stale_different_fields");
+    let _service = spawn_service(&config_path, &service_name)?;
+    let client_a = Connection::session()?;
+    let client_b = Connection::session()?;
+    let proxy_a = settings_proxy(&client_a, &service_name)?;
+    let proxy_b = settings_proxy(&client_b, &service_name)?;
+    let initial_a: SettingsDto = proxy_a.call("GetSettings", &())?;
+    let initial_b: SettingsDto = proxy_b.call("GetSettings", &())?;
+    assert_eq!(initial_a, initial_b);
+
+    let result_a: UpdateSettingsResult = proxy_a.call(
+        "UpdateSettings",
+        &settings_patch(
+            SettingsFieldMask::AUTO_SWITCH_ENABLED,
+            SettingsDto {
+                auto_switch_enabled: false,
+                ..initial_a
+            },
+        ),
+    )?;
+    assert!(!result_a.settings.auto_switch_enabled);
+
+    let result_b: UpdateSettingsResult = proxy_b.call(
+        "UpdateSettings",
+        &settings_patch(
+            SettingsFieldMask::FIX_TWO_CAPITALS,
+            SettingsDto {
+                fix_two_capitals: true,
+                ..initial_b
+            },
+        ),
+    )?;
+
+    assert!(!result_b.settings.auto_switch_enabled);
+    assert!(result_b.settings.fix_two_capitals);
+    let current: SettingsDto = proxy_b.call("GetSettings", &())?;
+    assert_eq!(current, result_b.settings);
+    let persisted = AppConfig::load_or_create(&config_path)?.settings();
+    assert!(!persisted.auto_switch_enabled);
+    assert!(persisted.fix_two_capitals);
+    Ok(())
+}
+
+#[test]
+fn last_patch_wins_for_the_same_field() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("last_same_field");
+    let _service = spawn_service(&config_path, &service_name)?;
+    let client_a = Connection::session()?;
+    let client_b = Connection::session()?;
+    let proxy_a = settings_proxy(&client_a, &service_name)?;
+    let proxy_b = settings_proxy(&client_b, &service_name)?;
+    let initial: SettingsDto = proxy_a.call("GetSettings", &())?;
+
+    let _: UpdateSettingsResult = proxy_a.call(
+        "UpdateSettings",
+        &settings_patch(
+            SettingsFieldMask::LAYOUT_DELAY_MS,
+            SettingsDto {
+                layout_delay_ms: 50,
+                ..initial
+            },
+        ),
+    )?;
+    let last: UpdateSettingsResult = proxy_b.call(
+        "UpdateSettings",
+        &settings_patch(
+            SettingsFieldMask::LAYOUT_DELAY_MS,
+            SettingsDto {
+                layout_delay_ms: 70,
+                ..initial
+            },
+        ),
+    )?;
+
+    assert_eq!(last.settings.layout_delay_ms, 70);
+    let current: SettingsDto = proxy_b.call("GetSettings", &())?;
+    assert_eq!(current.layout_delay_ms, 70);
+    assert_eq!(AppConfig::load_or_create(&config_path)?.layout.delay_ms, 70);
+    Ok(())
+}
+
+#[test]
+fn invalid_merged_patch_leaves_dbus_runtime_and_config_unchanged() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("invalid_merged_patch");
+    let _service = spawn_service(&config_path, &service_name)?;
+    let client = Connection::session()?;
+    let proxy = settings_proxy(&client, &service_name)?;
+    let initial: SettingsDto = proxy.call("GetSettings", &())?;
+    let enabled_before = proxy.get_property::<bool>("IsEnabled")?;
+    let bytes_before = std::fs::read(&config_path)?;
+
+    let error = proxy
+        .call_method(
+            "UpdateSettings",
+            &settings_patch(
+                SettingsFieldMask::SELECTED_TEXT_HOTKEY,
+                SettingsDto {
+                    selected_text_hotkey: initial.manual_correction_hotkey,
+                    ..initial
+                },
+            ),
+        )
+        .expect_err("merged duplicate hotkeys must be rejected");
+
+    assert!(error.to_string().contains("совпадают"));
+    let current: SettingsDto = proxy.call("GetSettings", &())?;
+    assert_eq!(current, initial);
+    assert_eq!(proxy.get_property::<bool>("IsEnabled")?, enabled_before);
+    assert_eq!(std::fs::read(&config_path)?, bytes_before);
+    Ok(())
+}
+
+#[test]
+fn stale_full_settings_signature_fails_without_writing() -> Result<(), Box<dyn Error>> {
+    let temp_dir = TempDir::new()?;
+    let config_path = temp_dir.path().join("config.toml");
+    let service_name = unique_service_name("stale_full_signature");
+    let _service = spawn_service(&config_path, &service_name)?;
+    let client = Connection::session()?;
+    let proxy = settings_proxy(&client, &service_name)?;
+    let initial: SettingsDto = proxy.call("GetSettings", &())?;
+    let bytes_before = std::fs::read(&config_path)?;
+
+    let error = proxy
+        .call_method(
+            "UpdateSettings",
+            &(SettingsDto {
+                fix_two_capitals: true,
+                ..initial
+            }),
+        )
+        .expect_err("the removed full-settings signature must fail closed");
+
+    let error_text = error.to_string();
+    let normalized_error = error_text.to_ascii_lowercase();
+    assert!(
+        normalized_error.contains("signature") || normalized_error.contains("invalidargs"),
+        "unexpected stale-client error: {error_text}"
+    );
+    let current: SettingsDto = proxy.call("GetSettings", &())?;
+    assert_eq!(current, initial);
+    assert_eq!(std::fs::read(&config_path)?, bytes_before);
+    Ok(())
+}
 
 #[test]
 fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
@@ -59,19 +217,22 @@ fn dbus_roundtrip_updates_runtime_and_config() -> Result<(), Box<dyn Error>> {
 
     let result: UpdateSettingsResult = proxy.call(
         "UpdateSettings",
-        &(SettingsDto {
-            auto_switch_enabled: false,
-            fix_two_capitals: false,
-            fix_accidental_caps_lock: false,
-            layout_delay_ms: 77,
-            manual_correction_hotkey: HotkeySpec::from(UndoKey::F12),
-            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::AltF12),
-            layout_switch: LayoutSwitchSetting {
-                combo: LayoutSwitchCombo::alt_shift(),
-                source: LayoutSwitchSource::Manual,
-                auto_detected: AutoDetectedLayoutSwitch::default(),
+        &settings_patch(
+            SettingsFieldMask::all(),
+            SettingsDto {
+                auto_switch_enabled: false,
+                fix_two_capitals: false,
+                fix_accidental_caps_lock: false,
+                layout_delay_ms: 77,
+                manual_correction_hotkey: HotkeySpec::from(UndoKey::F12),
+                selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::AltF12),
+                layout_switch: LayoutSwitchSetting {
+                    combo: LayoutSwitchCombo::alt_shift(),
+                    source: LayoutSwitchSource::Manual,
+                    auto_detected: AutoDetectedLayoutSwitch::default(),
+                },
             },
-        }),
+        ),
     )?;
     assert!(!result.restart_required);
 
@@ -126,19 +287,22 @@ fn dbus_roundtrip_preserves_complex_hotkey_specs() -> Result<(), Box<dyn Error>>
 
     let result: UpdateSettingsResult = proxy.call(
         "UpdateSettings",
-        &(SettingsDto {
-            auto_switch_enabled: true,
-            fix_two_capitals: false,
-            fix_accidental_caps_lock: false,
-            layout_delay_ms: 30,
-            manual_correction_hotkey: manual_hotkey,
-            selected_text_hotkey,
-            layout_switch: LayoutSwitchSetting {
-                combo: LayoutSwitchCombo::alt_shift(),
-                source: LayoutSwitchSource::Manual,
-                auto_detected: AutoDetectedLayoutSwitch::default(),
+        &settings_patch(
+            SettingsFieldMask::all(),
+            SettingsDto {
+                auto_switch_enabled: true,
+                fix_two_capitals: false,
+                fix_accidental_caps_lock: false,
+                layout_delay_ms: 30,
+                manual_correction_hotkey: manual_hotkey,
+                selected_text_hotkey,
+                layout_switch: LayoutSwitchSetting {
+                    combo: LayoutSwitchCombo::alt_shift(),
+                    source: LayoutSwitchSource::Manual,
+                    auto_detected: AutoDetectedLayoutSwitch::default(),
+                },
             },
-        }),
+        ),
     )?;
 
     assert!(!result.restart_required);
@@ -171,19 +335,22 @@ fn dbus_rejects_invalid_settings() -> Result<(), Box<dyn Error>> {
     let error = proxy
         .call_method(
             "UpdateSettings",
-            &(SettingsDto {
-                auto_switch_enabled: true,
-                fix_two_capitals: false,
-                fix_accidental_caps_lock: false,
-                layout_delay_ms: 999,
-                manual_correction_hotkey: HotkeySpec::from(UndoKey::Pause),
-                selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::ShiftPause),
-                layout_switch: LayoutSwitchSetting {
-                    combo: LayoutSwitchCombo::ctrl_shift(),
-                    source: LayoutSwitchSource::Manual,
-                    auto_detected: AutoDetectedLayoutSwitch::default(),
+            &settings_patch(
+                SettingsFieldMask::all(),
+                SettingsDto {
+                    auto_switch_enabled: true,
+                    fix_two_capitals: false,
+                    fix_accidental_caps_lock: false,
+                    layout_delay_ms: 999,
+                    manual_correction_hotkey: HotkeySpec::from(UndoKey::Pause),
+                    selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::ShiftPause),
+                    layout_switch: LayoutSwitchSetting {
+                        combo: LayoutSwitchCombo::ctrl_shift(),
+                        source: LayoutSwitchSource::Manual,
+                        auto_detected: AutoDetectedLayoutSwitch::default(),
+                    },
                 },
-            }),
+            ),
         )
         .expect_err("invalid settings must be rejected");
 
@@ -220,19 +387,22 @@ fn dbus_update_settings_changes_daemon_visible_is_enabled() -> Result<(), Box<dy
 
     let updated: UpdateSettingsResult = proxy.call(
         "UpdateSettings",
-        &(SettingsDto {
-            auto_switch_enabled: false,
-            fix_two_capitals: false,
-            fix_accidental_caps_lock: false,
-            layout_delay_ms: 30,
-            manual_correction_hotkey: HotkeySpec::from(UndoKey::Pause),
-            selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::ShiftPause),
-            layout_switch: LayoutSwitchSetting {
-                combo: LayoutSwitchCombo::ctrl_shift(),
-                source: LayoutSwitchSource::Manual,
-                auto_detected: AutoDetectedLayoutSwitch::default(),
+        &settings_patch(
+            SettingsFieldMask::all(),
+            SettingsDto {
+                auto_switch_enabled: false,
+                fix_two_capitals: false,
+                fix_accidental_caps_lock: false,
+                layout_delay_ms: 30,
+                manual_correction_hotkey: HotkeySpec::from(UndoKey::Pause),
+                selected_text_hotkey: HotkeySpec::from(SelectedTextHotkey::ShiftPause),
+                layout_switch: LayoutSwitchSetting {
+                    combo: LayoutSwitchCombo::ctrl_shift(),
+                    source: LayoutSwitchSource::Manual,
+                    auto_detected: AutoDetectedLayoutSwitch::default(),
+                },
             },
-        }),
+        ),
     )?;
 
     assert!(!updated.restart_required);

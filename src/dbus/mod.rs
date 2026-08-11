@@ -2,7 +2,9 @@ use crate::daemon::capture::CaptureOwner;
 use crate::daemon::runtime::log_layout_debug;
 use crate::daemon::runtime::RuntimeState;
 use crate::error::{DbusError, SettingsError, SwitcherError};
-use crate::model::{LayoutSwitchCaptureState, Settings, SettingsDto, UpdateSettingsResult};
+use crate::model::{
+    LayoutSwitchCaptureState, SettingsDto, SettingsPatch, SettingsPatchDto, UpdateSettingsResult,
+};
 use futures_util::{
     future::{select, Either},
     pin_mut, StreamExt,
@@ -260,7 +262,7 @@ pub trait OpenSwitcher {
     fn toggle(&self) -> zbus::Result<()>;
     fn request_exit(&self) -> zbus::Result<()>;
     fn get_settings(&self) -> zbus::Result<SettingsDto>;
-    fn update_settings(&self, settings: SettingsDto) -> zbus::Result<UpdateSettingsResult>;
+    fn update_settings(&self, patch: SettingsPatchDto) -> zbus::Result<UpdateSettingsResult>;
     fn start_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn renew_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
     fn cancel_layout_switch_capture(&self) -> zbus::Result<LayoutSwitchCaptureState>;
@@ -315,14 +317,14 @@ impl OpenSwitcherDbusApi {
     pub fn update_settings(
         &self,
         #[zbus(signal_context)] ctxt: SignalContext<'_>,
-        settings: SettingsDto,
+        patch: SettingsPatchDto,
     ) -> fdo::Result<UpdateSettingsResult> {
-        let settings = Settings::try_from(settings)
+        let patch = SettingsPatch::try_from(patch)
             .map_err(|err| fdo::Error::from(DbusError::from(SettingsError::from(err))))?;
         let (enabled_before, _) = self.runtime.last_confirmed_status();
         let result = self
             .runtime
-            .update_settings(settings)
+            .update_settings_patch(patch)
             .map_err(|err| fdo::Error::from(DbusError::from(err)))?;
 
         let (enabled, layout) = self.runtime.last_confirmed_status();

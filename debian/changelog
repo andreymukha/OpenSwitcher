@@ -1,3 +1,12 @@
+open-switcher (0.1.1-1) unstable; urgency=medium
+
+  * Release the audited input lifecycle and synthetic-input safety fixes.
+  * Harden seat-aware device access, package lifecycle, and layout detection.
+  * Preserve concurrent clipboard and settings updates on supported paths.
+  * Retire the unsupported direct dev runtime and refresh documentation.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 11 Aug 2026 22:50:00 +0300
+
 open-switcher (0.1.0-8) unstable; urgency=medium
 
   * Save configuration with a same-directory atomic replacement.

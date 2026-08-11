@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{report_config_commit_outcome, AppConfig};
 use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
 use crate::daemon::debug_log::{format_layout, try_debug_line, DebugLogKind};
 use crate::daemon::input_snapshot::{
@@ -135,7 +135,8 @@ impl ConfigService {
         if should_detect_layout_switch(&config) {
             let detected = detect_layout_switch_setting(context, detector);
             if apply_detected_layout_switch_if_changed(&mut config, detected) {
-                config.save_to_path(&config_path)?;
+                let outcome = config.save_to_path(&config_path)?;
+                report_config_commit_outcome("startup layout detection", &outcome);
             }
         }
 
@@ -170,9 +171,10 @@ impl ConfigService {
             .map_err(|_| SettingsError::LockPoisoned)?;
         let mut updated = config.clone();
         updated.apply_settings(settings);
-        updated
+        let outcome = updated
             .save_to_path(&self.config_path)
             .map_err(SettingsError::SaveFailed)?;
+        report_config_commit_outcome("settings update", &outcome);
         *config = updated;
 
         Ok(UpdateSettingsResult {
@@ -183,7 +185,9 @@ impl ConfigService {
 
     pub fn save(&self) -> Result<(), ConfigError> {
         let config = self.inner.read().map_err(|_| ConfigError::LockPoisoned)?;
-        config.save_to_path(&self.config_path)
+        config.save_to_path(&self.config_path).map(|outcome| {
+            report_config_commit_outcome("explicit save", &outcome);
+        })
     }
 
     pub fn snapshot(&self) -> Result<RuntimeConfigSnapshot, SettingsError> {

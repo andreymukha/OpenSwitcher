@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+mod atomic;
+pub use atomic::ConfigCommitOutcome;
+
+pub(crate) fn report_config_commit_outcome(context: &'static str, outcome: &ConfigCommitOutcome) {
+    if let ConfigCommitOutcome::CommittedDurabilityUncertain(error) = outcome {
+        eprintln!(
+            "[config] Configuration was committed during {context}, but directory sync failed: {error}"
+        );
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppConfig {
     pub layout: LayoutConfig,
@@ -77,7 +88,8 @@ impl AppConfig {
     pub fn load_or_create(path: &Path) -> Result<Self, ConfigError> {
         if !path.exists() {
             let default_config = Self::default();
-            default_config.save_to_path(path)?;
+            let outcome = default_config.save_to_path(path)?;
+            report_config_commit_outcome("initial creation", &outcome);
             return Ok(default_config);
         }
 
@@ -86,14 +98,15 @@ impl AppConfig {
         AppConfig::try_from(file)
     }
 
-    pub fn save_to_path(&self, path: &Path) -> Result<(), ConfigError> {
+    pub fn save_to_path(&self, path: &Path) -> Result<ConfigCommitOutcome, ConfigError> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let content = toml::to_string_pretty(&AppConfigFile::from(self))?;
-        fs::write(path, content)?;
-        Ok(())
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)?;
+        Ok(atomic::atomic_replace(path, content.as_bytes())?)
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
@@ -255,6 +268,8 @@ mod tests {
         HotkeySpec, HotkeyTrigger, SelectedTextHotkey, SessionType, SystemContext, UndoKey,
         INPUT_KEY_DELAY_MAX_MS, MAX_CORRECTION_SCHEDULE_MS,
     };
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
     // Test helpers
@@ -720,6 +735,40 @@ selected_text_switch_hotkey = "ShiftPause"
         assert_eq!(loaded.layout.delay_ms, 123);
         assert_eq!(loaded.delays.backspace_ms, 4);
         assert_eq!(loaded.delays.typing_ms, 5);
+    }
+
+    #[test]
+    fn invalid_save_keeps_existing_config_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.toml");
+        fs::write(&path, "known-old-config").unwrap();
+        let mut invalid = AppConfig::default();
+        invalid.layout.delay_ms = crate::model::LAYOUT_DELAY_MAX_MS + 1;
+
+        assert!(invalid.save_to_path(&path).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), "known-old-config");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_to_path_replaces_symlink_instead_of_following_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let target = temp_dir.path().join("unexpected-target");
+        let path = temp_dir.path().join("config.toml");
+        fs::write(&target, "target-old").unwrap();
+        symlink(&target, &path).unwrap();
+
+        AppConfig::default().save_to_path(&path).unwrap();
+
+        assert!(!fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(target).unwrap(), "target-old");
+        assert_eq!(
+            AppConfig::load_or_create(&path).unwrap(),
+            AppConfig::default()
+        );
     }
 
     #[test]

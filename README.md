@@ -47,10 +47,11 @@ desktop-specific layout detection/observation support.
 For normal use, download the Debian package from the GitHub Release and install it locally:
 
 ```bash
-sudo apt install ./open-switcher_0.1.0-4_amd64.deb
+sudo apt install ./open-switcher_VERSION_amd64.deb
 ```
 
-Add `--reinstall` only when reinstalling the same package version that is already installed.
+Replace `VERSION` with the version in the downloaded filename. Add `--reinstall` only when
+reinstalling the same package version that is already installed.
 
 Then start OpenSwitcher from the desktop application menu. The settings window controls whether
 OpenSwitcher starts automatically after login/reboot; launching it manually from the application

@@ -763,6 +763,20 @@ mod tests {
     }
 
     #[test]
+    fn sentinel_write_failure_before_mutation_preserves_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.fail_write_call = Some(1);
+        let mut transport = TestTransport::default();
+
+        assert!(SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .is_err());
+
+        assert_eq!(clipboard.write_calls, 1);
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
     fn rollback_failure_preserves_primary_copy_error() {
         let mut clipboard = TestClipboard::with_current_text("previous");
         clipboard.fail_write_call = Some(2);
@@ -777,6 +791,56 @@ mod tests {
 
         assert_eq!(error.to_string(), "copy failed");
         assert_eq!(clipboard.write_calls, 2);
+    }
+
+    #[test]
+    fn converted_write_failure_before_mutation_restores_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.queue_read(Ok("previous".into()));
+        clipboard.queue_read(Ok("Ghbdtn".into()));
+        clipboard.fail_write_call = Some(2);
+        let mut transport = TestTransport::default();
+
+        assert!(SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .is_err());
+
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn ambiguous_converted_write_failure_restores_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.queue_read(Ok("previous".into()));
+        clipboard.queue_read(Ok("Ghbdtn".into()));
+        clipboard.fail_write_call = Some(2);
+        clipboard.fail_write_after_mutation = true;
+        let mut transport = TestTransport::default();
+
+        assert!(SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .is_err());
+
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn sentinel_clear_failure_preserves_primary_copy_error() {
+        let mut clipboard = TestClipboard {
+            clear_should_fail: true,
+            ..TestClipboard::default()
+        };
+        let mut transport = TestTransport {
+            copy_should_fail: true,
+            ..TestTransport::default()
+        };
+
+        let error = SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "copy failed");
+        assert_eq!(clipboard.clear_calls, 1);
     }
 
     #[test]
@@ -815,5 +879,35 @@ mod tests {
 
         assert_eq!(clipboard.clear_calls, 1);
         assert_eq!(clipboard.current_text, None);
+    }
+
+    #[test]
+    fn copied_text_read_errors_timeout_and_restore_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.queue_read(Ok("previous".into()));
+        clipboard.queue_read(Err(SelectedTextError::ClipboardRead(
+            arboard::Error::ClipboardOccupied,
+        )));
+        clipboard.queue_read(Err(SelectedTextError::ClipboardRead(
+            arboard::Error::ContentNotAvailable,
+        )));
+        let mut transport = TestTransport::default();
+
+        let result = SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .unwrap();
+
+        assert_eq!(result, SelectedTextSwitchResult::NoSelectedText);
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn clipboard_transaction_keeps_existing_timing_bounds() {
+        assert_eq!(COPY_POLL_INTERVAL, Duration::from_millis(10));
+        assert_eq!(COPY_TIMEOUT, Duration::from_millis(900));
+        assert_eq!(COPY_CHANGE_STABLE_FOR, Duration::from_millis(60));
+        assert_eq!(COPY_MIN_ACCEPT_DELAY, Duration::from_millis(120));
+        assert_eq!(SENTINEL_CONFIRM_TIMEOUT, Duration::from_millis(120));
+        assert_eq!(PASTE_SETTLE_TIMEOUT, Duration::from_millis(300));
     }
 }

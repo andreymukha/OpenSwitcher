@@ -81,6 +81,7 @@ pub(super) struct ClipboardTransaction<'a, C: ClipboardAccess> {
     original_owner: Option<ClipboardOwnerToken>,
     current: Option<OwnedClipboardState>,
     pending_write: Option<PendingWrite>,
+    known_write_owners: Vec<ClipboardOwnerToken>,
     last_meaningful_text: Option<String>,
     finalized: bool,
 }
@@ -99,6 +100,7 @@ impl<'a, C: ClipboardAccess> ClipboardTransaction<'a, C> {
             original_owner: observation.owner,
             current: None,
             pending_write: None,
+            known_write_owners: Vec::new(),
             last_meaningful_text: None,
             finalized: false,
         }
@@ -125,10 +127,16 @@ impl<'a, C: ClipboardAccess> ClipboardTransaction<'a, C> {
             self.last_meaningful_text = Some(value.to_owned());
         }
         self.clipboard.set_text(value)?;
+        let owner = self.clipboard.owner_token();
+        if let Some(owner) = owner {
+            if !self.known_write_owners.contains(&owner) {
+                self.known_write_owners.push(owner);
+            }
+        }
         self.current = Some(OwnedClipboardState {
             kind,
             text: value.to_owned(),
-            owner: self.clipboard.owner_token(),
+            owner,
         });
         self.pending_write = None;
         Ok(())
@@ -252,6 +260,15 @@ impl<'a, C: ClipboardAccess> ClipboardTransaction<'a, C> {
             return OwnershipStatus::Owned;
         }
 
+        if self.pending_write.as_ref().is_some_and(|pending| {
+            observed_text.as_deref() == Some(pending.text.as_str())
+                && observation
+                    .owner
+                    .is_some_and(|owner| self.known_write_owners.contains(&owner))
+        }) {
+            return OwnershipStatus::Owned;
+        }
+
         if observation.owner.is_some() {
             OwnershipStatus::Foreign
         } else {
@@ -314,6 +331,15 @@ mod tests {
         fn with_text(text: &str) -> Self {
             Self {
                 text: Rc::new(RefCell::new(Some(text.to_owned()))),
+                owner: Rc::new(RefCell::new(Some(7))),
+                owner_reads: Rc::new(RefCell::new(VecDeque::new())),
+                owner_probe_available: Rc::new(RefCell::new(true)),
+            }
+        }
+
+        fn without_text() -> Self {
+            Self {
+                text: Rc::new(RefCell::new(None)),
                 owner: Rc::new(RefCell::new(Some(7))),
                 owner_reads: Rc::new(RefCell::new(VecDeque::new())),
                 owner_probe_available: Rc::new(RefCell::new(true)),
@@ -443,5 +469,39 @@ mod tests {
 
         assert_eq!(disposition, ClipboardDisposition::ExternalChangePreserved);
         assert_eq!(state.text().as_deref(), Some("Привет"));
+    }
+
+    #[test]
+    fn foreign_text_wins_during_drop_rollback() {
+        let state = SharedClipboardState::with_text("previous");
+        let mut clipboard = SharedClipboard {
+            state: state.clone(),
+        };
+        let mut transaction = ClipboardTransaction::begin(&mut clipboard);
+        transaction
+            .write_operation_text(OwnedTextKind::Sentinel, "unique sentinel")
+            .unwrap();
+
+        state.replace_text("foreign", 22);
+        drop(transaction);
+
+        assert_eq!(state.text().as_deref(), Some("foreign"));
+    }
+
+    #[test]
+    fn foreign_text_is_not_cleared_after_unrestorable_snapshot() {
+        let state = SharedClipboardState::without_text();
+        let mut clipboard = SharedClipboard {
+            state: state.clone(),
+        };
+        let mut transaction = ClipboardTransaction::begin(&mut clipboard);
+        transaction
+            .write_operation_text(OwnedTextKind::Sentinel, "unique sentinel")
+            .unwrap();
+
+        state.replace_text("foreign", 22);
+        transaction.finish_no_selected_text();
+
+        assert_eq!(state.text().as_deref(), Some("foreign"));
     }
 }

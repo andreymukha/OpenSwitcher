@@ -193,10 +193,8 @@ fn log_selected_text_job_result(result: &Result<SelectedTextSwitchResult, Switch
                 "result",
                 &format!("result=Replaced clipboard_disposition={clipboard_disposition:?}"),
             );
-            if *clipboard_disposition != ClipboardDisposition::Restored {
-                eprintln!(
-                    "[selected-text] Не удалось восстановить предыдущее содержимое буфера обмена."
-                );
+            if let Some(warning) = clipboard_warning(*clipboard_disposition) {
+                eprintln!("[selected-text] {warning}");
             }
         }
         Ok(SelectedTextSwitchResult::NoSelectedText) => {
@@ -210,9 +208,34 @@ fn log_selected_text_job_result(result: &Result<SelectedTextSwitchResult, Switch
     }
 }
 
+fn clipboard_warning(disposition: ClipboardDisposition) -> Option<&'static str> {
+    match disposition {
+        ClipboardDisposition::RestoreFailed => {
+            Some("Не удалось восстановить предыдущее содержимое буфера обмена.")
+        }
+        ClipboardDisposition::Restored
+        | ClipboardDisposition::ConvertedTextKept
+        | ClipboardDisposition::ExternalChangePreserved => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_warns_only_for_restore_failed() {
+        assert!(clipboard_warning(ClipboardDisposition::RestoreFailed).is_some());
+        assert_eq!(clipboard_warning(ClipboardDisposition::Restored), None);
+        assert_eq!(
+            clipboard_warning(ClipboardDisposition::ConvertedTextKept),
+            None
+        );
+        assert_eq!(
+            clipboard_warning(ClipboardDisposition::ExternalChangePreserved),
+            None
+        );
+    }
 
     #[test]
     fn selected_text_worker_startup_wait_is_bounded() {

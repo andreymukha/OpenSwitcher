@@ -8,14 +8,24 @@ use crate::model::{
 };
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 mod atomic;
 pub use atomic::ConfigCommitOutcome;
 
 pub(crate) fn report_config_commit_outcome(context: &'static str, outcome: &ConfigCommitOutcome) {
+    report_config_commit_outcome_to(std::io::stderr().lock(), context, outcome);
+}
+
+fn report_config_commit_outcome_to(
+    mut sink: impl Write,
+    context: &'static str,
+    outcome: &ConfigCommitOutcome,
+) {
     if let ConfigCommitOutcome::CommittedDurabilityUncertain(error) = outcome {
-        eprintln!(
+        let _ = writeln!(
+            sink,
             "[config] Configuration was committed during {context}, but directory sync failed: {error}"
         );
     }
@@ -271,6 +281,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
+
+    struct RejectingLogSink;
+
+    impl std::io::Write for RejectingLogSink {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("injected log sink failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected log sink failure"))
+        }
+    }
 
     // Test helpers
 
@@ -747,6 +769,15 @@ selected_text_switch_hotkey = "ShiftPause"
 
         assert!(invalid.save_to_path(&path).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "known-old-config");
+    }
+
+    #[test]
+    fn durability_warning_ignores_log_sink_failure() {
+        let outcome = ConfigCommitOutcome::CommittedDurabilityUncertain(std::io::Error::other(
+            "injected directory sync failure",
+        ));
+
+        report_config_commit_outcome_to(RejectingLogSink, "test commit", &outcome);
     }
 
     #[cfg(unix)]

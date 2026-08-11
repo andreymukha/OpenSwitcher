@@ -1,4 +1,4 @@
-use crate::config::{report_config_commit_outcome, AppConfig};
+use crate::config::{report_config_commit_outcome, AppConfig, ConfigCommitOutcome};
 use crate::daemon::capture::{CaptureEventOutcome, CaptureOwner, LayoutSwitchCaptureSession};
 use crate::daemon::debug_log::{format_layout, try_debug_line, DebugLogKind};
 use crate::daemon::input_snapshot::{
@@ -25,8 +25,8 @@ use crate::layout_switch::{
 use crate::model::{
     estimated_correction_schedule_ms, DesktopEnvironment, DetectionConfidence, DistroKind,
     HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, LayoutSwitchSetting, SessionType,
-    Settings, SettingsDto, SystemContext, UpdateSettingsResult, MAX_CORRECTION_EXTRA_BACKSPACES,
-    MAX_CORRECTION_KEYSTROKES, MAX_CORRECTION_SCHEDULE_MS,
+    Settings, SettingsDto, SettingsPatch, SystemContext, UpdateSettingsResult,
+    MAX_CORRECTION_EXTRA_BACKSPACES, MAX_CORRECTION_KEYSTROKES, MAX_CORRECTION_SCHEDULE_MS,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
 use std::path::PathBuf;
@@ -118,6 +118,11 @@ pub struct ConfigService {
     inner: RwLock<AppConfig>,
 }
 
+struct ConfigSettingsUpdate {
+    result: UpdateSettingsResult,
+    committed_snapshot: Option<RuntimeConfigSnapshot>,
+}
+
 impl ConfigService {
     pub fn load(config_path: PathBuf) -> Result<Self, ConfigError> {
         let context = SystemContextDetector::detect_current()?;
@@ -160,27 +165,52 @@ impl ConfigService {
             .map_err(|_| SettingsError::LockPoisoned)
     }
 
-    pub fn update_settings(
+    fn update_settings_patch(
         &self,
-        settings: Settings,
-    ) -> Result<UpdateSettingsResult, SettingsError> {
-        let settings = settings.validate()?;
+        patch: SettingsPatch,
+    ) -> Result<ConfigSettingsUpdate, SettingsError> {
         let mut config = self
             .inner
             .write()
             .map_err(|_| SettingsError::LockPoisoned)?;
+        let current = config.settings();
+        let merged = patch.apply_to(current)?;
+        if merged == current {
+            return Ok(ConfigSettingsUpdate {
+                result: UpdateSettingsResult {
+                    message: "Настройки уже актуальны.".to_string(),
+                    restart_required: false,
+                    settings: SettingsDto::from(current),
+                },
+                committed_snapshot: None,
+            });
+        }
+
         let mut updated = config.clone();
-        updated.apply_settings(settings);
+        updated.apply_settings(merged);
         let outcome = updated
             .save_to_path(&self.config_path)
             .map_err(SettingsError::SaveFailed)?;
-        report_config_commit_outcome("settings update", &outcome);
+        let durability_uncertain = matches!(
+            outcome,
+            ConfigCommitOutcome::CommittedDurabilityUncertain(_)
+        );
+        let snapshot = RuntimeConfigSnapshot::from(&updated);
         *config = updated;
+        report_config_commit_outcome("settings update", &outcome);
 
-        Ok(UpdateSettingsResult {
-            message: "Настройки сохранены и применены без перезапуска.".to_string(),
-            restart_required: false,
-            settings: SettingsDto::from(settings),
+        Ok(ConfigSettingsUpdate {
+            result: UpdateSettingsResult {
+                message: if durability_uncertain {
+                    "Настройки применены, но устойчивость записи после сбоя питания не подтверждена."
+                        .to_string()
+                } else {
+                    "Настройки сохранены и применены без перезапуска.".to_string()
+                },
+                restart_required: false,
+                settings: SettingsDto::from(merged),
+            },
+            committed_snapshot: Some(snapshot),
         })
     }
 
@@ -3846,10 +3876,14 @@ impl RuntimeState {
             .settings_update_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let mut settings = self.get_settings()?;
-        settings.auto_switch_enabled = !settings.auto_switch_enabled;
-        self.update_settings_under_gate(settings)?;
-        Ok(settings.auto_switch_enabled)
+        let current = self.get_settings()?;
+        let desired = Settings {
+            auto_switch_enabled: !current.auto_switch_enabled,
+            ..current
+        };
+        let result =
+            self.update_settings_patch_under_gate(SettingsPatch::between(current, desired))?;
+        Ok(result.settings.auto_switch_enabled)
     }
 
     pub fn current_layout(&self) -> bool {
@@ -4457,21 +4491,29 @@ impl RuntimeState {
         &self,
         settings: Settings,
     ) -> Result<UpdateSettingsResult, SettingsError> {
+        self.update_settings_patch(SettingsPatch::all(settings))
+    }
+
+    pub fn update_settings_patch(
+        &self,
+        patch: SettingsPatch,
+    ) -> Result<UpdateSettingsResult, SettingsError> {
         let _gate = self
             .settings_update_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        self.update_settings_under_gate(settings)
+        self.update_settings_patch_under_gate(patch)
     }
 
-    fn update_settings_under_gate(
+    fn update_settings_patch_under_gate(
         &self,
-        settings: Settings,
+        patch: SettingsPatch,
     ) -> Result<UpdateSettingsResult, SettingsError> {
-        let result = self.config_service.update_settings(settings)?;
-        let snapshot = self.config_service.snapshot()?;
-        self.publish_committed_config(snapshot);
-        Ok(result)
+        let update = self.config_service.update_settings_patch(patch)?;
+        if let Some(snapshot) = update.committed_snapshot {
+            self.publish_committed_config(snapshot);
+        }
+        Ok(update.result)
     }
 
     fn publish_committed_config(&self, snapshot: RuntimeConfigSnapshot) {
@@ -5272,6 +5314,9 @@ fn layout_label(is_english: bool) -> &'static str {
 mod input_snapshot_config_tests {
     use super::*;
     use crate::daemon::input_snapshot::SnapshotTryLoad;
+    use crate::model::{
+        AutoDetectedLayoutSwitch, DetectionStrategy, LayoutSwitchSource, SettingsPatch,
+    };
     use tempfile::TempDir;
 
     fn test_runtime_with_config_path(config_path: PathBuf) -> RuntimeState {
@@ -5384,5 +5429,132 @@ mod input_snapshot_config_tests {
         let after = runtime.input_snapshot_before_grab();
         assert_eq!(after.config_generation, before.config_generation + 2);
         assert_eq!(after.enabled, runtime.is_enabled());
+    }
+
+    #[test]
+    fn unrelated_patch_preserves_latest_tray_toggle() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let runtime = test_runtime_with_config_path(config_path.clone());
+        assert!(!runtime.toggle_enabled_result().unwrap());
+
+        let base = Settings::default();
+        let desired = Settings {
+            fix_two_capitals: true,
+            ..base
+        };
+        let result = runtime
+            .update_settings_patch(SettingsPatch::between(base, desired))
+            .unwrap();
+
+        let actual = runtime.get_settings().unwrap();
+        assert!(!actual.auto_switch_enabled);
+        assert!(actual.fix_two_capitals);
+        assert_eq!(Settings::try_from(result.settings).unwrap(), actual);
+        assert_eq!(
+            AppConfig::load_or_create(&config_path).unwrap().settings(),
+            actual
+        );
+    }
+
+    #[test]
+    fn same_field_patch_after_tray_toggle_wins_last() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let runtime = test_runtime_with_config_path(config_path.clone());
+        assert!(!runtime.toggle_enabled_result().unwrap());
+        let disabled = Settings {
+            auto_switch_enabled: false,
+            ..Settings::default()
+        };
+
+        let result = runtime
+            .update_settings_patch(SettingsPatch::between(disabled, Settings::default()))
+            .unwrap();
+
+        assert!(runtime.is_enabled());
+        assert!(runtime.get_settings().unwrap().auto_switch_enabled);
+        assert!(result.settings.auto_switch_enabled);
+        assert!(
+            runtime
+                .input_snapshot_before_grab()
+                .config
+                .auto_switch_enabled
+        );
+        assert!(
+            AppConfig::load_or_create(&config_path)
+                .unwrap()
+                .features
+                .auto_switch_enabled
+        );
+    }
+
+    #[test]
+    fn empty_patch_does_not_write_or_publish_generation() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let runtime = test_runtime_with_config_path(config_path.clone());
+        let before = runtime.input_snapshot_before_grab();
+        let current = runtime.get_settings().unwrap();
+
+        let result = runtime
+            .update_settings_patch(SettingsPatch::between(current, current))
+            .unwrap();
+
+        let after = runtime.input_snapshot_before_grab();
+        assert_eq!(after.config_generation, before.config_generation);
+        assert_eq!(runtime.get_settings().unwrap(), current);
+        assert!(!config_path.exists());
+        assert_eq!(Settings::try_from(result.settings).unwrap(), current);
+    }
+
+    #[test]
+    fn unrelated_patch_preserves_runtime_redetected_layout_switch() {
+        let temp = TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let runtime = test_runtime_with_config_path(config_path.clone());
+        {
+            let mut config = runtime.config_service.inner.write().unwrap();
+            config.layout.switch_source = LayoutSwitchSource::AutoDetected;
+            config.layout.auto_detected = AutoDetectedLayoutSwitch {
+                strategy: DetectionStrategy::CinnamonX11GSettingsXkbOptions,
+                confidence: DetectionConfidence::High,
+                context: SystemContext::default(),
+            };
+        }
+        let detected = LayoutSwitchSetting {
+            combo: LayoutSwitchCombo::super_space(),
+            source: LayoutSwitchSource::AutoDetected,
+            auto_detected: AutoDetectedLayoutSwitch {
+                strategy: DetectionStrategy::GnomeWaylandGSettingsWmKeybindings,
+                confidence: DetectionConfidence::High,
+                context: SystemContext::default(),
+            },
+        };
+        assert!(runtime
+            .config_service
+            .apply_detected_layout_switch_runtime(detected)
+            .unwrap()
+            .is_some());
+        let base = Settings::default();
+        let desired = Settings {
+            fix_two_capitals: true,
+            ..base
+        };
+
+        runtime
+            .update_settings_patch(SettingsPatch::between(base, desired))
+            .unwrap();
+
+        let actual = runtime.get_settings().unwrap();
+        assert!(actual.fix_two_capitals);
+        assert_eq!(actual.layout_switch, detected);
+        assert_eq!(
+            AppConfig::load_or_create(&config_path)
+                .unwrap()
+                .settings()
+                .layout_switch,
+            detected
+        );
     }
 }

@@ -1,3 +1,4 @@
+use super::clipboard_transaction::OwnedTextKind;
 use super::clipboard_transaction::{ClipboardAccess, ClipboardSnapshot, ClipboardTransaction};
 use super::engine::{ConversionOutcome, LayoutConversionEngine};
 use super::SelectedTextSwitchResult;
@@ -89,7 +90,7 @@ impl SelectedTextOperation {
             ),
         );
 
-        transaction.write_text(&sentinel)?;
+        transaction.write_operation_text(OwnedTextKind::Sentinel, &sentinel)?;
         log_selected_text_debug("clipboard-set-sentinel", &format!("sentinel={sentinel}"));
         let sentinel_confirmed = wait_for_clipboard_sentinel(&mut transaction, &sentinel);
         transport.copy_selection()?;
@@ -106,6 +107,7 @@ impl SelectedTextOperation {
                     "copy-received",
                     &format!("selected_text={}", summarize_text(&text)),
                 );
+                transaction.adopt_selected_text(&text);
                 text
             }
             CopyOutcome::TimedOut => {
@@ -127,7 +129,7 @@ impl SelectedTextOperation {
                 summarize_text(&converted_text)
             ),
         );
-        transaction.write_text(&converted_text)?;
+        transaction.write_operation_text(OwnedTextKind::Converted, &converted_text)?;
         log_selected_text_debug("clipboard-set-converted", &summarize_text(&converted_text));
         transport.paste_selection()?;
         log_selected_text_debug("paste-sent", "selection paste shortcut dispatched");
@@ -366,7 +368,10 @@ mod tests {
     struct TestClipboard {
         current_text: Option<String>,
         pending_reads: VecDeque<Result<String, SelectedTextError>>,
+        write_calls: usize,
         clear_calls: usize,
+        fail_write_call: Option<usize>,
+        fail_write_after_mutation: bool,
         clear_should_fail: bool,
     }
 
@@ -375,7 +380,10 @@ mod tests {
             Self {
                 current_text: Some(text.into()),
                 pending_reads: VecDeque::new(),
+                write_calls: 0,
                 clear_calls: 0,
+                fail_write_call: None,
+                fail_write_after_mutation: false,
                 clear_should_fail: false,
             }
         }
@@ -402,7 +410,15 @@ mod tests {
         }
 
         fn set_text(&mut self, value: &str) -> Result<(), SelectedTextError> {
+            self.write_calls += 1;
+            let should_fail = self.fail_write_call == Some(self.write_calls);
+            if should_fail && !self.fail_write_after_mutation {
+                return Err(clipboard_write_error("write failed before mutation"));
+            }
             self.current_text = Some(value.to_string());
+            if should_fail {
+                return Err(clipboard_write_error("write failed after mutation"));
+            }
             Ok(())
         }
 
@@ -422,18 +438,36 @@ mod tests {
     struct TestTransport {
         copied: bool,
         pasted: bool,
+        copy_should_fail: bool,
+        paste_should_fail: bool,
+        copy_should_panic: bool,
+        paste_should_panic: bool,
     }
 
     impl SelectionTransport for TestTransport {
         fn copy_selection(&mut self) -> Result<(), SwitcherError> {
+            assert!(!self.copy_should_panic, "copy panic");
+            if self.copy_should_fail {
+                return Err(std::io::Error::other("copy failed").into());
+            }
             self.copied = true;
             Ok(())
         }
 
         fn paste_selection(&mut self) -> Result<(), SwitcherError> {
+            assert!(!self.paste_should_panic, "paste panic");
+            if self.paste_should_fail {
+                return Err(std::io::Error::other("paste failed").into());
+            }
             self.pasted = true;
             Ok(())
         }
+    }
+
+    fn clipboard_write_error(description: &'static str) -> SelectedTextError {
+        SelectedTextError::ClipboardWrite(arboard::Error::Unknown {
+            description: description.into(),
+        })
     }
 
     #[test]
@@ -531,8 +565,7 @@ mod tests {
                 })),
                 Ok("Ghbdtn".into()),
             ]),
-            clear_calls: 0,
-            clear_should_fail: false,
+            ..TestClipboard::default()
         };
         let mut transport = TestTransport::default();
 
@@ -563,8 +596,8 @@ mod tests {
                 })),
                 Ok("Ghbdtn".into()),
             ]),
-            clear_calls: 0,
             clear_should_fail: true,
+            ..TestClipboard::default()
         };
         let mut transport = TestTransport::default();
 
@@ -622,5 +655,128 @@ mod tests {
     #[test]
     fn paste_settle_window_covers_delayed_x11_clipboard_requests() {
         assert!(PASTE_SETTLE_TIMEOUT >= Duration::from_millis(300));
+    }
+
+    #[test]
+    fn copy_failure_restores_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        let mut transport = TestTransport {
+            copy_should_fail: true,
+            ..TestTransport::default()
+        };
+
+        let error = SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "copy failed");
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn paste_failure_restores_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.queue_read(Ok("previous".into()));
+        clipboard.queue_read(Ok("Ghbdtn".into()));
+        let mut transport = TestTransport {
+            paste_should_fail: true,
+            ..TestTransport::default()
+        };
+
+        let error = SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "paste failed");
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn copy_panic_runs_drop_rollback() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        let mut transport = TestTransport {
+            copy_should_panic: true,
+            ..TestTransport::default()
+        };
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = SelectedTextOperation.execute(
+                &mut clipboard,
+                &mut transport,
+                &LayoutConversionEngine,
+            );
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn ambiguous_sentinel_write_failure_restores_previous_text() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.fail_write_call = Some(1);
+        clipboard.fail_write_after_mutation = true;
+        let mut transport = TestTransport::default();
+
+        assert!(SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .is_err());
+
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn rollback_failure_preserves_primary_copy_error() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.fail_write_call = Some(2);
+        let mut transport = TestTransport {
+            copy_should_fail: true,
+            ..TestTransport::default()
+        };
+
+        let error = SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .unwrap_err();
+
+        assert_eq!(error.to_string(), "copy failed");
+        assert_eq!(clipboard.write_calls, 2);
+    }
+
+    #[test]
+    fn paste_panic_runs_drop_rollback() {
+        let mut clipboard = TestClipboard::with_current_text("previous");
+        clipboard.queue_read(Ok("previous".into()));
+        clipboard.queue_read(Ok("Ghbdtn".into()));
+        let mut transport = TestTransport {
+            paste_should_panic: true,
+            ..TestTransport::default()
+        };
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = SelectedTextOperation.execute(
+                &mut clipboard,
+                &mut transport,
+                &LayoutConversionEngine,
+            );
+        }));
+
+        assert!(unwind.is_err());
+        assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
+    }
+
+    #[test]
+    fn copy_failure_clears_owned_sentinel_when_original_is_unrestorable() {
+        let mut clipboard = TestClipboard::default();
+        let mut transport = TestTransport {
+            copy_should_fail: true,
+            ..TestTransport::default()
+        };
+
+        assert!(SelectedTextOperation
+            .execute(&mut clipboard, &mut transport, &LayoutConversionEngine)
+            .is_err());
+
+        assert_eq!(clipboard.clear_calls, 1);
+        assert_eq!(clipboard.current_text, None);
     }
 }

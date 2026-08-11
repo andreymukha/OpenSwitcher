@@ -27,8 +27,8 @@ override_dh_auto_build: check-rust-toolchain
 	$(CARGO) build --release --locked --features settings-ui
 
 override_dh_auto_test: check-rust-toolchain
-	$(CARGO) test --locked
-	$(CARGO) test --locked --features settings-ui --lib
+	$(CARGO) test --locked -- --test-threads=1
+	$(CARGO) test --locked --features settings-ui --lib -- --test-threads=1
 	bash tests/wayland_diagnostics_test.sh
 	bash tests/input_access_package_test.sh
 	bash tests/debian_package_scripts_test.sh

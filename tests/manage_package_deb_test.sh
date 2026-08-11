@@ -149,6 +149,10 @@ grep -Fq "git diff --check" "$CALL_LOG"
 grep -Fq "lintian $DIST_DEB" "$CALL_LOG"
 grep -Fq "sudo apt install $DIST_DEB" "$OUTPUT_LOG"
 grep -Fq "The .ddeb file is optional and only needed for debugging." "$OUTPUT_LOG"
+grep -Fq '$(CARGO) test --locked -- --test-threads=1' "$REPO_ROOT/debian/rules"
+grep -Fq \
+    '$(CARGO) test --locked --features settings-ui --lib -- --test-threads=1' \
+    "$REPO_ROOT/debian/rules"
 
 [[ -f "$DIST_DEB" ]]
 [[ -f "$DIST_DDEB" ]]

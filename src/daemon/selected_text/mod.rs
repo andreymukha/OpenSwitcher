@@ -1,4 +1,5 @@
 mod clipboard;
+mod clipboard_transaction;
 mod debug;
 mod engine;
 mod runner;
@@ -13,11 +14,19 @@ pub(crate) use debug::summarize_text;
 pub use engine::ConversionDirection;
 pub use runner::SelectedTextJobRunner;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClipboardDisposition {
+    Restored,
+    ConvertedTextKept,
+    ExternalChangePreserved,
+    RestoreFailed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SelectedTextSwitchResult {
     Replaced {
         direction: ConversionDirection,
-        clipboard_restored: bool,
+        clipboard_disposition: ClipboardDisposition,
     },
     NoSelectedText,
 }

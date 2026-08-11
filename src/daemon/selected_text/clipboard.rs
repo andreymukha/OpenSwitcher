@@ -1,3 +1,4 @@
+use super::clipboard_transaction::{ClipboardAccess, ClipboardSnapshot, ClipboardTransaction};
 use super::engine::{ConversionOutcome, LayoutConversionEngine};
 use super::SelectedTextSwitchResult;
 use super::{log_selected_text_debug, summarize_text};
@@ -13,12 +14,6 @@ const COPY_CHANGE_STABLE_FOR: Duration = Duration::from_millis(60);
 const COPY_MIN_ACCEPT_DELAY: Duration = Duration::from_millis(120);
 const SENTINEL_CONFIRM_TIMEOUT: Duration = Duration::from_millis(120);
 const PASTE_SETTLE_TIMEOUT: Duration = Duration::from_millis(300);
-
-pub(super) trait ClipboardAccess {
-    fn get_text(&mut self) -> Result<String, SelectedTextError>;
-    fn set_text(&mut self, value: &str) -> Result<(), SelectedTextError>;
-    fn clear(&mut self) -> Result<(), SelectedTextError>;
-}
 
 pub(super) trait SelectionTransport {
     fn copy_selection(&mut self) -> Result<(), SwitcherError>;
@@ -67,12 +62,6 @@ impl SelectionTransport for SelectionKeyboardTransport {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ClipboardSnapshot {
-    Text(String),
-    Unavailable,
-}
-
 enum CopyOutcome {
     SelectedText(String),
     TimedOut,
@@ -88,7 +77,8 @@ impl SelectedTextOperation {
         transport: &mut impl SelectionTransport,
         converter: &LayoutConversionEngine,
     ) -> Result<SelectedTextSwitchResult, SwitcherError> {
-        let previous_clipboard = snapshot_clipboard(clipboard);
+        let mut transaction = ClipboardTransaction::begin(clipboard);
+        let previous_clipboard = transaction.original().clone();
         let sentinel = unique_clipboard_sentinel();
 
         log_selected_text_debug(
@@ -99,14 +89,14 @@ impl SelectedTextOperation {
             ),
         );
 
-        clipboard.set_text(&sentinel)?;
+        transaction.write_text(&sentinel)?;
         log_selected_text_debug("clipboard-set-sentinel", &format!("sentinel={sentinel}"));
-        let sentinel_confirmed = wait_for_clipboard_sentinel(clipboard, &sentinel);
+        let sentinel_confirmed = wait_for_clipboard_sentinel(&mut transaction, &sentinel);
         transport.copy_selection()?;
         log_selected_text_debug("copy-sent", "selection copy shortcut dispatched");
 
         let selected_text = match wait_for_copied_text(
-            clipboard,
+            &mut transaction,
             &sentinel,
             &previous_clipboard,
             sentinel_confirmed,
@@ -120,7 +110,7 @@ impl SelectedTextOperation {
             }
             CopyOutcome::TimedOut => {
                 log_selected_text_debug("copy-timeout", "clipboard did not change before timeout");
-                let _ = restore_clipboard(clipboard, &previous_clipboard, None);
+                transaction.finish_no_selected_text();
                 return Ok(SelectedTextSwitchResult::NoSelectedText);
             }
         };
@@ -137,22 +127,21 @@ impl SelectedTextOperation {
                 summarize_text(&converted_text)
             ),
         );
-        clipboard.set_text(&converted_text)?;
+        transaction.write_text(&converted_text)?;
         log_selected_text_debug("clipboard-set-converted", &summarize_text(&converted_text));
         transport.paste_selection()?;
         log_selected_text_debug("paste-sent", "selection paste shortcut dispatched");
         wait_for_paste_settle();
 
-        let clipboard_restored =
-            restore_clipboard(clipboard, &previous_clipboard, Some(&converted_text));
+        let clipboard_disposition = transaction.finish_success();
         log_selected_text_debug(
             "restore-finished",
-            &format!("clipboard_restored={clipboard_restored}"),
+            &format!("clipboard_disposition={clipboard_disposition:?}"),
         );
 
         Ok(SelectedTextSwitchResult::Replaced {
             direction,
-            clipboard_restored,
+            clipboard_disposition,
         })
     }
 }
@@ -211,13 +200,6 @@ fn wait_for_clipboard_sentinel(clipboard: &mut impl ClipboardAccess, sentinel: &
     }
 }
 
-fn snapshot_clipboard(clipboard: &mut impl ClipboardAccess) -> ClipboardSnapshot {
-    match clipboard.get_text() {
-        Ok(text) => ClipboardSnapshot::Text(text),
-        Err(_) => ClipboardSnapshot::Unavailable,
-    }
-}
-
 fn wait_for_copied_text(
     clipboard: &mut impl ClipboardAccess,
     sentinel: &str,
@@ -254,7 +236,7 @@ fn wait_for_copied_text(
                 let elapsed = started.elapsed();
                 let matches_previous = matches!(
                     previous_clipboard,
-                    ClipboardSnapshot::Text(previous) if previous == &text
+                    ClipboardSnapshot::RestorableText(previous) if previous == &text
                 );
                 let should_ignore =
                     elapsed < COPY_MIN_ACCEPT_DELAY || (matches_previous && !observed_sentinel);
@@ -319,7 +301,7 @@ fn wait_for_copied_text(
             if let Some(text) = candidate_text {
                 let matches_previous = matches!(
                     previous_clipboard,
-                    ClipboardSnapshot::Text(previous) if previous == &text
+                    ClipboardSnapshot::RestorableText(previous) if previous == &text
                 );
                 if matches_previous && !observed_sentinel {
                     log_selected_text_debug(
@@ -356,39 +338,6 @@ fn wait_for_paste_settle() {
     thread::sleep(PASTE_SETTLE_TIMEOUT);
 }
 
-fn restore_clipboard(
-    clipboard: &mut impl ClipboardAccess,
-    previous: &ClipboardSnapshot,
-    fallback_text: Option<&str>,
-) -> bool {
-    match previous {
-        ClipboardSnapshot::Text(text) => {
-            let restored = clipboard.set_text(text).is_ok();
-            log_selected_text_debug(
-                "restore-text",
-                &format!("restored={restored} text={}", summarize_text(text)),
-            );
-            restored
-        }
-        ClipboardSnapshot::Unavailable => {
-            if clipboard.clear().is_ok() {
-                log_selected_text_debug("restore-clear", "restored=true via clipboard.clear()");
-                true
-            } else if let Some(text) = fallback_text {
-                let restored = clipboard.set_text(text).is_ok();
-                log_selected_text_debug(
-                    "restore-fallback",
-                    &format!("restored={restored} text={}", summarize_text(text)),
-                );
-                restored
-            } else {
-                log_selected_text_debug("restore-failed", "no previous text and no fallback");
-                false
-            }
-        }
-    }
-}
-
 fn unique_clipboard_sentinel() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -399,8 +348,10 @@ fn unique_clipboard_sentinel() -> String {
 
 fn describe_clipboard_snapshot(snapshot: &ClipboardSnapshot) -> String {
     match snapshot {
-        ClipboardSnapshot::Text(text) => format!("Text({})", summarize_text(text)),
-        ClipboardSnapshot::Unavailable => "Unavailable".to_string(),
+        ClipboardSnapshot::RestorableText(text) => {
+            format!("RestorableText({})", summarize_text(text))
+        }
+        ClipboardSnapshot::Unrestorable => "Unrestorable".to_string(),
     }
 }
 
@@ -408,6 +359,7 @@ fn describe_clipboard_snapshot(snapshot: &ClipboardSnapshot) -> String {
 mod tests {
     use super::*;
     use crate::daemon::selected_text::engine::ConversionDirection;
+    use crate::daemon::selected_text::ClipboardDisposition;
     use std::collections::VecDeque;
 
     #[derive(Default)]
@@ -509,7 +461,7 @@ mod tests {
             result,
             SelectedTextSwitchResult::Replaced {
                 direction: ConversionDirection::EnToRu,
-                clipboard_restored: true,
+                clipboard_disposition: ClipboardDisposition::Restored,
             }
         );
         assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
@@ -534,7 +486,7 @@ mod tests {
             result,
             SelectedTextSwitchResult::Replaced {
                 direction: ConversionDirection::EnToRu,
-                clipboard_restored: true,
+                clipboard_disposition: ClipboardDisposition::Restored,
             }
         );
         assert_eq!(clipboard.current_text.as_deref(), Some("previous"));
@@ -561,14 +513,14 @@ mod tests {
             result,
             SelectedTextSwitchResult::Replaced {
                 direction: ConversionDirection::EnToRu,
-                clipboard_restored: true,
+                clipboard_disposition: ClipboardDisposition::Restored,
             }
         );
         assert_eq!(clipboard.current_text.as_deref(), Some("old clipboard"));
     }
 
     #[test]
-    fn clears_clipboard_when_previous_text_was_unavailable() {
+    fn unrestorable_clipboard_keeps_converted_text_without_clear() {
         let converter = LayoutConversionEngine;
         let operation = SelectedTextOperation;
         let mut clipboard = TestClipboard {
@@ -592,15 +544,15 @@ mod tests {
             result,
             SelectedTextSwitchResult::Replaced {
                 direction: ConversionDirection::EnToRu,
-                clipboard_restored: true,
+                clipboard_disposition: ClipboardDisposition::ConvertedTextKept,
             }
         );
-        assert_eq!(clipboard.clear_calls, 1);
-        assert_eq!(clipboard.current_text, None);
+        assert_eq!(clipboard.clear_calls, 0);
+        assert_eq!(clipboard.current_text.as_deref(), Some("Привет"));
     }
 
     #[test]
-    fn falls_back_to_converted_text_when_clear_is_unavailable() {
+    fn unrestorable_clipboard_does_not_depend_on_clear_support() {
         let converter = LayoutConversionEngine;
         let operation = SelectedTextOperation;
         let mut clipboard = TestClipboard {
@@ -624,9 +576,10 @@ mod tests {
             result,
             SelectedTextSwitchResult::Replaced {
                 direction: ConversionDirection::EnToRu,
-                clipboard_restored: true,
+                clipboard_disposition: ClipboardDisposition::ConvertedTextKept,
             }
         );
+        assert_eq!(clipboard.clear_calls, 0);
         assert_eq!(clipboard.current_text.as_deref(), Some("Привет"));
     }
 
@@ -652,7 +605,7 @@ mod tests {
     #[test]
     fn accepts_selected_text_matching_previous_clipboard_after_sentinel_was_observed() {
         let selected_text = "А терминал можно вынести отдельно ";
-        let previous_clipboard = ClipboardSnapshot::Text(selected_text.to_string());
+        let previous_clipboard = ClipboardSnapshot::RestorableText(selected_text.to_string());
         let mut clipboard = TestClipboard::default();
         clipboard.queue_read(Ok("sentinel".into()));
         clipboard.queue_read(Ok(selected_text.into()));

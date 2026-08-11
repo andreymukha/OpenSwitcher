@@ -1,4 +1,7 @@
-use super::{log_selected_text_debug, SelectedTextSwitchResult, SelectedTextSwitchService};
+use super::{
+    log_selected_text_debug, ClipboardDisposition, SelectedTextSwitchResult,
+    SelectedTextSwitchService,
+};
 use crate::daemon::keyboard::log_input_debug;
 use crate::daemon::keyboard::SelectionKeyboardTransport;
 use crate::error::SwitcherError;
@@ -183,13 +186,14 @@ impl SelectedTextJobRunner {
 fn log_selected_text_job_result(result: &Result<SelectedTextSwitchResult, SwitcherError>) {
     match result {
         Ok(SelectedTextSwitchResult::Replaced {
-            clipboard_restored, ..
+            clipboard_disposition,
+            ..
         }) => {
             log_selected_text_debug(
                 "result",
-                &format!("result=Replaced clipboard_restored={clipboard_restored}"),
+                &format!("result=Replaced clipboard_disposition={clipboard_disposition:?}"),
             );
-            if !clipboard_restored {
+            if *clipboard_disposition != ClipboardDisposition::Restored {
                 eprintln!(
                     "[selected-text] Не удалось восстановить предыдущее содержимое буфера обмена."
                 );

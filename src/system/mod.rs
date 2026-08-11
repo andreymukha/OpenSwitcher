@@ -11,8 +11,6 @@ use std::process::Command;
 
 pub struct SystemContextDetector;
 
-const RUNTIME_MODE_ENV: &str = "OPEN_SWITCHER_RUNTIME_MODE";
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SessionEnvironment {
     xdg_session_type: Option<String>,
@@ -86,30 +84,6 @@ impl SessionDetectionSummary {
 struct SystemContextDetection {
     context: SystemContext,
     summary: SessionDetectionSummary,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeMode {
-    Dev,
-    Managed,
-}
-
-fn parse_runtime_mode(value: Option<&str>) -> RuntimeMode {
-    match value
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("dev") => RuntimeMode::Dev,
-        _ => RuntimeMode::Managed,
-    }
-}
-
-pub fn current_runtime_mode() -> RuntimeMode {
-    parse_runtime_mode(env::var(RUNTIME_MODE_ENV).ok().as_deref())
-}
-
-pub fn is_dev_runtime_mode() -> bool {
-    current_runtime_mode() == RuntimeMode::Dev
 }
 
 pub use user_services::{UserServiceController, DAEMON_UNIT, TRAY_UNIT};
@@ -666,17 +640,5 @@ mod tests {
                 distro: DistroKind::Ubuntu,
             }
         );
-    }
-
-    #[test]
-    fn runtime_mode_defaults_to_managed() {
-        assert_eq!(parse_runtime_mode(None), RuntimeMode::Managed);
-        assert_eq!(parse_runtime_mode(Some("managed")), RuntimeMode::Managed);
-    }
-
-    #[test]
-    fn runtime_mode_detects_dev_from_environment() {
-        assert_eq!(parse_runtime_mode(Some("dev")), RuntimeMode::Dev);
-        assert_eq!(parse_runtime_mode(Some("DEV")), RuntimeMode::Dev);
     }
 }

@@ -20,7 +20,6 @@ pub(crate) mod xtest_guardian;
 use crate::config::default_config_path;
 use crate::dbus::{CaptureOwnerMonitor, OpenSwitcherDbusApi, OBJECT_PATH, SERVICE_NAME};
 use crate::error::SwitcherError;
-use crate::system::is_dev_runtime_mode;
 use keyboard::{log_input_debug, WriterShutdownOutcome, WriterTerminalReport};
 use runtime::{log_layout_debug, BackendSyncResult, ConfigService, RuntimeState};
 use service::DaemonService;
@@ -79,17 +78,10 @@ pub fn run() -> Result<(), SwitcherError> {
         }
     }
     runtime.start_background_sync_polling();
-    if !is_dev_runtime_mode() {
-        let tray_probe = SessionBusTrayPresenceProbe {
-            connection: Connection::session()?,
-        };
-        runtime.start_tray_watchdog(tray_probe);
-    } else {
-        log_layout_debug(
-            "tray-watchdog-start",
-            "enabled=false reason=dev-runtime-mode",
-        );
-    }
+    let tray_probe = SessionBusTrayPresenceProbe {
+        connection: Connection::session()?,
+    };
+    runtime.start_tray_watchdog(tray_probe);
     let mut session_monitor = SessionActivityMonitor::start()?;
     let session_access = session_monitor.publication();
     let (connection, mut capture_owner_monitor) =

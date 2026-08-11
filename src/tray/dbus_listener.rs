@@ -1,6 +1,5 @@
 use crate::dbus::OpenSwitcherProxyBlocking;
 use crate::error::SwitcherError;
-use crate::system::is_dev_runtime_mode;
 use crate::system::UserServiceController;
 use crate::tray::single_instance::{
     start_daemon_with_retry, DAEMON_RECOVERY_DELAY, MAX_DAEMON_RECOVERY_ATTEMPTS,
@@ -76,10 +75,6 @@ impl DbusListener {
     }
 
     pub fn ensure_daemon_running(&self) -> Result<(), SwitcherError> {
-        if is_dev_runtime_mode() {
-            return Ok(());
-        }
-
         if self.daemon_is_available()? {
             return Ok(());
         }
@@ -101,7 +96,6 @@ impl DbusListener {
     ) {
         let connection = self.connection.clone();
         let services = self.services.clone();
-        let dev_runtime_mode = is_dev_runtime_mode();
         thread::spawn(move || loop {
             let daemon_available = match DBusProxy::new(&connection) {
                 Ok(proxy) => {
@@ -119,7 +113,7 @@ impl DbusListener {
                 }
             };
 
-            if !daemon_available && !dev_runtime_mode {
+            if !daemon_available {
                 eprintln!("[tray] Daemon is unavailable, attempting recovery...");
                 if let Err(err) = start_daemon_with_retry(
                     &services,

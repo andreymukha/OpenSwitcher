@@ -8,6 +8,9 @@
 
 **Tech Stack:** Rust 2021, `arboard 3.6.1`, `x11rb 0.13.2`, существующий selected-text worker, unit tests с fake clipboard/transport, Debian package и QEMU VM-лаборатория.
 
+**Статус выполнения:** завершён 2026-08-11; фактические результаты записаны в
+`docs/audits/2026-08-11-clipboard-transaction-validation.md`.
+
 ---
 
 ## Карта файлов

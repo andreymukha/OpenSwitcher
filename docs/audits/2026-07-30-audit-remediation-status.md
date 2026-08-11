@@ -1,12 +1,12 @@
 # Актуальный статус исправлений аудита OpenSwitcher
 
-**Дата:** 2026-07-31
+**Дата:** 2026-08-11
 
 **База `master`:**
-`064b792174740a9fbc39489dd7f4505fe7c8fa10`
+`e673c19e9d90495a476aa31d2fd532e4637f80a5`
 
 **Проверенный candidate:**
-`c6438ce2609f2cd6ef9cfc5680d3fe00d6e03929`
+`063610454aad6df4055e29aef899093debcb1e6f`
 
 **Исходный аудит:**
 `docs/audits/2026-07-15-openswitcher-deep-read-only-audit.md`
@@ -18,9 +18,10 @@ roadmap. Он сопоставляет каждое исходное замеч�
 исправлений и уже сохранёнными validation reports.
 
 Это не новая полная двухпрофильная runtime-кампания. Статус обновлён по
-сохранённым validation reports, включая целевую H-02/M-07 проверку с
-виртуальной QEMU-клавиатурой. Физические устройства, clipboard, layout,
-systemd, udev и ACL хоста не затрагивались.
+сохранённым validation reports, включая целевую H-02/M-07 проверку и
+двухпрофильную проверку clipboard-транзакции с виртуальной QEMU-клавиатурой.
+Физические устройства, clipboard, layout, systemd, udev и ACL хоста не
+затрагивались.
 
 Статусы означают:
 
@@ -28,20 +29,24 @@ systemd, udev и ACL хоста не затрагивались.
   автоматические либо package-first runtime-доказательства;
 - **частично закрыто** — опасная часть устранена, но один исходный сценарий
   остался без полного решения или доказательства;
+- **принятое продуктовое поведение** — исходный технический риск сознательно
+  принят в явно ограниченной форме, потому что иное поведение ухудшает основную
+  пользовательскую функцию;
 - **открыто** — исходная первопричина по-прежнему присутствует в текущем коде.
 
 ## Сводка
 
-| Исходная серьёзность | Закрыто | Частично закрыто | Открыто |
-|---|---:|---:|---:|
-| Critical | 1 | 0 | 0 |
-| High | 8 | 0 | 0 |
-| Medium | 4 | 0 | 6 |
-| Low | 2 | 0 | 0 |
-| **Всего** | **15** | **0** | **6** |
+| Исходная серьёзность | Закрыто | Принято | Частично закрыто | Открыто |
+|---|---:|---:|---:|---:|
+| Critical | 1 | 0 | 0 | 0 |
+| High | 8 | 0 | 0 | 0 |
+| Medium | 6 | 1 | 0 | 3 |
+| Low | 2 | 0 | 0 | 0 |
+| **Всего** | **17** | **1** | **0** | **3** |
 
-Открытых и частично закрытых Critical/High больше нет. Оставшиеся шесть
-замечаний имеют Medium severity.
+Открытых и частично закрытых Critical/High больше нет. Открыты только M-04,
+M-05 и M-06. M-02 отдельно зафиксирован как принятое продуктовое поведение, а
+не выдан за полное техническое восстановление произвольного MIME.
 
 ## Critical и High
 
@@ -78,9 +83,9 @@ systemd, udev и ACL хоста не затрагивались.
 
 | Finding | Статус | Текущее основание |
 |---|---|---|
-| M-01 — clipboard не восстанавливается на ранних ошибках | **Открыто** | После установки sentinel ошибки `copy_selection`, чтения, записи converted text или `paste_selection` выходят через `?` без общего rollback guard. |
-| M-02 — non-text clipboard теряется | **Открыто** | Snapshot хранит только `Text` либо `Unavailable`; MIME/image payload не сохраняется, а restore для `Unavailable` очищает clipboard. |
-| M-03 — restore затирает конкурентное изменение clipboard | **Открыто** | После фиксированного settle restore выполняется без проверки текущего owner/content generation. |
+| M-01 — clipboard не восстанавливается на ранних ошибках | **Закрыто** | `ClipboardTransaction` фиксирует намерение до внешней записи и выполняет единый условный rollback на ранних `?` и при unwind через `Drop`. Failure-at-every-step/panic matrix и package-first smoke в обеих VM пройдены. |
+| M-02 — non-text clipboard теряется | **Принятое продуктовое поведение** | Произвольные MIME не архивируются: картинка или другой невосстановимый payload может быть заменён. Это согласованная политика — операция не блокируется, а после успешной вставки в clipboard остаётся преобразованный текст. Служебный sentinel удаляется, когда владение им подтверждено. |
+| M-03 — restore затирает конкурентное изменение clipboard | **Закрыто в практической границе** | Restore требует согласованного owner/value/owner-наблюдения, совпадения owner и точного значения операции. Unit-тесты покрывают смену owner/value, а Mint/X11 и Ubuntu/Wayland сохранили конкурентную запись. Атомарного clipboard CAS нет, поэтому короткое протокольное TOCTOU-микроокно остаётся документированным ограничением. |
 | M-04 — конфигурация записывается неатомарно | **Открыто** | `AppConfig::save_to_path()` по-прежнему использует прямой `fs::write(path, content)` без temp file, `fsync` и atomic rename. |
 | M-05 — stale D-Bus settings update теряет изменения | **Открыто** | API по-прежнему принимает полный `SettingsDto` без revision/CAS; внутренний lock сериализует только момент записи. |
 | M-06 — stale PID file может получить чужой PID | **Открыто** | `manage.sh::is_running()` проверяет PID только через `kill -0`, после чего `stop_component()` может послать ему SIGTERM/SIGKILL без проверки executable/start time. |
@@ -101,16 +106,20 @@ systemd, udev и ACL хоста не затрагивались.
 На текущей линии исправлений имеются следующие evidence:
 
 - текущий Rust gate без optional settings UI: 957 passed, 1 ignored;
-- предыдущий H-07 gate с `--features settings-ui`: 1001 passed, 1 ignored;
+- текущий package gate с `--features settings-ui`: 1018 passed, 1 ignored;
 - package shell gates и `git diff --check`;
 - exact DEB `0.1.0-5` в Mint/Cinnamon/X11 и Ubuntu/GNOME/Wayland;
 - exact DEB `0.1.0-6` в целевой Mint/Cinnamon/X11 H-02/M-07 кампании;
+- exact DEB `0.1.0-7` в Mint/Cinnamon/X11 и Ubuntu/GNOME/Wayland для
+  M-01..M-03;
 - active upgrade, reinstall, remove и purge;
 - session deactivation/recovery и освобождение input backend;
 - F12, auto correction, исправление двух заглавных и accidental Caps Lock;
 - H-06 daemon/guardian crash evidence на предыдущем exact code slice;
 - H-07 fail-closed normal/transient/extra/same-count evidence;
 - H-02 held-key/pre-grab и M-07 triple unplug/replug evidence;
+- selected-text: восстановление прежнего текста, image/non-text fallback,
+  конкурентный owner и `NoSelectedText` без оставшегося sentinel в обеих VM;
 - пользовательский smoke установленного DEB на host.
 
 Этого достаточно для продолжения remediation без немедленного повторения всей
@@ -119,11 +128,9 @@ systemd, udev и ACL хоста не затрагивались.
 
 ## Приоритет продолжения
 
-1. **M-01..M-03:** одна транзакционная clipboard/selected-text граница с
-   rollback guard, сохранением поддерживаемых форматов и условным restore.
-2. **M-04 + M-05:** crash-safe config commit и revision/CAS для настроек.
-3. **M-06:** безопасная process identity для development lifecycle.
-4. После последнего изменения — одна объединённая финальная кампания.
+1. **M-04 + M-05:** crash-safe config commit и revision/CAS для настроек.
+2. **M-06:** безопасная process identity для development lifecycle.
+3. После последнего изменения — одна объединённая финальная кампания.
 
 После каждого slice выполняются только его regression tests, общий Rust/package
 gate и минимальный релевантный VM smoke. Полная двухпрофильная кампания не
@@ -138,7 +145,7 @@ gate и минимальный релевантный VM smoke. Полная д�
 3. обычную функциональную матрицу X11 и Wayland;
 4. повтор ключевых H-06/H-08 single-fault сценариев на объединённом коде;
 5. управляемый pre-grab queue test и unplug/replug для H-02/M-07;
-6. clipboard failure-at-every-step и concurrent-owner сценарии;
+6. повтор ключевых clipboard-сценариев на итоговом объединённом DEB;
 7. suspend/resume, если VM/desktop даёт воспроизводимую границу;
 8. ограниченный host happy-path acceptance без опасной fault injection.
 

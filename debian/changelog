@@ -1,3 +1,12 @@
+open-switcher (0.1.0-7) unstable; urgency=medium
+
+  * Restore text clipboard after selected-text failures and panic unwinds.
+  * Preserve concurrent clipboard updates instead of blindly restoring stale
+    data.
+  * Keep converted text when the previous clipboard format is not restorable.
+
+ -- Andrey Mukha <6871314+andreymukha@users.noreply.github.com>  Tue, 11 Aug 2026 12:39:05 +0300
+
 open-switcher (0.1.0-6) unstable; urgency=high
 
   * Close the remaining H-02 startup handoff gap by opening and grabbing the

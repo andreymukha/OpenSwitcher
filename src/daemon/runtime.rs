@@ -25,7 +25,7 @@ use crate::layout_switch::{
 use crate::model::{
     estimated_correction_schedule_ms, DesktopEnvironment, DetectionConfidence, DistroKind,
     HotkeySpec, LayoutSwitchCaptureState, LayoutSwitchCombo, LayoutSwitchSetting, SessionType,
-    Settings, SystemContext, UpdateSettingsResult, MAX_CORRECTION_EXTRA_BACKSPACES,
+    Settings, SettingsDto, SystemContext, UpdateSettingsResult, MAX_CORRECTION_EXTRA_BACKSPACES,
     MAX_CORRECTION_KEYSTROKES, MAX_CORRECTION_SCHEDULE_MS,
 };
 use crate::system::{SystemContextDetector, UserServiceController};
@@ -180,6 +180,7 @@ impl ConfigService {
         Ok(UpdateSettingsResult {
             message: "Настройки сохранены и применены без перезапуска.".to_string(),
             restart_required: false,
+            settings: SettingsDto::from(settings),
         })
     }
 

@@ -606,7 +606,7 @@ mod tests {
     use crate::error::ServiceManagerError;
     use crate::error::ValidationError;
     use crate::model::LayoutSwitchCapturePhase;
-    use crate::model::{LayoutSwitchSetting, LayoutSwitchSource, Settings};
+    use crate::model::{LayoutSwitchSetting, LayoutSwitchSource, Settings, SettingsDto};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -1270,9 +1270,14 @@ mod tests {
     #[test]
     fn save_keeps_persisted_changes_when_autostart_apply_fails_and_reloads_real_state() {
         let client = FakeSettingsClient::default();
+        let committed = Settings {
+            auto_switch_enabled: false,
+            ..Settings::default()
+        };
         client.push_save_result(Ok(UpdateSettingsResult {
             message: "saved".to_string(),
             restart_required: false,
+            settings: SettingsDto::from(committed),
         }));
 
         let temp_dir = tempfile::tempdir().unwrap();

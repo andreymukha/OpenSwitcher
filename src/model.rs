@@ -1041,10 +1041,183 @@ impl TryFrom<SettingsDto> for Settings {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(transparent)]
+pub struct SettingsFieldMask(u16);
+
+impl SettingsFieldMask {
+    pub const AUTO_SWITCH_ENABLED: Self = Self(1 << 0);
+    pub const FIX_TWO_CAPITALS: Self = Self(1 << 1);
+    pub const FIX_ACCIDENTAL_CAPS_LOCK: Self = Self(1 << 2);
+    pub const LAYOUT_DELAY_MS: Self = Self(1 << 3);
+    pub const MANUAL_CORRECTION_HOTKEY: Self = Self(1 << 4);
+    pub const SELECTED_TEXT_HOTKEY: Self = Self(1 << 5);
+    pub const LAYOUT_SWITCH: Self = Self(1 << 6);
+    const ALL_BITS: u16 = (1 << 7) - 1;
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn all() -> Self {
+        Self(Self::ALL_BITS)
+    }
+
+    pub const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u16 {
+        self.0
+    }
+
+    pub const fn contains(self, field: Self) -> bool {
+        self.0 & field.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn insert(&mut self, field: Self) {
+        self.0 |= field.0;
+    }
+
+    fn validate(self) -> Result<Self, ValidationError> {
+        let unknown = self.0 & !Self::ALL_BITS;
+        if unknown == 0 {
+            Ok(self)
+        } else {
+            Err(ValidationError::UnknownSettingsPatchFields { unknown })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+pub struct SettingsPatchDto {
+    pub changed: SettingsFieldMask,
+    pub values: SettingsDto,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SettingsPatch {
+    changed: SettingsFieldMask,
+    values: Settings,
+}
+
+impl SettingsPatch {
+    pub fn between(base: Settings, desired: Settings) -> Self {
+        let mut changed = SettingsFieldMask::empty();
+        if base.auto_switch_enabled != desired.auto_switch_enabled {
+            changed.insert(SettingsFieldMask::AUTO_SWITCH_ENABLED);
+        }
+        if base.fix_two_capitals != desired.fix_two_capitals {
+            changed.insert(SettingsFieldMask::FIX_TWO_CAPITALS);
+        }
+        if base.fix_accidental_caps_lock != desired.fix_accidental_caps_lock {
+            changed.insert(SettingsFieldMask::FIX_ACCIDENTAL_CAPS_LOCK);
+        }
+        if base.layout_delay_ms != desired.layout_delay_ms {
+            changed.insert(SettingsFieldMask::LAYOUT_DELAY_MS);
+        }
+        if base.manual_correction_hotkey != desired.manual_correction_hotkey {
+            changed.insert(SettingsFieldMask::MANUAL_CORRECTION_HOTKEY);
+        }
+        if base.selected_text_hotkey != desired.selected_text_hotkey {
+            changed.insert(SettingsFieldMask::SELECTED_TEXT_HOTKEY);
+        }
+        if base.layout_switch != desired.layout_switch {
+            changed.insert(SettingsFieldMask::LAYOUT_SWITCH);
+        }
+
+        Self {
+            changed,
+            values: desired,
+        }
+    }
+
+    pub fn all(values: Settings) -> Self {
+        Self {
+            changed: SettingsFieldMask::all(),
+            values,
+        }
+    }
+
+    pub const fn changed(self) -> SettingsFieldMask {
+        self.changed
+    }
+
+    pub fn apply_to(self, mut current: Settings) -> Result<Settings, ValidationError> {
+        if self
+            .changed
+            .contains(SettingsFieldMask::AUTO_SWITCH_ENABLED)
+        {
+            current.auto_switch_enabled = self.values.auto_switch_enabled;
+        }
+        if self.changed.contains(SettingsFieldMask::FIX_TWO_CAPITALS) {
+            current.fix_two_capitals = self.values.fix_two_capitals;
+        }
+        if self
+            .changed
+            .contains(SettingsFieldMask::FIX_ACCIDENTAL_CAPS_LOCK)
+        {
+            current.fix_accidental_caps_lock = self.values.fix_accidental_caps_lock;
+        }
+        if self.changed.contains(SettingsFieldMask::LAYOUT_DELAY_MS) {
+            current.layout_delay_ms = self.values.layout_delay_ms;
+        }
+        if self
+            .changed
+            .contains(SettingsFieldMask::MANUAL_CORRECTION_HOTKEY)
+        {
+            current.manual_correction_hotkey = self.values.manual_correction_hotkey;
+        }
+        if self
+            .changed
+            .contains(SettingsFieldMask::SELECTED_TEXT_HOTKEY)
+        {
+            current.selected_text_hotkey = self.values.selected_text_hotkey;
+        }
+        if self.changed.contains(SettingsFieldMask::LAYOUT_SWITCH) {
+            current.layout_switch = self.values.layout_switch;
+        }
+        current.validate()
+    }
+}
+
+impl From<SettingsPatch> for SettingsPatchDto {
+    fn from(value: SettingsPatch) -> Self {
+        Self {
+            changed: value.changed,
+            values: SettingsDto::from(value.values),
+        }
+    }
+}
+
+impl TryFrom<SettingsPatchDto> for SettingsPatch {
+    type Error = ValidationError;
+
+    fn try_from(value: SettingsPatchDto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            changed: value.changed.validate()?,
+            values: Settings {
+                auto_switch_enabled: value.values.auto_switch_enabled,
+                fix_two_capitals: value.values.fix_two_capitals,
+                fix_accidental_caps_lock: value.values.fix_accidental_caps_lock,
+                layout_delay_ms: value.values.layout_delay_ms,
+                manual_correction_hotkey: value.values.manual_correction_hotkey,
+                selected_text_hotkey: value.values.selected_text_hotkey,
+                layout_switch: value.values.layout_switch,
+            },
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 pub struct UpdateSettingsResult {
     pub message: String,
     pub restart_required: bool,
+    pub settings: SettingsDto,
 }
 
 #[cfg(test)]
@@ -1125,6 +1298,91 @@ mod tests {
 
         let roundtripped = Settings::try_from(dto).unwrap();
         assert_eq!(roundtripped, settings);
+    }
+
+    #[test]
+    fn settings_patch_between_marks_only_changed_fields() {
+        let base = Settings::default();
+        let desired = Settings {
+            fix_two_capitals: true,
+            layout_delay_ms: 77,
+            ..base
+        };
+
+        let patch = SettingsPatch::between(base, desired);
+
+        assert!(patch
+            .changed()
+            .contains(SettingsFieldMask::FIX_TWO_CAPITALS));
+        assert!(patch.changed().contains(SettingsFieldMask::LAYOUT_DELAY_MS));
+        assert!(!patch
+            .changed()
+            .contains(SettingsFieldMask::AUTO_SWITCH_ENABLED));
+        assert_eq!(patch.apply_to(base).unwrap(), desired);
+    }
+
+    #[test]
+    fn settings_patch_ignores_unmarked_invalid_dto_value() {
+        let current = Settings::default();
+        let dto = SettingsPatchDto {
+            changed: SettingsFieldMask::empty(),
+            values: SettingsDto {
+                layout_delay_ms: LAYOUT_DELAY_MAX_MS + 1,
+                ..SettingsDto::default()
+            },
+        };
+
+        let patch = SettingsPatch::try_from(dto).unwrap();
+
+        assert_eq!(patch.apply_to(current).unwrap(), current);
+    }
+
+    #[test]
+    fn settings_patch_rejects_unknown_mask_bits() {
+        let dto = SettingsPatchDto {
+            changed: SettingsFieldMask::from_bits(1 << 15),
+            values: SettingsDto::default(),
+        };
+
+        assert!(matches!(
+            SettingsPatch::try_from(dto),
+            Err(ValidationError::UnknownSettingsPatchFields { unknown })
+                if unknown == 1 << 15
+        ));
+    }
+
+    #[test]
+    fn settings_patch_validates_final_hotkey_combination() {
+        let current = Settings::default();
+        let dto = SettingsPatchDto {
+            changed: SettingsFieldMask::SELECTED_TEXT_HOTKEY,
+            values: SettingsDto {
+                selected_text_hotkey: current.manual_correction_hotkey,
+                ..SettingsDto::default()
+            },
+        };
+        let patch = SettingsPatch::try_from(dto).unwrap();
+
+        assert!(matches!(
+            patch.apply_to(current),
+            Err(ValidationError::DuplicateHotkey { .. })
+        ));
+        assert_ne!(
+            current.selected_text_hotkey,
+            current.manual_correction_hotkey
+        );
+    }
+
+    #[test]
+    fn update_settings_result_carries_committed_snapshot() {
+        let expected = SettingsDto::default();
+        let result = UpdateSettingsResult {
+            message: "saved".to_string(),
+            restart_required: false,
+            settings: expected,
+        };
+
+        assert_eq!(result.settings, expected);
     }
 
     #[test]

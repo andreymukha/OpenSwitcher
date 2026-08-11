@@ -54,6 +54,8 @@ pub enum ValidationError {
     },
     #[error("Горячие клавиши ручного исправления и выделенного текста совпадают: {hotkey}")]
     DuplicateHotkey { hotkey: String },
+    #[error("Patch настроек содержит неизвестные поля: 0x{unknown:04x}")]
+    UnknownSettingsPatchFields { unknown: u16 },
 }
 
 #[derive(Debug, Error)]

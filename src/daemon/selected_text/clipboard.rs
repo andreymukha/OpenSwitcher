@@ -1,5 +1,8 @@
-use super::clipboard_transaction::OwnedTextKind;
-use super::clipboard_transaction::{ClipboardAccess, ClipboardSnapshot, ClipboardTransaction};
+use super::clipboard_owner::X11ClipboardOwnerProbe;
+use super::clipboard_transaction::{
+    read_with_stable_owner, ClipboardAccess, ClipboardOwnerToken, ClipboardSnapshot,
+    ClipboardTransaction, OwnedTextKind,
+};
 use super::engine::{ConversionOutcome, LayoutConversionEngine};
 use super::SelectedTextSwitchResult;
 use super::{log_selected_text_debug, summarize_text};
@@ -23,12 +26,16 @@ pub(super) trait SelectionTransport {
 
 pub(super) struct SystemClipboard {
     inner: Clipboard,
+    owner_probe: Option<X11ClipboardOwnerProbe>,
 }
 
 impl SystemClipboard {
     pub(super) fn new() -> Result<Self, SelectedTextError> {
         Clipboard::new()
-            .map(|inner| Self { inner })
+            .map(|inner| Self {
+                inner,
+                owner_probe: X11ClipboardOwnerProbe::try_new(),
+            })
             .map_err(SelectedTextError::ClipboardUnavailable)
     }
 }
@@ -51,6 +58,10 @@ impl ClipboardAccess for SystemClipboard {
             .clear()
             .map_err(SelectedTextError::ClipboardClear)
     }
+
+    fn owner_token(&mut self) -> Option<ClipboardOwnerToken> {
+        self.owner_probe.as_ref()?.current_owner()
+    }
 }
 
 impl SelectionTransport for SelectionKeyboardTransport {
@@ -64,7 +75,10 @@ impl SelectionTransport for SelectionKeyboardTransport {
 }
 
 enum CopyOutcome {
-    SelectedText(String),
+    SelectedText {
+        text: String,
+        owner: Option<ClipboardOwnerToken>,
+    },
     TimedOut,
 }
 
@@ -80,12 +94,13 @@ impl SelectedTextOperation {
     ) -> Result<SelectedTextSwitchResult, SwitcherError> {
         let mut transaction = ClipboardTransaction::begin(clipboard);
         let previous_clipboard = transaction.original().clone();
+        let original_owner_known = transaction.original_owner_is_known();
         let sentinel = unique_clipboard_sentinel();
 
         log_selected_text_debug(
             "start",
             &format!(
-                "previous_clipboard={} sentinel={sentinel}",
+                "previous_clipboard={} original_owner_known={original_owner_known} sentinel={sentinel}",
                 describe_clipboard_snapshot(&previous_clipboard)
             ),
         );
@@ -102,12 +117,12 @@ impl SelectedTextOperation {
             &previous_clipboard,
             sentinel_confirmed,
         )? {
-            CopyOutcome::SelectedText(text) => {
+            CopyOutcome::SelectedText { text, owner } => {
                 log_selected_text_debug(
                     "copy-received",
                     &format!("selected_text={}", summarize_text(&text)),
                 );
-                transaction.adopt_selected_text(&text);
+                transaction.adopt_selected_text(&text, owner);
                 text
             }
             CopyOutcome::TimedOut => {
@@ -211,17 +226,21 @@ fn wait_for_copied_text(
     let started = Instant::now();
     let mut attempt = 0usize;
     let mut candidate_text: Option<String> = None;
+    let mut candidate_owner: Option<ClipboardOwnerToken> = None;
     let mut candidate_changed_at: Option<Instant> = None;
     let mut observed_sentinel = sentinel_confirmed_before_copy;
 
     loop {
         attempt += 1;
-        match clipboard.get_text() {
+        let observation = read_with_stable_owner(clipboard);
+        match observation.text {
             Ok(text) if text != sentinel => {
-                let is_new_candidate = candidate_text.as_deref() != Some(text.as_str());
+                let is_new_candidate = candidate_text.as_deref() != Some(text.as_str())
+                    || candidate_owner != observation.owner;
                 if is_new_candidate {
                     candidate_changed_at = Some(Instant::now());
                     candidate_text = Some(text.clone());
+                    candidate_owner = observation.owner;
                     log_selected_text_debug(
                         "copy-poll-candidate",
                         &format!(
@@ -269,12 +288,16 @@ fn wait_for_copied_text(
                             summarize_text(&text)
                         ),
                     );
-                    return Ok(CopyOutcome::SelectedText(text));
+                    return Ok(CopyOutcome::SelectedText {
+                        text,
+                        owner: observation.owner,
+                    });
                 }
             }
             Ok(_) => {
                 observed_sentinel = true;
                 candidate_text = None;
+                candidate_owner = None;
                 candidate_changed_at = None;
                 if attempt == 1 || attempt.is_multiple_of(20) {
                     log_selected_text_debug(
@@ -324,7 +347,10 @@ fn wait_for_copied_text(
                         summarize_text(&text)
                     ),
                 );
-                return Ok(CopyOutcome::SelectedText(text));
+                return Ok(CopyOutcome::SelectedText {
+                    text,
+                    owner: candidate_owner,
+                });
             }
             return Ok(CopyOutcome::TimedOut);
         }
@@ -367,6 +393,7 @@ mod tests {
     #[derive(Default)]
     struct TestClipboard {
         current_text: Option<String>,
+        owner: Option<ClipboardOwnerToken>,
         pending_reads: VecDeque<Result<String, SelectedTextError>>,
         write_calls: usize,
         clear_calls: usize,
@@ -379,6 +406,7 @@ mod tests {
         fn with_current_text(text: impl Into<String>) -> Self {
             Self {
                 current_text: Some(text.into()),
+                owner: Some(ClipboardOwnerToken(11)),
                 pending_reads: VecDeque::new(),
                 write_calls: 0,
                 clear_calls: 0,
@@ -397,6 +425,9 @@ mod tests {
         fn get_text(&mut self) -> Result<String, SelectedTextError> {
             if let Some(result) = self.pending_reads.pop_front() {
                 if let Ok(text) = &result {
+                    if self.current_text.as_deref() != Some(text.as_str()) {
+                        self.owner = Some(ClipboardOwnerToken(22));
+                    }
                     self.current_text = Some(text.clone());
                 }
                 return result;
@@ -416,6 +447,7 @@ mod tests {
                 return Err(clipboard_write_error("write failed before mutation"));
             }
             self.current_text = Some(value.to_string());
+            self.owner = Some(ClipboardOwnerToken(11));
             if should_fail {
                 return Err(clipboard_write_error("write failed after mutation"));
             }
@@ -430,7 +462,12 @@ mod tests {
                 }));
             }
             self.current_text = None;
+            self.owner = Some(ClipboardOwnerToken(11));
             Ok(())
+        }
+
+        fn owner_token(&mut self) -> Option<ClipboardOwnerToken> {
+            self.owner
         }
     }
 
@@ -648,7 +685,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            CopyOutcome::SelectedText(text) if text == selected_text
+            CopyOutcome::SelectedText { text, .. } if text == selected_text
         ));
     }
 

@@ -22,7 +22,8 @@ This repository contains the full development history of the project.
 
 OpenSwitcher is in active development.
 
-The first release target is a Linux desktop application for EN/RU typing workflows, built around a `daemon + tray` runtime model.
+OpenSwitcher is a Linux desktop application for EN/RU typing workflows, built around a
+`daemon + tray` runtime model.
 
 Current release baseline:
 - confirmed environments are listed in [Tested Environments](#tested-environments)
@@ -35,8 +36,8 @@ Current release baseline:
 
 | Environment | Session | Status | Verification |
 | --- | --- | --- | --- |
-| Linux Mint 22.2 Cinnamon | X11 | Supported baseline | Confirmed by local smoke testing |
-| Ubuntu 24.04 LTS GNOME 46 | Wayland | Supported Wayland target | Confirmed by local Wayland smoke testing |
+| Linux Mint 22.2 Cinnamon | X11 | Supported baseline | Confirmed by exact-DEB VM testing |
+| Ubuntu 24.04 LTS GNOME 46 | Wayland | Supported Wayland target | Confirmed by exact-DEB VM testing |
 
 Environments not listed here are best-effort. The current confirmed Wayland target is GNOME
 Wayland; other Wayland desktops/compositors are diagnostics-first until tested and backed by
@@ -83,7 +84,7 @@ Use the canonical package for real installation and runtime checks:
 ./manage.sh doctor
 ```
 
-Direct `target/` binary launches through `manage.sh` are no longer supported.
+Direct launches of `target/` binaries are not supported.
 User runtime checks use the installed package and `systemd --user`.
 
 ## Components
@@ -160,8 +161,8 @@ a warning but allows saving.
 - Main supported typing scenario is EN/RU
 - Layout/backend support is still conservative and backend-driven
 - The current backend layer is designed for expansion, but support is not yet broad across all desktop environments
-- Application-specific exclusions are not included in the first release
-- A GNOME Shell extension is not included
+- Application-specific exclusions are not currently available
+- A GNOME Shell extension is not included in the package
 - Tray support depends on the desktop environment providing a compatible StatusNotifier/AppIndicator host
 - A missing tray icon does not by itself prove that the daemon, D-Bus, or settings are broken
 - A visible, working tray is still required for any environment considered fully supported
@@ -233,6 +234,12 @@ Selected-text conversion uses a clipboard-based flow:
 - temporarily replaces the clipboard with the converted text
 - sends a paste shortcut
 - then attempts to restore the previous clipboard contents
+
+When the previous clipboard contains text and no other application changes it during the
+operation, OpenSwitcher restores that text on supported success and safe failure paths. Desktop
+clipboard protocols do not provide an atomic compare-and-swap, so a short race window remains.
+If the previous clipboard contains a non-text format such as an image, a successful conversion
+intentionally leaves the converted text in the clipboard instead of blocking the conversion.
 
 Hotkey capture can depend on the physical keyboard and desktop environment. On some laptops,
 function keys, `Pause`, `ScrollLock`, `Insert`, or `Menu` may be affected by Fn-key handling,
@@ -397,6 +404,8 @@ Distribution assets in the repository:
 
 - `dist/systemd/open-switcher-daemon.service`
 - `dist/systemd/open-switcher-tray.service`
+- `dist/systemd/open-switcher-xtest-guardian.socket`
+- `dist/systemd/open-switcher-xtest-guardian.service`
 - `dist/open-switcher.desktop`
 - `dist/icons/hicolor/512x512/apps/open-switcher.png`
 
@@ -412,30 +421,6 @@ Notes:
 - the desktop entry starts the tray service through `systemctl --user`
 - the tray unit pulls in the daemon unit
 - the XDG autostart fallback at `~/.config/autostart/open-switcher.desktop` also starts the tray systemd service, not the tray binary directly, for desktop-session login reliability
-
-## Direct Binary Runs
-
-This section is mainly for development and manual local debugging.
-
-If you want to run the binaries manually from the build tree:
-
-Daemon:
-
-```bash
-./target/debug/open-switcher
-```
-
-Tray:
-
-```bash
-./target/debug/open-switcher-tray
-```
-
-Settings:
-
-```bash
-./target/debug/open-switcher-settings
-```
 
 ## Configuration
 
@@ -481,16 +466,16 @@ gdbus monitor \
 - Confirmed environments are listed in [Tested Environments](#tested-environments).
 - Current confirmed Wayland target: GNOME Wayland.
 - Linux desktop environments and Wayland compositors not listed in Tested Environments are best-effort until tested and backed by diagnostics/backend support.
-- Application-specific exclusions are not included in the first release.
-- A GNOME Shell extension is not included.
+- Application-specific exclusions are not currently available.
+- A GNOME Shell extension is not included in the package.
 - Tray visibility depends on a compatible StatusNotifier/AppIndicator host.
 - Tray visibility is checked separately from daemon, D-Bus, and settings health.
 - A missing tray icon does not by itself prove daemon failure, but it is a user-facing acceptance failure for any fully supported environment.
 - The official runtime and autostart model depends on `systemd --user`.
-- Selected-text conversion temporarily uses the clipboard and attempts to restore previous clipboard contents after conversion.
+- Selected-text conversion follows the clipboard policy described above: text restoration is conditional, and successful conversion intentionally replaces a previous non-text payload with converted text.
 - Manual and selected-text hotkey capture may depend on laptop Fn keys and desktop/global shortcut handling.
 - The autocorrection heuristic is intentionally conservative. Some short RU -> EN technical false negatives may remain, for example `cargo`, `rust`, `sudo`, `git`, `ssh`, `npm`, `jwt`.
-- Existing rustfmt drift and non-hermetic shell/platform tests are known technical debt for later cleanup.
+- Some shell/platform tests depend on Linux session services and cannot run hermetically in every restricted sandbox.
 
 ## Development Smoke Test
 
